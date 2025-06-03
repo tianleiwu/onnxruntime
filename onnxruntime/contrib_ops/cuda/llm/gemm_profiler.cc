@@ -38,58 +38,75 @@ GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::GemmPluginPro
   }
 }
 
-// template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
-// void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::serialize(
-//     char*& buffer, GemmIdType const& gemmId) const
-// {
-//     auto mProfileMap = mMNKProfileMap->getMProfileMap(gemmId);
+// Write values into buffer. Note that this is not portable across different architectures (endianness).
+template <typename T>
+void write(char*& buffer, T const& val)
+{
+    std::memcpy(buffer, &val, sizeof(T));
+    buffer += sizeof(T);
+}
 
-//     // Save number of profiles for given GEMM ID
-//     write(buffer, static_cast<int>(mProfileMap->size()));
-//     for (auto const& pair : *mProfileMap)
-//     {
-//         // Save pair of M to the best GEMM config
-//         write(buffer, pair);
-//     }
-// }
+// Read values from buffer. Note that this is not portable across different architectures (endianness).
+template <typename T>
+void read(char const*& buffer, T& val)
+{
+    std::memcpy(&val, buffer, sizeof(T));
+    buffer += sizeof(T);
+}
 
-// template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
-// void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::deserialize(
-//     char const*& data, GemmDims& dims, GemmIdType const& gemmId)
-// {
-//     // NOTE: this mutex is not needed since each thread owns its private map, but will put here for
-//     // consistency
-//     writer_lock lock(mMNKProfileMap->mutex);
+template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
+void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::serialize(
+    char*& buffer, GemmIdType const& gemmId) const
+{
+    auto mProfileMap = mMNKProfileMap->getMProfileMap(gemmId);
 
-//     mDims = dims;
+    // Save number of profiles for given GEMM ID
+    write(buffer, static_cast<int>(mProfileMap->size()));
+    for (auto const& pair : *mProfileMap)
+    {
+        // Save pair of M to the best GEMM config
+        write(buffer, pair);
+    }
+}
 
-//     // GemmId gemmId(dims.n, dims.k);
-//     if (!mMNKProfileMap->existsMProfileMap(gemmId))
-//     {
-//         // Create GEMM with GEMM ID if it does not exist
-//         mMNKProfileMap->createMProfileMap(gemmId);
-//     }
-//     // Populate map with profiles of GEMM ID
-//     auto profileMap = mMNKProfileMap->getMProfileMap(gemmId);
-//     int selectedMapSize;
-//     read(data, selectedMapSize);
-//     for (int ii = 0; ii < selectedMapSize; ++ii)
-//     {
-//         std::pair<int, std::optional<Config>> config;
-//         read(data, config);
-//         profileMap->insert(config);
-//     }
-// }
+template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
+void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::deserialize(
+    char const*& data, GemmDims& dims, GemmIdType const& gemmId)
+{
+    // NOTE: this mutex is not needed since each thread owns its private map, but will put here for
+    // consistency
+    writer_lock lock(mMNKProfileMap->mutex);
 
-// template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
-// size_t GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::getSerializationSize(
-//     GemmIdType const& gemmId) const
-// {
-//     reader_lock lock(mMNKProfileMap->mutex);
-//     return sizeof(int) +                                 // size of the tactics map
-//         mMNKProfileMap->getMProfileMap(gemmId)->size()
-//         * sizeof(std::pair<int, std::optional<Config>>); // size of the tactics map
-// }
+    mDims = dims;
+
+    // GemmId gemmId(dims.n, dims.k);
+    if (!mMNKProfileMap->existsMProfileMap(gemmId))
+    {
+        // Create GEMM with GEMM ID if it does not exist
+        mMNKProfileMap->createMProfileMap(gemmId);
+    }
+
+    // Populate map with profiles of GEMM ID
+    auto profileMap = mMNKProfileMap->getMProfileMap(gemmId);
+    int selectedMapSize;
+    read(data, selectedMapSize);
+    for (int ii = 0; ii < selectedMapSize; ++ii)
+    {
+        std::pair<int, std::optional<Config>> config;
+        read(data, config);
+        profileMap->insert(config);
+    }
+}
+
+template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
+size_t GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::getSerializationSize(
+    GemmIdType const& gemmId) const
+{
+    reader_lock lock(mMNKProfileMap->mutex);
+    return sizeof(int) +                                 // size of the tactics map
+        mMNKProfileMap->getMProfileMap(gemmId)->size()
+        * sizeof(std::pair<int, std::optional<Config>>); // size of the tactics map
+}
 
 template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
 int GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::getMaxProfileM() const {

@@ -178,10 +178,11 @@ class GemmPluginProfiler {
 
   virtual ~GemmPluginProfiler() = default;
 
-  // void serialize(char*& buffer, GemmIdType const& gemmId) const;
+  void serialize(char*& buffer, GemmIdType const& gemmId) const;
 
-  // void deserialize(char const*& data, GemmDims& dims, GemmIdType const& gemmId);
-  // size_t getSerializationSize(GemmIdType const& gemmId) const;
+  void deserialize(char const*& data, GemmDims& dims, GemmIdType const& gemmId);
+
+  size_t getSerializationSize(GemmIdType const& gemmId) const;
 
   void profileTactics(RunnerPtr const& runner, nvinfer::DataType const& type, GemmDims const& dims,
                       GemmIdType const& gemmId, bool hasWeightOnlyCudaKernel = false);

@@ -123,14 +123,18 @@ LayoutDetails getLayoutDetailsForArch(QuantType quant_type) {
   return details;
 }
 
-LayoutDetails getLayoutDetailsForTransform(QuantType quant_type, int arch) {
+LayoutDetails getLayoutDetailsForTransform(QuantType quant_type, int arch, int &normalized_arch) {
   if (arch >= 75 && arch < 80) {
+    normalized_arch = 75;
     return getLayoutDetailsForArch<cutlass::arch::Sm75>(quant_type);
   } else if (arch >= 80 && arch < 90) {
+    normalized_arch = 80;
     return getLayoutDetailsForArch<cutlass::arch::Sm80>(quant_type);
   } else if (arch >= 90 && arch < 100) {
+    normalized_arch = 90;
     return getLayoutDetailsForArch<cutlass::arch::Sm90>(quant_type);
   } else if (arch >= 100) {
+    normalized_arch = 80;
     return getLayoutDetailsForArch<cutlass::arch::Sm80>(quant_type);
   } else {
     ORT_THROW("Unsupported Arch");
