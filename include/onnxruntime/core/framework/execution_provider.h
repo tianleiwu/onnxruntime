@@ -62,7 +62,6 @@ using RunOptions = ::OrtRunOptions;
 enum class DataLayout {
   NCHW,
   NHWC,
-  NCHWC,
 };
 
 class IExecutionProvider {
@@ -170,7 +169,7 @@ class IExecutionProvider {
   /**
      Get the device id of current execution provider
   */
-  virtual int GetDeviceId() const { return 0; };
+  virtual int GetDeviceId() const { return default_device_.Id(); };
 
   /**
      Get execution provider's configuration options.
