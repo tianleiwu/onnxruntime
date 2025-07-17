@@ -282,12 +282,6 @@ inline __device__ void compute_attn_1rowblock(const Params& params, const int bi
   }
 #endif
 
-  if constexpr (Is_softcap) {
-    if (params.head_sink_ptr != nullptr) {
-      sink = cutlass::fast_tanh(sink * params.softcap);
-    }
-  }
-
   // For performance reason, we separate out two kinds of iterations:
   // those that need masking on S, and those that don't.
   // We need masking on S for the very last block when K and V has length not multiple of kBlockN.

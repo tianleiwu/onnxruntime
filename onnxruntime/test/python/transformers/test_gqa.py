@@ -665,6 +665,7 @@ def attention_ref(
         print("add attn_bias", scores)
 
     if use_smooth_softmax or (head_sink is not None):
+        # Note that the sink directly joins softmax. No scaling and softcap!
         attention = smooth_softmax_ref(scores, head_sink)
         print("softmax with sink", attention)
     else:
@@ -733,10 +734,7 @@ def parity_check_gqa_prompt(
     ) * std
     new_v = torch.randn_like(new_k) * std
 
-    # head_sink = torch.rand(config.num_heads, dtype=torch_type, device=device) if config.has_head_sink else None
-    head_sink = torch.zeros(config.num_heads, dtype=torch_type, device=device) if config.has_head_sink else None
-    # This will fail when head_sink is not zeros.
-    # head_sink = torch.ones(config.num_heads, dtype=torch_type, device=device) if config.has_head_sink else None
+    head_sink = torch.rand(config.num_heads, dtype=torch_type, device=device) if config.has_head_sink else None
 
     print("head_sink:", head_sink)
     window_size = (-1, -1)
@@ -1005,9 +1003,9 @@ def get_softmax_options():
 
 
 def gqa_cuda_prompt_test_cases():
-    batches = [1] if pipeline_mode else [1, 3, 5]
-    seqs = [(1, 1)] if pipeline_mode else [(35, 35), (127, 127), (240, 240), (2000, 2000)]
-    num_h = [(1, 1)] if pipeline_mode else [(6, 3), (9, 9), (32, 8)]
+    batches = [3] if pipeline_mode else [1, 3, 5]
+    seqs = [(35, 35)] if pipeline_mode else [(35, 35), (127, 127), (240, 240), (2000, 2000)]
+    num_h = [(6, 3)] if pipeline_mode else [(6, 3), (9, 9), (32, 8)]
     h_sizes = [32] if pipeline_mode else [32, 64, 128, 256]
     smmoth_softmax__head_sink = get_softmax_options()
 
@@ -1015,10 +1013,10 @@ def gqa_cuda_prompt_test_cases():
         for sq, skv in seqs:
             for n, n2 in num_h:
                 for h in h_sizes:
-                    for lws in [-1]:  # [-1, random.randint(1, skv)]:
+                    for lws in [-1, random.randint(1, skv)]:
                         for rotary, rotary_interleaved in get_cuda_rotary_options():
-                            for packed in [False]:  # [False, True]:
-                                for softcap in [0.0]:  # [0.0, 50.0]:
+                            for packed in [False, True]:
+                                for softcap in [0.0, 50.0]:
                                     if rotary and h % 16 > 0:
                                         continue
                                     for use_smooth_softmax, has_head_sink in smmoth_softmax__head_sink:

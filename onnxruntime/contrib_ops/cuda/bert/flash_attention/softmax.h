@@ -225,7 +225,10 @@ struct Softmax {
   }
 
   template <bool Split = false, typename Tensor0>
-  __forceinline__ __device__ TensorT normalize_softmax_lse(Tensor0& acc_o, float softmax_scale, float sink) {
+  __forceinline__ __device__ TensorT normalize_softmax_lse(Tensor0& acc_o,
+                                                           float softmax_scale,
+                                                           float sink) {  // IMPORTANT: sink is a pre-scaled logit
+
     SumOp<float> sum_op;
     quad_allreduce_(row_sum, row_sum, sum_op);
     TensorT lse = make_fragment_like(row_sum);
@@ -237,27 +240,100 @@ struct Softmax {
 #pragma unroll
     for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
       float sum = row_sum(mi);
+      float max_unscaled = row_max(mi);  // Max of the qk scores, NOT scaled.
 
       if (use_sink) {
-        const float sink_scaled = sink * softmax_scale;
-        const float max_scaled = (row_max(mi) == -kInfinity) ? 0.f : (row_max(mi) * softmax_scale);
-        float sink_exp = expf(sink_scaled - max_scaled);
+        // 1. Find the max of the *scaled* scores.
+        //    The `sink` is already scaled, but `max_unscaled` is not.
+        const float max_scaled = (max_unscaled == -kInfinity)
+                                     ? -kInfinity
+                                     : max_unscaled * softmax_scale;
 
-        printf("blocks=(%d, %d, %d) threads=(%d, %d, %d) mi = %d, sink=%f, softmax_scale=%f, sink_exp = %f, max=%f, sum = %f, sum + sink_exp=%f\n",
-          blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y, threadIdx.z,
-          mi, sink, softmax_scale, sink_exp, row_max(mi), sum, sum + sink_exp);
+        // 2. The true maximum is the max of all scaled values.
+        const float true_max_scaled = max(max_scaled, sink);
 
-        // When sink - row_max(mi) is too large
-        if (sink_exp != sink_exp && row_max(mi) != -kInfinity) {
-          #pragma unroll
-          for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
-            acc_o_rowcol(mi, ni) = 0.0f;
-          }
-          continue;
+        // 3. Rescale the intermediate sum and the output accumulator (acc_o).
+        //    They were calculated relative to `max_scaled` and must be
+        //    rescaled to be relative to `true_max_scaled`.
+        const float rescale_factor = expf(max_scaled - true_max_scaled);
+
+#pragma unroll
+        for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
+          acc_o_rowcol(mi, ni) *= rescale_factor;
         }
 
-        sum += sink_exp;
+        // 4. Calculate the final sum, including the sink's contribution.
+        sum *= rescale_factor;
+        sum += expf(sink - true_max_scaled);
+
+        // 5. Optional: Update row_max and row_sum in-place.
+        // row_max(mi) = true_max_scaled / softmax_scale;
+        // row_sum(mi) = sum
+        max_unscaled = true_max_scaled / softmax_scale;
       }
+
+      lse(mi) = (sum == 0.f || sum != sum)
+                    ? (Split ? -kInfinity : kInfinity)
+                    : max_unscaled * softmax_scale + __logf(sum);
+
+      // 6. Perform the final normalization with the corrected sum.
+      float inv_sum = (sum == 0.f || !isfinite(sum)) ? 1.f : 1.f / sum;
+
+#pragma unroll
+      for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
+        acc_o_rowcol(mi, ni) *= inv_sum;
+      }
+    }
+
+    return lse;
+  }
+
+  //     float sum = row_sum(mi);
+  //     float max_val = row_max(mi);
+
+  //     if (use_sink) {
+
+  //       const float softmax_scale_log2 = softmax_scale * M_LOG2E;
+
+  //       // Update max, and rescale acc_o_rowcol and sum
+  //       if (sink > max_val) {
+  //         float max_prev = max_val;
+  //         max_val = sink;
+
+  //         float scores_scale = exp2f((max_prev - max_val) * softmax_scale_log2);
+
+  // #pragma unroll
+  //         for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
+  //           acc_o_rowcol(mi, ni) *= scores_scale;
+  //         }
+
+  //         sum *= scores_scale;
+  //       }
+
+  //       // Add the sink's contribution to the sum.
+  //        sum += exp2f((sink - max_val) * softmax_scale_log2);
+  //     }
+
+      // if (use_sink) {
+      //   const float sink_scaled = sink * softmax_scale;
+      //   const float max_scaled = (row_max(mi) == -kInfinity) ? 0.f : (row_max(mi) * softmax_scale);
+      //   float sink_exp = expf(sink_scaled - max_scaled);
+
+      //   printf("blocks=(%d, %d, %d) threads=(%d, %d, %d) mi = %d, sink=%f, softmax_scale=%f, sink_exp = %f, max=%f, sum = %f, sum + sink_exp=%f\n",
+      //     blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y, threadIdx.z,
+      //     mi, sink, softmax_scale, sink_exp, row_max(mi), sum, sum + sink_exp);
+
+      //   // When sink - row_max(mi) is too large
+      //   if (sink_exp != sink_exp && row_max(mi) != -kInfinity) {
+      //     #pragma unroll
+      //     for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
+      //       acc_o_rowcol(mi, ni) = 0.0f;
+      //     }
+      //     continue;
+      //   }
+
+      //   sum += sink_exp;
+      // }
 
       // if (use_sink) {
 
@@ -272,22 +348,24 @@ struct Softmax {
       //   sum += expf((sink - row_max(mi)) * softmax_scale);
       // }
 
-      float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
-      lse(mi) = (sum == 0.f || sum != sum)
-                    ? (Split ? -kInfinity : kInfinity)
-                    : row_max(mi) * softmax_scale + __logf(sum);
-      float scale = inv_sum;
-#pragma unroll
-      for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
-        printf("blocks=(%d, %d, %d) threads=(%d, %d, %d) mi = %d, ni = %d, acc=%f scale=%f acc*scale = %f\n",
-          blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y, threadIdx.z,
-          mi, ni, acc_o_rowcol(mi, ni), scale, acc_o_rowcol(mi, ni) * scale);
-        acc_o_rowcol(mi, ni) *= scale;
-      }
-    }
+//       float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
+//       lse(mi) = (sum == 0.f || sum != sum)
+//                     ? (Split ? -kInfinity : kInfinity)
+//                     : max_val * softmax_scale + __logf(sum);
+//       float scale = inv_sum;
 
-    return lse;
-  };
+// #pragma unroll
+//       for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
+//         printf("blocks=(%d, %d, %d) threads=(%d, %d, %d) mi = %d, ni = %d, acc=%f scale=%f acc*scale = %f\n",
+//           blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y, threadIdx.z,
+//           mi, ni, acc_o_rowcol(mi, ni), scale, acc_o_rowcol(mi, ni) * scale);
+//         acc_o_rowcol(mi, ni) *= scale;
+//       }
+//     }
+
+//     return lse;
+//   };
+// };
 };
 
 }  // namespace flash
