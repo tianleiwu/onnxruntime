@@ -134,7 +134,8 @@ struct Softmax {
 //       if (use_sink) {
 // #pragma unroll
 //         for (int mi = 0; mi < size<0>(row_max); ++mi) {
-//           row_max(mi) = max(row_max(mi), sink);  // Sink value ensures that row_max cannot be -inf
+//           // The row_max is not scaled but sink is scaled, so sink must be divided by softmax_scale.
+//           row_max(mi) = max(row_max(mi), sink / softmax_scale_log2 * float(M_LOG2E));
 //         }
 //       }
 
@@ -144,7 +145,7 @@ struct Softmax {
 //       if (use_sink) {
 // #pragma unroll
 //         for (int mi = 0; mi < size<0>(row_sum); ++mi) {
-//           float sink_exp = exp2f((sink - row_max(mi)) * softmax_scale_log2);
+//           float sink_exp = exp2f(sink * float(M_LOG2E) - row_max(mi) * softmax_scale_log2);
 //           row_sum(mi) += sink_exp;
 //         }
 //       }
@@ -154,12 +155,6 @@ struct Softmax {
 
       flash::template reduce_max</*zero_init=*/false>(scores, row_max);
 
-//       if (use_sink) {
-// #pragma unroll
-//         for (int mi = 0; mi < size<0>(row_max); ++mi) {
-//           row_max(mi) = max(row_max(mi), sink);
-//         }
-//       }
 
       Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
       static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
@@ -188,16 +183,6 @@ struct Softmax {
       // We don't do the reduce across threads here since we don't need to use the row_sum.
       // We do that reduce at the end when we need to normalize the softmax.
       flash::reduce_sum</*zero_init=*/false>(scores, row_sum);
-
-      //       if (use_sink) {
-      //         const float sink_scaled = sink * softmax_scale_log2;
-      // #pragma unroll
-      //         for (int mi = 0; mi < size<0>(row_sum); ++mi) {
-      //           const float max_scaled = row_max(mi) == -kInfinity ? 0.f : row_max(mi) * softmax_scale_log2;
-      //           float sink_exp = exp2f(sink_scaled - max_scaled);
-      //           row_sum(mi) += sink_exp;
-      //         }
-      //       }
     }
 
     if (threadIdx.x == 0) {
@@ -288,84 +273,6 @@ struct Softmax {
     return lse;
   }
 
-  //     float sum = row_sum(mi);
-  //     float max_val = row_max(mi);
-
-  //     if (use_sink) {
-
-  //       const float softmax_scale_log2 = softmax_scale * M_LOG2E;
-
-  //       // Update max, and rescale acc_o_rowcol and sum
-  //       if (sink > max_val) {
-  //         float max_prev = max_val;
-  //         max_val = sink;
-
-  //         float scores_scale = exp2f((max_prev - max_val) * softmax_scale_log2);
-
-  // #pragma unroll
-  //         for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
-  //           acc_o_rowcol(mi, ni) *= scores_scale;
-  //         }
-
-  //         sum *= scores_scale;
-  //       }
-
-  //       // Add the sink's contribution to the sum.
-  //        sum += exp2f((sink - max_val) * softmax_scale_log2);
-  //     }
-
-      // if (use_sink) {
-      //   const float sink_scaled = sink * softmax_scale;
-      //   const float max_scaled = (row_max(mi) == -kInfinity) ? 0.f : (row_max(mi) * softmax_scale);
-      //   float sink_exp = expf(sink_scaled - max_scaled);
-
-      //   printf("blocks=(%d, %d, %d) threads=(%d, %d, %d) mi = %d, sink=%f, softmax_scale=%f, sink_exp = %f, max=%f, sum = %f, sum + sink_exp=%f\n",
-      //     blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y, threadIdx.z,
-      //     mi, sink, softmax_scale, sink_exp, row_max(mi), sum, sum + sink_exp);
-
-      //   // When sink - row_max(mi) is too large
-      //   if (sink_exp != sink_exp && row_max(mi) != -kInfinity) {
-      //     #pragma unroll
-      //     for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
-      //       acc_o_rowcol(mi, ni) = 0.0f;
-      //     }
-      //     continue;
-      //   }
-
-      //   sum += sink_exp;
-      // }
-
-      // if (use_sink) {
-
-      //   float scores_max_cur = !Check_inf
-      //                              ? row_max(mi)
-      //                              : (row_max(mi) == -kInfinity ? 0.0f : row_max(mi));
-      //   float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
-      //   row_sum(mi) *= scores_scale;
-      // }
-
-      // if (use_sink) {
-      //   sum += expf((sink - row_max(mi)) * softmax_scale);
-      // }
-
-//       float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
-//       lse(mi) = (sum == 0.f || sum != sum)
-//                     ? (Split ? -kInfinity : kInfinity)
-//                     : max_val * softmax_scale + __logf(sum);
-//       float scale = inv_sum;
-
-// #pragma unroll
-//       for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
-//         printf("blocks=(%d, %d, %d) threads=(%d, %d, %d) mi = %d, ni = %d, acc=%f scale=%f acc*scale = %f\n",
-//           blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y, threadIdx.z,
-//           mi, ni, acc_o_rowcol(mi, ni), scale, acc_o_rowcol(mi, ni) * scale);
-//         acc_o_rowcol(mi, ni) *= scale;
-//       }
-//     }
-
-//     return lse;
-//   };
-// };
 };
 
 }  // namespace flash
