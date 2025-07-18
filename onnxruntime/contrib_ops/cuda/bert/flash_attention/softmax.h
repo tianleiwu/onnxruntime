@@ -94,14 +94,34 @@ struct Softmax {
   __forceinline__ __device__ Softmax() {};
 
   template <bool Is_first, bool Check_inf = false, typename Tensor0, typename Tensor1>
-  __forceinline__ __device__ void softmax_rescale_o(Tensor0& acc_s, Tensor1& acc_o, float softmax_scale_log2) {
+  __forceinline__ __device__ void softmax_rescale_o(Tensor0& acc_s, Tensor1& acc_o, float softmax_scale_log2,
+                                                    const float unscaled_sink) {
     // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
     Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
     static_assert(decltype(size<0>(scores))::value == kNRows);
     if (Is_first) {
       flash::template reduce_max</*zero_init=*/true>(scores, row_max);
+
+        // If sink is enabled, update the max with the unscaled sink value (row_max is unscaled).
+        const bool use_sink = (unscaled_sink != -kInfinity);
+        if (use_sink) {
+            #pragma unroll
+            for (int mi = 0; mi < size<0>(row_max); ++mi) {
+                row_max(mi) = max(row_max(mi), unscaled_sink);
+            }
+        }
+
       flash::scale_apply_exp2(scores, row_max, softmax_scale_log2);
       flash::reduce_sum</*zero_init=*/true>(scores, row_sum);
+
+      // If sink is enabled, add its contribution to the sum.
+      if (use_sink) {
+          #pragma unroll
+          for (int mi = 0; mi < size<0>(row_sum); ++mi) {
+              float sink_exp = exp2f((unscaled_sink - row_max(mi)) * softmax_scale_log2);
+              row_sum(mi) += sink_exp;
+          }
+      }
     } else {
       Tensor scores_max_prev = make_fragment_like(row_max);
       cute::copy(row_max, scores_max_prev);
@@ -130,52 +150,19 @@ struct Softmax {
   };
 
   template <bool Split = false, typename Tensor0>
-  __forceinline__ __device__ TensorT normalize_softmax_lse(Tensor0& acc_o,
-                                                           float softmax_scale,
-                                                           float sink) {  // IMPORTANT: sink is a pre-scaled logit
-
+  __forceinline__ __device__ TensorT normalize_softmax_lse(Tensor0& acc_o, float softmax_scale) {
     SumOp<float> sum_op;
     quad_allreduce_(row_sum, row_sum, sum_op);
     TensorT lse = make_fragment_like(row_sum);
     Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
     static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
 
-    const bool use_sink = (sink != -kInfinity);
-
 #pragma unroll
     for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
       float sum = row_sum(mi);
-      float max_unscaled = row_max(mi);  // Max of the qk scores, NOT scaled.
-
-      if (use_sink) {
-        const float max_scaled = (max_unscaled == -kInfinity)
-                                     ? -kInfinity
-                                     : max_unscaled * softmax_scale;
-
-        const float true_max_scaled = max(max_scaled, sink);
-
-        // Rescale the intermediate the output accumulator (acc_o) and sum.
-        // They were calculated relative to `max_scaled` and must be
-        // rescaled to be relative to `true_max_scaled`.
-        const float rescale_factor = expf(max_scaled - true_max_scaled);
-
-#pragma unroll
-        for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
-          acc_o_rowcol(mi, ni) *= rescale_factor;
-        }
-
-        sum *= rescale_factor;
-
-        // Add the sink to the sum.
-        sum += expf(sink - true_max_scaled);
-
-        // The unscaled max that reflects the sink. It is used for the below LSE calculation.
-        max_unscaled = true_max_scaled / softmax_scale;
-      }
-
       lse(mi) = (sum == 0.f || sum != sum)
                     ? (Split ? -kInfinity : kInfinity)
-                    : max_unscaled * softmax_scale + __logf(sum);
+                    : row_max(mi) * softmax_scale + __logf(sum);
 
       float inv_sum = (sum == 0.f || !isfinite(sum)) ? 1.f : 1.f / sum;
 #pragma unroll

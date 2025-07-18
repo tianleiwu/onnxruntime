@@ -41,6 +41,7 @@ struct MemoryEfficientAttentionParams {
   const void* key = nullptr;                // [B, L, N, H], where L is kv_sequence_length
   const void* value = nullptr;              // [B, L, N, H_v]
   const void* attn_bias = nullptr;          // [B or 1, N or 1, S, L] or null
+  const void* head_sink = nullptr;          // [N]
   void* workspace = nullptr;                // [B, S, N, H_v] when kNeedsOutputAccumulatorBuffer, nullptr otherwise
   void* output = nullptr;                   // [B, S, N, H_v]
 

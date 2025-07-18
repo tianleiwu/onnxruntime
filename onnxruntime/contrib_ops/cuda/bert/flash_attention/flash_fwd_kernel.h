@@ -33,6 +33,13 @@ namespace flash {
 using namespace cute;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+template <typename Element, typename Params>
+__forceinline__ __device__ float get_sink(const Params& params, const int bidh) {
+  float unscaled_sink = (params.head_sink_ptr != nullptr)
+                        ? reinterpret_cast<Element*>(params.head_sink_ptr)[bidh] / params.scale_softmax
+                        : (params.smooth_softmax ? 0.0f : -kInfinity);
+  return unscaled_sink;
+}
 
 template <typename ElementAccum, typename Params, int kBlockM, bool Is_even_MN>
 __forceinline__ __device__ auto get_lse_tile(const Params& params, const int bidb, const int bidh, const int m_block, const BlockInfo</*Varlen=*/!Is_even_MN>& binfo) {
@@ -262,6 +269,7 @@ inline __device__ void compute_attn_1rowblock(const Params& params, const int bi
   flash::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q,
                                                    params.window_size_left, params.window_size_right, alibi_slope);
 
+  float unscaled_sink = get_sink<Element, Params>(params, bidh);
   // For performance reason, we separate out two kinds of iterations:
   // those that need masking on S, and those that don't.
   // We need masking on S for the very last block when K and V has length not multiple of kBlockN.
@@ -314,8 +322,8 @@ inline __device__ void compute_attn_1rowblock(const Params& params, const int bi
 
     // TODO: when we have key_padding_mask we'll need to Check_inf
     masking_step == 0
-        ? softmax.template softmax_rescale_o</*Is_first=*/true, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2)
-        : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
+        ? softmax.template softmax_rescale_o</*Is_first=*/true, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2, unscaled_sink)
+        : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2, unscaled_sink);
 
     // Convert acc_s from fp32 to fp16/bf16
     Tensor rP = flash::convert_type<Element>(acc_s);
@@ -359,7 +367,7 @@ inline __device__ void compute_attn_1rowblock(const Params& params, const int bi
     mask.template apply_mask</*Causal_mask=*/false>(
         acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16);
 
-    softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
+    softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2, unscaled_sink);
 
     Tensor rP = flash::convert_type<Element>(acc_s);
     // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
@@ -369,10 +377,7 @@ inline __device__ void compute_attn_1rowblock(const Params& params, const int bi
   }
 
   // Epilogue
-  float sink = (params.head_sink_ptr != nullptr)
-                   ? reinterpret_cast<Element*>(params.head_sink_ptr)[bidh]
-                   : (params.smooth_softmax ? 0.0f : -kInfinity);
-  Tensor lse = softmax.template normalize_softmax_lse<>(acc_o, params.scale_softmax, sink);
+  Tensor lse = softmax.template normalize_softmax_lse<>(acc_o, params.scale_softmax);
 
   // Convert acc_o from fp32 to fp16/bf16
   Tensor rO = flash::convert_type<Element>(acc_o);
@@ -781,6 +786,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
                                        : reinterpret_cast<float*>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
   flash::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
 
+  float unscaled_sink = get_sink<Element, Params>(params, bidh);
+
   // For performance reason, we separate out two kinds of iterations:
   // those that need masking on S, and those that don't.
   // We need masking on S for the very last block when K and V has length not multiple of kBlockN.
@@ -853,8 +860,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
 
     // We have key_padding_mask so we'll need to Check_inf
     masking_step == 0
-        ? softmax.template softmax_rescale_o</*Is_first=*/true, /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2)
-        : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2);
+        ? softmax.template softmax_rescale_o</*Is_first=*/true, /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2, unscaled_sink)
+        : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2, unscaled_sink);
     // if (cute::thread0()) { print(scores_max); print(scores_sum); print(scores); }
 
     // Convert acc_s from fp32 to fp16/bf16
@@ -919,7 +926,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
 
     mask.template apply_mask</*Causal_mask=*/false>(
         acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16);
-    softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
+    softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2, unscaled_sink);
 
     Tensor rP = flash::convert_type<Element>(acc_s);
     // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
@@ -930,10 +937,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
   }
 
   // Epilogue
-  float sink = (params.head_sink_ptr != nullptr)
-                   ? reinterpret_cast<Element*>(params.head_sink_ptr)[bidh]
-                   : (params.smooth_softmax ? 0.0f : -std::numeric_limits<float>::infinity());
-  Tensor lse = softmax.template normalize_softmax_lse<Split>(acc_o, params.scale_softmax, sink);
+  Tensor lse = softmax.template normalize_softmax_lse<Split>(acc_o, params.scale_softmax);
 
   Tensor sOaccum = make_tensor(make_smem_ptr(reinterpret_cast<ElementO*>(smem_)), typename Kernel_traits::SmemLayoutO{});  // (SMEM_M,SMEM_N)
   // Partition sO to match the accumulator partitioning
