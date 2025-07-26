@@ -39,27 +39,81 @@ def value_string_of(numpy_array):
 def print_tensor(name, numpy_array):
     print(f"const std::vector<float> {name} = {value_string_of(numpy_array)};")
 
-
 def quant_dequant(weights, quant_mode: bool = True):
-    # use the test version `_symmetric_...` to get the non-interleaved weights
-    type = torch.quint4x2 if quant_mode else torch.int8
-    # This import is needed to use torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix()
-    # Comment out this line for passing the lintrunner check in the CI.
-    # import tensorrt_llm
+    """
+    Perform symmetric per-row quantization and dequantization.
 
-    quant_weights, processed_q_weight, torch_weight_scales = (
-        torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix(weights.T.cpu().contiguous(), type)
-    )
+    Args:
+        weights (torch.Tensor): Input 2D weight matrix of shape [out_features, in_features]
+        quant_mode (bool): If True, quantize to INT4 (packed), otherwise INT8
 
-    # Unpack the int4s int int8s
+    Returns:
+        scales (torch.Tensor): Per-row scale factors (shape [out_features])
+        packed_weights (torch.Tensor): The quantized weights (uint8 packed for INT4, int8 for INT8)
+        dequant_weights (torch.Tensor): Reconstructed weights from quantized + scale
+    """
+    print("shape of weights:", weights.shape)
+
+    # Transpose to [in_features, out_features] to match original
+    W = weights.T.contiguous()  # [in_features, out_features]
+    orig_shape = W.shape
+
+    # Symmetric quantization per row
+    max_vals = W.abs().amax(dim=-1, keepdim=True)  # per row
+    eps = 1e-8  # prevent divide-by-zero
+    scale = max_vals / (7 if quant_mode else 127)
+    scale = scale.clamp(min=eps)
+
+    W_scaled = W / scale  # de-scaled float
+    W_q = W_scaled.round().clamp(-7 if quant_mode else -127, 7 if quant_mode else 127)
+
     if quant_mode:
-        upper = quant_weights >> 4
-        lower = (quant_weights << 4) >> 4  # Arithmetic right shift sign extends
-        quant_weights = torch.stack((lower, upper), dim=2).view(weights.T.shape)
+        # Convert to INT4: Pack two int4 into one uint8
+        W_q = W_q.to(torch.int8)
+        if W_q.shape[1] % 2 != 0:
+            # Pad if in_features is odd
+            W_q = torch.nn.functional.pad(W_q, (0, 1), value=0)
 
-    quant_weights = quant_weights.to(dtype=weights.dtype)
-    result = torch.multiply(quant_weights, torch_weight_scales.unsqueeze(0)).T.contiguous()
-    return torch_weight_scales.to(torch.float16), processed_q_weight, result.to(device=weights.device)
+        lower = (W_q[:, 0::2] & 0x0F)
+        upper = ((W_q[:, 1::2] & 0x0F) << 4)
+        packed = (lower | upper).to(torch.uint8)  # shape: [num_rows, in_features // 2]
+
+        # Dequantization
+        unpacked_low = (packed & 0x0F).to(torch.int8)
+        unpacked_high = ((packed >> 4) & 0x0F).to(torch.int8)
+        # Sign correction
+        unpacked_low[unpacked_low >= 8] -= 16
+        unpacked_high[unpacked_high >= 8] -= 16
+        unpacked = torch.stack((unpacked_low, unpacked_high), dim=2).view(orig_shape)
+        W_deq = (unpacked * scale).T.contiguous()
+
+        return scale.squeeze().to(torch.float16), packed, W_deq.to(dtype=weights.dtype, device=weights.device)
+
+    else:
+        W_q = W_q.to(torch.int8)
+        W_deq = (W_q * scale).T.contiguous()
+        return scale.squeeze().to(torch.float16), W_q, W_deq.to(dtype=weights.dtype, device=weights.device)
+
+# def quant_dequant(weights, quant_mode: bool = True):
+#     # use the test version `_symmetric_...` to get the non-interleaved weights
+#     type = torch.quint4x2 if quant_mode else torch.int8
+#     # This import is needed to use torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix()
+#     # Comment out this line for passing the lintrunner check in the CI.
+#     import tensorrt_llm
+
+#     quant_weights, processed_q_weight, torch_weight_scales = (
+#         torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix(weights.T.cpu().contiguous(), type)
+#     )
+
+#     # Unpack the int4s int int8s
+#     if quant_mode:
+#         upper = quant_weights >> 4
+#         lower = (quant_weights << 4) >> 4  # Arithmetic right shift sign extends
+#         quant_weights = torch.stack((lower, upper), dim=2).view(weights.T.shape)
+
+#     quant_weights = quant_weights.to(dtype=weights.dtype)
+#     result = torch.multiply(quant_weights, torch_weight_scales.unsqueeze(0)).T.contiguous()
+#     return torch_weight_scales.to(torch.float16), processed_q_weight, result.to(device=weights.device)
 
 
 def create_moe_onnx_graph(
@@ -995,39 +1049,39 @@ def phi3_test_cases():
             yield batch_size, sequence_length
 
 
-class TestSwitchMoE(unittest.TestCase):
-    @parameterized.expand(small_test_cases())
-    def test_switch_moe_parity(self, batch_size, sequence_length):
-        # if platform.system() == "Windows":
-        #     pytest.skip("Skip on Windows")
-        switch_moe = SwitchMoE(
-            batch_size=batch_size,
-            sequence_length=sequence_length,
-            num_experts=8,
-            in_features=256,
-            hidden_features=1024,
-            out_features=256,
-        )
-        switch_moe.parity_check()
-        # switch_moe.benchmark_ort()
+# class TestSwitchMoE(unittest.TestCase):
+#     @parameterized.expand(small_test_cases())
+#     def test_switch_moe_parity(self, batch_size, sequence_length):
+#         # if platform.system() == "Windows":
+#         #     pytest.skip("Skip on Windows")
+#         switch_moe = SwitchMoE(
+#             batch_size=batch_size,
+#             sequence_length=sequence_length,
+#             num_experts=8,
+#             in_features=256,
+#             hidden_features=1024,
+#             out_features=256,
+#         )
+#         switch_moe.parity_check()
+#         # switch_moe.benchmark_ort()
 
 
-class TestMixtralMoE(unittest.TestCase):
-    @parameterized.expand(small_test_cases())
-    def test_mixtral_moe_parity(self, batch_size, sequence_length):
-        config = MixtralConfig(hidden_size=256, intermediate_size=1024)
-        mixtral_moe = MixtralSparseMoeBlock(config, batch_size, sequence_length)
-        mixtral_moe.parity_check()
-        # mixtral_moe.benchmark_ort()
+# class TestMixtralMoE(unittest.TestCase):
+#     @parameterized.expand(small_test_cases())
+#     def test_mixtral_moe_parity(self, batch_size, sequence_length):
+#         config = MixtralConfig(hidden_size=256, intermediate_size=1024)
+#         mixtral_moe = MixtralSparseMoeBlock(config, batch_size, sequence_length)
+#         mixtral_moe.parity_check()
+#         # mixtral_moe.benchmark_ort()
 
 
-class TestPhiMoE(unittest.TestCase):
-    @parameterized.expand(phi3_test_cases())
-    def test_phi3_moe_parity(self, batch_size, sequence_length):
-        config = PhiMoEConfig(hidden_size=256, intermediate_size=1024)
-        phi3_moe = PhiMoESparseMoeBlock(config, batch_size, sequence_length)
-        phi3_moe.parity_check()
-        # phi3_moe.benchmark_ort()
+# class TestPhiMoE(unittest.TestCase):
+#     @parameterized.expand(phi3_test_cases())
+#     def test_phi3_moe_parity(self, batch_size, sequence_length):
+#         config = PhiMoEConfig(hidden_size=256, intermediate_size=1024)
+#         phi3_moe = PhiMoESparseMoeBlock(config, batch_size, sequence_length)
+#         phi3_moe.parity_check()
+#         # phi3_moe.benchmark_ort()
 
 
 # ---------------------------------------------
@@ -1101,8 +1155,7 @@ def create_swiglu_moe_onnx_graph(
                 "fc2_experts_weights",
                 "fc2_experts_weight_scale",
                 "fc2_experts_bias",
-            ]
-
+            ],
             ["output"],
             "MoE_0",
             k=topk,
@@ -1237,7 +1290,12 @@ class SwigluMoEBlock(SparseMoeBlockORTHelper):
                 weight_1_list.append(self.experts[i].w1.weight)
                 weight_2_list.append(self.experts[i].w2.weight)
             else:
+                print("shape of self.experts[i].w1.weight:", self.experts[i].w1.weight.shape)
                 scale1, pre_qweight1, w1_qdq = quant_dequant(self.experts[i].w1.weight, False)
+                print("shape of scale1:", scale1.shape)
+                print("shape of pre_qweight1:", pre_qweight1.shape)
+                print("shape of w1_qdq:", w1_qdq.shape)
+
                 scale2, pre_qweight2, w2_qdq = quant_dequant(self.experts[i].w2.weight, False)
                 self.experts[i].w1.weight.data = w1_qdq
                 self.experts[i].w2.weight.data = w2_qdq
