@@ -56,9 +56,6 @@ void topk_gating_softmax_kernelLauncher(const T* input, const bool* finished, T*
                                         int* indices, int* source_row, int num_rows, int num_experts, int k,
                                         bool normalize_routing_weights, bool use_sparse_mixer, cudaStream_t stream);
 
-template <typename T, bool interleaved>
-void invokeSwiGLU(T* output, T const* input, int intermediate_size, int num_rows, float swiglu_alpha, cudaStream_t stream);
-
 class CubKeyValueSorter {
  public:
   CubKeyValueSorter();

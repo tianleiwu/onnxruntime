@@ -28,6 +28,10 @@
 #include "cutlass/matrix_coord.h"
 #include "cutlass/semaphore.h"
 
+#include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/epilogue/threadblock/epilogue_base.h"
+#include "cutlass/epilogue/threadblock/predicated_tile_iterator.h"
+
 #include "cutlass/gemm/kernel/gemm_transpose_operands.h"
 #include "cutlass/layout/matrix.h"
 #include "cutlass/trace.h"
@@ -60,7 +64,8 @@ template <typename Mma_,                        ///! Threadblock-scoped matrix m
           typename ThreadblockSwizzle_,         ///! Threadblock swizzling function
           typename KernelArch,                  ///! The Architecture this kernel is compiled for. Used since SIMT
                                                 /// kernels lose top-level arch.
-          GroupScheduleMode GroupScheduleMode_  ///! Type of scheduling to perform
+          GroupScheduleMode GroupScheduleMode_,  ///! Type of scheduling to perform
+          bool kIsSwigluFusion = false
           >
 struct MoeFCGemm {
  public:
@@ -266,8 +271,10 @@ struct MoeFCGemm {
           "MoeFCGemm::can_implement() - weight scales are ignored for all types except uint8_t and uint4b_t");
       return Status::kInvalid;
     } else if (args.group_size != args.gemm_k) {
-      CUTLASS_TRACE_HOST("MoeFCGemm::can_implement() - scale shape should be (1, gemm_n)");
-      return Status::kInvalid;
+       if (!kIsSwigluFusion || args.group_size != args.gemm_k * 2) {
+            CUTLASS_TRACE_HOST("MoeFCGemm::can_implement() - scale shape should be (1, gemm_n)");
+            return Status::kInvalid;
+       }
     } else if (static_cast<size_t>(args.gemm_n) < Mma::IteratorB::AccessType::kElements) {
       CUTLASS_TRACE_HOST("MoeFCGemm::can_implement() - gemm_n is smaller than the input alignment");
       return Status::kInvalid;
@@ -313,6 +320,10 @@ struct MoeFCGemm {
       GemmCoord problem_size = problem_visitor.problem_size();
       int32_t problem_idx = problem_visitor.problem_index();
       int32_t cta_idx = int32_t(problem_visitor.threadblock_idx());
+
+      if (kIsSwigluFusion) {
+        problem_size.n() *= 2;
+      }
 
       GemmCoord grid_shape = problem_visitor.grid_shape(problem_size);
 
@@ -395,30 +406,90 @@ struct MoeFCGemm {
       //
       // Epilogue
       //
-
       EpilogueOutputOp output_op(params.output_op);
 
-      ElementC* ptr_C = reinterpret_cast<ElementC*>(params.ptr_C) + problem_idx * gemm_n;
-      ElementC* ptr_D = reinterpret_cast<ElementC*>(params.ptr_D) + rows_to_jump * gemm_n;
+      if constexpr (kIsSwigluFusion) {
+        using AccType = typename Mma::FragmentC::Element;
+        using OutType = ElementC;
+        static constexpr float kSwigluAlpha = 1.702f;
 
-      LayoutC layout_C(0);
-      LayoutC layout_D(gemm_n);
+        // Custom epilogue for SwiGLU Fusion
+        ElementC* ptr_D = reinterpret_cast<ElementC*>(params.ptr_D) + rows_to_jump * (gemm_n / 2);
 
-      typename Epilogue::OutputTileIterator::Params params_C(layout_C);
-      typename Epilogue::OutputTileIterator::Params params_D(layout_D);
+        using OutputTileIterator = cutlass::epilogue::threadblock::PredicatedTileIterator<
+            typename Epilogue::OutputTileIterator::ThreadMap, OutType>;
 
-      // Tile iterator loading from source tensor.
-      typename Epilogue::OutputTileIterator iterator_C(params_C, ptr_C, problem_size.mn(), thread_idx,
-                                                       threadblock_offset.mn());
+        const cutlass::gemm::GemmCoord problem_size_out(problem_size.m(), problem_size.n() / 2, problem_size.k());
 
-      // Tile iterator writing to destination tensor.
-      typename Epilogue::OutputTileIterator iterator_D(params_D, ptr_D, problem_size.mn(), thread_idx,
-                                                       threadblock_offset.mn());
+        OutputTileIterator iterator_D(
+            typename OutputTileIterator::Params(gemm_n / 2),
+            ptr_D,
+            problem_size_out.mn(),
+            thread_idx,
+            {threadblock_offset.m(), threadblock_offset.n() / 2});
 
-      Epilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx, lane_idx);
+        typename Epilogue::AccumulatorFragmentIterator accum_fragment_iterator(accumulators);
 
-      // Execute the epilogue operator to update the destination tensor.
-      epilogue(output_op, iterator_D, accumulators, iterator_C);
+        CUTLASS_PRAGMA_UNROLL
+        for (int row = 0; row < Epilogue::OutputTileIterator::ThreadMap::Iterations::kRow; ++row) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int col = 0; col < Epilogue::OutputTileIterator::ThreadMap::Iterations::kColumn / 2; ++col) {
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        // The iterator's store method handles predicates internally.
+            // No need for an external if check.
+
+            // Point the fragment iterator to the correct place in the accumulator tile
+            int accum_fragment_idx = row * Epilogue::OutputTileIterator::ThreadMap::Iterations::kColumn + col * 2;
+
+            typename Epilogue::AccumulatorFragmentIterator::Fragment accum_fragment;
+            accum_fragment_iterator.load(accum_fragment, accum_fragment_idx);
+
+            typename OutputTileIterator::Fragment output_fragment;
+
+            using AccFragment = cutlass::Array<AccType, Epilogue::kElementsPerAccess>;
+            using OutFragment = cutlass::Array<OutType, Epilogue::kElementsPerAccess / 2>;
+
+            AccFragment const* acc_frag_ptr = reinterpret_cast<AccFragment const*>(&accum_fragment);
+            OutFragment* out_frag_ptr = reinterpret_cast<OutFragment*>(&output_fragment);
+
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < out_frag_ptr->size(); ++i) {
+                AccType gate_val = (*acc_frag_ptr)[2*i];
+                AccType linear_val = (*acc_frag_ptr)[2*i+1];
+
+                float sigmoid_arg = kSwigluAlpha * static_cast<float>(gate_val);
+                float sigmoid_out = 1.f / (1.f + expf(-sigmoid_arg));
+
+                float swish_out = static_cast<float>(gate_val) * sigmoid_out;
+                (*out_frag_ptr)[i] = static_cast<OutType>(swish_out * (static_cast<float>(linear_val) + 1.f));
+            }
+
+            iterator_D.store(output_fragment);
+            ++iterator_D;
+          }
+        }
+      } else {
+        ElementC* ptr_C = reinterpret_cast<ElementC*>(params.ptr_C) + problem_idx * gemm_n;
+        ElementC* ptr_D = reinterpret_cast<ElementC*>(params.ptr_D) + rows_to_jump * gemm_n;
+
+        LayoutC layout_C(0);
+        LayoutC layout_D(gemm_n);
+
+        typename Epilogue::OutputTileIterator::Params params_C(layout_C);
+        typename Epilogue::OutputTileIterator::Params params_D(layout_D);
+
+        // Tile iterator loading from source tensor.
+        typename Epilogue::OutputTileIterator iterator_C(params_C, ptr_C, problem_size.mn(), thread_idx,
+                                                         threadblock_offset.mn());
+
+        // Tile iterator writing to destination tensor.
+        typename Epilogue::OutputTileIterator iterator_D(params_D, ptr_D, problem_size.mn(), thread_idx,
+                                                         threadblock_offset.mn());
+
+        Epilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx, lane_idx);
+
+        // Execute the epilogue operator to update the destination tensor.
+        epilogue(output_op, iterator_D, accumulators, iterator_C);
+      }
 
       // Next tile
       problem_visitor.advance(gridDim.x);

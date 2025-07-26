@@ -53,6 +53,7 @@ enum class ActivationType { Gelu,
                             ReGLU,
                             SiGLU,
                             SwiGLU,
+                            SwiGLU_AF,
                             Identity,
                             InvalidType };
 

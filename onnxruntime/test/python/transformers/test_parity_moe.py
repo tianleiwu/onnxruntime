@@ -1261,7 +1261,7 @@ class SwigluMoEBlock(SparseMoeBlockORTHelper):
 class TestSwigluMoE(unittest.TestCase):
     @parameterized.expand(small_test_cases())
     def test_swiglu_moe_parity(self, batch_size, sequence_length):
-        config = SwigluMoeConfig(hidden_size=1024, intermediate_size=1024, num_experts_per_token=1, num_local_experts=4)
+        config = SwigluMoeConfig(hidden_size=1024, intermediate_size=1024)
         moe = SwigluMoEBlock(config, batch_size, sequence_length)
         moe.parity_check()
 

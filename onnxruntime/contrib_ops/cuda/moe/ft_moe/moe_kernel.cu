@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -44,71 +44,6 @@
 
 namespace ort_fastertransformer {
 static constexpr int WARP_SIZE = 32;
-
-// SwiGLU with interleaved is like the following python code using PyTorch:
-//   dim = x.shape[-1]
-//   x = x.view(-1, dim // 2, 2)
-//   x_glu, x_linear = x[..., 0], x[..., 1]
-//   y = x_glu * torch.sigmoid(alpha * x_glu) * (x_linear + 1)
-template <typename T>
-__global__ void swiglu_kernel_interleaved(T* output, T const* input, int intermediate_size, int num_rows, float swiglu_alpha) {
-  int const row = blockIdx.x;
-  if (row >= num_rows) {
-    return;
-  }
-
-  T const* row_input = input + row * 2 * intermediate_size;
-  T* row_output = output + row * intermediate_size;
-
-  for (int i = threadIdx.x; i < intermediate_size; i += blockDim.x) {
-    T x_glu = row_input[2 * i];
-    T x_linear = row_input[2 * i + 1];
-
-    float sigmoid_arg = swiglu_alpha * static_cast<float>(x_glu);
-    float sigmoid_out = 1.f / (1.f + expf(-sigmoid_arg));
-
-    float swish_out = static_cast<float>(x_glu) * sigmoid_out;
-    row_output[i] = static_cast<T>(swish_out * (static_cast<float>(x_linear) + 1.f));
-  }
-}
-
-// Non interleaved version of SwiGLU kernel, which splits each row into two chunks of same size.
-template <typename T>
-__global__ void swiglu_kernel_chunked(T* output, T const* input, int intermediate_size, int num_rows, float swiglu_alpha) {
-  int const row = blockIdx.x;
-  if (row >= num_rows) {
-    return;
-  }
-
-  T const* row_input = input + row * 2 * intermediate_size;
-  T* row_output = output + row * intermediate_size;
-
-  for (int i = threadIdx.x; i < intermediate_size; i += blockDim.x) {
-    T x_glu = row_input[i];
-    T x_linear = row_input[i + intermediate_size];
-
-    float sigmoid_arg = swiglu_alpha * static_cast<float>(x_glu);
-    float sigmoid_out = 1.f / (1.f + expf(-sigmoid_arg));
-
-    float swish_out = static_cast<float>(x_glu) * sigmoid_out;
-    row_output[i] = static_cast<T>(swish_out * (static_cast<float>(x_linear) + 1.f));
-  }
-}
-
-template <typename T, bool interleaved>
-void invokeSwiGLU(T* output, T const* input, int intermediate_size, int num_rows, float swiglu_alpha, cudaStream_t stream) {
-  if (num_rows == 0) {
-    return;
-  }
-  dim3 block(std::min(intermediate_size, 1024));
-  dim3 grid(num_rows);
-
-  if constexpr (interleaved) {
-    swiglu_kernel_interleaved<T><<<grid, block, 0, stream>>>(output, input, intermediate_size, num_rows, swiglu_alpha);
-  } else {
-    swiglu_kernel_chunked<T><<<grid, block, 0, stream>>>(output, input, intermediate_size, num_rows, swiglu_alpha);
-  }
-}
 
 // ====================== Softmax things ===============================
 // We have our own implementation of softmax here so we can support transposing the output
@@ -767,13 +702,7 @@ size_t CutlassMoeFCRunner<T, WeightType, Enable>::getWorkspaceSize(size_t num_ro
   total_ws_bytes += padded_experts * sizeof(int64_t);        // Hold total_rows_before_expert_
   total_ws_bytes += num_softmax_outs * sizeof(T);
 
-  size_t bytes_for_fc1_result;
-  if (activation_type_ == ActivationType::SwiGLU) {
-    // Space for both fc1_result_ and act_result_.
-    bytes_for_fc1_result = (2 * interbuf_size + interbuf_size) * sizeof(T);
-  } else {
-    bytes_for_fc1_result = has_fc3_ ? 2 * interbuf_size * sizeof(T) : interbuf_size * sizeof(T);
-  }
+  size_t bytes_for_fc1_result = has_fc3_ ? 2 * interbuf_size * sizeof(T) : interbuf_size * sizeof(T);
 
   const size_t sorter_ws_size_bytes = pad_to_multiple_of_16(sorter_.getWorkspaceSize(k * num_rows));
   sorter_.update_num_experts(static_cast<int>(num_experts));
@@ -806,21 +735,9 @@ void CutlassMoeFCRunner<T, WeightType, Enable>::configure_ws_ptrs(char* ws_ptr, 
 
   char* current_ptr = reinterpret_cast<char*>(total_rows_before_expert_ + padded_experts);
 
-  if (activation_type_ == ActivationType::SwiGLU) {
-    // fc1_result_ is used for GEMM1 output (2 * inter_size)
-    fc1_result_ = reinterpret_cast<T*>(current_ptr);
-    current_ptr += 2 * interbuf_size * sizeof(T);
-
-    // act_result_ is used for SwiGLU output (inter_size)
-    act_result_ = reinterpret_cast<T*>(current_ptr);
-    current_ptr += interbuf_size * sizeof(T);
-
-    ORT_ENFORCE(!has_fc3_, "SwiGLU activation is not supported with fc3");
-  } else {
-    fc1_result_ = reinterpret_cast<T*>(current_ptr);
-    act_result_ = nullptr;  // No extra buffer for activation since it is done inplace.
-    current_ptr += interbuf_size * sizeof(T);
-  }
+  fc1_result_ = reinterpret_cast<T*>(current_ptr);
+  act_result_ = nullptr;  // No extra buffer for activation since it is done inplace.
+  current_ptr += (has_fc3_ ? 2 * interbuf_size : interbuf_size) * sizeof(T);
 
   if (has_fc3_) {
     fc3_result_ = reinterpret_cast<T*>(current_ptr);
@@ -977,44 +894,35 @@ void CutlassMoeFCRunner<T, WeightType, Enable>::run_moe_fc(
                          stream);
   }
 
+  // This is the FUSED path.
+  // The first GEMM's N dim is 2*inter_size. The fused epilogue produces output of dim inter_size.
+  // The output of the first stage is written to fc1_result_.
   if (fc1_activation_type == ActivationType::SwiGLU) {
-    T* gemm1_output_buffer = fc1_result_;
-    T* swiglu_output_buffer = act_result_;
-
     moe_gemm_runner_.moe_gemm_bias_act(
         permuted_data_ + total_past_rows_ * hidden_size,
         fc1_expert_weights,
         fc1_scales,
         fc1_expert_biases,
-        gemm1_output_buffer + total_past_rows_ * 2 * inter_size,
+        fc1_result_ + total_past_rows_ * inter_size,  // Output goes here
         total_rows_before_expert_ + local_experts_start_index,
         expanded_active_expert_rows,
-        2 * inter_size,
-        hidden_size,
+        2 * inter_size,  // N for GEMM1
+        hidden_size,     // K for GEMM1
         local_num_experts,
-        ActivationType::Identity,
+        ActivationType::SwiGLU_AF,  // Fused activation
         stream);
 
-    constexpr bool swiglu_interleaved = true;
-    constexpr float swiglu_alpha = 1.702f;
-    invokeSwiGLU<T, swiglu_interleaved>(
-        swiglu_output_buffer + total_past_rows_ * inter_size,
-        gemm1_output_buffer + total_past_rows_ * 2 * inter_size,
-        inter_size,
-        total_covered_rows_,
-        swiglu_alpha,
-        stream);
-
+    // Second GEMM (FC2)
     moe_gemm_runner_.moe_gemm(
-        swiglu_output_buffer + total_past_rows_ * inter_size,
+        fc1_result_ + total_past_rows_ * inter_size,  // Input from previous stage
         fc2_expert_weights,
         fc2_scales,
         nullptr,
         fc2_result + total_past_rows_ * hidden_size,
         total_rows_before_expert_ + local_experts_start_index,
         expanded_active_expert_rows,
-        hidden_size,
-        inter_size,
+        hidden_size,  // N for GEMM2
+        inter_size,   // K for GEMM2
         local_num_experts,
         stream);
 
@@ -1317,8 +1225,4 @@ template void finalize_moe_routing_kernelLauncher(const float*, float*, const fl
                                                   const float*, const int*, const int*, int, int, int, cudaStream_t);
 template void finalize_moe_routing_kernelLauncher(const half*, half*, const half*, const half*, const half*,
                                                   const half*, const int*, const int*, int, int, int, cudaStream_t);
-
-template void invokeSwiGLU<float, true>(float*, float const*, int, int, float, cudaStream_t);
-template void invokeSwiGLU<half, true>(half*, half const*, int, int, float, cudaStream_t);
-
 }  // namespace ort_fastertransformer

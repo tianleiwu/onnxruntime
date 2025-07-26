@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -59,6 +59,22 @@
 
 namespace ort_fastertransformer {
 
+// A tag for the SwiGLU epilogue fusion
+struct EpilogueOpSwiGLU {};
+
+// Add specialization for EpilogueOpSwiGLU to use the default linear combination
+// This is needed for the template machinery to compile, even though the SwiGLU
+// path in MoeFCGemm uses custom logic and doesn't call this operator directly.
+template <typename ElementType, int ElementsPerAccess, typename ElementAccumulator>
+struct Epilogue<ElementType, ElementsPerAccess, ElementAccumulator, EpilogueOpSwiGLU> {
+  using Op = cutlass::epilogue::thread::LinearCombination<
+      ElementType,
+      ElementsPerAccess,
+      ElementAccumulator,
+      ElementAccumulator,
+      DefaultScaleMode>;
+};
+
 // ============================= Variable batched Gemm things ===========================
 template <typename T, typename WeightType, typename arch, typename EpilogueTag, typename ThreadblockShape,
           typename WarpShape, int Stages>
@@ -93,6 +109,8 @@ void generic_moe_gemm_kernelLauncher(const T* A, const WeightType* B, const T* w
   using EpilogueOp =
       typename Epilogue<ElementType, MixedGemmArchTraits::ElementsPerAccessC, ElementAccumulator, EpilogueTag>::Op;
 
+  constexpr bool is_swiglu_fusion = std::is_same<EpilogueTag, EpilogueOpSwiGLU>::value;
+
   // Finally, set up the kernel.
   using GemmKernel_ = typename cutlass::gemm::kernel::DefaultGemmGrouped<
       ElementType, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone, MixedGemmArchTraits::ElementsPerAccessA,
@@ -106,7 +124,8 @@ void generic_moe_gemm_kernelLauncher(const T* A, const WeightType* B, const T* w
   using GemmKernel = cutlass::gemm::kernel::MoeFCGemm<typename GemmKernel_::Mma, typename GemmKernel_::Epilogue,
                                                       typename GemmKernel_::ThreadblockSwizzle,
                                                       arch,  // Ensure top level arch is used for dispatch
-                                                      GemmKernel_::kGroupScheduleMode>;
+                                                      GemmKernel_::kGroupScheduleMode,
+                                                      is_swiglu_fusion>;
 
   using GemmGrouped = cutlass::gemm::device::GemmGrouped<GemmKernel>;
 
@@ -121,11 +140,14 @@ void generic_moe_gemm_kernelLauncher(const T* A, const WeightType* B, const T* w
   typename EpilogueOp::Params epilogue_op(ElementAccumulator(1.f),
                                           biases ? ElementAccumulator(1.f) : ElementAccumulator(0.f));
 
-  int const group_size = gemm_k;
+  // For SwiGLU, the output N dimension is halved.
+  const int64_t gemm_n_out = is_swiglu_fusion ? gemm_n / 2 : gemm_n;
+  const int64_t group_size = is_swiglu_fusion ? gemm_k * 2 : gemm_k;
+
   typename GemmGrouped::Arguments args(
       num_experts, threadblock_count, group_size, epilogue_op, reinterpret_cast<ElementType const*>(A),
       reinterpret_cast<CutlassWeightType const*>(B), reinterpret_cast<ElementType const*>(weight_scales),
-      reinterpret_cast<ElementType const*>(biases), reinterpret_cast<ElementType*>(C), total_rows_before_expert, gemm_n,
+      reinterpret_cast<ElementType const*>(biases), reinterpret_cast<ElementType*>(C), total_rows_before_expert, gemm_n_out,
       gemm_k);
 
   GemmGrouped gemm;
@@ -476,7 +498,6 @@ void MoeGemmRunner<T, WeightType>::moe_gemm_bias_act(const T* A, const WeightTyp
                                                      int64_t total_rows, int64_t gemm_n, int64_t gemm_k,
                                                      int num_experts, ActivationType activation_type,
                                                      cudaStream_t stream) {
-  // Swiglu will use Identity to call this function so we not need to handle it here.
   switch (activation_type) {
     case ActivationType::Relu:
       run_gemm<EpilogueOpDefaultReLU>(A, B, weight_scales, biases, C, total_rows_before_expert, total_rows, gemm_n,
@@ -489,6 +510,10 @@ void MoeGemmRunner<T, WeightType>::moe_gemm_bias_act(const T* A, const WeightTyp
     case ActivationType::Silu:
       run_gemm<EpilogueOpDefaultSilu>(A, B, weight_scales, biases, C, total_rows_before_expert, total_rows, gemm_n,
                                       gemm_k, num_experts, stream);
+      break;
+    case ActivationType::SwiGLU_AF:
+      run_gemm<EpilogueOpSwiGLU>(A, B, weight_scales, biases, C, total_rows_before_expert, total_rows, gemm_n,
+                                 gemm_k, num_experts, stream);
       break;
     case ActivationType::Identity:
       run_gemm<EpilogueOpDefault>(A, B, weight_scales, biases, C, total_rows_before_expert, total_rows, gemm_n, gemm_k,
