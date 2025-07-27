@@ -39,60 +39,87 @@ def value_string_of(numpy_array):
 def print_tensor(name, numpy_array):
     print(f"const std::vector<float> {name} = {value_string_of(numpy_array)};")
 
-def quant_dequant(weights, quant_mode: bool = True):
+def quant_dequant(weights: torch.Tensor, is_4_bit_quantization: bool = True):
     """
-    Perform symmetric per-row quantization and dequantization.
+    Performs symmetric per-column quantization and dequantization on a weight tensor.
+
+    This implementation is a pure PyTorch replacement for the original function that
+    relied on a custom tensorrt_llm operator. It supports both 8-bit (int8) and
+    4-bit (quint4x2 style) quantization.
 
     Args:
-        weights (torch.Tensor): Input 2D weight matrix of shape [out_features, in_features]
-        quant_mode (bool): If True, quantize to INT4 (packed), otherwise INT8
+        weights (torch.Tensor): The input weight tensor to be quantized.
+        is_4_bit_quantization (bool): If True, performs 4-bit quantization. If False,
+                           performs 8-bit quantization.
 
     Returns:
-        scales (torch.Tensor): Per-row scale factors (shape [out_features])
-        packed_weights (torch.Tensor): The quantized weights (uint8 packed for INT4, int8 for INT8)
-        dequant_weights (torch.Tensor): Reconstructed weights from quantized + scale
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing:
+            - scales (torch.float16): The quantization scales for each column.
+            - processed_q_weight (torch.int8): The packed quantized weights. For
+              4-bit mode, two 4-bit values are packed into a single int8. For
+              8-bit mode, this is the standard int8 quantized tensor. It is
+              transposed relative to the input weights' shape.
+            - dequantized_weights (torch.Tensor): The weights after being dequantized,
+              restored to the original dtype and device.
     """
-    print("shape of weights:", weights.shape)
+    # Determine quantization bits and range based on the mode
+    if is_4_bit_quantization:
+        # 4-bit symmetric quantization
+        q_bits = 4
+        q_max = 2**(q_bits - 1) - 1  # 7
+        q_min = -2**(q_bits - 1)     # -8
+    else:
+        # 8-bit symmetric quantization
+        q_bits = 8
+        q_max = 2**(q_bits - 1) - 1  # 127
+        q_min = -2**(q_bits - 1)     # -128
 
-    # Transpose to [in_features, out_features] to match original
-    W = weights.T.contiguous()  # [in_features, out_features]
-    orig_shape = W.shape
+    # 1. Calculate per-column scales
+    # The scale is calculated based on the maximum absolute value in each column.
+    # `dim=0` operates along the columns of the weight matrix.
+    max_abs_val = torch.max(torch.abs(weights), dim=0, keepdim=True).values
+    # Avoid division by zero for empty columns
+    max_abs_val[max_abs_val == 0] = 1.0
+    scales = max_abs_val / q_max
 
-    # Symmetric quantization per row
-    max_vals = W.abs().amax(dim=-1, keepdim=True)  # per row
-    eps = 1e-8  # prevent divide-by-zero
-    scale = max_vals / (7 if quant_mode else 127)
-    scale = scale.clamp(min=eps)
+    # 2. Quantize the weights
+    # The formula is round(value / scale)
+    quant_weights = torch.round(weights / scales).clamp(q_min, q_max).to(torch.int8)
 
-    W_scaled = W / scale  # de-scaled float
-    W_q = W_scaled.round().clamp(-7 if quant_mode else -127, 7 if quant_mode else 127)
+    # 3. Pack weights for 4-bit mode and prepare for output
+    if is_4_bit_quantization:
+        # For 4-bit, we need to pack two 4-bit integers into a single int8.
+        # The TRT-LLM op works on transposed weights, so we transpose here
+        # before packing to match the expected output format.
+        q_weights_t = quant_weights.T.contiguous()
 
-    if quant_mode:
-        # Convert to INT4: Pack two int4 into one uint8
-        W_q = W_q.to(torch.int8)
-        if W_q.shape[1] % 2 != 0:
-            # Pad if in_features is odd
-            W_q = torch.nn.functional.pad(W_q, (0, 1), value=0)
+        # Reshape to group pairs of 4-bit values.
+        # Example: a (C, H) tensor becomes (C, H/2, 2)
+        shape = q_weights_t.shape
+        q_weights_t_reshaped = q_weights_t.view(shape[0], shape[1] // 2, 2)
 
-        lower = (W_q[:, 0::2] & 0x0F)
-        upper = ((W_q[:, 1::2] & 0x0F) << 4)
-        packed = (lower | upper).to(torch.uint8)  # shape: [num_rows, in_features // 2]
+        # Isolate the lower and upper 4-bit values
+        lower_nibble = q_weights_t_reshaped[..., 0]
+        upper_nibble = q_weights_t_reshaped[..., 1]
 
-        # Dequantization
-        unpacked_low = (packed & 0x0F).to(torch.int8)
-        unpacked_high = ((packed >> 4) & 0x0F).to(torch.int8)
-        # Sign correction
-        unpacked_low[unpacked_low >= 8] -= 16
-        unpacked_high[unpacked_high >= 8] -= 16
-        unpacked = torch.stack((unpacked_low, unpacked_high), dim=2).view(orig_shape)
-        W_deq = (unpacked * scale).T.contiguous()
-
-        return scale.squeeze().to(torch.float16), packed, W_deq.to(dtype=weights.dtype, device=weights.device)
+        # Pack them into a single int8.
+        # `lower & 0x0F` ensures we only take the lower 4 bits.
+        # `upper << 4` shifts the upper value to the most significant 4 bits.
+        processed_q_weight = (lower_nibble & 0x0F) | (upper_nibble << 4)
 
     else:
-        W_q = W_q.to(torch.int8)
-        W_deq = (W_q * scale).T.contiguous()
-        return scale.squeeze().to(torch.float16), W_q, W_deq.to(dtype=weights.dtype, device=weights.device)
+        # For 8-bit, the processed weights are just the transposed quantized weights.
+        processed_q_weight = quant_weights.T.contiguous()
+
+    # 4. Dequantize the weights to verify and return
+    # This reverses the quantization process: value = quantized_value * scale
+    dequantized_weights = quant_weights.to(weights.dtype) * scales.to(weights.dtype)
+
+    return (
+        scales.squeeze(0).to(torch.float16),
+        processed_q_weight,
+        dequantized_weights.to(device=weights.device)
+    )
 
 # def quant_dequant(weights, quant_mode: bool = True):
 #     # use the test version `_symmetric_...` to get the non-interleaved weights
@@ -947,17 +974,20 @@ class PhiMoESparseMoeBlock(SparseMoeBlockORTHelper):
                 w3_list.append(self.experts[i].w3.weight)
         else:
             for i in range(self.num_experts):
-                w1_scale, pre_qweight1, w1_qdq = quant_dequant(self.experts[i].w1.weight, False)
-                w2_scale, pre_qweight2, w2_qdq = quant_dequant(self.experts[i].w2.weight, False)
-                w3_scale, pre_qweight3, w3_qdq = quant_dequant(self.experts[i].w3.weight, False)
+                # Corrected quantization logic for per-output-channel quantization
+                w1_scale, pre_qweight1, w1_qdq = quant_dequant(self.experts[i].w1.weight.T, False)
+                w2_scale, pre_qweight2, w2_qdq = quant_dequant(self.experts[i].w2.weight.T, False)
+                w3_scale, pre_qweight3, w3_qdq = quant_dequant(self.experts[i].w3.weight.T, False)
 
-                self.experts[i].w1.weight.data = w1_qdq
-                self.experts[i].w2.weight.data = w2_qdq
-                self.experts[i].w3.weight.data = w3_qdq
+                # Transpose dequantized weights back for the PyTorch reference model
+                self.experts[i].w1.weight.data = w1_qdq.T
+                self.experts[i].w2.weight.data = w2_qdq.T
+                self.experts[i].w3.weight.data = w3_qdq.T
 
-                w1_list.append(pre_qweight1)
-                w2_list.append(pre_qweight2)
-                w3_list.append(pre_qweight3)
+                # Transpose quantized weights to match the expected ONNX layout
+                w1_list.append(pre_qweight1.T)
+                w2_list.append(pre_qweight2.T)
+                w3_list.append(pre_qweight3.T)
                 w1_scale_list.append(w1_scale)
                 w2_scale_list.append(w2_scale)
                 w3_scale_list.append(w3_scale)
@@ -1075,13 +1105,13 @@ def phi3_test_cases():
 #         # mixtral_moe.benchmark_ort()
 
 
-# class TestPhiMoE(unittest.TestCase):
-#     @parameterized.expand(phi3_test_cases())
-#     def test_phi3_moe_parity(self, batch_size, sequence_length):
-#         config = PhiMoEConfig(hidden_size=256, intermediate_size=1024)
-#         phi3_moe = PhiMoESparseMoeBlock(config, batch_size, sequence_length)
-#         phi3_moe.parity_check()
-#         # phi3_moe.benchmark_ort()
+class TestPhiMoE(unittest.TestCase):
+    @parameterized.expand(phi3_test_cases())
+    def test_phi3_moe_parity(self, batch_size, sequence_length):
+        config = PhiMoEConfig(hidden_size=256, intermediate_size=1024)
+        phi3_moe = PhiMoESparseMoeBlock(config, batch_size, sequence_length)
+        phi3_moe.parity_check()
+        # phi3_moe.benchmark_ort()
 
 
 # ---------------------------------------------
@@ -1165,6 +1195,9 @@ def create_swiglu_moe_onnx_graph(
         ),
     ]
 
+    if use_quant:
+        nodes[0].attribute.extend([helper.make_attribute("expert_weight_bits", 8)])
+
     fc1_weight_shape = [num_experts, hidden_size, 2 * inter_size]
     fc1_bias_shape = [num_experts, 2 * inter_size]
     fc1_experts_weight_scale_shape = [num_experts, 2 * inter_size]
@@ -1181,9 +1214,9 @@ def create_swiglu_moe_onnx_graph(
     initializers = [
         helper.make_tensor(
             "fc1_experts_weights",
-            ORT_DTYPE if not use_quant else TensorProto.UINT8,
+            TensorProto.UINT8 if use_quant else ORT_DTYPE,
             fc1_weight_shape,
-            fc1_experts_weights.to(torch_type).flatten().tolist(),
+            fc1_experts_weights.flatten().detach().numpy().astype(numpy_type).tolist() if use_quant else fc1_experts_weights.to(torch_type).flatten().tolist(),
             raw=False,
         ),
         helper.make_tensor(
@@ -1195,9 +1228,9 @@ def create_swiglu_moe_onnx_graph(
         ),
         helper.make_tensor(
             "fc2_experts_weights",
-            ORT_DTYPE if not use_quant else TensorProto.UINT8,
+            TensorProto.UINT8 if use_quant else ORT_DTYPE,
             fc2_weight_shape,
-            fc2_experts_weights.to(torch_type).flatten().tolist(),
+            fc2_experts_weights.flatten().detach().numpy().astype(numpy_type).tolist() if use_quant else fc2_experts_weights.to(torch_type).flatten().tolist(),
             raw=False,
         ),
         helper.make_tensor(
@@ -1205,37 +1238,28 @@ def create_swiglu_moe_onnx_graph(
             ORT_DTYPE,
             fc2_bias_shape,
             fc2_experts_bias.to(torch_type).flatten().tolist(),
-            raw=False,
-        ),
-        helper.make_tensor(
-            "fc2_experts_weights",
-            ORT_DTYPE if not use_quant else TensorProto.UINT8,
-            fc2_weight_shape,
-            fc2_experts_weights.to(torch_type).flatten().tolist(),
-            raw=False,
-        ),
-        helper.make_tensor(
-            "fc2_experts_bias",
-            ORT_DTYPE,
-            fc2_bias_shape,
-            fc2_experts_bias.to(torch_type).flatten().tolist(),
-            raw=False,
-        ),
-        helper.make_tensor(
-            "fc1_experts_weight_scale",
-            ORT_DTYPE,
-            fc1_experts_weight_scale_shape,
-            fc1_experts_weight_scale.to(torch_type).flatten().tolist(),
-            raw=False,
-        ),
-        helper.make_tensor(
-            "fc2_experts_weight_scale",
-            ORT_DTYPE,
-            fc2_experts_weight_scale_shape,
-            fc2_experts_weight_scale.to(torch_type).flatten().tolist(),
             raw=False,
         ),
     ]
+
+    if use_quant:
+        initializers.extend([
+            helper.make_tensor(
+                "fc1_experts_weight_scale",
+                ORT_DTYPE,
+                fc1_experts_weight_scale_shape,
+                fc1_experts_weight_scale.to(torch_type).flatten().tolist(),
+                raw=False,
+            ),
+            helper.make_tensor(
+                "fc2_experts_weight_scale",
+                ORT_DTYPE,
+                fc2_experts_weight_scale_shape,
+                fc2_experts_weight_scale.to(torch_type).flatten().tolist(),
+                raw=False,
+            ),
+        ])
+
 
     graph_inputs = [
         helper.make_tensor_value_info("input", ORT_DTYPE, [num_tokens, hidden_size]),
@@ -1265,6 +1289,8 @@ def create_swiglu_moe_onnx_graph(
     return model.SerializeToString()
 
 
+# In file: test_parity_moe.py
+
 class SwigluMoEBlock(SparseMoeBlockORTHelper):
     def __init__(self, config: SwigluMoeConfig, batch_size: int, sequence_length: int):
         super().__init__()
@@ -1290,17 +1316,16 @@ class SwigluMoEBlock(SparseMoeBlockORTHelper):
                 weight_1_list.append(self.experts[i].w1.weight)
                 weight_2_list.append(self.experts[i].w2.weight)
             else:
-                print("shape of self.experts[i].w1.weight:", self.experts[i].w1.weight.shape)
-                scale1, pre_qweight1, w1_qdq = quant_dequant(self.experts[i].w1.weight, False)
-                print("shape of scale1:", scale1.shape)
-                print("shape of pre_qweight1:", pre_qweight1.shape)
-                print("shape of w1_qdq:", w1_qdq.shape)
+                # Pass the transposed weight to quant_dequant to get correct scales,
+                # then transpose the resulting quantized weight back to the expected layout.
+                scale1, pre_qweight1, w1_qdq = quant_dequant(self.experts[i].w1.weight.T, False)
+                scale2, pre_qweight2, w2_qdq = quant_dequant(self.experts[i].w2.weight.T, False)
 
-                scale2, pre_qweight2, w2_qdq = quant_dequant(self.experts[i].w2.weight, False)
-                self.experts[i].w1.weight.data = w1_qdq
-                self.experts[i].w2.weight.data = w2_qdq
-                weight_1_list.append(pre_qweight1)
-                weight_2_list.append(pre_qweight2)
+                self.experts[i].w1.weight.data = w1_qdq.T
+                self.experts[i].w2.weight.data = w2_qdq.T
+
+                weight_1_list.append(pre_qweight1.T)
+                weight_2_list.append(pre_qweight2.T)
                 scale_1_list.append(scale1)
                 scale_2_list.append(scale2)
 
