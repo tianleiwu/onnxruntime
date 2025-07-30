@@ -1,12 +1,15 @@
 import torch
 
+import torch
+
 def quant_dequant_torch(weights: torch.Tensor, is_4_bit_quantization: bool):
     """
-    Performs symmetric per-column quantization and dequantization on a weight tensor.
+    Performs symmetric per-row quantization and dequantization on a weight tensor.
 
     This implementation is a pure PyTorch replacement for the original function that
     relied on a custom tensorrt_llm operator. It supports both 8-bit (int8) and
-    4-bit (quint4x2 style) quantization.
+    4-bit (quint4x2 style) quantization. This version is modified to match the
+    behavior of the tensorrt_llm operator which performs per-row quantization.
 
     Args:
         weights (torch.Tensor): The input weight tensor to be quantized.
@@ -15,7 +18,7 @@ def quant_dequant_torch(weights: torch.Tensor, is_4_bit_quantization: bool):
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing:
-            - scales (torch.float16): The quantization scales for each column.
+            - scales (torch.float16): The quantization scales for each row.
             - processed_q_weight (torch.int8): The packed quantized weights. For
               4-bit mode, two 4-bit values are packed into a single int8. For
               8-bit mode, this is the standard int8 quantized tensor. It is
@@ -30,7 +33,8 @@ def quant_dequant_torch(weights: torch.Tensor, is_4_bit_quantization: bool):
         q_max = 2 ** (q_bits - 1) - 1  # 7
         q_min = -(2 ** (q_bits - 1))  # -8
 
-        max_abs_val = torch.max(torch.abs(weights), dim=0, keepdim=True).values
+        # Changed from per-column (dim=0) to per-row (dim=1) to match TRT-LLM
+        max_abs_val = torch.max(torch.abs(weights), dim=1, keepdim=True).values
         max_abs_val[max_abs_val == 0] = 1.0
         scales = max_abs_val / q_max
 
@@ -50,19 +54,22 @@ def quant_dequant_torch(weights: torch.Tensor, is_4_bit_quantization: bool):
         q_max = 2 ** (q_bits - 1) - 1  # 127
         q_min = -(2 ** (q_bits - 1))  # -128
 
-        max_abs_val = torch.max(torch.abs(weights), dim=0, keepdim=True).values
+        # Changed from per-column (dim=0) to per-row (dim=1) to match TRT-LLM
+        max_abs_val = torch.max(torch.abs(weights), dim=1, keepdim=True).values
         max_abs_val[max_abs_val == 0] = 1.0
         scales = max_abs_val / q_max
 
         quant_weights = torch.round(weights / scales).clamp(q_min, q_max).to(torch.int8)
 
-        # For 8-bit, the processed weights are just the transposed quantized weights (no packing)
+        # For 8-bit, the processed weights are just the transposed quantized weights
         processed_q_weight = quant_weights.T.contiguous()
 
     # Dequantize the weights to verify and return for PyTorch-side parity check
     dequantized_weights = quant_weights.to(weights.dtype) * scales.to(weights.dtype)
 
-    return (scales.squeeze(0).to(torch.float16), processed_q_weight, dequantized_weights.to(device=weights.device))
+    # Squeeze the scales to match the shape (in_features,) from TRT-LLM
+    # TODO: processed_q_weight need interleave
+    return (scales.squeeze().to(torch.float16), processed_q_weight, dequantized_weights.to(device=weights.device))
 
 
 def quant_dequant_trt(weights, is_4_bit_quantization: bool = True):
@@ -72,101 +79,6 @@ def quant_dequant_trt(weights, is_4_bit_quantization: bool = True):
     # Comment out this line for passing the lintrunner check in the CI.
     import tensorrt_llm
 
-    """ Here is C++ code for _symmetric_quantize_last_axis_of_batched_matrix:
-    std::vector<Tensor> symmetric_quantize_helper(
-        Tensor weight, torch::ScalarType quant_type, bool return_unprocessed_quantized_tensor)
-    {
-        CHECK_CPU(weight);
-        CHECK_CONTIGUOUS(weight);
-        TORCH_CHECK(weight.numel() != 0, "weight should not be empty tensor");
-        TORCH_CHECK(weight.dim() == 2 || weight.dim() == 3, "Invalid dim. The dim of weight should be 2 or 3");
-
-        auto _st = weight.scalar_type();
-        TORCH_CHECK(_st == torch::kFloat32 || _st == torch::kFloat16 || _st == torch::kBFloat16,
-            "Invalid datatype. Weight must be FP16 or BF16");
-        check_quant_type_allowed(quant_type);
-        QuantType ft_quant_type = get_ft_quant_type(quant_type);
-
-        const size_t num_experts = weight.dim() == 2 ? 1 : weight.size(0);
-        const size_t num_rows = weight.size(-2);
-        const size_t num_cols = weight.size(-1);
-
-        const size_t bits_in_type = get_weight_quant_bits(ft_quant_type);
-        const size_t bytes_per_out_col = num_cols * bits_in_type / 8;
-
-        std::vector<int64_t> quantized_weight_shape;
-        std::vector<int64_t> scale_shape;
-        if (weight.dim() == 2)
-        {
-            quantized_weight_shape = {int64_t(num_rows), int64_t(bytes_per_out_col)};
-            scale_shape = {int64_t(num_cols)};
-        }
-        else if (weight.dim() == 3)
-        {
-            quantized_weight_shape = {int64_t(num_experts), int64_t(num_rows), int64_t(bytes_per_out_col)};
-            scale_shape = {int64_t(num_experts), int64_t(num_cols)};
-        }
-        else
-        {
-            TORCH_CHECK(false, "Invalid weight dimension. Weight must have dim 2 or 3");
-        }
-
-        Tensor unprocessed_quantized_weight
-            = torch::empty(quantized_weight_shape, torch::dtype(torch::kInt8).device(torch::kCPU).requires_grad(false));
-
-        Tensor processed_quantized_weight = torch::empty_like(unprocessed_quantized_weight);
-
-        Tensor scales = torch::empty(scale_shape, torch::dtype(weight.dtype()).device(torch::kCPU).requires_grad(false));
-
-        int8_t* unprocessed_quantized_weight_ptr = get_ptr<int8_t>(unprocessed_quantized_weight);
-        int8_t* processed_quantized_weight_ptr = get_ptr<int8_t>(processed_quantized_weight);
-
-        // TODO This should be removed if Grouped GEMM is updated to not need interleaved input
-        bool force_interleave = weight.dim() == 3;
-
-        if (weight.scalar_type() == at::ScalarType::Float)
-        {
-            symmetric_quantize<float, float>(processed_quantized_weight_ptr, unprocessed_quantized_weight_ptr,
-                get_ptr<float>(scales), get_ptr<float const>(weight), {num_experts, num_rows, num_cols}, ft_quant_type,
-                force_interleave);
-        }
-        else if (weight.scalar_type() == at::ScalarType::Half)
-        {
-            symmetric_quantize<half, half>(processed_quantized_weight_ptr, unprocessed_quantized_weight_ptr,
-                get_ptr<half>(scales), get_ptr<half const>(weight), {num_experts, num_rows, num_cols}, ft_quant_type,
-                force_interleave);
-        }
-    #ifdef ENABLE_BF16
-        else if (weight.scalar_type() == at::ScalarType::BFloat16)
-        {
-            symmetric_quantize<__nv_bfloat16, __nv_bfloat16>(processed_quantized_weight_ptr,
-                unprocessed_quantized_weight_ptr, get_ptr<__nv_bfloat16>(scales), get_ptr<__nv_bfloat16 const>(weight),
-                {num_experts, num_rows, num_cols}, ft_quant_type, force_interleave);
-        }
-    #endif
-        else
-        {
-            TORCH_CHECK(false, "Invalid datatype. Weight must be BF16/FP16");
-        }
-
-        if (return_unprocessed_quantized_tensor)
-        {
-            return std::vector<Tensor>{unprocessed_quantized_weight, processed_quantized_weight, scales};
-        }
-
-        return std::vector<Tensor>{processed_quantized_weight, scales};
-    }
-
-
-
-    // Same as symmetric_quantize_last_axis_of_batched_matrix but returns a tuple of:
-    // (unprocessed_quantized_weights, preprocessed_quantized_weights, scales)
-    // Exposed mainly for testing, so that the unprocessed weights can be passed to torch functions.
-    std::vector<Tensor> _symmetric_quantize_last_axis_of_batched_matrix(Tensor weight, torch::ScalarType quant_type)
-    {
-        return symmetric_quantize_helper(weight, quant_type, true);
-    }
-    """
     quant_weights, processed_q_weight, torch_weight_scales = (
         torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix(weights.T.cpu().contiguous(), type)
     )
