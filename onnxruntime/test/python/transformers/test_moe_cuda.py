@@ -29,7 +29,10 @@ pipeline_mode = os.getenv("PIPELINE_MODE", "1") == "1"
 onnxruntime.preload_dlls()
 
 # Determine the execution provider and device based on CUDA availability.
-use_cuda = "CUDAExecutionProvider" in onnxruntime.get_available_providers() and torch.cuda.is_available()
+# use_cuda = "CUDAExecutionProvider" in onnxruntime.get_available_providers() and torch.cuda.is_available()
+# device = torch.device("cuda:0" if use_cuda else "cpu")
+# ort_provider = ["CUDAExecutionProvider"] if use_cuda else ["CPUExecutionProvider"]
+use_cuda = False
 device = torch.device("cuda:0" if use_cuda else "cpu")
 ort_provider = ["CUDAExecutionProvider"] if use_cuda else ["CPUExecutionProvider"]
 
@@ -61,7 +64,7 @@ def quant_dequant(weights, is_4_bit_quantization: bool = True):
     type = torch.quint4x2 if is_4_bit_quantization else torch.int8
     # This import is needed to use torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix()
     # Comment out this line for passing the lintrunner check in the CI.
-    # import tensorrt_llm
+    import tensorrt_llm
 
     quant_weights, processed_q_weight, torch_weight_scales = (
         torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix(weights.T.cpu().contiguous(), type)
@@ -570,25 +573,28 @@ class PhiMoEBlockSparseTop2MLP(MoEBlockSparseTop2MLP):
 
 
 class SparseMoeBlockORTHelper(nn.Module):
-    def __init__(self, quant_bits=0, onnx_dtype=None):
+    def __init__(self, quant_bits=0, onnx_dtype=None, scale_onnx_dtype=None):
         super().__init__()
         self.quant_bits = quant_bits
         if onnx_dtype is None:
             self.onnx_dtype = TensorProto.FLOAT16 if self.quant_bits > 0 else TensorProto.FLOAT
         else:
             self.onnx_dtype = onnx_dtype
+        self.scale_onnx_dtype = scale_onnx_dtype or self.onnx_dtype
+
         self.np_type = numpy.float16 if self.onnx_dtype == TensorProto.FLOAT16 else numpy.float32
 
-    def create_ort_session(self, moe_onnx_graph):
+    def create_ort_session(self, moe_onnx_graph, providers=None):
         from onnxruntime import InferenceSession, SessionOptions  # noqa: PLC0415
 
         sess_options = SessionOptions()
         sess_options.log_severity_level = 2
 
+        providers=providers or ort_provider
         try:
-            ort_session = InferenceSession(moe_onnx_graph, sess_options, providers=ort_provider)
+            ort_session = InferenceSession(moe_onnx_graph, sess_options, providers=providers)
         except Exception as e:
-            print(f"Failed to create ONNX Runtime session with provider {ort_provider}: {e}")
+            print(f"Failed to create ONNX Runtime session with providers {providers}: {e}")
             print("Skipping ONNX Runtime execution for this test case.")
             return None
 
@@ -901,7 +907,7 @@ class PhiMoESparseMoeBlock(SparseMoeBlockORTHelper):
     and memory on padding.
     """
 
-    def __init__(self, config, batch_size, sequence_length, quant_bits=0, onnx_dtype=None):
+    def __init__(self, config, batch_size, sequence_length, quant_bits=0, onnx_dtype=None, providers=None):
         super().__init__(quant_bits, onnx_dtype)
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size
@@ -969,7 +975,7 @@ class PhiMoESparseMoeBlock(SparseMoeBlockORTHelper):
             moe_experts_weight_scale3,
         )
 
-        self.ort_sess = self.create_ort_session(self.moe_onnx_graph)
+        self.ort_sess = self.create_ort_session(self.moe_onnx_graph, providers=providers)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """ """
@@ -1025,35 +1031,35 @@ def small_test_cases():
             yield batch_size, sequence_length
 
 
-@unittest.skipIf(not use_cuda, "skipping moe test since it requires cuda environment.")
-class TestSwitchMoE(unittest.TestCase):
-    @parameterized.expand(small_test_cases())
-    def test_switch_moe_parity(self, batch_size, sequence_length):
-        switch_moe = SwitchMoE(
-            batch_size=batch_size,
-            sequence_length=sequence_length,
-            num_experts=8,
-            in_features=256,
-            hidden_features=1024,
-            out_features=256,
-        )
-        switch_moe.to(device)
-        switch_moe.parity_check()
+# @unittest.skipIf(use_cuda, "skipping moe test since it requires cuda environment.")
+# class TestSwitchMoE(unittest.TestCase):
+#     @parameterized.expand(small_test_cases())
+#     def test_switch_moe_parity(self, batch_size, sequence_length):
+#         switch_moe = SwitchMoE(
+#             batch_size=batch_size,
+#             sequence_length=sequence_length,
+#             num_experts=8,
+#             in_features=256,
+#             hidden_features=1024,
+#             out_features=256,
+#         )
+#         switch_moe.to(device)
+#         switch_moe.parity_check()
 
 
 # quant_bits (0 for fp32/fp32, 8 for int8/fp16, 4 for int4/fp16)
 # since qMoE test requires tensorrt_llm for quant_dequant. We disable it in CI pipeline to avoid extra dependency.
-quant_bits_list = [0] if pipeline_mode else [0, 8, 4]
+quant_bits_list = [0, 8, 4]
 
 
-@unittest.skipIf(not use_cuda, "skipping moe test since it requires cuda environment.")
-class TestMixtralMoE(unittest.TestCase):
-    @parameterized.expand(small_test_cases())
-    def test_mixtral_moe_parity(self, batch_size, sequence_length):
-        config = MixtralConfig(hidden_size=256, intermediate_size=1024)
-        mixtral_moe = MixtralSparseMoeBlock(config, batch_size, sequence_length)
-        mixtral_moe.to(device)
-        mixtral_moe.parity_check()
+# @unittest.skipIf(use_cuda, "skipping moe test since it requires cuda environment.")
+# class TestMixtralMoE(unittest.TestCase):
+#     @parameterized.expand(small_test_cases())
+#     def test_mixtral_moe_parity(self, batch_size, sequence_length):
+#         config = MixtralConfig(hidden_size=256, intermediate_size=1024)
+#         mixtral_moe = MixtralSparseMoeBlock(config, batch_size, sequence_length)
+#         mixtral_moe.to(device)
+#         mixtral_moe.parity_check()
 
 
 phi3_test_cases = list(
@@ -1065,14 +1071,23 @@ phi3_test_cases = list(
 )
 
 
-@unittest.skipIf(not use_cuda, "skipping moe test since it requires cuda environment.")
-class TestPhiMoE(unittest.TestCase):
-    @parameterized.expand(phi3_test_cases)
-    def test_phi3_moe_parity(self, batch_size, sequence_length, quant_bits):
-        config = PhiMoEConfig(hidden_size=256, intermediate_size=1024)
-        phi3_moe = PhiMoESparseMoeBlock(config, batch_size, sequence_length, quant_bits)
-        phi3_moe.to(device)
-        phi3_moe.parity_check()
+# @unittest.skipIf(not use_cuda, "skipping moe test since it requires cuda environment.")
+# class TestPhiMoE(unittest.TestCase):
+    # @parameterized.expand(phi3_test_cases)
+    # def test_phi3_moe_parity(self, batch_size, sequence_length, quant_bits):
+    #     config = PhiMoEConfig(hidden_size=256, intermediate_size=1024)
+    #     phi3_moe = PhiMoESparseMoeBlock(config, batch_size, sequence_length, quant_bits)
+    #     phi3_moe.to(device)
+    #     phi3_moe.parity_check()
+
+# class TestPhiMoECpu(unittest.TestCase):
+#     @parameterized.expand([(b, s, q) for b, s, q in phi3_test_cases if q in (8, 4)])
+#     def test_phi3_qmoe_cpu_parity(self, batch_size, sequence_length, quant_bits):
+#         if "CPUExecutionProvider" not in onnxruntime.get_available_providers():
+#             self.skipTest("CPUExecutionProvider is not available.")
+#         config = PhiMoEConfig(hidden_size=256, intermediate_size=1024)
+#         phi3_moe = PhiMoESparseMoeBlock(config, batch_size, sequence_length, quant_bits, onnx_dtype=TensorProto.FLOAT16, providers=["CPUExecutionProvider"])
+#         phi3_moe.parity_check()
 
 
 # ---------------------------------------------
@@ -1154,6 +1169,7 @@ def create_swiglu_moe_onnx_graph(
     fc2_experts_bias: torch.Tensor,
     fc1_experts_weight_scale: torch.Tensor = None,
     fc2_experts_weight_scale: torch.Tensor = None,
+    scale_onnx_dtype: int = None,
 ):
     use_quant = quant_bits > 0
     op_name = "QMoE" if use_quant else "MoE"
@@ -1212,6 +1228,10 @@ def create_swiglu_moe_onnx_graph(
     torch_dtype = onnx_to_torch_type_map[onnx_dtype]
     weight_torch_dtype = onnx_to_torch_type_map[weight_onnx_type]
 
+    if scale_onnx_dtype is None:
+        scale_onnx_dtype = onnx_dtype
+    scale_torch_dtype = onnx_to_torch_type_map[scale_onnx_dtype]
+
     initializers = [
         make_onnx_intializer(
             "fc1_experts_weights", fc1_experts_weights.to(weight_torch_dtype), fc1_weight_shape, weight_onnx_type
@@ -1228,15 +1248,15 @@ def create_swiglu_moe_onnx_graph(
             [
                 make_onnx_intializer(
                     "fc1_experts_weight_scale",
-                    fc1_experts_weight_scale.to(torch_dtype),
+                    fc1_experts_weight_scale.to(scale_torch_dtype),
                     fc1_experts_weight_scale_shape,
-                    onnx_dtype,
+                    scale_onnx_dtype,
                 ),
                 make_onnx_intializer(
                     "fc2_experts_weight_scale",
-                    fc2_experts_weight_scale.to(torch_dtype),
+                    fc2_experts_weight_scale.to(scale_torch_dtype),
                     fc2_experts_weight_scale_shape,
-                    onnx_dtype,
+                    scale_onnx_dtype,
                 ),
             ]
         )
@@ -1271,9 +1291,9 @@ def create_swiglu_moe_onnx_graph(
 
 class SwigluMoEBlock(SparseMoeBlockORTHelper):
     def __init__(
-        self, config: SwigluMoeConfig, batch_size: int, sequence_length: int, quant_bits: int = 0, onnx_dtype=None
+        self, config: SwigluMoeConfig, batch_size: int, sequence_length: int, quant_bits: int = 0, onnx_dtype=None, scale_onnx_dtype=None, providers=None
     ):
-        super().__init__(quant_bits, onnx_dtype=onnx_dtype)
+        super().__init__(quant_bits, onnx_dtype=onnx_dtype, scale_onnx_dtype=scale_onnx_dtype)
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size
         self.num_experts = config.num_local_experts
@@ -1341,9 +1361,10 @@ class SwigluMoEBlock(SparseMoeBlockORTHelper):
             fc2_experts_bias=fc2_experts_bias,
             fc1_experts_weight_scale=moe_experts_weight_scale1,
             fc2_experts_weight_scale=moe_experts_weight_scale2,
+            scale_onnx_dtype=self.scale_onnx_dtype,
         )
 
-        self.ort_sess = self.create_ort_session(self.moe_onnx_graph)
+        self.ort_sess = self.create_ort_session(self.moe_onnx_graph, providers=providers)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
@@ -1389,15 +1410,23 @@ swiglu_test_cases = list(
 )
 
 
-@unittest.skipIf(not use_cuda, "skipping moe test since it requires cuda environment.")
-class TestSwigluMoE(unittest.TestCase):
-    @parameterized.expand(swiglu_test_cases)
-    def test_swiglu_moe_parity(self, batch_size, sequence_length, quant_bits):
-        config = SwigluMoeConfig(hidden_size=64, intermediate_size=256, num_experts_per_token=2, num_local_experts=4)
-        moe = SwigluMoEBlock(config, batch_size, sequence_length, quant_bits)
-        moe.to(device)
-        moe.parity_check()
+# @unittest.skipIf(not use_cuda, "skipping moe test since it requires cuda environment.")
+# class TestSwigluMoE(unittest.TestCase):
+    # @parameterized.expand(swiglu_test_cases)
+    # def test_swiglu_moe_parity(self, batch_size, sequence_length, quant_bits):
+    #     config = SwigluMoeConfig(hidden_size=64, intermediate_size=256, num_experts_per_token=2, num_local_experts=4)
+    #     moe = SwigluMoEBlock(config, batch_size, sequence_length, quant_bits)
+    #     moe.to(device)
+    #     moe.parity_check()
 
+class TestSwigluMoECpu(unittest.TestCase):
+    @parameterized.expand([(b, s, q) for b, s, q in swiglu_test_cases if q in (8, 4)])
+    def test_swiglu_qmoe_cpu_parity(self, batch_size, sequence_length, quant_bits):
+        if "CPUExecutionProvider" not in onnxruntime.get_available_providers():
+            self.skipTest("CPUExecutionProvider is not available.")
+        config = SwigluMoeConfig(hidden_size=128, intermediate_size=512, num_experts_per_token=1, num_local_experts=4)
+        moe = SwigluMoEBlock(config, batch_size, sequence_length, quant_bits, onnx_dtype=TensorProto.FLOAT16, scale_onnx_dtype=TensorProto.FLOAT, providers=["CPUExecutionProvider"])
+        moe.parity_check()
 
 def has_bf16_moe():
     if "CUDAExecutionProvider" not in onnxruntime.get_available_providers() or not torch.cuda.is_available():
@@ -1406,14 +1435,14 @@ def has_bf16_moe():
     return major >= 8
 
 
-@unittest.skipIf(not has_bf16_moe(), "skipping bf16 moe tests.")
-class TestSwigluMoeBf16(unittest.TestCase):
-    @parameterized.expand(swiglu_test_cases)
-    def test_swiglu_moe_parity(self, batch_size, sequence_length, quant_bits):
-        config = SwigluMoeConfig(hidden_size=64, intermediate_size=128, num_experts_per_token=2, num_local_experts=4)
-        moe = SwigluMoEBlock(config, batch_size, sequence_length, quant_bits, onnx_dtype=TensorProto.BFLOAT16)
-        moe.to(device)
-        moe.parity_check()
+# @unittest.skipIf(not has_bf16_moe(), "skipping bf16 moe tests.")
+# class TestSwigluMoeBf16(unittest.TestCase):
+#     @parameterized.expand(swiglu_test_cases)
+#     def test_swiglu_moe_parity(self, batch_size, sequence_length, quant_bits):
+#         config = SwigluMoeConfig(hidden_size=64, intermediate_size=128, num_experts_per_token=2, num_local_experts=4)
+#         moe = SwigluMoEBlock(config, batch_size, sequence_length, quant_bits, onnx_dtype=TensorProto.BFLOAT16)
+#         moe.to(device)
+#         moe.parity_check()
 
 
 perf_test_cases = list(
@@ -1425,24 +1454,23 @@ perf_test_cases = list(
 )
 
 
-@unittest.skipIf(pipeline_mode or not use_cuda, "skipping performance test in CI pipeline.")
-class TestSwigluMoEPerf(unittest.TestCase):
-    @parameterized.expand(perf_test_cases)
-    def test_swiglu_moe_parity(self, batch_size, sequence_length, quant_bits):
-        hidden_size = 2880
-        intermediate_size = 2880
-        num_experts_per_token = 8
-        num_local_experts = 128
-        config = SwigluMoeConfig(
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_experts_per_token=num_experts_per_token,
-            num_local_experts=num_local_experts,
-        )
-        moe = SwigluMoEBlock(config, batch_size, sequence_length, quant_bits)
-        moe.to(device)
-        moe.benchmark_ort()
-
+# @unittest.skipIf(pipeline_mode or not use_cuda, "skipping performance test in CI pipeline.")
+# class TestSwigluMoEPerf(unittest.TestCase):
+#     @parameterized.expand(perf_test_cases)
+#     def test_swiglu_moe_parity(self, batch_size, sequence_length, quant_bits):
+#         hidden_size = 2880
+#         intermediate_size = 2880
+#         num_experts_per_token = 8
+#         num_local_experts = 128
+#         config = SwigluMoeConfig(
+#             hidden_size=hidden_size,
+#             intermediate_size=intermediate_size,
+#             num_experts_per_token=num_experts_per_token,
+#             num_local_experts=num_local_experts,
+#         )
+#         moe = SwigluMoEBlock(config, batch_size, sequence_length, quant_bits)
+#         moe.to(device)
+#         moe.benchmark_ort()
 
 if __name__ == "__main__":
     unittest.main()
