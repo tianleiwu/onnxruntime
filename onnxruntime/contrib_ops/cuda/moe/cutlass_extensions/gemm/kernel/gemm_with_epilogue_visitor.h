@@ -51,7 +51,7 @@
 
 #include "contrib_ops/cuda/moe/cutlass_extensions/epilogue/threadblock/epilogue_per_row_per_col_scale.h"
 
-namespace tk = tensorrt_llm::common;
+namespace tk = onnxruntime::llm::common;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 

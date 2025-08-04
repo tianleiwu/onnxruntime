@@ -40,26 +40,104 @@ def print_tensor(name, numpy_array):
     print(f"const std::vector<float> {name} = {value_string_of(numpy_array)};")
 
 
-def quant_dequant(weights, quant_mode: bool = True):
-    # use the test version `_symmetric_...` to get the non-interleaved weights
-    type = torch.quint4x2 if quant_mode else torch.int8
-    # This import is needed to use torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix()
-    # Comment out this line for passing the lintrunner check in the CI.
-    # import tensorrt_llm
+def quant_dequant(weights: torch.Tensor, is_4_bit_quantization: bool = True):
+    """
+    Performs symmetric per-column quantization and dequantization on a weight tensor.
 
-    quant_weights, processed_q_weight, torch_weight_scales = (
-        torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix(weights.T.cpu().contiguous(), type)
+    This implementation is a pure PyTorch replacement for the original function that
+    relied on a custom tensorrt_llm operator. It supports both 8-bit (int8) and
+    4-bit (quint4x2 style) quantization.
+
+    Args:
+        weights (torch.Tensor): The input weight tensor to be quantized.
+        is_4_bit_quantization (bool): If True, performs 4-bit quantization. If False,
+                           performs 8-bit quantization.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing:
+            - scales (torch.float16): The quantization scales for each column.
+            - processed_q_weight (torch.int8): The packed quantized weights. For
+              4-bit mode, two 4-bit values are packed into a single int8. For
+              8-bit mode, this is the standard int8 quantized tensor. It is
+              transposed relative to the input weights' shape.
+            - dequantized_weights (torch.Tensor): The weights after being dequantized,
+              restored to the original dtype and device.
+    """
+    # Determine quantization bits and range based on the mode
+    if is_4_bit_quantization:
+        # 4-bit symmetric quantization
+        q_bits = 4
+        q_max = 2**(q_bits - 1) - 1  # 7
+        q_min = -2**(q_bits - 1)     # -8
+    else:
+        # 8-bit symmetric quantization
+        q_bits = 8
+        q_max = 2**(q_bits - 1) - 1  # 127
+        q_min = -2**(q_bits - 1)     # -128
+
+    # 1. Calculate per-column scales
+    # The scale is calculated based on the maximum absolute value in each column.
+    # `dim=0` operates along the columns of the weight matrix.
+    max_abs_val = torch.max(torch.abs(weights), dim=0, keepdim=True).values
+    # Avoid division by zero for empty columns
+    max_abs_val[max_abs_val == 0] = 1.0
+    scales = max_abs_val / q_max
+
+    # 2. Quantize the weights
+    # The formula is round(value / scale)
+    quant_weights = torch.round(weights / scales).clamp(q_min, q_max).to(torch.int8)
+
+    # 3. Pack weights for 4-bit mode and prepare for output
+    if is_4_bit_quantization:
+        # For 4-bit, we need to pack two 4-bit integers into a single int8.
+        # The TRT-LLM op works on transposed weights, so we transpose here
+        # before packing to match the expected output format.
+        q_weights_t = quant_weights.T.contiguous()
+
+        # Reshape to group pairs of 4-bit values.
+        # Example: a (C, H) tensor becomes (C, H/2, 2)
+        shape = q_weights_t.shape
+        q_weights_t_reshaped = q_weights_t.view(shape[0], shape[1] // 2, 2)
+
+        # Isolate the lower and upper 4-bit values
+        lower_nibble = q_weights_t_reshaped[..., 0]
+        upper_nibble = q_weights_t_reshaped[..., 1]
+
+        # Pack them into a single int8.
+        # `lower & 0x0F` ensures we only take the lower 4 bits.
+        # `upper << 4` shifts the upper value to the most significant 4 bits.
+        processed_q_weight = (lower_nibble & 0x0F) | (upper_nibble << 4)
+
+    else:
+        # For 8-bit, the processed weights are just the transposed quantized weights.
+        processed_q_weight = quant_weights.T.contiguous()
+
+    # 4. Dequantize the weights to verify and return
+    # This reverses the quantization process: value = quantized_value * scale
+    dequantized_weights = quant_weights.to(weights.dtype) * scales.to(weights.dtype)
+
+    return (
+        scales.squeeze(0).to(torch.float16),
+        processed_q_weight,
+        dequantized_weights.to(device=weights.device)
     )
 
-    # Unpack the int4s int int8s
-    if quant_mode:
-        upper = quant_weights >> 4
-        lower = (quant_weights << 4) >> 4  # Arithmetic right shift sign extends
-        quant_weights = torch.stack((lower, upper), dim=2).view(weights.T.shape)
 
-    quant_weights = quant_weights.to(dtype=weights.dtype)
-    result = torch.multiply(quant_weights, torch_weight_scales.unsqueeze(0)).T.contiguous()
-    return torch_weight_scales.to(torch.float16), processed_q_weight, result.to(device=weights.device)
+# def quant_dequant(weights, quant_mode: bool = True):
+#     type = torch.quint4x2 if quant_mode else torch.int8
+#     import tensorrt_llm
+#     quant_weights, processed_q_weight, torch_weight_scales = (
+#         torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix(weights.T.cpu().contiguous(), type)
+#     )
+
+#     if quant_mode:
+#         upper = quant_weights >> 4
+#         lower = (quant_weights << 4) >> 4  # Arithmetic right shift sign extends
+#         quant_weights = torch.stack((lower, upper), dim=2).view(weights.T.shape)
+
+#     quant_weights = quant_weights.to(dtype=weights.dtype)
+#     result = torch.multiply(quant_weights, torch_weight_scales.unsqueeze(0)).T.contiguous()
+#     return torch_weight_scales.to(torch.float16), processed_q_weight, result.to(device=weights.device)
 
 
 def create_moe_onnx_graph(
