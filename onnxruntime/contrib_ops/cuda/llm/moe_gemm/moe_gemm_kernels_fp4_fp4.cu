@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#if 0
+
 #include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_template_dispatch.h"
 
 namespace onnxruntime::llm::kernels::cutlass_kernels {
@@ -23,4 +25,7 @@ template class MoeGemmRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, half>;
 template class MoeGemmRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, __nv_bfloat16>;
 #endif
 #endif
+
 }  // namespace onnxruntime::llm::kernels::cutlass_kernels
+
+#endif
