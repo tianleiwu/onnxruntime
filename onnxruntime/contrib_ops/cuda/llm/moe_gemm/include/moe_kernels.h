@@ -425,6 +425,13 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   static constexpr bool use_fp4 = false;
 #endif
 
+  // Added by ORT
+
+  ActivationType activation_type_;
+  bool has_fc3_;
+  bool normalize_routing_weights_;
+  bool use_sparse_mixer_;
+
   static constexpr bool use_block_scaling = use_fp4 || use_wfp4afp8;
 
   // This should leave the variable unchanged in any currently supported configuration
@@ -435,7 +442,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   static_assert(std::is_same_v<OutputType, BackBoneType>, "Scale and bias types must match OutputType");
 
  public:
-  CutlassMoeFCRunner();
+  CutlassMoeFCRunner(int sm_version, ActivationType activation_type, bool has_fc3, bool normalize_routing_weights, bool use_sparse_mixer);
 
   ~CutlassMoeFCRunner() override = default;
 

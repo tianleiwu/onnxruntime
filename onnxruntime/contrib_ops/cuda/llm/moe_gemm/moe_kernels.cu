@@ -2204,9 +2204,18 @@ void dequantFP8(OutputType* output, InputType const* input, int64_t const* num_v
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
-CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::CutlassMoeFCRunner()
-    : blockscale_gemm_runner_{std::make_unique<
-          kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunner<__nv_bfloat16, __nv_fp8_e4m3, __nv_bfloat16>>()} {
+CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::CutlassMoeFCRunner(
+    int sm_version,
+    ActivationType activation_type,
+    bool has_fc3,
+    bool normalize_routing_weights,
+    bool use_sparse_mixer)
+    : sm_(sm_version),
+      activation_type_(activation_type),
+      has_fc3_(has_fc3),
+      normalize_routing_weights_(normalize_routing_weights),
+      use_sparse_mixer_(use_sparse_mixer),
+      blockscale_gemm_runner_{std::make_unique<kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunner<__nv_bfloat16, __nv_fp8_e4m3, __nv_bfloat16>>()} {
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>

@@ -2,9 +2,10 @@
 // Licensed under the MIT License.
 
 #include <type_traits>
+#include "cutlass/numeric_types.h"
 #include "core/common/safeint.h"
 #include "core/providers/cuda/cuda_common.h"
-//#include "contrib_ops/cuda/llm/moe_gemm/include/moe_kernels.h"
+// #include "contrib_ops/cuda/llm/moe_gemm/include/moe_kernels.h"
 #include "contrib_ops/cuda/quantization/moe_quantization.h"
 
 using namespace onnxruntime::cuda;
@@ -15,7 +16,6 @@ namespace onnxruntime {
 namespace contrib {
 namespace cuda {
 
-#if 0
 #define REGISTER_KERNEL()                                                                  \
   ONNX_OPERATOR_KERNEL_EX(QMoE, kMSDomain, 1, kCudaExecutionProvider,                      \
                           (*KernelDefBuilder::Create())                                    \
@@ -185,7 +185,6 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
 #pragma GCC diagnostic pop
 #endif
 }
-#endif // 0
 
 }  // namespace cuda
 }  // namespace contrib
