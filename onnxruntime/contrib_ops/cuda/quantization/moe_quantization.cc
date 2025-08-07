@@ -4,6 +4,7 @@
 #include <type_traits>
 #include "core/common/safeint.h"
 #include "core/providers/cuda/cuda_common.h"
+//#include "contrib_ops/cuda/llm/moe_gemm/include/moe_kernels.h"
 #include "contrib_ops/cuda/quantization/moe_quantization.h"
 
 using namespace onnxruntime::cuda;
@@ -14,6 +15,7 @@ namespace onnxruntime {
 namespace contrib {
 namespace cuda {
 
+#if 0
 #define REGISTER_KERNEL()                                                                  \
   ONNX_OPERATOR_KERNEL_EX(QMoE, kMSDomain, 1, kCudaExecutionProvider,                      \
                           (*KernelDefBuilder::Create())                                    \
@@ -71,10 +73,11 @@ Status QMoE::QuantizedMoEImpl(OpKernelContext* context,
   using T = MLFloat16;
   using CudaT = typename ToCudaType<T>::MappedType;
 
-  ort_fastertransformer::CutlassMoeFCRunner<CudaT, CudaWeightT> moe_runner(sm,
-                                                                           fc3_experts_weights_optional != nullptr,
-                                                                           normalize_routing_weights_,
-                                                                           use_sparse_mixer_);
+  onnxruntime::llm::kernels::cutlass_kernels::CutlassMoeFCRunner<CudaT, CudaWeightT> moe_runner(
+      sm,
+      fc3_experts_weights_optional != nullptr,
+      normalize_routing_weights_,
+      use_sparse_mixer_);
 
   size_t ws_size = moe_runner.getWorkspaceSize(
       static_cast<size_t>(moe_params.num_rows), static_cast<size_t>(moe_params.hidden_size),
@@ -182,6 +185,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
 #pragma GCC diagnostic pop
 #endif
 }
+#endif // 0
 
 }  // namespace cuda
 }  // namespace contrib

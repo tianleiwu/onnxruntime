@@ -6,7 +6,7 @@
 #include "core/common/common.h"
 #include "core/framework/tensor_shape.h"
 #include "core/framework/op_kernel.h"
-#include "contrib_ops/cuda/moe/ft_moe/moe_gemm_kernels.h"
+#include "contrib_ops/cuda/llm/moe_gemm/include/common.h"
 
 namespace onnxruntime {
 namespace contrib {
@@ -211,16 +211,17 @@ class MoEBase {
   MoEBase(const OpKernelInfo& op_kernel_info) {
     ORT_ENFORCE(op_kernel_info.GetAttr<int64_t>("k", &k_).IsOK());
 
+    using onnxruntime::llm::kernels::cutlass_kernels::ActivationType;
     std::string activation_type_str;
     ORT_ENFORCE(op_kernel_info.GetAttr<std::string>("activation_type", &activation_type_str).IsOK());
     if (activation_type_str == "relu") {
-      activation_type_ = ort_fastertransformer::ActivationType::Relu;
+      activation_type_ = ActivationType::Relu;
     } else if (activation_type_str == "gelu") {
-      activation_type_ = ort_fastertransformer::ActivationType::Gelu;
+      activation_type_ = ActivationType::Gelu;
     } else if (activation_type_str == "silu") {
-      activation_type_ = ort_fastertransformer::ActivationType::Silu;
+      activation_type_ = ActivationType::Silu;
     } else if (activation_type_str == "identity") {
-      activation_type_ = ort_fastertransformer::ActivationType::Identity;
+      activation_type_ = ActivationType::Identity;
     } else {
       ORT_THROW("Unsupported MoE activation type: ", activation_type_str);
     }
@@ -236,7 +237,7 @@ class MoEBase {
   bool normalize_routing_weights_;
   bool use_sparse_mixer_;
   int64_t k_;
-  ort_fastertransformer::ActivationType activation_type_;
+  onnxruntime::llm::kernels::cutlass_kernels::ActivationType activation_type_;
 };
 
 }  // namespace cuda
