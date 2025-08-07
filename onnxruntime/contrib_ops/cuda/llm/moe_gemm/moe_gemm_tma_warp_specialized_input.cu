@@ -65,7 +65,7 @@ void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(int8_t* start_ptr, i
   auto buffers = workspaceBuffers(num_experts, scaling_type);
   std::array<int8_t*, 17> pointers{};
   ORT_ENFORCE(pointers.size() == buffers.size(), "Mismatching workspace size and number of buffers");
-  for (int i = 0; i < buffers.size(); i++) {
+  for (size_t i = 0; i < buffers.size(); i++) {
     pointers[i] = start_ptr;
     start_ptr = onnxruntime::llm::common::nextWorkspacePtr(start_ptr, buffers[i]);
   }

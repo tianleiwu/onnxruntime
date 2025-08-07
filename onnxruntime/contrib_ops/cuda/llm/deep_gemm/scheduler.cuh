@@ -41,8 +41,10 @@ enum class GemmType {
   StridedBatched
 };
 
+#if defined(__clang__)
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
+#endif
 
 template <uint32_t kNumTMAMulticast, uint32_t kNumNBlocks, uint32_t kNumNBlocksPerGroup>
 __device__ __forceinline__ void get_swizzled_block_idx(
@@ -676,6 +678,8 @@ struct SchedulerSelectorSwapAB {
   using type = decltype(select_type());
 };
 
+#if defined(__clang__)
 #pragma clang diagnostic pop
+#endif
 
 }  // namespace deep_gemm

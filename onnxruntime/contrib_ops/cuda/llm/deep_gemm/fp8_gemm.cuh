@@ -24,8 +24,14 @@
  * limitations under the License.
  */
 
+#if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunknown-pragmas"
+#endif
+
 #pragma once
 
 #include <cutlass/arch/barrier.h>
@@ -347,4 +353,8 @@ void runGemm(cudaKernel_t kernel, void* mat_a, uint64_t ld_a, uint64_t stride_a,
 
 };  // namespace deep_gemm
 
+#if defined(__clang__)
 #pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
