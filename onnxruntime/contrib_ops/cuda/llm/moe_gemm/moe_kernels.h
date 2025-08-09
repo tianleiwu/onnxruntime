@@ -15,18 +15,28 @@
  */
 
 #pragma once
-#include "contrib_ops/cuda/llm/moe_gemm/include/moe_gemm_kernels.h"
+
+#ifdef __GNUC__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wunused-local-typedefs"
+#endif
+
+#include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_kernels.h"
 #include "cutlass/gemm/gemm.h"
 #include "core/common/common.h"
+#include "core/providers/cuda/cuda_common.h"
 #include "contrib_ops/cuda/llm/common/cuda_runtime_utils.h"
 #include "contrib_ops/cuda/llm/common/quantization.h"
 #include "contrib_ops/cuda/llm/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
+#include "contrib_ops/cuda/llm/nv_infer_datatype.h"
+
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
 #endif
-#include "contrib_ops/cuda/llm/nv_infer_datatype.h"
-#include <array>
 #include <cuda_runtime_api.h>
+
+#include <array>
 #include <map>
 #include <optional>
 #include <random>
@@ -837,3 +847,7 @@ void populateRandomBuffer(void* buffer_void, size_t size, cudaStream_t stream);
 
 }  // namespace cutlass_kernels
 }  // namespace onnxruntime::llm::kernels
+
+#ifdef __GNUC__ 
+#pragma GCC diagnostic pop
+#endif

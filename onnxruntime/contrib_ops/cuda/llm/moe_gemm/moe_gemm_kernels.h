@@ -25,11 +25,11 @@
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/layout/layout.h"
-#include "contrib_ops/cuda/llm/common/cudaFp8Utils.h"
+#include "contrib_ops/cuda/llm/common/cuda_fp8_utils.h"
 #include "contrib_ops/cuda/llm/common/workspace.h"
 #include "contrib_ops/cuda/llm/cutlass_extensions/gemm_configs.h"
 
-#include "contrib_ops/cuda/llm/moe_gemm/include/common.h"
+#include "contrib_ops/cuda/llm/moe_gemm/common.h"
 
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>

@@ -55,7 +55,7 @@
 #include "contrib_ops/cuda/llm/cutlass_heuristic.h"
 #include "contrib_ops/cuda/llm/cutlass_type_conversion.h"
 
-#include "contrib_ops/cuda/llm/moe_gemm/include/moe_gemm_kernels.h"
+#include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_kernels.h"
 #include "contrib_ops/cuda/llm/moe_gemm/launchers/moe_gemm_tma_ws_launcher.h"
 #include "contrib_ops/cuda/llm/moe_gemm/moe_tma_warp_specialized_traits.h"
 

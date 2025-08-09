@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "contrib_ops/cuda/llm/kernels/preQuantScaleKernel.h"
+#include "contrib_ops/cuda/llm/kernels/pre_quant_scale_kernel.h"
 
 namespace onnxruntime::llm {
 namespace kernels {

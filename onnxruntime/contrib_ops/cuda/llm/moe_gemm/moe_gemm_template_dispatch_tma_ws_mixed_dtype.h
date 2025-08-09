@@ -47,7 +47,7 @@
 #pragma GCC diagnostic pop
 #endif
 
-#include "contrib_ops/cuda/llm/moe_gemm/include/moe_gemm_kernels.h"
+#include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_kernels.h"
 #include "contrib_ops/cuda/llm/moe_gemm/launchers/moe_gemm_tma_ws_mixed_input_launcher.h"
 #include "contrib_ops/cuda/llm/common/cuda_runtime_utils.h"
 #include "contrib_ops/cuda/llm/cutlass_heuristic.h"

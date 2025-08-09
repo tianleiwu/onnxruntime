@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "contrib_ops/cuda/llm/common/cudaBf16Wrapper.h"
+#include "contrib_ops/cuda/llm/common/cuda_bf16_wrapper.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 

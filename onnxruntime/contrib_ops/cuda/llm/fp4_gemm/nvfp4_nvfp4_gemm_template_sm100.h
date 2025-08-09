@@ -29,10 +29,10 @@
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/gemm.h"
 
-#include "contrib_ops/cuda/llm/kernels/archCondition.h"
+#include "contrib_ops/cuda/llm/kernels/arch_condition.h"
 #include "contrib_ops/cuda/llm/cutlass_type_conversion.h"
 
-#include "contrib_ops/cuda/llm/common/envUtils.h"
+#include "contrib_ops/cuda/llm/common/env_utils.h"
 
 #ifndef _WIN32
 #pragma GCC diagnostic pop

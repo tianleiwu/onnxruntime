@@ -22,11 +22,13 @@ REGISTER_KERNEL_TYPED(float)
 REGISTER_KERNEL_TYPED(MLFloat16)
 
 template <typename T>
-MoE<T>::MoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoEBase(op_kernel_info) {
+MoE<T>::MoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoEBase(op_kernel_info, GetDeviceProp()) {
 }
 
 template <typename T>
 Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
+    ORT_UNUSED_PARAMETER(context);
+/*    
   const Tensor* input = context->Input<Tensor>(0);
   const Tensor* router_probs = context->Input<Tensor>(1);
   const Tensor* fc1_experts_weights = context->Input<Tensor>(2);
@@ -91,7 +93,8 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
       reinterpret_cast<const CudaT*>(fc2_experts_weights->DataRaw()), fc_scales_ptr,
       static_cast<int>(moe_params.num_rows), static_cast<int>(moe_params.hidden_size),
       static_cast<int>(moe_params.inter_size), static_cast<int>(moe_params.num_experts),
-      static_cast<int>(moe_params.local_num_experts), 0 /*local_experts_start_index_ used in sharded MoE*/,
+      static_cast<int>(moe_params.local_num_experts), 
+      0, //local_experts_start_index_ used in sharded
       static_cast<int>(k_), reinterpret_cast<char*>(work_space.get()), reinterpret_cast<CudaT*>(fc2_output.get()),
       reinterpret_cast<CudaT*>(expert_scales.get()),
       reinterpret_cast<int*>(expanded_source_row_to_expanded_dest_row.get()),
@@ -108,8 +111,9 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
       reinterpret_cast<int*>(expanded_source_row_to_expanded_dest_row.get()),
       reinterpret_cast<int*>(expert_for_source_row.get()), static_cast<int>(moe_params.num_rows),
       static_cast<int>(moe_params.hidden_size), static_cast<int>(k_), Stream(context));
-
+*/
   return Status::OK();
+
 }
 
 }  // namespace cuda

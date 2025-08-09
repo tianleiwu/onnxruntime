@@ -15,9 +15,9 @@
  */
 
 // #include "contrib_ops/cuda/llm/common/assert.h"
-#include "contrib_ops/cuda/llm/common/cudaTypeUtils.cuh"
+#include "contrib_ops/cuda/llm/common/cuda_type_utils.cuh"
 #include "contrib_ops/cuda/llm/common/logger.h"
-#include "contrib_ops/cuda/llm/common/memoryUtils.h"
+#include "contrib_ops/cuda/llm/common/memory_utils.h"
 #include "core/providers/cuda/shared_inc/cuda_call.h"
 
 #include <curand_kernel.h>

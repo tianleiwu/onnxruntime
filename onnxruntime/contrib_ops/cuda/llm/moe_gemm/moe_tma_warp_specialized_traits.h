@@ -17,7 +17,7 @@
 #pragma once
 
 #include "cutlass/arch/mma_sm90.h"
-#include "contrib_ops/cuda/llm/moe_gemm/include/moe_gemm_kernels.h"
+#include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_kernels.h"
 #include "contrib_ops/cuda/llm/cutlass_extensions/epilogue_helpers.h"
 
 #ifdef ENABLE_FP4

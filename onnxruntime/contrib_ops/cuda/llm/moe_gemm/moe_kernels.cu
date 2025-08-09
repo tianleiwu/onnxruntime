@@ -25,48 +25,40 @@
 #include <sstream>
 
 // Ignore CUTLASS warnings about type punning
-#ifdef __GNUC__  // Check if the compiler is GCC or Clang
+#ifdef __GNUC__
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif
+
 #include "cute/tensor.hpp"
 #include "cutlass/conv/convolution.h"
-// Order matters here, packed_stride.hpp is missing cute and convolution includes
 #include "cutlass/util/packed_stride.hpp"
-
 #include "cutlass/array.h"
 #include "cutlass/epilogue/thread/activation.h"
 #include "cutlass/numeric_conversion.h"
 #include "cutlass/numeric_types.h"
-
 #include "contrib_ops/cuda/llm/cutlass_extensions/epilogue/thread/fused_activations.h"
 
-#ifdef __GNUC__  // Check if the compiler is GCC or Clang
+#ifdef __GNUC__
 #pragma GCC diagnostic pop
 #endif
 
 #include "core/common/common.h"
 #include "contrib_ops/cuda/llm/common/logger.h"
-#include "contrib_ops/cuda/llm/common/memoryUtils.h"
+#include "contrib_ops/cuda/llm/common/memory_utils.h"
 #include "contrib_ops/cuda/llm/common/cuda_runtime_utils.h"
-#include "contrib_ops/cuda/llm/common/dataType.h"
-#include "contrib_ops/cuda/llm//common/envUtils.h"
+#include "contrib_ops/cuda/llm/common/data_type.h"
+// #include "contrib_ops/cuda/llm/common/env_utils.h"
 #include "contrib_ops/cuda/llm/common/workspace.h"
 #include "contrib_ops/cuda/llm/cutlass_type_conversion.h"
-#include "contrib_ops/cuda/llm/kernels/preQuantScaleKernel.h"
+#include "contrib_ops/cuda/llm/kernels/pre_quant_scale_kernel.h"
 #include "contrib_ops/cuda/llm/kernels/quantization.cuh"
-#include "contrib_ops/cuda/llm/moe_gemm/include/moe_kernels.h"
-#include "contrib_ops/cuda/llm/moe_gemm/include/moe_util_kernels.h"
+#include "contrib_ops/cuda/llm/moe_gemm/moe_kernels.h"
+#include "contrib_ops/cuda/llm/moe_gemm/moe_util_kernels.h"
 
-#ifndef CUDART_VERSION
-#error CUDART_VERSION Undefined!
-#elif (CUDART_VERSION >= 11050)
 #include <cub/cub.cuh>
 #include <curand_kernel.h>
 #include <curand_philox4x32_x.h>
-#else
-#include "3rdparty/cub/cub.cuh"
-#endif
 
 using namespace onnxruntime::llm::kernels;
 using namespace onnxruntime::llm::common;

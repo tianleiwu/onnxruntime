@@ -30,8 +30,8 @@
 #include "cutlass/gemm/gemm.h"
 
 #include "contrib_ops/cuda/llm/common/cuda_runtime_utils.h"
-#include "contrib_ops/cuda/llm/common/envUtils.h"
-#include "contrib_ops/cuda/llm/kernels/archCondition.h"
+#include "contrib_ops/cuda/llm/common/env_utils.h"
+#include "contrib_ops/cuda/llm/kernels/arch_condition.h"
 #include "contrib_ops/cuda/llm/cutlass_type_conversion.h"
 
 #ifndef _WIN32

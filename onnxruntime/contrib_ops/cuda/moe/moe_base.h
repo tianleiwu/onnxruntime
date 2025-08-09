@@ -4,9 +4,9 @@
 #pragma once
 
 #include "core/common/common.h"
-#include "core/framework/tensor_shape.h"
 #include "core/framework/op_kernel.h"
-#include "contrib_ops/cuda/llm/moe_gemm/include/common.h"
+#include "core/providers/cuda/cuda_common.h"
+#include "contrib_ops/cuda/llm/moe_gemm/common.h"
 
 namespace onnxruntime {
 namespace contrib {
@@ -208,7 +208,7 @@ class MoEBase {
   }
 
  protected:
-  MoEBase(const OpKernelInfo& op_kernel_info) {
+  MoEBase(const OpKernelInfo& op_kernel_info, const cudaDeviceProp& device_prop) {
     ORT_ENFORCE(op_kernel_info.GetAttr<int64_t>("k", &k_).IsOK());
 
     using onnxruntime::llm::kernels::cutlass_kernels::ActivationType;
@@ -232,12 +232,15 @@ class MoEBase {
     if (use_sparse_mixer_) {
       ORT_ENFORCE(k_ == 2, "Sparse mixer only supports k=2");
     }
+
+    sm_ = device_prop.major * 10 + device_prop.minor;
   }
 
   bool normalize_routing_weights_;
   bool use_sparse_mixer_;
   int64_t k_;
   onnxruntime::llm::kernels::cutlass_kernels::ActivationType activation_type_;
+  int sm_;
 };
 
 }  // namespace cuda

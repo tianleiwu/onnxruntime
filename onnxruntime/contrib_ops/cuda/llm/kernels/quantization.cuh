@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#include "contrib_ops/cuda/llm/common/cudaTypeUtils.cuh"
+#include "contrib_ops/cuda/llm/common/cuda_type_utils.cuh"
 #include "contrib_ops/cuda/llm/common/cuda_runtime_utils.h"
-#include "contrib_ops/cuda/llm/common/quantTypeUtils.cuh"
-#include "contrib_ops/cuda/llm/common/reduceKernelUtils.cuh"
+#include "contrib_ops/cuda/llm/common/quant_type_utils.cuh"
+#include "contrib_ops/cuda/llm/common/reduce_kernel_utils.cuh"
 // #include "tensorrt_llm/kernels/quantization.h"
 #include <float.h>
 

@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "contrib_ops/cuda/llm/moe_gemm/include/moe_gemm_kernels.h"
+#include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_kernels.h"
 #include <cuda_runtime_api.h>
 
 namespace onnxruntime::llm::kernels::cutlass_kernels {

@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "contrib_ops/cuda/llm/common/cudaFp8Utils.h"
+#include "contrib_ops/cuda/llm/common/cuda_fp8_utils.h"
 #include "contrib_ops/cuda/llm/common/cuda_runtime_utils.h"
 
 #include <cassert>

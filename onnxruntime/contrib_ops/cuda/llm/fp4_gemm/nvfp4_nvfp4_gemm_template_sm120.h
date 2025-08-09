@@ -32,7 +32,7 @@
 
 #include "contrib_ops/cuda/llm/cutlass_type_conversion.h"
 
-#include "contrib_ops/cuda/llm/common/envUtils.h"
+#include "contrib_ops/cuda/llm/common/env_utils.h"
 #include "contrib_ops/cuda/llm/common/logger.h"
 
 #ifndef _WIN32

@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "contrib_ops/cuda/llm/moe_gemm/include/moe_gemm_kernels.h"
+#include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_kernels.h"
 #include "contrib_ops/cuda/llm/cutlass_extensions/gemm_configs.h"
 #include "contrib_ops/cuda/llm/cutlass_extensions/weight_only_quant_op.h"
 #include <cuda_runtime_api.h>

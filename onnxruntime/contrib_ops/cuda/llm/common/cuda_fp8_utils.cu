@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#include "contrib_ops/cuda/llm/common/cudaFp8Utils.h"
+#include "contrib_ops/cuda/llm/common/cuda_fp8_utils.h"
 #include "contrib_ops/cuda/llm/common/cuda_runtime_utils.h"
-#include "contrib_ops/cuda/llm/common/envUtils.h"
-#include "contrib_ops/cuda/llm/common/reduceKernelUtils.cuh"
+#include "contrib_ops/cuda/llm/common/env_utils.h"
+#include "contrib_ops/cuda/llm/common/reduce_kernel_utils.cuh"
 #include <algorithm>
 #include <cstdio>
 #include <cuda_fp16.h>

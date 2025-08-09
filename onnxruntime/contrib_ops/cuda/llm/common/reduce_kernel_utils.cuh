@@ -21,7 +21,7 @@
 #else
 #include <cooperative_groups.h>
 #endif
-#include "contrib_ops/cuda/llm/common/cudaTypeUtils.cuh"
+#include "contrib_ops/cuda/llm/common/cuda_type_utils.cuh"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
