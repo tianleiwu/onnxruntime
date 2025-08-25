@@ -4,6 +4,10 @@
 
 
 # ---[ Python + Numpy
+
+# Ensure NumPy target exists
+find_package(Python3 COMPONENTS Interpreter Development NumPy REQUIRED)
+
 set(onnxruntime_pybind_srcs_pattern
     "${ONNXRUNTIME_ROOT}/python/*.cc"
     "${ONNXRUNTIME_ROOT}/python/*.h"
@@ -193,6 +197,9 @@ if(WIN32)
   # onnxruntime_pybind11_state is a DLL
   target_sources(onnxruntime_pybind11_state PRIVATE "${ONNXRUNTIME_ROOT}/core/dll/dllmain.cc")
 endif()
+
+target_include_directories(onnxruntime_pybind11_state PRIVATE ${Python3_NumPy_INCLUDE_DIRS})
+
 target_link_libraries(onnxruntime_pybind11_state PRIVATE
     onnxruntime_session
     ${onnxruntime_libs}
@@ -208,7 +215,6 @@ target_link_libraries(onnxruntime_pybind11_state PRIVATE
     onnxruntime_common
     onnxruntime_flatbuffers
     ${pybind11_lib}
-    Python::NumPy
 )
 set(onnxruntime_pybind11_state_dependencies
     ${onnxruntime_EXTERNAL_DEPENDENCIES}
