@@ -1124,7 +1124,7 @@ constexpr const char* GroupQueryAttention_ver1_doc = R"DOC(
 Group Query Self/Cross Attention with KV Cache Quantization Support.
 
 This operator implements causal grouped-query attention with past state (KV cache) support.
-It also supports optional float8, int8 or int4 quantization for the KV cache to reduce memory footprint.
+It also supports optional float8, int8, int4 or int2 quantization for the KV cache to reduce memory footprint.
 
 **Cache Format:**
 The past and present KV cache tensors are expected in a BNSH format: `(batch_size, num_heads, cache_sequence_length, head_size)`, where `cache_sequence_length` is the length of the cached key/value sequences, or the maximum sequence length when past and present buffer sharing is used.
@@ -1135,6 +1135,8 @@ The operator will output `present_key` and `present_value` in same format as the
 k_scale and present_k_scale will share buffer when past and present buffer sharing is used, same for v_scale and present_v_scale.
 The shapes of the k_scale and v_scale tensors are broadcastable to past_key and past_value shape.
 The shapes of the present_k_scale and present_v_scale tensors are broadcastable to present_key and present_value shape.
+For 4-bit quantization, the data type can be int4 or uint8. When uint8 is used, each byte contains two 4-bit quantized values, and bit width of quantized KV cache can be set using `kv_cache_bit_width` attribute.
+For 2-bit quantization, the data type can be uint8, and each byte contains four 2-bit quantized values, and bit width of quantized KV cache can be set using `kv_cache_bit_width` attribute.
 
 **Quantization Modes (`k_quant_type`, `v_quant_type` attributes):**
 - **"NONE"**: No quantization.
@@ -1177,6 +1179,9 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
               "Output values of QK matrix multiplication before (1) or after (2) softmax normalization. Default value is 0 (don't output).",
               AttributeProto::INT,
               static_cast<int64_t>(QKOutputType::NO_OUTPUT))
+        .Attr("k_quant_type", "Quantization type for K cache. One of 'NONE', 'PER_TENSOR', 'PER_CHANNEL', 'PER_TOKEN'.", AttributeProto::STRING, std::string("NONE"))
+        .Attr("v_quant_type", "Quantization type for V cache. One of 'NONE', 'PER_TENSOR', 'PER_CHANNEL', 'PER_TOKEN'.", AttributeProto::STRING, std::string("NONE"))
+        .Attr("kv_cache_bit_width", "Bit width of quantized KV cache when its data type is uint8. Supported values are 4 and 2.", AttributeProto::INT, OPTIONAL_VALUE)
         .Input(0,
                "query",
                "Query with shape (batch_size, sequence_length, hidden_size), or packed QKV with shape"
@@ -1265,7 +1270,7 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
         .Output(4, "present_k_scale", "Scale tensor for present_key.", "T_SCALE", OpSchema::Optional)
         .Output(5, "present_v_scale", "Scale tensor for present_value.", "T_SCALE", OpSchema::Optional)
         .TypeConstraint("T", {"tensor(float16)", "tensor(bfloat16)", "tensor(float)"}, "Constrain input and output to float tensors.")
-        .TypeConstraint("T_CACHE", {"tensor(float16)", "tensor(bfloat16)", "tensor(int8)", "tensor(int4)", "tensor(float8e4m3fn)", "tensor(float8e5m2)"}, "Constrain KV cache types.")
+        .TypeConstraint("T_CACHE", {"tensor(float16)", "tensor(bfloat16)", "tensor(uint8)", "tensor(int8)", "tensor(int4)", "tensor(float8e4m3fn)", "tensor(float8e5m2)"}, "Constrain KV cache types.")
         .TypeConstraint("T_SCALE", {"tensor(float)"}, "Constrain scale types.")
         .TypeConstraint("M", {"tensor(int32)"}, "Constrain mask to int tensor.")
         .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
