@@ -1121,15 +1121,22 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
         }));
 
 constexpr const char* GroupQueryAttention_ver1_doc = R"DOC(
-Group Query Self/Cross Attention.
+Group Query Self/Cross Attention with KV Cache Quantization Support.
 
-*Highly recommend using k-v cache share buffer for both CPU and CUDA. Enabled through IOBinding past and present kv.
-Supports different number of heads for q and kv for CPU and CUDA.
-Only supports causal and local attention.
-Supports rotary position embedding for CPU and CUDA.
-Supports packed input for CPU and CUDA.
-Supports continuous decoding for batch_size == 1 for CPU and CUDA.
+This operator implements causal grouped-query attention with past state (KV cache) support.
+It also supports optional float8, int8 or int4 quantization for the KV cache to reduce memory footprint.
 
+**Cache Format:**
+The past and present KV cache tensors are expected in a BNSH format: `(batch_size, num_heads, cache_sequence_length, head_size)`, where `cache_sequence_length` is the length of the cached key/value sequences, or the maximum sequence length when past and present buffer sharing is used.
+
+**Quantization:**
+When quantization is enabled, `past_key` and `past_value` inputs must be of type `float8`, `int8` or `int4`. The corresponding `k_scale` and `v_scale` tensors must be provided. The operator will output `present_key` and `present_value` in same format as the `past_key` and `past_value`, and `present_k_scale` and `present_v_scale` will contain updated scales if dynamic quantization is used.
+
+**Quantization Modes (`k_quant_type`, `v_quant_type` attributes):**
+- **"NONE"**: No quantization.
+- **"PER_TENSOR"**: A single scale for the entire tensor. Scale shape: `[1, 1, 1, 1]`.
+- **"PER_CHANNEL"**: A scale for each channel (head_size dimension), shared across all other dimensions. Scale shape: `[1, num_heads_k, 1, head_size]`.
+- **"PER_TOKEN"**: A scale for each token (sequence_length dimension), shared across all other dimensions. Scale shape: `[batch_size, 1, cache_sequence_length, 1]`. This mode is dynamic and computes scales on-the-fly for new tokens.
 )DOC";
 
 ONNX_MS_OPERATOR_SET_SCHEMA(
@@ -1185,13 +1192,13 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
                "past_key",
                "past state key with support for format BNSH. When past_key uses same tensor as present_key"
                "(k-v cache), it is of length max_sequence_length... otherwise of length past_sequence_length.",
-               "T",
+               "T_CACHE",
                OpSchema::Optional)
         .Input(4,
                "past_value",
                "past state value with support for format BNSH. When past_value uses same tensor as present_value"
                "(k-v cache), it is of length max_sequence_length... otherwise of length past_sequence_length.",
-               "T",
+               "T_CACHE",
                OpSchema::Optional)
         .Input(5,
                "seqlens_k",
@@ -1228,6 +1235,8 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
                "1D tensor with shape (num_heads). Each head has a smooth factor adding to the denominator of softmax.",
                "T",
                OpSchema::Optional)
+        .Input(12, "k_scale", "Scale tensor for past_key.", "T_SCALE", OpSchema::Optional)
+        .Input(13, "v_scale", "Scale tensor for past_value.", "T_SCALE", OpSchema::Optional)
         .Output(0,
                 "output",
                 "3D output tensor with shape (batch_size, sequence_length, hidden_size)",
@@ -1237,19 +1246,21 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
                 "present state key with support for format BNSH. When past_key uses same tensor as present_key"
                 "(k-v buffer), it is of length max_sequence_length... otherwise of length past_sequence_length +"
                 "kv_sequence_length.",
-                "T")
+                "T_CACHE")
         .Output(2,
                 "present_value",
                 "present state value with support for format BNSH. When past_value uses same tensor as present_value"
                 "(k-v buffer), it is of length max_sequence_length... otherwise of length past_sequence_length +"
                 "kv_sequence_length.",
-                "T")
+                "T_CACHE")
         .Output(3,
                 "output_qk",
                 "Values of QK matrix multiplication, either before or after softmax normalization",
                 "T",
                 OpSchema::Optional)
         .TypeConstraint("T", {"tensor(float16)", "tensor(bfloat16)", "tensor(float)"}, "Constrain input and output to float tensors.")
+        .TypeConstraint("T_CACHE", {"tensor(float16)", "tensor(bfloat16)", "tensor(int8)", "tensor(int4)", "tensor(float8e4m3fn)", "tensor(float8e5m2)"}, "Constrain KV cache types.")
+        .TypeConstraint("T_SCALE", {"tensor(float)"}, "Constrain scale types.")
         .TypeConstraint("M", {"tensor(int32)"}, "Constrain mask to int tensor.")
         .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
           GroupQueryAttentionTypeAndShapeInference(ctx, 3, 3);
