@@ -35,11 +35,11 @@ include(CheckSymbolExists)
 include(GNUInstallDirs) # onnxruntime_providers_* require CMAKE_INSTALL_* variables
 
 if (NOT CMAKE_CXX_STANDARD)
-  # TODO: update this once all system adapt c++20
+# TODO: update this once all system adapt c++20
   if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(CMAKE_CXX_STANDARD 20)
   else()
-    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD 20)
   endif()
 endif()
 
@@ -1428,6 +1428,8 @@ if (onnxruntime_USE_CUDA)
   find_package(CUDAToolkit REQUIRED)
 
   if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 11.8)
+    add_definitions("-DENABLE_BF16")
+    message(STATUS "CUDA Toolkit version is greater or equal than 11.8, enable -DENABLE_BF16 flag")
     add_definitions("-DENABLE_FP8")
     message(STATUS "CUDA Toolkit version is greater or equal than 11.8, enable -DENABLE_FP8 flag")
   endif()

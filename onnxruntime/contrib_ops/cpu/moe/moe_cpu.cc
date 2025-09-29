@@ -23,8 +23,8 @@ namespace contrib {
 
 template <typename T>
 MoE<T>::MoE(const OpKernelInfo& op_kernel_info) : OpKernel(op_kernel_info), MoEBaseCPU(op_kernel_info) {
-  if (activation_type_ == ActivationType::SwiGLU && swiglu_fusion_ != 1) {
-    ORT_THROW("CPU MoE only supports interleaved SwiGLU format. Please set swiglu_fusion=1.");
+  if (activation_type_ == ActivationType::Swiglu && swiglu_fusion_ != 1) {
+    ORT_THROW("CPU MoE only supports interleaved Swiglu format. Please set swiglu_fusion=1.");
   }
 }
 
@@ -52,7 +52,7 @@ Status MoE<T>::Compute(OpKernelContext* context) const {
       fc2_experts_weights, fc2_experts_bias, nullptr,
       fc3_experts_weights, fc3_experts_bias, nullptr,
       1,
-      activation_type_ == ActivationType::SwiGLU));
+      activation_type_ == ActivationType::Swiglu));
 
   Tensor* output = context->Output(0, input->Shape());
 
@@ -77,7 +77,7 @@ Status MoE<T>::ComputeMoE(const OpKernelContext* context,
   const int64_t hidden_size = input_shape[input_shape.NumDimensions() - 1];
   const int64_t num_experts = router_shape[1];
   const int64_t inter_size = (fc2_shape[1] * fc2_shape[2]) / hidden_size;
-  const bool is_swiglu = activation_type_ == ActivationType::SwiGLU;
+  const bool is_swiglu = activation_type_ == ActivationType::Swiglu;
   const int64_t fc1_output_size = is_swiglu ? (inter_size * 2) : inter_size;
 
   const T* input_data = input->Data<T>();
@@ -446,7 +446,7 @@ Status MoE<T>::ProcessExpertBatch(const T* input_tokens,
   ORT_UNUSED_PARAMETER(expert_id);
   ORT_UNUSED_PARAMETER(fc1_output_buffer);
   ORT_UNUSED_PARAMETER(activation_output_buffer);
-  const bool is_swiglu = activation_type_ == ActivationType::SwiGLU;
+  const bool is_swiglu = activation_type_ == ActivationType::Swiglu;
   const int64_t fc1_output_size = is_swiglu ? (inter_size * 2) : inter_size;
 
   constexpr int64_t stack_threshold = 1024;
@@ -485,7 +485,7 @@ Status MoE<T>::ProcessExpertBatch(const T* input_tokens,
 
   if (is_swiglu) {
     for (int64_t batch = 0; batch < batch_size; ++batch) {
-      ApplySwiGLUVectorized(fc1_output + batch * fc1_output_size,
+      ApplySwigluVectorized(fc1_output + batch * fc1_output_size,
                             activation_output + batch * inter_size,
                             inter_size);
     }
@@ -564,7 +564,7 @@ void MoE<T>::ApplyActivationVectorized(T* data, int64_t size) const {
 }
 
 template <typename T>
-void MoE<T>::ApplySwiGLUVectorized(const T* input, T* output, int64_t size) const {
+void MoE<T>::ApplySwigluVectorized(const T* input, T* output, int64_t size) const {
   for (int64_t i = 0; i < size; ++i) {
     float gate = static_cast<float>(input[2 * i]);
     float linear = static_cast<float>(input[2 * i + 1]);
@@ -588,8 +588,8 @@ void MoE<T>::ApplySwiGLUVectorized(const T* input, T* output, int64_t size) cons
 }
 
 template <>
-void MoE<float>::ApplySwiGLUVectorized(const float* input, float* output, int64_t size) const {
-  ApplySwiGLUActivation(input, output, size, true,
+void MoE<float>::ApplySwigluVectorized(const float* input, float* output, int64_t size) const {
+  ApplySwigluActivation(input, output, size, true,
                         activation_alpha_, activation_beta_, swiglu_limit_);
 }
 

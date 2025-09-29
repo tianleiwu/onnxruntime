@@ -791,21 +791,21 @@ Status QMoECPU<T>::Compute(OpKernelContext* context) const {
             for (int64_t i = start_token; i < end_token; ++i) {
               const float* C1_token = C1 + i * fc1_out_features;
               float* A2_token = A2 + i * inter_size;
-              ApplySwiGLUActivation(C1_token, A2_token, inter_size, true, activation_alpha_, activation_beta_, swiglu_limit_);
+              moe::ApplySwiGLUActivation(C1_token, A2_token, inter_size, true, activation_alpha_, activation_beta_, swiglu_limit_);
             }
           });
         } else {
           for (int64_t i = 0; i < num_expert_tokens; ++i) {
             const float* C1_token = C1 + i * fc1_out_features;
             float* A2_token = A2 + i * inter_size;
-            ApplySwiGLUActivation(C1_token, A2_token, inter_size, true, activation_alpha_, activation_beta_, swiglu_limit_);
+            moe::ApplySwiGLUActivation(C1_token, A2_token, inter_size, true, activation_alpha_, activation_beta_, swiglu_limit_);
           }
         }
       } else {
         for (int64_t i = 0; i < num_expert_tokens; ++i) {
           const float* C1_token = C1 + i * fc1_out_features;
           float* A2_token = A2 + i * inter_size;
-          ApplySwiGLUActivation(C1_token, A2_token, inter_size, true, activation_alpha_, activation_beta_, swiglu_limit_);
+          moe::ApplySwiGLUActivation(C1_token, A2_token, inter_size, true, activation_alpha_, activation_beta_, swiglu_limit_);
         }
       }
 

@@ -8,6 +8,7 @@
 
 namespace onnxruntime {
 namespace contrib {
+namespace moe {
 
 float ApplyActivation(float x, ActivationType activation_type) {
   switch (activation_type) {
@@ -19,8 +20,8 @@ float ApplyActivation(float x, ActivationType activation_type) {
       return x * (1.0f / (1.0f + std::exp(-x)));
     case ActivationType::Identity:
       return x;
-    case ActivationType::SwiGLU:
-      // SwiGLU is a special case handled by ApplySwiGLUActivation, this is just a placeholder
+    case ActivationType::Swiglu:
+      // Swiglu: This is handled specially as it requires gating, not applied here
       return x;
     default:
       return x;
@@ -56,5 +57,6 @@ void ApplySwiGLUActivation(const float* input_data, float* output_data, int64_t 
   }
 }
 
+}  // namespace moe
 }  // namespace contrib
 }  // namespace onnxruntime
