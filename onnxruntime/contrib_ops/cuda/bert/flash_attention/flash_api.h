@@ -35,6 +35,13 @@
 
 namespace onnxruntime {
 namespace flash {
+// Enum to define quantization granularity, directly usable by the kernel.
+enum class KVQuantizationType {
+  NONE = 0,
+  PER_TENSOR = 1,
+  PER_CHANNEL = 2,
+  PER_TOKEN = 3,
+};
 
 Status mha_fwd(const cudaDeviceProp& dprops,
                cudaStream_t stream,
@@ -89,10 +96,14 @@ Status mha_varlen_fwd(const cudaDeviceProp& dprops,
 Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
                        cudaStream_t stream,
                        void* q,            // batch_size x seqlen_q x num_heads x head_size
-                       void* kcache,       // batch_size x seqlen_k x num_heads_k x head_size or batch_size x num_heads_k seqlen_k x x head_size
-                       void* vcache,       // batch_size x seqlen_k x num_heads_k x head_size or batch_size x num_heads_k seqlen_k x x head_size
-                       void* k,            // batch_size x seqlen_k_new x num_heads_k x head_size
-                       void* v,            // batch_size x seqlen_k_new x num_heads_k x head_size
+                       void* kcache,       // (int8 or T) batch_size x num_heads_k x seqlen_k x head_size
+                       void* vcache,       // (int8 or T) batch_size x num_heads_k x seqlen_k x head_size
+                       void* k_new,        // (T) batch_size x seqlen_k_new x num_heads_k x head_size
+                       void* v_new,        // (T) batch_size x seqlen_k_new x num_heads_k x head_size
+                       void* k_scale,      // (float*) scaling factors for K cache (mutable)
+                       void* v_scale,      // (float*) scaling factors for V cache (mutable)
+                       const KVQuantizationType k_quant_type,
+                       const KVQuantizationType v_quant_type,
                        void* out,          // batch_size x seqlen_q x num_heads x head_size
                        void* softmax_lse,  // batch_size x num_heads x seqlen_q
                        void* seqlens_k_,   // batch_size

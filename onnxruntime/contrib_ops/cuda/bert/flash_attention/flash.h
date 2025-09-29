@@ -98,6 +98,14 @@ struct Flash_fwd_params : public Qkv_params {
   index_t knew_head_stride = 0;
   index_t vnew_head_stride = 0;
 
+  // Note: K/V cache pointers (k_ptr, v_ptr) can now point to int8 data.
+  // Note: k_new/v_new pointers (knew_ptr, vnew_ptr) are always fp16/bf16.
+  void* __restrict__ k_scale_ptr = nullptr;
+  void* __restrict__ v_scale_ptr = nullptr;
+  KVQuantizationType k_quant_type = KVQuantizationType::NONE;
+  KVQuantizationType v_quant_type = KVQuantizationType::NONE;
+
+
   // The cos and sin matrices for rotary embedding.
   void* __restrict__ rotary_cos_ptr = nullptr;
   void* __restrict__ rotary_sin_ptr = nullptr;

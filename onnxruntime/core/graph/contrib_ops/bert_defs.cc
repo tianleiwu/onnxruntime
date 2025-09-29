@@ -1121,138 +1121,62 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
         }));
 
 constexpr const char* GroupQueryAttention_ver1_doc = R"DOC(
-Group Query Self/Cross Attention.
+Group Query Self/Cross Attention with KV Cache Quantization Support.
 
-*Highly recommend using k-v cache share buffer for both CPU and CUDA. Enabled through IOBinding past and present kv.
-Supports different number of heads for q and kv for CPU and CUDA.
-Only supports causal and local attention.
-Supports rotary position embedding for CPU and CUDA.
-Supports packed input for CPU and CUDA.
-Supports continuous decoding for batch_size == 1 for CPU and CUDA.
+This operator implements causal self-attention, cross-attention, and grouped-query attention with past state (KV cache) support.
+It also supports optional int8 quantization for the KV cache to reduce memory footprint.
 
+**Cache Format:**
+The past and present KV cache tensors are expected in a BNSH format: `(batch_size, num_heads, sequence_length, head_size)`.
+
+**Quantization:**
+When quantization is enabled, `past_key` and `past_value` inputs must be of type `int8`. The corresponding `k_scale` and `v_scale` tensors must be provided. The operator will output `present_key` and `present_value` in `int8` format, and `present_k_scale` and `present_v_scale` will contain updated scales if dynamic quantization is used.
+
+**Quantization Modes (`k_quant_type`, `v_quant_type` attributes):**
+- **"NONE"**: No quantization.
+- **"PER_TENSOR"**: A single scale for the entire tensor. Scale shape: `[1, 1, 1, 1]`.
+- **"PER_CHANNEL"**: A scale for each channel (head_size dimension), shared across all other dimensions. Scale shape: `[1, num_heads_k, 1, head_size]`.
+- **"PER_TOKEN"**: A scale for each token (sequence_length dimension), shared across all other dimensions. Scale shape: `[batch_size, 1, sequence_length, 1]`. This mode is dynamic and computes scales on-the-fly for new tokens.
 )DOC";
 
 ONNX_MS_OPERATOR_SET_SCHEMA(
     GroupQueryAttention, 1,
     OpSchema()
         .SetDoc(GroupQueryAttention_ver1_doc)
-        .Attr("num_heads", "Number of attention heads for q", AttributeProto::INT)
-        .Attr("kv_num_heads", "Number of attention heads for k and v", AttributeProto::INT)
-        .Attr("scale",
-              "Custom scale will be used if specified. Default value is 1/sqrt(head_size)",
-              AttributeProto::FLOAT,
-              OPTIONAL_VALUE)
-        .Attr("softcap",
-              "Softcap value for attention weights. Default value is 0.",
-              AttributeProto::FLOAT,
-              OPTIONAL_VALUE)
-        .Attr("local_window_size",
-              "left_window_size for local attention (like Mistral). Default value is -1 meaning unused.",
-              AttributeProto::INT,
-              static_cast<int64_t>(-1))
-        .Attr("do_rotary",
-              "Whether to use rotary position embedding. Default value is 0.",
-              AttributeProto::INT,
-              OPTIONAL_VALUE)
-        .Attr("rotary_interleaved",
-              "Rotate using interleaved pattern. Default value is 0 (False).",
-              AttributeProto::INT,
-              OPTIONAL_VALUE)
-        .Attr("smooth_softmax",
-              "Use a smooth factor in softmax.",
-              AttributeProto::INT,
-              static_cast<int64_t>(-1))
-        .Attr("qk_output",
-              "Output values of QK matrix multiplication before (1) or after (2) softmax normalization. Default value is 0 (don't output).",
-              AttributeProto::INT,
-              static_cast<int64_t>(QKOutputType::NO_OUTPUT))
-        .Input(0,
-               "query",
-               "Query with shape (batch_size, sequence_length, hidden_size), or packed QKV with shape"
-               "(batch_size, sequence_length, d) where d is (num_heads * head_size + 2 * kv_num_heads * head_size).",
-               "T")
-        .Input(1,
-               "key",
-               "Key with shape (batch_size, kv_sequence_length, kv_hidden_size) ",
-               "T",
-               OpSchema::Optional)
-        .Input(2,
-               "value",
-               "Value with shape (batch_size, kv_sequence_length, kv_hidden_size)",
-               "T",
-               OpSchema::Optional)
-        .Input(3,
-               "past_key",
-               "past state key with support for format BNSH. When past_key uses same tensor as present_key"
-               "(k-v cache), it is of length max_sequence_length... otherwise of length past_sequence_length.",
-               "T",
-               OpSchema::Optional)
-        .Input(4,
-               "past_value",
-               "past state value with support for format BNSH. When past_value uses same tensor as present_value"
-               "(k-v cache), it is of length max_sequence_length... otherwise of length past_sequence_length.",
-               "T",
-               OpSchema::Optional)
-        .Input(5,
-               "seqlens_k",
-               "1D Tensor of shape (batch_size). Equivalent to (total_sequence_lengths - 1).",
-               "M")
-        .Input(6,
-               "total_sequence_length",
-               "Scalar tensor equivalent to the maximum total sequence length (past + new) of the batch. Used for "
-               "checking inputs and determining prompt vs token generation case.",
-               "M")
-        .Input(7,
-               "cos_cache",
-               "2D tensor with shape (max_sequence_length, head_size / 2).",
-               "T",
-               OpSchema::Optional)
-        .Input(8,
-               "sin_cache",
-               "2D tensor with shape (max_sequence_length, head_size / 2).",
-               "T",
-               OpSchema::Optional)
-        .Input(9,
-               "position_ids",
-               "2D tensor with shape (batch_size, sequence_length). When processing the first prompt the kernel "
-               "uses only the first element",
-               "tensor(int64)",
-               OpSchema::Optional)
-        .Input(10,
-               "attention_bias",
-               "additional add to QxK' with shape (batch_size or 1, num_heads or 1, sequence_length, total_sequence_length)",
-               "T",
-               OpSchema::Optional)
-        .Input(11,
-               "head_sink",
-               "1D tensor with shape (num_heads). Each head has a smooth factor adding to the denominator of softmax.",
-               "T",
-               OpSchema::Optional)
-        .Output(0,
-                "output",
-                "3D output tensor with shape (batch_size, sequence_length, hidden_size)",
-                "T")
-        .Output(1,
-                "present_key",
-                "present state key with support for format BNSH. When past_key uses same tensor as present_key"
-                "(k-v buffer), it is of length max_sequence_length... otherwise of length past_sequence_length +"
-                "kv_sequence_length.",
-                "T")
-        .Output(2,
-                "present_value",
-                "present state value with support for format BNSH. When past_value uses same tensor as present_value"
-                "(k-v buffer), it is of length max_sequence_length... otherwise of length past_sequence_length +"
-                "kv_sequence_length.",
-                "T")
-        .Output(3,
-                "output_qk",
-                "Values of QK matrix multiplication, either before or after softmax normalization",
-                "T",
-                OpSchema::Optional)
-        .TypeConstraint("T", {"tensor(float16)", "tensor(bfloat16)", "tensor(float)"}, "Constrain input and output to float tensors.")
-        .TypeConstraint("M", {"tensor(int32)"}, "Constrain mask to int tensor.")
+        .Attr("num_heads", "Number of attention heads for q.", AttributeProto::INT)
+        .Attr("kv_num_heads", "Number of attention heads for k and v.", AttributeProto::INT)
+        .Attr("scale", "Custom scale. Default is 1/sqrt(head_size).", AttributeProto::FLOAT, OPTIONAL_VALUE)
+        .Attr("softcap", "Softcap value for attention weights.", AttributeProto::FLOAT, OPTIONAL_VALUE)
+        .Attr("local_window_size", "Window size for local attention.", AttributeProto::INT, static_cast<int64_t>(-1))
+        .Attr("do_rotary", "Flag for rotary position embedding.", AttributeProto::INT, OPTIONAL_VALUE)
+        .Attr("rotary_interleaved", "Flag for interleaved rotary embedding.", AttributeProto::INT, OPTIONAL_VALUE)
+        .Attr("k_quant_type", "Quantization type for K cache. One of 'NONE', 'PER_TENSOR', 'PER_CHANNEL', 'PER_TOKEN'.", AttributeProto::STRING, std::string("NONE"))
+        .Attr("v_quant_type", "Quantization type for V cache. One of 'NONE', 'PER_TENSOR', 'PER_CHANNEL', 'PER_TOKEN'.", AttributeProto::STRING, std::string("NONE"))
+        .Input(0, "query", "Query tensor.", "T")
+        .Input(1, "key", "Key tensor.", "T", OpSchema::Optional)
+        .Input(2, "value", "Value tensor.", "T", OpSchema::Optional)
+        .Input(3, "past_key", "Past key cache.", "T_CACHE", OpSchema::Optional)
+        .Input(4, "past_value", "Past value cache.", "T_CACHE", OpSchema::Optional)
+        .Input(5, "seqlens_k", "1D tensor of past sequence lengths.", "M")
+        .Input(6, "total_sequence_length", "Scalar tensor of total sequence length.", "M")
+        .Input(7, "cos_cache", "Cache for rotary embedding cos values.", "T", OpSchema::Optional)
+        .Input(8, "sin_cache", "Cache for rotary embedding sin values.", "T", OpSchema::Optional)
+        .Input(9, "position_ids", "2D tensor of position IDs.", "tensor(int64)", OpSchema::Optional)
+        .Input(10, "attention_bias", "Bias tensor for attention scores.", "T", OpSchema::Optional)
+        .Input(11, "head_sink", "1D tensor for smooth softmax.", "T", OpSchema::Optional)
+        .Input(12, "k_scale", "Scale tensor for past_key.", "T_SCALE", OpSchema::Optional)
+        .Input(13, "v_scale", "Scale tensor for past_value.", "T_SCALE", OpSchema::Optional)
+        .Output(0, "output", "Attention output.", "T")
+        .Output(1, "present_key", "Present key cache.", "T_CACHE")
+        .Output(2, "present_value", "Present value cache.", "T_CACHE")
+        .Output(3, "present_k_scale", "Scale tensor for present_key.", "T_SCALE", OpSchema::Optional)
+        .Output(4, "present_v_scale", "Scale tensor for present_value.", "T_SCALE", OpSchema::Optional)
+        .TypeConstraint("T", {"tensor(float16)", "tensor(bfloat16)"}, "Constrain query, key, value, and output types.")
+        .TypeConstraint("T_CACHE", {"tensor(float16)", "tensor(bfloat16)", "tensor(int8)"}, "Constrain KV cache types.")
+        .TypeConstraint("T_SCALE", {"tensor(float)"}, "Constrain scale types.")
+        .TypeConstraint("M", {"tensor(int32)"}, "Constrain seqlens and total_sequence_length to int32.")
         .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
-          GroupQueryAttentionTypeAndShapeInference(ctx, 3, 3);
+          GroupQueryAttentionTypeAndShapeInference(ctx);
         }));
 
 constexpr const char* PagedAttention_ver1_doc = R"DOC(
