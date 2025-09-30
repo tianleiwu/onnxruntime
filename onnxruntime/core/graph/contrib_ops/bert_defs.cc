@@ -1153,7 +1153,7 @@ It also supports optional float8, int8, int4 or int2 quantization for the KV cac
 The past and present KV cache tensors are expected in a BNSH format: `(batch_size, num_heads, cache_sequence_length, head_size)`, where `cache_sequence_length` is the length of the cached key/value sequences, or the maximum sequence length when past and present buffer sharing is used.
 
 **Quantization:**
-When quantization is enabled, `past_key` and `past_value` inputs must be of type `float8`, `int8` or `int4`. The corresponding `k_scale` and `v_scale` tensors must be provided.
+When quantization is enabled, `past_key` and `past_value` inputs must be of type `float8e4m3fn`, `float8e5m2`, `uint8`, `int8` or `int4`. The corresponding `k_scale` and `v_scale` tensors must be provided.
 The operator will output `present_key` and `present_value` in same format as the `past_key` and `past_value`, and `present_k_scale` and `present_v_scale` will contain updated scales if dynamic quantization is used.
 k_scale and present_k_scale will share buffer when past and present buffer sharing is used, same for v_scale and present_v_scale.
 The shapes of the k_scale, v_scale, present_k_scale and present_v_scale tensors shall be broadcastable to present_key shape.
