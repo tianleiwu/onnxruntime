@@ -234,8 +234,37 @@ void MultiHeadAttentionTypeAndShapeInference(ONNX_NAMESPACE::InferenceContext& c
 void BaseGroupQueryAttentionTypeAndShapeInference(ONNX_NAMESPACE::InferenceContext& ctx,
                                                   int past_key_index = -1,
                                                   int use_max_past_present_buffer = -1,
-                                                  int output_qk_index = -1) {
-  ONNX_NAMESPACE::propagateElemTypeFromInputToOutput(ctx, 0, 0);
+                                                  int output_qk_index = -1,
+                                                  bool support_quantized_kv_cache = false) {
+  // Type inference for outputs
+  ONNX_NAMESPACE::propagateElemTypeFromInputToOutput(ctx, 0, 0);  // output
+
+  if (ctx.getNumOutputs() >= 3) {  // has present output
+    const auto* past_key_type = ctx.getInputType(past_key_index);
+    if (past_key_type != nullptr) {
+      // present_key and present_value have the same type as past_key/past_value.
+      // This allows them to be int8 or packed uint8 when quantization is enabled.
+      ONNX_NAMESPACE::propagateElemTypeFromInputToOutput(ctx, past_key_index, 1);      // present_key
+      ONNX_NAMESPACE::propagateElemTypeFromInputToOutput(ctx, past_key_index + 1, 2);  // present_value
+    } else {
+      // If no past state, present is the same type as query.
+      ONNX_NAMESPACE::propagateElemTypeFromInputToOutput(ctx, 0, 1);
+      ONNX_NAMESPACE::propagateElemTypeFromInputToOutput(ctx, 0, 2);
+    }
+  }
+
+  if (support_quantized_kv_cache) {
+    // If k_scale and v_scale are present, propagate their types and shapes to the present_scale outputs.
+    if (ctx.hasOutput(12) && ctx.hasOutput(4)) {
+      ONNX_NAMESPACE::propagateElemTypeFromInputToOutput(ctx, 12, 4);
+      ONNX_NAMESPACE::propagateShapeFromInputToOutput(ctx, 12, 4);
+    }
+
+    if (ctx.hasOutput(13) && ctx.hasOutput(5)) {
+      ONNX_NAMESPACE::propagateElemTypeFromInputToOutput(ctx, 13, 5);
+      ONNX_NAMESPACE::propagateShapeFromInputToOutput(ctx, 13, 5);
+    }
+  }
 
   int64_t kv_sequence_length = -1;
   if (hasInputShape(ctx, 0)) {
@@ -280,12 +309,6 @@ void BaseGroupQueryAttentionTypeAndShapeInference(ONNX_NAMESPACE::InferenceConte
   }
 
   if (ctx.getNumOutputs() >= 3) {  // has present output
-    // copy the type from query to present key
-    ONNX_NAMESPACE::propagateElemTypeFromInputToOutput(ctx, 0, 1);
-
-    // copy the type from query to present value
-    ONNX_NAMESPACE::propagateElemTypeFromInputToOutput(ctx, 0, 2);
-
     int64_t total_sequence_length_value = 0;
     const auto* total_sequence_length_data = ctx.getInputData(6);
     if (total_sequence_length_data != nullptr) {
@@ -1133,8 +1156,7 @@ The past and present KV cache tensors are expected in a BNSH format: `(batch_siz
 When quantization is enabled, `past_key` and `past_value` inputs must be of type `float8`, `int8` or `int4`. The corresponding `k_scale` and `v_scale` tensors must be provided.
 The operator will output `present_key` and `present_value` in same format as the `past_key` and `past_value`, and `present_k_scale` and `present_v_scale` will contain updated scales if dynamic quantization is used.
 k_scale and present_k_scale will share buffer when past and present buffer sharing is used, same for v_scale and present_v_scale.
-The shapes of the k_scale and v_scale tensors are broadcastable to past_key and past_value shape.
-The shapes of the present_k_scale and present_v_scale tensors are broadcastable to present_key and present_value shape.
+The shapes of the k_scale, v_scale, present_k_scale and present_v_scale tensors shall be broadcastable to present_key shape.
 For 4-bit quantization, the data type can be int4 or uint8. When uint8 is used, each byte contains two 4-bit quantized values, and bit width of quantized KV cache can be set using `kv_cache_bit_width` attribute.
 For 2-bit quantization, the data type can be uint8, and each byte contains four 2-bit quantized values, and bit width of quantized KV cache can be set using `kv_cache_bit_width` attribute.
 
@@ -1270,7 +1292,7 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
         .Output(4, "present_k_scale", "Scale tensor for present_key.", "T_SCALE", OpSchema::Optional)
         .Output(5, "present_v_scale", "Scale tensor for present_value.", "T_SCALE", OpSchema::Optional)
         .TypeConstraint("T", {"tensor(float16)", "tensor(bfloat16)", "tensor(float)"}, "Constrain input and output to float tensors.")
-        .TypeConstraint("T_CACHE", {"tensor(float16)", "tensor(bfloat16)", "tensor(uint8)", "tensor(int8)", "tensor(int4)", "tensor(float8e4m3fn)", "tensor(float8e5m2)"}, "Constrain KV cache types.")
+        .TypeConstraint("T_CACHE", {"tensor(float)", "tensor(float16)", "tensor(bfloat16)", "tensor(uint8)", "tensor(int8)", "tensor(int4)", "tensor(float8e4m3fn)", "tensor(float8e5m2)"}, "Constrain KV cache types.")
         .TypeConstraint("T_SCALE", {"tensor(float)"}, "Constrain scale types.")
         .TypeConstraint("M", {"tensor(int32)"}, "Constrain mask to int tensor.")
         .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
