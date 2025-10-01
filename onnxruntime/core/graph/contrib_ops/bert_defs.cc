@@ -1266,8 +1266,8 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
                "1D tensor with shape (num_heads). Each head has a smooth factor adding to the denominator of softmax.",
                "T",
                OpSchema::Optional)
-        .Input(12, "k_scale", "Scale tensor for past_key.", "T_SCALE", OpSchema::Optional)
-        .Input(13, "v_scale", "Scale tensor for past_value.", "T_SCALE", OpSchema::Optional)
+        .Input(12, "k_scale", "Scale tensor for past_key.", "T", OpSchema::Optional)
+        .Input(13, "v_scale", "Scale tensor for past_value.", "T", OpSchema::Optional)
         .Output(0,
                 "output",
                 "3D output tensor with shape (batch_size, sequence_length, hidden_size)",
@@ -1289,11 +1289,10 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
                 "Values of QK matrix multiplication, either before or after softmax normalization",
                 "T",
                 OpSchema::Optional)
-        .Output(4, "present_k_scale", "Scale tensor for present_key.", "T_SCALE", OpSchema::Optional)
-        .Output(5, "present_v_scale", "Scale tensor for present_value.", "T_SCALE", OpSchema::Optional)
+        .Output(4, "present_k_scale", "Scale tensor for present_key.", "T", OpSchema::Optional)
+        .Output(5, "present_v_scale", "Scale tensor for present_value.", "T", OpSchema::Optional)
         .TypeConstraint("T", {"tensor(float16)", "tensor(bfloat16)", "tensor(float)"}, "Constrain input and output to float tensors.")
         .TypeConstraint("T_CACHE", {"tensor(float)", "tensor(float16)", "tensor(bfloat16)", "tensor(uint8)", "tensor(int8)", "tensor(int4)", "tensor(float8e4m3fn)", "tensor(float8e5m2)"}, "Constrain KV cache types.")
-        .TypeConstraint("T_SCALE", {"tensor(float)"}, "Constrain scale types.")
         .TypeConstraint("M", {"tensor(int32)"}, "Constrain mask to int tensor.")
         .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
           GroupQueryAttentionTypeAndShapeInference(ctx, 3, 3);
