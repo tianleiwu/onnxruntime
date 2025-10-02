@@ -191,6 +191,10 @@
       target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=221>")
     endif()
 
+    if (MSVC)
+      target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:-Xcompiler /bigobj>")
+    endif()
+
     if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
       if (UNIX)
         # Suppress -Wattributes warning from protobuf headers with nvcc on Linux
@@ -264,7 +268,6 @@
       target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-w>)
       target_compile_definitions(${target} PRIVATE COMPILE_HOPPER_TMA_GEMMS)
       if (MSVC)
-        target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:-Xcompiler /bigobj>")
         target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=177>")
         target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:-Xcompiler /wd4172>")
       endif()
