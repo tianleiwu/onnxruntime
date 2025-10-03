@@ -30,8 +30,9 @@ __global__ void DequantizeKernel(T* dequantized_data,
        i += blockDim.x * gridDim.x) {
     int h = i % head_size;
     int s = (i / head_size) % S;
-    int n = (i / head_size / S) % num_heads;
-    int b = (i / head_size / S / num_heads);
+    int n = (i / (head_size * S)) % num_heads;
+    int b = i / (num_heads * head_size * S);
+
 
     float scale_val = 1.0f;
     if (quant_type == KVQuantizationType::PER_TENSOR) {

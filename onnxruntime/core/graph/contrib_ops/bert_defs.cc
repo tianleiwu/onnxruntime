@@ -365,7 +365,16 @@ void BaseGroupQueryAttentionTypeAndShapeInference(ONNX_NAMESPACE::InferenceConte
       }
 
       if (output_qk_index >= 0) {
-        const bool did_supply_qk_buffer = ctx.hasOutput(output_qk_index);
+        // An output is considered "supplied" only if it's present AND has a meaningful type definition.
+        // An empty string placeholder for an optional output will not have a tensor type proto.
+        bool did_supply_qk_buffer = false;
+        if (ctx.hasOutput(output_qk_index)) {
+          const auto* type_proto = ctx.getOutputType(output_qk_index);
+          if (type_proto != nullptr && type_proto->has_tensor_type()) {
+            did_supply_qk_buffer = true;
+          }
+        }
+
         const int64_t qk_output_type = getAttribute(ctx, "qk_output", static_cast<int64_t>(QKOutputType::NO_OUTPUT));
 
         if (qk_output_type == static_cast<int64_t>(QKOutputType::NO_OUTPUT) && did_supply_qk_buffer) {
@@ -1295,7 +1304,11 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
         .TypeConstraint("T_CACHE", {"tensor(float)", "tensor(float16)", "tensor(bfloat16)", "tensor(uint8)", "tensor(int8)", "tensor(float8e4m3fn)", "tensor(float8e5m2)"}, "Constrain KV cache types.")
         .TypeConstraint("M", {"tensor(int32)"}, "Constrain mask to int tensor.")
         .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
-          GroupQueryAttentionTypeAndShapeInference(ctx, 3, 3);
+          // The 'output_qk' is an optional output at index 3.
+          // Pass its index to the shape inference logic only if the node instance actually has more than 3 outputs.
+          // Otherwise, pass -1 to signal that the optional output is not present and validation should be skipped.
+          int qk_output_index = ctx.getNumOutputs() > 3 ? 3 : -1;
+          GroupQueryAttentionTypeAndShapeInference(ctx, 3, qk_output_index);
         }));
 
 constexpr const char* PagedAttention_ver1_doc = R"DOC(

@@ -261,6 +261,8 @@ def create_gqa_node_and_io(
     ort_type,
     share_buffer=True,
     is_past=False,
+    output_qk:int=0,  # CUDA does not support output_qk for GQA
+    output_scale=True,
 ):
     past_kv_seqlen, present_kv_seqlen = 0, 0
     if is_past:
@@ -276,6 +278,21 @@ def create_gqa_node_and_io(
 
     # --- Node Definition ---
     is_quantized = config.k_quant_type != "NONE" or config.v_quant_type != "NONE"
+    outputs=[
+            "output",
+            "present_key",
+            "present_value",
+        ]
+
+    if output_qk > 0:
+        outputs.append("output_qk")
+
+    if output_scale:
+        if output_qk == 0:
+            outputs.append("")
+        outputs.append("present_k_scale")
+        outputs.append("present_v_scale")
+
     node = helper.make_node(
         op_type="GroupQueryAttention",
         inputs=[
@@ -294,14 +311,7 @@ def create_gqa_node_and_io(
             "k_scale" if config.k_quant_type != "NONE" and (is_past or share_buffer) else "",
             "v_scale" if config.v_quant_type != "NONE" and (is_past or share_buffer) else "",
         ],
-        outputs=[
-            "output",
-            "present_key",
-            "present_value",
-            "output_qk",
-            "present_k_scale",
-            "present_v_scale",
-        ],
+        outputs=outputs,
         name="GroupQueryAttention_0",
         num_heads=config.num_heads,
         kv_num_heads=config.kv_num_heads,
@@ -310,6 +320,7 @@ def create_gqa_node_and_io(
         rotary_interleaved=config.rotary_interleaved,
         softcap=config.softcap,
         smooth_softmax=1 if config.use_smooth_softmax else 0,
+        qk_output=output_qk,
         k_quant_type=config.k_quant_type,
         v_quant_type=config.v_quant_type,
         kv_cache_bit_width=config.kv_cache_bit_width if config.kv_cache_bit_width > 0 else 0,
@@ -357,9 +368,9 @@ def create_gqa_node_and_io(
             ]
         )
         if config.k_quant_type != "NONE":
-            graph_input.append(helper.make_tensor_value_info("k_scale", TensorProto.FLOAT, None))
+            graph_input.append(helper.make_tensor_value_info("k_scale", ort_type, None))
         if config.v_quant_type != "NONE":
-            graph_input.append(helper.make_tensor_value_info("v_scale", TensorProto.FLOAT, None))
+            graph_input.append(helper.make_tensor_value_info("v_scale", ort_type, None))
 
     if config.rotary:
         rotary_dim = (math.floor(config.head_size / 16) * 16) // 2
@@ -398,10 +409,22 @@ def create_gqa_node_and_io(
         ),
         helper.make_tensor_value_info("present_key", cache_ort_type, output_k_shape),
         helper.make_tensor_value_info("present_value", cache_ort_type, output_k_shape),
-        helper.make_tensor_value_info("output_qk", ort_type, None),
-        helper.make_tensor_value_info("present_k_scale", TensorProto.FLOAT, None),
-        helper.make_tensor_value_info("present_v_scale", TensorProto.FLOAT, None),
     ]
+
+    if output_qk > 0:
+        graph_output.append(
+            helper.make_tensor_value_info(
+                "output_qk",
+                ort_type,
+                [config.batch_size, config.num_heads, config.q_sequence_length, present_kv_seqlen],
+            )
+        )
+
+    if output_scale:
+        graph_output.extend([
+            helper.make_tensor_value_info("present_k_scale", ort_type, None),
+            helper.make_tensor_value_info("present_v_scale", ort_type, None),
+        ])
 
     return node, graph_input, graph_output
 
@@ -488,13 +511,13 @@ def gqa_prompt_func(
 
     # Quantization inputs
     if k_scale is not None:
-        io_binding.bind_cpu_input("k_scale", k_scale.detach().cpu().numpy())
+        io_binding.bind_cpu_input("k_scale", k_scale.detach().cpu().numpy().astype(numpy_type))
     if v_scale is not None:
-        io_binding.bind_cpu_input("v_scale", v_scale.detach().cpu().numpy())
+        io_binding.bind_cpu_input("v_scale", v_scale.detach().cpu().numpy().astype(numpy_type))
 
     # Outputs
     io_binding.bind_output("output")
-    io_binding.bind_output("output_qk")
+    # io_binding.bind_output("output_qk")
     io_binding.bind_output("present_k_scale")
     io_binding.bind_output("present_v_scale")
 
@@ -593,13 +616,13 @@ def gqa_past_func(
 
     # Quantization inputs
     if k_scale is not None:
-        io_binding.bind_cpu_input("k_scale", k_scale.detach().cpu().numpy())
+        io_binding.bind_cpu_input("k_scale", k_scale.detach().cpu().numpy().astype(numpy_type))
     if v_scale is not None:
-        io_binding.bind_cpu_input("v_scale", v_scale.detach().cpu().numpy())
+        io_binding.bind_cpu_input("v_scale", v_scale.detach().cpu().numpy().astype(numpy_type))
 
     # Outputs
     io_binding.bind_output("output")
-    io_binding.bind_output("output_qk")
+    # io_binding.bind_output("output_qk")
     io_binding.bind_output("present_k_scale")
     io_binding.bind_output("present_v_scale")
 
@@ -835,8 +858,14 @@ def parity_check_gqa_prompt(
     arange = rearrange(torch.arange(config.buffer_sequence_length, device=device), "s -> 1 s")
     kv_seqlens_expanded = rearrange(cache_seqlens, "b -> b 1")
     update_mask = arange < kv_seqlens_expanded
-    k_cache_ref[update_mask] = rearrange(k_ro, "b s ... -> (b s) ...").to(dtype=torch_type)
-    v_cache_ref[update_mask] = rearrange(new_v, "b s ... -> (b s) ...").to(dtype=torch_type)
+
+    # Explicitly cast the source tensor to the destination's dtype before assignment.
+    source_k = rearrange(k_ro, "b s ... -> (b s) ...")
+    k_cache_ref[update_mask] = source_k.to(k_cache_ref.dtype)
+
+    source_v = rearrange(new_v, "b s ... -> (b s) ...")
+    v_cache_ref[update_mask] = source_v.to(v_cache_ref.dtype)
+
     key_padding_mask = arange < kv_seqlens_expanded
 
     out_ref, _ = attention_ref(

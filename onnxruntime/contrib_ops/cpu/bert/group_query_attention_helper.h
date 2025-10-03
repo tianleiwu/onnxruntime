@@ -411,10 +411,10 @@ Status CheckOutputs(const T* output_qk, int qk_output) {
 }
 
 inline Status CheckNoQKOutput(int num_outputs, int qk_output) {
-  if (num_outputs > 3) {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
-                           "output_qk optional output is not supported");
-  }
+  // if (num_outputs > 3) {
+  //   return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
+  //                          "output_qk optional output is not supported");
+  // }
 
   if (qk_output != static_cast<int>(QKOutputType::NO_OUTPUT)) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,

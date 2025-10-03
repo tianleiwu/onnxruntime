@@ -275,7 +275,7 @@ Status LaunchGetSeqlensInteractive(const int32_t* seqlens_k, int32_t* seqlens_k_
                                    const int batch_size, const int sequence_length, cudaStream_t stream,
                                    const int max_threads_per_block) {
   const int threads = std::min(batch_size, max_threads_per_block);
-  const int blocks = (threads / max_threads_per_block) + 1;
+  const int blocks = (batch_size + threads - 1) / threads;
   GetSeqlensInteractive<<<blocks, threads, 0, stream>>>(seqlens_k, seqlens_k_buff, batch_size,
                                                         sequence_length);
   return CUDA_CALL(cudaGetLastError());
@@ -432,25 +432,46 @@ Status FlashAttention(
     value = reinterpret_cast<T*>(key) + value_offset;
   }
 
+
   void* seqlens_k = reinterpret_cast<void*>(data.seqlens_k);
-  if (parameters.is_subsequent_prompt) {
-    ORT_RETURN_IF_ERROR(LaunchGetSeqlensInteractive(reinterpret_cast<const int32_t*>(data.seqlens_k),
-                                                    reinterpret_cast<int32_t*>(data.seqlens_k_buff), batch_size,
-                                                    sequence_length, stream, max_threads_per_block));
-    seqlens_k = reinterpret_cast<void*>(data.seqlens_k_buff);
-  } else if (parameters.is_first_prompt) {
-    // set seqlens_k to zeros... flash api uses seqlens_k to indicate where to append key and value
-    // user should use seqlens_k to index into output to get new tokens
-    if (batch_size <= parameters.zeros_count) {
-      seqlens_k = parameters.zero_ptr;
-    } else {
-      // Launch kernel to create larger seqlen tensor when batch_size > 256
-      constexpr int thr_per_blk = 256;
-      int blk_in_grid = (batch_size + thr_per_blk - 1) / thr_per_blk;
-      repeat_seqlen<<<blk_in_grid, thr_per_blk, 0, stream>>>(data.seqlens_k_buff, 0, batch_size);
+  if (parameters.is_first_prompt) {
+      // This correctly handles the prompt case by setting seqlens_k to zeros
+      if (batch_size <= parameters.zeros_count) {
+          seqlens_k = parameters.zero_ptr;
+      } else {
+          constexpr int thr_per_blk = 256;
+          int blk_in_grid = (batch_size + thr_per_blk - 1) / thr_per_blk;
+          repeat_seqlen<<<blk_in_grid, thr_per_blk, 0, stream>>>(data.seqlens_k_buff, 0, batch_size);
+          seqlens_k = reinterpret_cast<void*>(data.seqlens_k_buff);
+      }
+  } else {
+      // This now correctly handles ALL cases with a past KV cache (q_len=1 and q_len>1)
+      ORT_RETURN_IF_ERROR(LaunchGetSeqlensInteractive(reinterpret_cast<const int32_t*>(data.seqlens_k),
+                                                      reinterpret_cast<int32_t*>(data.seqlens_k_buff), batch_size,
+                                                      sequence_length, stream, max_threads_per_block));
       seqlens_k = reinterpret_cast<void*>(data.seqlens_k_buff);
-    }
   }
+
+
+  // void* seqlens_k = reinterpret_cast<void*>(data.seqlens_k);
+  // if (parameters.is_subsequent_prompt) {
+  //   ORT_RETURN_IF_ERROR(LaunchGetSeqlensInteractive(reinterpret_cast<const int32_t*>(data.seqlens_k),
+  //                                                   reinterpret_cast<int32_t*>(data.seqlens_k_buff), batch_size,
+  //                                                   sequence_length, stream, max_threads_per_block));
+  //   seqlens_k = reinterpret_cast<void*>(data.seqlens_k_buff);
+  // } else if (parameters.is_first_prompt) {
+  //   // set seqlens_k to zeros... flash api uses seqlens_k to indicate where to append key and value
+  //   // user should use seqlens_k to index into output to get new tokens
+  //   if (batch_size <= parameters.zeros_count) {
+  //     seqlens_k = parameters.zero_ptr;
+  //   } else {
+  //     // Launch kernel to create larger seqlen tensor when batch_size > 256
+  //     constexpr int thr_per_blk = 256;
+  //     int blk_in_grid = (batch_size + thr_per_blk - 1) / thr_per_blk;
+  //     repeat_seqlen<<<blk_in_grid, thr_per_blk, 0, stream>>>(data.seqlens_k_buff, 0, batch_size);
+  //     seqlens_k = reinterpret_cast<void*>(data.seqlens_k_buff);
+  //   }
+  // }
 
   if (!parameters.kv_share_buffer || parameters.is_first_prompt) {  // copy past kv to present kv
     ORT_RETURN_IF_ERROR(LaunchConcatNewToPastKV(parameters, data, nullptr, nullptr, stream, max_threads_per_block,
