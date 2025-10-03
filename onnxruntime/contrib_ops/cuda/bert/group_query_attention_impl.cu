@@ -27,6 +27,7 @@ limitations under the License.
 
 #include <cassert>
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
 #include <cub/cub.cuh>
 #include "core/providers/cuda/cu_inc/common.cuh"
 #include "core/providers/cuda/cuda_common.h"
@@ -43,7 +44,7 @@ limitations under the License.
 #include "contrib_ops/cuda/bert/attention_impl.h"
 #include "core/providers/cuda/shared_inc/cuda_call.h"
 #include "contrib_ops/cuda/bert/rotary_embedding_impl.h"
-#include <cublas_v2.h>
+#include "contrib_ops/cuda/bert/group_query_attention_qdq.cuh"
 
 using namespace onnxruntime::cuda;
 

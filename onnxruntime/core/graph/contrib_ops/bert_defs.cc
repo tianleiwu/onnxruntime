@@ -1157,14 +1157,13 @@ When quantization is enabled, `past_key` and `past_value` inputs must be of type
 The operator will output `present_key` and `present_value` in same format as the `past_key` and `past_value`, and `present_k_scale` and `present_v_scale` will contain updated scales if dynamic quantization is used.
 k_scale and present_k_scale will share buffer when past and present buffer sharing is used, same for v_scale and present_v_scale.
 The shapes of the k_scale, v_scale, present_k_scale and present_v_scale tensors shall be broadcastable to present_key shape.
-For 4-bit quantization, the data type can be int4 or uint8. When uint8 is used, each byte contains two 4-bit quantized values.
-For 2-bit quantization, the data type can be uint8, and each byte contains four 2-bit quantized values.
-The bit width of quantized KV cache can be set using `kv_cache_bit_width` attribute. It is only required when the data type of KV cache is uint8. Supported values are 4 and 2.
+
+For 4-bit or 2-bit quantization, the data type can be uint8. Each byte contains two 4-bit or four 2-bit quantized values. The bit width of quantized KV cache can be set using `kv_cache_bit_width` attribute.
 
 **Quantization Modes (`k_quant_type`, `v_quant_type` attributes):**
 - **"NONE"**: No quantization.
 - **"PER_TENSOR"**: A single scale for the entire tensor. Scale example shape: `[1]` or `[1, 1, 1, 1]`.
-- **"PER_CHANNEL"**: A scale for each channel (head_size dimension), shared across all other dimensions. Scale example shape: `[num_heads_k, 1, head_size]` or `[1, num_heads_k, 1, head_size]`.
+- **"PER_CHANNEL"**: A scale for each channel. Scale example shape: `[1, num_heads_k, 1, head_size]`.
 - **"PER_TOKEN"**: A scale for each token. Scale shape: `[batch_size, 1, cache_sequence_length, 1]`. This mode is dynamic and computes scales on-the-fly for new tokens.
 )DOC";
 
@@ -1293,7 +1292,7 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
         .Output(4, "present_k_scale", "Scale tensor for present_key.", "T", OpSchema::Optional)
         .Output(5, "present_v_scale", "Scale tensor for present_value.", "T", OpSchema::Optional)
         .TypeConstraint("T", {"tensor(float16)", "tensor(bfloat16)", "tensor(float)"}, "Constrain input and output to float tensors.")
-        .TypeConstraint("T_CACHE", {"tensor(float)", "tensor(float16)", "tensor(bfloat16)", "tensor(uint8)", "tensor(int8)", "tensor(int4)", "tensor(float8e4m3fn)", "tensor(float8e5m2)"}, "Constrain KV cache types.")
+        .TypeConstraint("T_CACHE", {"tensor(float)", "tensor(float16)", "tensor(bfloat16)", "tensor(uint8)", "tensor(int8)", "tensor(float8e4m3fn)", "tensor(float8e5m2)"}, "Constrain KV cache types.")
         .TypeConstraint("M", {"tensor(int32)"}, "Constrain mask to int tensor.")
         .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
           GroupQueryAttentionTypeAndShapeInference(ctx, 3, 3);

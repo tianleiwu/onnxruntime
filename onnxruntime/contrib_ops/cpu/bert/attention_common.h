@@ -59,6 +59,14 @@ enum class QKOutputType : int {
   AFTER_SOFTMAX = 2
 };
 
+// Enum to define quantization granularity, directly usable by the kernel.
+enum class KVQuantizationType {
+  NONE = 0,
+  PER_TENSOR = 1,
+  PER_CHANNEL = 2,
+  PER_TOKEN = 3,
+};
+
 constexpr bool LAYOUT_BSNH = false;
 constexpr bool LAYOUT_BNSH = true;
 
