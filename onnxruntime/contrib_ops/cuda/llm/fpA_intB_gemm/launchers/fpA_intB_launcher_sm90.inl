@@ -274,8 +274,9 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const*, WeightType co
                                             ScaleZeroType const*, ScaleZeroType const*, BiasType const*,
                                             float const, OutputType*, int, int, int, int const, tkc::CutlassGemmConfig,
                                             char*, size_t, cudaStream_t, int*) {
-  ORT_LLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-  ORT_THROW("[fpA_intB_gemm] Please recompile with support for hopper by passing 90a-real as an arch.");
+  // Do nothing. This stub is intended for builds that do not include SM90 SASS.
+  // The profiler will detect that this kernel does not produce a valid result
+  // and will correctly discard it as a potential tactic.
 }
 #endif  // COMPILE_HOPPER_TMA_GEMMS
 

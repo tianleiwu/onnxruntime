@@ -318,12 +318,20 @@ Status MatMulNBits<T>::ComputeInternal(OpKernelContext* ctx) const {
   CudaT* out_data = reinterpret_cast<CudaT*>(Y->MutableData<T>());
 
   if constexpr (std::is_same<T, MLFloat16>::value || std::is_same<T, BFloat16>::value) {
-    if (has_fpA_intB_gemm_) {
-      // We expect weight/scale/zero_point(optional) inputs are initializers and have been prepacked.
-      // User could disable it by setting ORT_FPA_INTB_GEMM=0 if those tensors cannot be prepacked (It is rare).
+    bool run_fpa_intb_path = false;
+    if (has_fpA_intB_gemv_ && has_fpA_intB_gemm_) {
       ORT_ENFORCE(is_prepacked_weight_ && is_prepacked_scale_ && (is_prepacked_zero_point_ || !has_zero_points_),
                   "To use fpA_intB_gemm, prepacking must be done on weight, scale and zero point.");
 
+      // Check if there are any valid tactics. If not, we will use the fallback path.
+      // This handles the build with 90-virtual but not 90a-real, where there is no fpa_intb_gemm kernel for sm90.
+      if (!weightOnlyGemmRunner_->getConfigs().empty()) {
+        printf("Using fpA_intB_gemm\n");
+        run_fpa_intb_path = true;
+      }
+    }
+
+    if (run_fpa_intb_path) {
       auto const& bestTactic = gemmProfiler_->getBestConfig(m, gemmId_);
 
 #if ORT_LLM_VERBOSE > 1
