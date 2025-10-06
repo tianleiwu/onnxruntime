@@ -436,7 +436,7 @@ else()
           ${MLAS_SRC_DIR}/sconv_kernel_neon.cpp
           ${MLAS_SRC_DIR}/spool_kernel_neon.cpp
         )
-        
+
         # Conditionally add the SVE implementation if compiler supports it
         if (onnxruntime_USE_SVE)
           list(APPEND mlas_platform_srcs ${MLAS_SRC_DIR}/sve/mlasi_sve.h)
@@ -450,7 +450,7 @@ else()
         endif()
         set_source_files_properties(${MLAS_SRC_DIR}/sqnbitgemm_kernel_neon_int8.cpp
                                     PROPERTIES COMPILE_FLAGS " -march=armv8.2-a+dotprod")
-        set_source_files_properties(${MLAS_SRC_DIR}/sqnbitgemm_kernel_neon_int8_i8mm.cpp 
+        set_source_files_properties(${MLAS_SRC_DIR}/sqnbitgemm_kernel_neon_int8_i8mm.cpp
 				    PROPERTIES COMPILE_FLAGS " -march=armv8.2-a+i8mm ")
 
         if (NOT APPLE)
@@ -858,6 +858,12 @@ if (NOT onnxruntime_ORT_MINIMAL_BUILD)
     target_link_libraries(onnxruntime_mlas_q4dq PRIVATE atomic)
   endif()
   target_link_libraries(onnxruntime_mlas_q4dq PRIVATE Threads::Threads)
+
+  if (HAVE_LIBBACKTRACE)
+    add_dependencies(onnxruntime_mlas_q4dq libbacktrace::libbacktrace)
+    target_compile_definitions(onnxruntime_mlas_q4dq PRIVATE "$<$<CONFIG:Debug>:USE_LIBBACKTRACE>")
+    target_link_libraries(onnxruntime_mlas_q4dq PRIVATE "$<$<CONFIG:Debug>:libbacktrace::libbacktrace>")
+  endif()
 
   if (CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     if (onnxruntime_ENABLE_WEBASSEMBLY_THREADS)
