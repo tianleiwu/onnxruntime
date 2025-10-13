@@ -1277,7 +1277,8 @@ def gqa_cuda_past_test_cases(allow_head_sink: bool = True):
     # s: new sequence length, s2: past sequence length
     seqs = [(1, 1024)] if pipeline_mode else [(1, 128), (1, 1024), (1, 2048), (1, 5000)]
     num_h = [(32, 8)] if pipeline_mode else [(6, 3), (9, 9), (32, 8)]
-    h_sizes = [256] if pipeline_mode else [64, 128, 256]
+    # We test 128 in pipeline since quantized kv cache is only enabled for head_size=128 in flash attention.
+    h_sizes = [128] if pipeline_mode else [64, 128, 256]
     smmoth_softmax__head_sink = get_softmax_options(allow_head_sink)
 
     for b in batches:

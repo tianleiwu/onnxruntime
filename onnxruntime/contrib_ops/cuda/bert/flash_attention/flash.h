@@ -133,6 +133,16 @@ struct Flash_fwd_params : public Qkv_params {
 
   bool unpadded_lse = false;
   const cudaDeviceProp* dprops = nullptr;
+
+  // Quantization params
+  void* __restrict__ k_scale_ptr = nullptr;
+  void* __restrict__ v_scale_ptr = nullptr;
+
+  // 0: NONE, 1: PER_TENSOR, 2: PER_CHANNEL
+  int k_quant_type = 0;
+  int v_quant_type = 0;
+
+  int kv_cache_bit_width = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

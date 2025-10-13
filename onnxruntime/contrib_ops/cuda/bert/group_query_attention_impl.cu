@@ -463,6 +463,9 @@ Status FlashAttention(
   void* sin_cache = reinterpret_cast<void*>(const_cast<T*>(data.sin_cache));
   void* head_sink = reinterpret_cast<void*>(const_cast<T*>(data.head_sink));
 
+  void* k_scale = const_cast<void*>(reinterpret_cast<const void*>(data.k_scale));
+  void* v_scale = const_cast<void*>(reinterpret_cast<const void*>(data.v_scale));
+
   bool past_bsnh = past_kv_format == AttentionQkvFormat::Q_K_V_BSNH;
 
   DUMP_TENSOR_INIT();
@@ -477,7 +480,9 @@ Status FlashAttention(
       parameters.seqlen_present_kv_cache, kv_sequence_length, parameters.rotary_dim,
       scale, parameters.softcap, is_causal, is_bf16, parameters.use_smooth_softmax, past_bsnh, parameters.num_splits,
       reinterpret_cast<void*>(data.softmax_lse_accum), reinterpret_cast<void*>(data.out_accum),
-      parameters.local_window_size, parameters.rotary_interleaved, parameters.is_packed_qkv));
+      parameters.local_window_size, parameters.rotary_interleaved, parameters.is_packed_qkv,
+      0, 1, k_scale, v_scale, static_cast<int>(parameters.k_quant_type),
+      static_cast<int>(parameters.v_quant_type), parameters.kv_cache_bit_width));
 
   DUMP_TENSOR("flash attention output", data.output, batch_size, sequence_length, num_heads, head_size);
 

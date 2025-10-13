@@ -60,7 +60,7 @@ enum class QKOutputType : int {
 };
 
 // Enum to define quantization granularity.
-enum class KVQuantizationType {
+enum class KVQuantizationType: int {
   NONE = 0,
   PER_TENSOR = 1,
   PER_CHANNEL = 2,

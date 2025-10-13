@@ -436,6 +436,13 @@ bool is_supported(const cudaDeviceProp& dprops, size_t head_size, size_t num_hea
   return (dprops.major >= 8) && (head_size % 8 == 0) && (head_size <= 256) && (num_heads % num_heads_k == 0);
 }
 
+bool is_supported_quantization(bool is_causal, size_t head_size, int k_quant_type, int v_quant_type, int kv_cache_bit_width) {
+  return is_causal && head_size == 128 &&
+         ((k_quant_type == 0 && v_quant_type == 0) ||
+          (k_quant_type == 1 && v_quant_type == 1 && kv_cache_bit_width == 8) ||
+          (k_quant_type == 2 && v_quant_type == 2 && kv_cache_bit_width == 4));
+}
+
 // This API is used when past key and value are present... since cached, these are assumed to have sequence length
 // of max_sequence_length, so seqlen_k == max_sequence_length. The actual past sequence length is held in seqlens_k_.
 Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
@@ -473,7 +480,12 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
                        bool is_rotary_interleaved,
                        bool is_packed_qkv,
                        int max_num_blocks_per_seq,
-                       int page_block_size) {
+                       int page_block_size,
+                       void* k_scale,
+                       void* v_scale,
+                       int k_quant_type,
+                       int v_quant_type,
+                       int kv_cache_bit_width) {
   auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
   const int head_size_rounded = head_size <= 192 ? round_multiple(head_size, 32) : 256;
   const int seqlen_q_rounded = round_multiple(seqlen_q, 128);
@@ -571,6 +583,12 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
     // params.num_blocks = 0;
     params.page_block_size = 1;
   }
+
+  params.k_scale_ptr = k_scale;
+  params.v_scale_ptr = v_scale;
+  params.k_quant_type = k_quant_type;
+  params.v_quant_type = v_quant_type;
+  params.kv_cache_bit_width = kv_cache_bit_width;
 
   // Only split kernel supports appending to KV cache
   run_mha_fwd(params, stream, /*force_split_kernel=*/k_new != nullptr);

@@ -35,9 +35,10 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_kernel, bool Is_causal, bool Is_local, boo
 #endif
 }
 
-DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_kernel, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV) {
+DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_kernel, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV,
+                            int K_QUANT_TYPE, int V_QUANT_TYPE, int KV_BIT_WIDTH) {
 #if defined(ARCH_SUPPORTS_FLASH)
-  flash::compute_attn_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params);
+  flash::compute_attn_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV, K_QUANT_TYPE, V_QUANT_TYPE, KV_BIT_WIDTH>(params);
 #else
   FLASH_UNSUPPORTED_ARCH
 #endif
@@ -106,17 +107,29 @@ void run_flash_splitkv_fwd(Flash_fwd_params& params, cudaStream_t stream) {
             BOOL_SWITCH(params.knew_ptr != nullptr, Append_KV_Const, [&] {
               ALIBI_SWITCH(params.alibi_slopes_ptr != nullptr, Has_alibi, [&] {
                 SOFTCAP_SWITCH(params.softcap > 0.0, Is_softcap, [&] {
-                  // If Append_KV_Const, then we must have seqlen_offsets, which means cu_seqlens_k != nullptr.
-                  // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
-                  // If Is_Local_Const, set Is_causal to false
-                  auto kernel = &flash_fwd_splitkv_kernel < Kernel_traits, Is_causal, Is_Local_Const && !Is_causal, Has_alibi,
-                  IsEvenMNConst && !Append_KV_Const && IsEvenKConst && !Is_Local_Const && Kernel_traits::kHeadDim <= 128,
-                  IsEvenKConst, Is_softcap, SplitConst, Append_KV_Const >;
-                  // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, true, Split, Append_KV_Const>;
-                  // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, IsEvenKConst>;
+                  // ===================== MODIFICATION STARTS HERE =====================
+                  // Define a type for our kernel function pointer
+                  using kernel_t = void (*)(const Flash_fwd_params);
+                  kernel_t kernel = &flash_fwd_splitkv_kernel < Kernel_traits, Is_causal, Is_Local_Const && !Is_causal, Has_alibi,
+                    IsEvenMNConst && !Append_KV_Const && IsEvenKConst && !Is_Local_Const && Kernel_traits::kHeadDim <= 128,
+                    IsEvenKConst, Is_softcap, SplitConst, Append_KV_Const, 0, 0, 0 > ;
+
+                  // The constraints (Is_causal and kHeadDim == 128) are used to reduce binary size and build time.
+                  // If you add more combinations here, please also update is_supported_quantization function.
+                  if constexpr (Is_causal && Kernel_traits::kHeadDim == 128) {
+                    if (params.k_quant_type == 1 && params.v_quant_type == 1 && params.kv_cache_bit_width == 8) {
+                      kernel = &flash_fwd_splitkv_kernel < Kernel_traits, Is_causal, Is_Local_Const && !Is_causal, Has_alibi,
+                      IsEvenMNConst && !Append_KV_Const && IsEvenKConst && !Is_Local_Const && Kernel_traits::kHeadDim <= 128,
+                      IsEvenKConst, Is_softcap, SplitConst, Append_KV_Const, 1, 1, 8 > ;
+                    } else if (params.k_quant_type == 2 && params.v_quant_type == 2 && params.kv_cache_bit_width == 4) {
+                      kernel = &flash_fwd_splitkv_kernel < Kernel_traits, Is_causal, Is_Local_Const && !Is_causal, Has_alibi,
+                      IsEvenMNConst && !Append_KV_Const && IsEvenKConst && !Is_Local_Const && Kernel_traits::kHeadDim <= 128,
+                      IsEvenKConst, Is_softcap, SplitConst, Append_KV_Const, 2, 2, 4 > ;
+                    }
+                  }
+
                   if (smem_size >= 48 * 1024) {
-                    cudaFuncSetAttribute(
-                        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_size));
+                    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_size));
                   }
                   kernel<<<grid, Kernel_traits::kNThreads, static_cast<int>(smem_size), stream>>>(params);
                 });
@@ -127,6 +140,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params& params, cudaStream_t stream) {
       });
     });
   });
+
   if (params.num_splits > 1) {
     // We want kBlockM to be as small as possible for more parallelism.
     // With 128 threads we can load 512 elements at a time, so if headdim is divisible by 128, kBlockM = 4.

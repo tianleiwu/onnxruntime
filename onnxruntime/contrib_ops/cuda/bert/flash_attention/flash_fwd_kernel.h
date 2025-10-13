@@ -27,6 +27,7 @@
 #include "contrib_ops/cuda/bert/flash_attention/softmax.h"
 #include "contrib_ops/cuda/bert/flash_attention/mask.h"
 #include "contrib_ops/cuda/bert/flash_attention/rotary.h"
+#include "contrib_ops/cuda/bert/flash_attention/dequantize.h"
 
 namespace onnxruntime {
 namespace flash {
@@ -441,7 +442,8 @@ inline __device__ void compute_attn_1rowblock(const Params& params, const int bi
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
+template <typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV,
+          int K_QUANT_TYPE, int V_QUANT_TYPE, int KV_BIT_WIDTH, typename Params>
 inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, const int bidb, const int bidh,
                                                       const int m_block, const int n_split_idx,
                                                       const int num_n_splits) {
@@ -465,6 +467,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
       typename Kernel_traits::GmemTiledCopyO,
       typename Kernel_traits::GmemTiledCopyOaccum>;
   using ElementO = std::conditional_t<!Split, Element, ElementAccum>;
+  using QuantKV = typename cutlass::platform::conditional<KV_BIT_WIDTH == 8, int8_t, uint8_t>::type;
 
   const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
   // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) { printf("Is_even_MN = %d, is_cumulativ = %d, seqlen_k_cache = %d, actual_seqlen_k = %d\n", Is_even_MN, params.is_seqlens_k_cumulative, binfo.seqlen_k_cache, binfo.actual_seqlen_k); }
@@ -552,10 +555,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
   Tensor gK = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.k_ptr) + row_offset_k),
                           Shape<Int<kBlockN>, Int<kHeadDim>>{},
                           make_stride(params.k_row_stride, _1{}));
-  // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) { printf("k_ptr = %p, row_offset_k = %d, gK_ptr = %p\n", params.k_ptr, row_offset_k, gK.data()); }
   Tensor gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.v_ptr) + row_offset_v),
                           Shape<Int<kBlockN>, Int<kHeadDim>>{},
                           make_stride(params.v_row_stride, _1{}));
+  Tensor gK_quant = make_tensor(make_gmem_ptr(reinterpret_cast<QuantKV*>(params.k_ptr) + row_offset_k),
+                                Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                make_stride(params.k_row_stride, _1{}));
+  Tensor gV_quant = make_tensor(make_gmem_ptr(reinterpret_cast<QuantKV*>(params.v_ptr) + row_offset_v),
+                                Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                make_stride(params.v_row_stride, _1{}));
 
   Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)),
                           typename Kernel_traits::SmemLayoutQ{});
@@ -573,6 +581,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
   Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
   Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K)
   Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
+  Tensor tKgK_quant = gmem_thr_copy_QKV.partition_S(gK_quant);
+  Tensor tVgV_quant = gmem_thr_copy_QKV.partition_S(gV_quant);
 
   typename Kernel_traits::TiledMma tiled_mma;
   auto thr_mma = tiled_mma.get_thread_slice(tidx);
@@ -763,9 +773,16 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
   }
 
   int n_block = n_block_max - 1;
-  // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-  flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
-                                     binfo.actual_seqlen_k - n_block * kBlockN);
+  if constexpr (K_QUANT_TYPE != 0) {
+    flash::copy_and_dequantize<Is_even_MN, Is_even_K, K_QUANT_TYPE, KV_BIT_WIDTH>(
+        gmem_tiled_copy_QKV, tKgK_quant, tKsK, tKVcKV, tKVpKV,
+        binfo.actual_seqlen_k - n_block * kBlockN,
+        reinterpret_cast<const Element*>(params.k_scale_ptr),
+        params.d, bidh / params.h_h_k_ratio);
+  } else {
+    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
+                                       binfo.actual_seqlen_k - n_block * kBlockN);
+  }
   cute::cp_async_fence();
 
   // flash::cp_async_wait<0>();
@@ -810,11 +827,25 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
         const int block_table_offset_next = n_block * kBlockN - block_table_idx_next * params.page_block_size;
         tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
       }
-      flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
+      if constexpr (V_QUANT_TYPE != 0) {
+        flash::copy_and_dequantize</*Is_even_MN=*/true, Is_even_K, V_QUANT_TYPE, KV_BIT_WIDTH>(
+            gmem_tiled_copy_QKV, tVgV_quant, tVsV, tKVcKV, tKVpKV,
+            binfo.actual_seqlen_k, reinterpret_cast<const Element*>(params.v_scale_ptr),
+            params.d, bidh / params.h_h_k_ratio);
+      } else {
+        flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
+      }
     } else {
-      // Clear the smem tiles to account for predicated off loads
-      flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
-          gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN);
+      if constexpr (V_QUANT_TYPE != 0) {
+        flash::copy_and_dequantize<Is_even_MN, Is_even_K, V_QUANT_TYPE, KV_BIT_WIDTH>(
+            gmem_tiled_copy_QKV, tVgV_quant, tVsV, tKVcKV, tKVpKV,
+            binfo.actual_seqlen_k - n_block * kBlockN,
+            reinterpret_cast<const Element*>(params.v_scale_ptr),
+            params.d, bidh / params.h_h_k_ratio);
+      } else {
+        flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+            gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN);
+      }
     }
     cute::cp_async_fence();
 
@@ -845,7 +876,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
         const int block_table_offset_next = (n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
         tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
       }
-      flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+      if constexpr (K_QUANT_TYPE != 0) {
+        flash::copy_and_dequantize</*Is_even_MN=*/true, Is_even_K, K_QUANT_TYPE, KV_BIT_WIDTH>(
+            gmem_tiled_copy_QKV, tKgK_quant, tKsK, tKVcKV, tKVpKV,
+            binfo.actual_seqlen_k,
+            reinterpret_cast<const Element*>(params.k_scale_ptr),
+            params.d, bidh / params.h_h_k_ratio);
+      } else {
+        flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+      }
       // This cp_async_fence needs to be in the if block, otherwise the synchronization
       // isn't right and we get race conditions.
       cute::cp_async_fence();
@@ -888,7 +927,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
       const int block_table_offset_next = n_block * kBlockN - block_table_idx_next * params.page_block_size;
       tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
     }
-    flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
+    if constexpr (V_QUANT_TYPE != 0) {
+        flash::copy_and_dequantize</*Is_even_MN=*/true, Is_even_K, V_QUANT_TYPE, KV_BIT_WIDTH>(
+            gmem_tiled_copy_QKV, tVgV_quant, tVsV, tKVcKV, tKVpKV,
+            binfo.actual_seqlen_k,
+            reinterpret_cast<const Element*>(params.v_scale_ptr),
+            params.d, bidh / params.h_h_k_ratio);
+    } else {
+        flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
+    }
     cute::cp_async_fence();
 
     flash::gemm(
@@ -911,7 +958,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
         const int block_table_offset_next = (n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
         tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
       }
-      flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+      if constexpr (K_QUANT_TYPE != 0) {
+        flash::copy_and_dequantize</*Is_even_MN=*/true, Is_even_K, K_QUANT_TYPE, KV_BIT_WIDTH>(
+            gmem_tiled_copy_QKV, tKgK_quant, tKsK, tKVcKV, tKVpKV,
+            binfo.actual_seqlen_k,
+            reinterpret_cast<const Element*>(params.k_scale_ptr),
+            params.d, bidh / params.h_h_k_ratio);
+      } else {
+        flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+      }
       // This cp_async_fence needs to be in the if block, otherwise the synchronization
       // isn't right and we get race conditions.
       cute::cp_async_fence();
@@ -1030,7 +1085,8 @@ inline __device__ void compute_attn(const Params& params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
+template <typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV,
+          int K_QUANT_TYPE, int V_QUANT_TYPE, int KV_BIT_WIDTH, typename Params>
 inline __device__ void compute_attn_splitkv(const Params& params) {
   const int m_block = blockIdx.x;
   // The block index for the batch.
@@ -1039,7 +1095,8 @@ inline __device__ void compute_attn_splitkv(const Params& params) {
   const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
   const int n_split_idx = Split ? blockIdx.y : 0;
   const int num_n_splits = Split ? gridDim.y : 1;
-  flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
+  flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV,
+                                        K_QUANT_TYPE, V_QUANT_TYPE, KV_BIT_WIDTH>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

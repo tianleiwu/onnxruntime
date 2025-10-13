@@ -96,6 +96,9 @@ struct GroupQueryAttentionParameters : AttentionParameters {
   AttentionQkvFormat past_kv_format;
   int zeros_count;
   int* zero_ptr;
+  KVQuantizationType k_quant_type = KVQuantizationType::NONE;
+  KVQuantizationType v_quant_type = KVQuantizationType::NONE;
+  int kv_cache_bit_width = 0;  // valid when k_quant_type or v
 };
 
 // Parameters deduced from node attributes and inputs/outputs.
