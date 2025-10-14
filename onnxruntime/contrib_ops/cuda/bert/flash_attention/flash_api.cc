@@ -437,10 +437,10 @@ bool is_supported(const cudaDeviceProp& dprops, size_t head_size, size_t num_hea
 }
 
 bool is_supported_quantization(bool is_causal, size_t head_size, int k_quant_type, int v_quant_type, int kv_cache_bit_width) {
-  return is_causal && head_size == 128 &&
-         ((k_quant_type == 0 && v_quant_type == 0) ||
-          (k_quant_type == 1 && v_quant_type == 1 && kv_cache_bit_width == 8) ||
-          (k_quant_type == 2 && v_quant_type == 2 && kv_cache_bit_width == 4));
+  return (k_quant_type == 0 && v_quant_type == 0) || // no quantization supported for all head sizes
+         (is_causal && head_size == 128 &&
+          ((k_quant_type == 1 && v_quant_type == 1 && kv_cache_bit_width == 8) ||
+           (k_quant_type == 2 && v_quant_type == 2 && kv_cache_bit_width == 4)));
 }
 
 // This API is used when past key and value are present... since cached, these are assumed to have sequence length

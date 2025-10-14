@@ -820,13 +820,19 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
     if (masking_step > 0) {
       if (block_table == nullptr) {
         tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+        tVgV_quant.data() = tVgV_quant.data() + (-int(kBlockN * params.v_row_stride));
       } else {
         const int block_table_idx_cur = (n_block + 1) * kBlockN / params.page_block_size;
         const int block_table_offset_cur = (n_block + 1) * kBlockN - block_table_idx_cur * params.page_block_size;
         const int block_table_idx_next = n_block * kBlockN / params.page_block_size;
         const int block_table_offset_next = n_block * kBlockN - block_table_idx_next * params.page_block_size;
-        tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
+
+        const int offset_diff = block_table_offset_next - block_table_offset_cur;
+        tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + offset_diff * params.v_row_stride;
+
+        tVgV_quant.data() = tVgV_quant.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + offset_diff * params.v_row_stride;
       }
+
       if constexpr (V_QUANT_TYPE != 0) {
         flash::copy_and_dequantize</*Is_even_MN=*/true, Is_even_K, V_QUANT_TYPE, KV_BIT_WIDTH>(
             gmem_tiled_copy_QKV, tVgV_quant, tVsV, tKVcKV, tKVpKV,
@@ -869,13 +875,17 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
       // Advance gK
       if (block_table == nullptr) {
         tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+        tKgK_quant.data() = tKgK_quant.data() + (-int(kBlockN * params.k_row_stride));
       } else {
         const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
         const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
         const int block_table_idx_next = (n_block - 1) * kBlockN / params.page_block_size;
         const int block_table_offset_next = (n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
-        tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
+        const int offset_diff = block_table_offset_next - block_table_offset_cur;
+        tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + offset_diff * params.k_row_stride;
+        tKgK_quant.data() = tKgK_quant.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + offset_diff * params.k_row_stride;
       }
+
       if constexpr (K_QUANT_TYPE != 0) {
         flash::copy_and_dequantize</*Is_even_MN=*/true, Is_even_K, K_QUANT_TYPE, KV_BIT_WIDTH>(
             gmem_tiled_copy_QKV, tKgK_quant, tKsK, tKVcKV, tKVpKV,
@@ -920,12 +930,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
     // Advance gV
     if (block_table == nullptr) {
       tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+      tVgV_quant.data() = tVgV_quant.data() + (-int(kBlockN * params.v_row_stride));
     } else {
       const int block_table_idx_cur = (n_block + 1) * kBlockN / params.page_block_size;
       const int block_table_offset_cur = (n_block + 1) * kBlockN - block_table_idx_cur * params.page_block_size;
       const int block_table_idx_next = n_block * kBlockN / params.page_block_size;
       const int block_table_offset_next = n_block * kBlockN - block_table_idx_next * params.page_block_size;
-      tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
+      const int offset_diff = block_table_offset_next - block_table_offset_cur;
+      tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + offset_diff * params.v_row_stride;
+      tVgV_quant.data() = tVgV_quant.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + offset_diff * params.v_row_stride;
     }
     if constexpr (V_QUANT_TYPE != 0) {
         flash::copy_and_dequantize</*Is_even_MN=*/true, Is_even_K, V_QUANT_TYPE, KV_BIT_WIDTH>(
@@ -951,12 +964,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
       // Advance gK
       if (block_table == nullptr) {
         tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+        tKgK_quant.data() = tKgK_quant.data() + (-int(kBlockN * params.k_row_stride));
       } else {
         const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
         const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
         const int block_table_idx_next = (n_block - 1) * kBlockN / params.page_block_size;
         const int block_table_offset_next = (n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
-        tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
+        const int offset_diff = block_table_offset_next - block_table_offset_cur;
+        tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + offset_diff * params.k_row_stride;
+        tKgK_quant.data() = tKgK_quant.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + offset_diff * params.k_row_stride;
       }
       if constexpr (K_QUANT_TYPE != 0) {
         flash::copy_and_dequantize</*Is_even_MN=*/true, Is_even_K, K_QUANT_TYPE, KV_BIT_WIDTH>(

@@ -60,6 +60,21 @@ __global__ void repeat_seqlen(int32_t* seqlens_k, int32_t seqlen, int batch_size
   if (id < batch_size) seqlens_k[id] = seqlen;
 }
 
+__global__ void GetPastSeqLens(const int32_t* total_seqlens, int32_t* past_seqlens, const int batch_size, const int sequence_length) {
+    int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    if (tid < batch_size) {
+        past_seqlens[tid] = total_seqlens[tid] + 1 - sequence_length;
+    }
+}
+
+Status LaunchGetPastSeqLens(const int32_t* total_seqlens, int32_t* past_seqlens, const int batch_size, const int sequence_length, cudaStream_t stream, const int max_threads_per_block) {
+    const int threads = std::min(batch_size, max_threads_per_block);
+    const int blocks = (batch_size + threads - 1) / threads;
+    GetPastSeqLens<<<blocks, threads, 0, stream>>>(total_seqlens, past_seqlens, batch_size, sequence_length);
+    return CUDA_CALL(cudaGetLastError());
+}
+
+
 // Concat new to past in present. Supports past BSNH or past BNSH
 template <typename T>
 Status LaunchConcatNewToPastKV(contrib::GroupQueryAttentionParameters& parameters,
@@ -433,12 +448,13 @@ Status FlashAttention(
   }
 
   void* seqlens_k = reinterpret_cast<void*>(data.seqlens_k);
-  if (parameters.is_subsequent_prompt) {
-    ORT_RETURN_IF_ERROR(LaunchGetSeqlensInteractive(reinterpret_cast<const int32_t*>(data.seqlens_k),
-                                                    reinterpret_cast<int32_t*>(data.seqlens_k_buff), batch_size,
-                                                    sequence_length, stream, max_threads_per_block));
-    seqlens_k = reinterpret_cast<void*>(data.seqlens_k_buff);
-  } else if (parameters.is_first_prompt) {
+  // if (parameters.is_subsequent_prompt) {
+  //   ORT_RETURN_IF_ERROR(LaunchGetSeqlensInteractive(reinterpret_cast<const int32_t*>(data.seqlens_k),
+  //                                                   reinterpret_cast<int32_t*>(data.seqlens_k_buff), batch_size,
+  //                                                   sequence_length, stream, max_threads_per_block));
+  //   seqlens_k = reinterpret_cast<void*>(data.seqlens_k_buff);
+  // } else
+  if (parameters.is_first_prompt) {
     // set seqlens_k to zeros... flash api uses seqlens_k to indicate where to append key and value
     // user should use seqlens_k to index into output to get new tokens
     if (batch_size <= parameters.zeros_count) {
@@ -450,6 +466,13 @@ Status FlashAttention(
       repeat_seqlen<<<blk_in_grid, thr_per_blk, 0, stream>>>(data.seqlens_k_buff, 0, batch_size);
       seqlens_k = reinterpret_cast<void*>(data.seqlens_k_buff);
     }
+  } else {
+    // THIS IS THE FIX: Add this 'else' block to handle the standard "past" case.
+    // This logic correctly calculates 'past_len' from the 'total_len - 1' input.
+    ORT_RETURN_IF_ERROR(LaunchGetSeqlensInteractive(reinterpret_cast<const int32_t*>(data.seqlens_k),
+                                                    reinterpret_cast<int32_t*>(data.seqlens_k_buff), batch_size,
+                                                    sequence_length, stream, max_threads_per_block));
+    seqlens_k = reinterpret_cast<void*>(data.seqlens_k_buff);
   }
 
   if (!parameters.kv_share_buffer || parameters.is_first_prompt) {  // copy past kv to present kv
