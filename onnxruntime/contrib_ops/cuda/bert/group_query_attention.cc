@@ -8,6 +8,8 @@
 #include "contrib_ops/cpu/bert/group_query_attention_helper.h"
 #include "contrib_ops/cuda/bert/cutlass_fmha/memory_efficient_attention.h"
 #include "contrib_ops/cuda/bert/flash_attention/flash_api.h"
+#include "contrib_ops/cuda/utils/dump_cuda_tensor.h"
+#include "contrib_ops/cpu/utils/debug_macros.h"
 
 using namespace onnxruntime::cuda;
 using namespace ::onnxruntime::common;
@@ -95,8 +97,6 @@ Status HandleDequantization(
       return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Quantized KV cache requires kv_cache_bit_width to be 4 or 8.");
     }
     ORT_RETURN_IF_ERROR(status);
-    // DUMP_TENSOR("dequantized_past_key", quant_data.dequantized_past_key_buffer.get(),
-    //             params.batch_size, params.kv_num_heads, params.seqlen_past_kv_cache, params.head_size);
 
     quant_data.dequantized_present_key_buffer = kernel->template GetScratchBuffer<T>(present_kv_size, context->GetComputeStream());
     data.present_key = reinterpret_cast<CudaT*>(quant_data.dequantized_present_key_buffer.get());
@@ -130,8 +130,6 @@ Status HandleDequantization(
       return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Quantized KV cache requires kv_cache_bit_width to be 4 or 8.");
     }
     ORT_RETURN_IF_ERROR(status);
-    // DUMP_TENSOR("dequantized_past_value", quant_data.dequantized_past_value_buffer.get(),
-    //             params.batch_size, params.kv_num_heads, params.seqlen_past_kv_cache, params.head_size);
 
     quant_data.dequantized_present_value_buffer = kernel->template GetScratchBuffer<T>(present_kv_size, context->GetComputeStream());
     data.present_value = reinterpret_cast<CudaT*>(quant_data.dequantized_present_value_buffer.get());
@@ -444,6 +442,12 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
 
   QuantizationData<T> quant_data;
   ORT_RETURN_IF_ERROR(HandleDequantization(this, context, parameters, data, quant_data));
+
+  DUMP_TENSOR_INIT();
+  DUMP_TENSOR("past_key", data.past_key,
+                parameters.batch_size, parameters.kv_num_heads, parameters.seqlen_past_kv_cache, parameters.head_size);
+  DUMP_TENSOR("past_value", data.past_value,
+               parameters.batch_size, parameters.kv_num_heads, parameters.seqlen_past_kv_cache, parameters.head_size);
 
   if (data.past_key == data.present_key) {
     parameters.kv_share_buffer = true;
