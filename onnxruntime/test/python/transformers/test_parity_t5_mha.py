@@ -147,7 +147,7 @@ def create_t5_mha_graph(
         initializers,
     )
 
-    model = helper.make_model(graph)
+    model = helper.make_model(graph, opset_imports=(helper.make_opsetid("ai.onnx", 18), helper.make_opsetid(domain="com.microsoft", version=1)))
     return model.SerializeToString()
 
 
@@ -264,7 +264,7 @@ def create_t5_decoder_masked_mha_graph(
         initializers,
     )
 
-    model = helper.make_model(graph)
+    model = helper.make_model(graph, opset_imports=(helper.make_opsetid("ai.onnx", 18), helper.make_opsetid(domain="com.microsoft", version=1)))
     return model.SerializeToString()
 
 

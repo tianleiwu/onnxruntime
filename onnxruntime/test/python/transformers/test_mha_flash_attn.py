@@ -99,7 +99,7 @@ def create_packed_multihead_attention_graph(config: Config):
         ],
     )
 
-    model = helper.make_model(graph)
+    model = helper.make_model(graph, opset_imports=(helper.make_opsetid("ai.onnx", 18), helper.make_opsetid(domain="com.microsoft", version=1)))
     return model.SerializeToString()
 
 
@@ -160,7 +160,7 @@ def create_multihead_attention_graph(config: Config):
         ],
     )
 
-    model = helper.make_model(graph)
+    model = helper.make_model(graph, opset_imports=(helper.make_opsetid("ai.onnx", 18), helper.make_opsetid(domain="com.microsoft", version=1)))
     return model.SerializeToString()
 
 
@@ -371,7 +371,7 @@ def parity_check_mha(
         out = torch.reshape(out, (config.batch_size, config.sequence_length, config.num_heads, config.head_size))
         out = out.detach().cpu().numpy()
         # Pytorch to compare
-        out_ref, _ = attention_ref(q, k, v, None, None, 0.0, None, causal=False)
+        out_ref, _ = attention_ref(q, k, v)
         out_ref = out_ref.detach().cpu().numpy()
 
     numpy.testing.assert_allclose(

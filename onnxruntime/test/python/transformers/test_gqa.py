@@ -261,9 +261,8 @@ def create_group_query_attention_graph_prompt(
     ]
 
     graph = helper.make_graph(nodes, "GroupQueryAttention_Graph", graph_input, graph_output)
-    model = helper.make_model(graph)
+    model = helper.make_model(graph, opset_imports=(helper.make_opsetid("ai.onnx", 18), helper.make_opsetid(domain="com.microsoft", version=1)))
     return model.SerializeToString()
-
 
 def create_group_query_attention_graph_past(
     config: GQAConfig,
@@ -381,7 +380,7 @@ def create_group_query_attention_graph_past(
     ]
 
     graph = helper.make_graph(nodes, "GroupQueryAttention_Graph", graph_input, graph_output)
-    model = helper.make_model(graph)
+    model = helper.make_model(graph, opset_imports=(helper.make_opsetid("ai.onnx", 18), helper.make_opsetid(domain="com.microsoft", version=1)))
     return model.SerializeToString()
 
 

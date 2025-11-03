@@ -21,7 +21,6 @@ import torch
 from onnx import helper
 from parity_utilities import compare_outputs, create_ort_session, find_transformers_source, parse_arguments
 from torch import nn
-from transformers.modeling_utils import Conv1D
 
 if find_transformers_source():
     from onnx_model import OnnxModel
@@ -61,9 +60,9 @@ class MyGPT2Attention(nn.Module):
         self.split_size = self.embed_dim
         assert self.head_dim * self.num_heads == self.embed_dim
 
-        self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
+        self.c_attn = torch.nn.Linear(3 * self.embed_dim, self.embed_dim)
         # Use random bias instead of zeros for parity test.
-        self.c_attn.bias = nn.Parameter(torch.normal(0.0, 0.1, (3 * self.embed_dim,)))
+        self.c_attn.bias = nn.Parameter(torch.normal(0.0, 0.1, (self.embed_dim,)))
 
         self.use_cache = use_cache
         self.debug = debug

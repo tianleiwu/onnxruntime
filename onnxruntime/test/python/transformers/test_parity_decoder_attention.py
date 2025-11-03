@@ -382,7 +382,7 @@ def create_decoder_attention_graph(
         initializers,
     )
 
-    model = helper.make_model(graph)
+    model = helper.make_model(graph, opset_imports=(helper.make_opsetid("ai.onnx", 18), helper.make_opsetid(domain="com.microsoft", version=1)))
     return model.SerializeToString()
 
 

@@ -21,7 +21,7 @@ from bert_padding import pad_input, unpad_input
 from einops import rearrange, repeat
 from onnx import TensorProto, helper
 
-from onnxruntime import InferenceSession, OrtValue, SessionOptions
+from onnxruntime import InferenceSession, OrtValue, SessionOptions, get_available_providers
 
 torch.manual_seed(0)
 
@@ -384,7 +384,7 @@ def create_group_query_attention_graph_prompt(
         graph_output,
     )
 
-    model = helper.make_model(graph)
+    model = helper.make_model(graph, opset_imports=(helper.make_opsetid("ai.onnx", 18), helper.make_opsetid(domain="com.microsoft", version=1)))
 
     return model.SerializeToString()
 
@@ -604,7 +604,7 @@ def create_group_query_attention_graph_past(
         graph_output,
     )
 
-    model = helper.make_model(graph)
+    model = helper.make_model(graph, opset_imports=(helper.make_opsetid("ai.onnx", 18), helper.make_opsetid(domain="com.microsoft", version=1)))
     return model.SerializeToString()
 
 
@@ -2481,6 +2481,10 @@ class TestGQA(unittest.TestCase):
         qk_output,
         additional_params=None,
     ):
+        if "CUDAExecutionProvider" in get_available_providers():
+            print("CUDA is available, skipping CPU-only tests.")
+            return
+
         if additional_params is None:
             additional_params = {}
 
