@@ -1427,9 +1427,18 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
 constexpr const char* qMoE_ver1_doc = R"DOC(
       Quantized mixture of experts (MoE).
 
-      Only weights are quantized with symmetric quantization.
       The quantized weights are stored in column major order per expert.
       The quantization block size can be specified. If not provided, column wise quantization is used.
+
+      The formula of linear dequantization of the quantized weights using scale and (optionally) zero-point is:
+        dequantized_weight = (quantized_weight - zero_point) * scale
+      When zero_point is not provided, the default value is 2^(bits-1): 8 for 4 bits, 128 for 8 bits.
+
+      If block_size is provided, both hidden_size and inter_size must be divisible by the block size, and
+      the dequantization is performed per block of size block_size along the K (input feature) dimension.
+
+      If block_size and zero_point are provided, both hidden_size and inter_size must be divisible by block_size * pack_size,
+      where pack_size = 8 / expert_weight_bits.
 
       The SwiGLU (Swish-Gated Linear Unit) activation function is like:
          g = xW + b
@@ -1484,8 +1493,7 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
         .Attr("block_size",
               "Size of each quantization block along the K (input feature) dimension. "
               "Must be power of two and ≥ 16 (e.g., 16, 32, 64, 128). "
-              "If provided, both hidden_size and inter_size must be divisible by the block size. "
-              "Otherwise, there is no blocking and a whole column shares one scaling factor. ",
+              "If not provided, there is no blocking and a whole column shares one scaling factor. ",
               AttributeProto::INT,
               OPTIONAL_VALUE)
         .Input(0,
@@ -1500,7 +1508,7 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
         .Input(2,
                "fc1_experts_weights",
                "3D tensor with shape (num_experts, fusion_size * inter_size, hidden_size / pack_size), "
-               "The fusion_size is 2 for fused swiglu, or 1 otherwise. The pack_size is 8 / expert_weight_bits.",
+               "The fusion_size is 2 for fused swiglu, or 1 otherwise.",
                "T1")
         .Input(3,
                "fc1_scales",
@@ -1539,6 +1547,24 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
                "fc3_experts_bias",
                "2D optional tensor with shape (num_experts, inter_size)",
                "T",
+               OpSchema::Optional)
+        .Input(11,
+               "fc1_zero_points",
+               "2D tensor with shape (num_experts, fusion_size * inter_size / pack_size), or "
+               "3D tensor with shape (num_experts, fusion_size * inter_size, hidden_size / block_size / pack_size) when block_size is provided.",
+               "T1",
+               OpSchema::Optional)
+        .Input(12,
+               "fc2_zero_points",
+               "2D tensor with shape (num_experts, hidden_size / pack_size), or "
+               "3D tensor with shape (num_experts, hidden_size, inter_size / block_size / pack_size) when block_size is provided.",
+               "T1",
+               OpSchema::Optional)
+        .Input(13,
+               "fc3_zero_points",
+               "2D optional tensor with shape (num_experts, inter_size / pack_size), or "
+               "3D optional tensor with shape (num_experts, inter_size, hidden_size / block_size / pack_size) when block_size is provided.",
+               "T1",
                OpSchema::Optional)
         .Output(0,
                 "output",
