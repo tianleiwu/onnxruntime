@@ -98,15 +98,17 @@ Status LaunchDequantizeKV(cudaStream_t stream, T* dequantized_data,
 template <typename T, typename T_QUANT, typename T_SCALE>
 __global__ void QuantizeKernel(T_QUANT* quantized_data,
                                const T* dequantized_data, const T_SCALE* scale,
-                               const int* seqlens, int total_elements,
+                               const int* seqlens, int total_packed_elements,
                                int cache_sequence_length, int num_heads, int head_size,
                                int bit_width, KVQuantizationType quant_type) {
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total_elements;
+  int elements_per_head_packed = (bit_width == 4) ? (head_size + 1) / 2 : head_size;
+
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total_packed_elements;
        i += blockDim.x * gridDim.x) {
-    int h = i % head_size;
-    int s = (i / head_size) % cache_sequence_length;
-    int n = (i / (head_size * cache_sequence_length)) % num_heads;
-    int b = i / (num_heads * head_size * cache_sequence_length);
+    int h_packed = i % elements_per_head_packed;
+    int s = (i / elements_per_head_packed) % cache_sequence_length;
+    int n = (i / (elements_per_head_packed * cache_sequence_length)) % num_heads;
+    int b = i / (num_heads * elements_per_head_packed * cache_sequence_length);
 
     // Zero out padding in the present_kv cache.
     // `seqlens` (seqlens_k) provides the total valid sequence length for each batch item.
@@ -116,78 +118,77 @@ __global__ void QuantizeKernel(T_QUANT* quantized_data,
       if (bit_width == 8) {
         reinterpret_cast<int8_t*>(quantized_data)[i] = 0;
       } else {  // 4
-        // To avoid race conditions, only the thread for the even index writes the packed byte.
-        if (i % 2 == 0) {
-          uint8_t zero_nibble = (0 + 8) & 0x0F;
-          uint8_t high_nibble;
-          // Check if the next element is also in a padded region.
-          if (s >= total_valid_len_b - (i % 2 == 0 ? 1 : 0)) {
-            high_nibble = (0 + 8) & 0x0F;
-          } else {
-            // This path is complex; the safest approach is ensuring padded dequantized_data is zero,
-            // but for robustness, we handle it here. Let's assume the adjacent value needs to be calculated.
-            // (A simpler implementation would be to ensure `dequantized_data` is zeroed out before this kernel)
-            // For now, let's just write zero for both nibbles if the first is padding.
-            high_nibble = (0 + 8) & 0x0F;
-          }
-          reinterpret_cast<uint8_t*>(quantized_data)[i / 2] = zero_nibble | (high_nibble << 4);
-        }
+        // With packed iteration, each thread handles one byte (2 values).
+        // Since we are in the padding region, write a zero byte.
+        reinterpret_cast<uint8_t*>(quantized_data)[i] = (0 + 8) | ((0 + 8) << 4);
       }
       continue;
     }
 
-    float scale_val = 1.0f;
-    if (quant_type == KVQuantizationType::PER_TENSOR) {
-      scale_val = static_cast<float>(scale[0]);
-    } else {  // PER_CHANNEL
-      int scale_idx = n * head_size + h;
-      scale_val = static_cast<float>(scale[scale_idx]);
-    }
-
-    float inv_scale = (scale_val == 0.0f) ? 0.0f : 1.0f / scale_val;
-    float val_float = static_cast<float>(dequantized_data[i]) * inv_scale;
-
     if (bit_width == 8) {
+      int h = h_packed;
+      float scale_val = 1.0f;
+      if (quant_type == KVQuantizationType::PER_TENSOR) {
+        scale_val = static_cast<float>(scale[0]);
+      } else {  // PER_CHANNEL
+        int scale_idx = n * head_size + h;
+        scale_val = static_cast<float>(scale[scale_idx]);
+      }
+
+      float inv_scale = (scale_val == 0.0f) ? 0.0f : 1.0f / scale_val;
+      int64_t flattened_input_idx = (int64_t)b * num_heads * cache_sequence_length * head_size +
+                                    (int64_t)n * cache_sequence_length * head_size +
+                                    (int64_t)s * head_size +
+                                    h;
+      float val_float = static_cast<float>(dequantized_data[flattened_input_idx]) * inv_scale;
+
       int32_t val_int32 = static_cast<int32_t>(rintf(val_float));
       reinterpret_cast<int8_t*>(quantized_data)[i] =
           static_cast<int8_t>(max(-128, min(127, val_int32)));
     } else {  // 4
-      int32_t val_int32 = static_cast<int32_t>(rintf(val_float));
-      int8_t val_int8 = static_cast<int8_t>(max(-8, min(7, val_int32)));
+      int h0 = h_packed * 2;
+      int h1 = h0 + 1;
 
-      if (i % 2 == 0) {
-        int8_t next_val_int8 = 0;
-        if (i + 1 < total_elements) {
-          int s_next = ((i + 1) / head_size) % cache_sequence_length;
-          // Check if the next element is in a padded region as well.
-          if (s_next >= total_valid_len_b) {
-            next_val_int8 = 0;
-          } else {
-            float scale_val_next = 1.0f;
-            if (quant_type == KVQuantizationType::PER_TENSOR) {
-              scale_val_next = static_cast<float>(scale[0]);
-            } else {  // PER_CHANNEL
-              int h_next = (i + 1) % head_size;
-              int n_next = ((i + 1) / (head_size * cache_sequence_length)) % num_heads;
-              int scale_idx_next = n_next * head_size + h_next;
-              scale_val_next = static_cast<float>(scale[scale_idx_next]);
-            }
-
-            float inv_scale_next =
-                (scale_val_next == 0.0f) ? 0.0f : 1.0f / scale_val_next;
-            float next_val_float =
-                static_cast<float>(dequantized_data[i + 1]) * inv_scale_next;
-
-            int32_t next_val_int32 = static_cast<int32_t>(rintf(next_val_float));
-            next_val_int8 = static_cast<int8_t>(max(-8, min(7, next_val_int32)));
-          }
-        }
-
-        uint8_t low_nibble = (val_int8 + 8) & 0x0F;
-        uint8_t high_nibble = (next_val_int8 + 8) & 0x0F;
-        reinterpret_cast<uint8_t*>(quantized_data)[i / 2] =
-            low_nibble | (high_nibble << 4);
+      // Compute first nibble
+      float scale0 = 1.0f;
+      if (quant_type == KVQuantizationType::PER_TENSOR) {
+        scale0 = static_cast<float>(scale[0]);
+      } else {
+        scale0 = static_cast<float>(scale[n * head_size + h0]);
       }
+      float inv_scale0 = (scale0 == 0.0f) ? 0.0f : 1.0f / scale0;
+
+      int64_t input_idx0 = (int64_t)b * num_heads * cache_sequence_length * head_size +
+                           (int64_t)n * cache_sequence_length * head_size +
+                           (int64_t)s * head_size +
+                           h0;
+      float val0 = static_cast<float>(dequantized_data[input_idx0]) * inv_scale0;
+      int8_t q0 = static_cast<int8_t>(max(-8.0f, min(7.0f, rintf(val0))));
+
+      // Compute second nibble if within head_size
+      int8_t q1 = 0; // Default to 0 (value 0) if padded
+      if (h1 < head_size) {
+        float scale1 = 1.0f;
+        if (quant_type == KVQuantizationType::PER_TENSOR) {
+           scale1 = static_cast<float>(scale[0]);
+        } else {
+           scale1 = static_cast<float>(scale[n * head_size + h1]);
+        }
+        float inv_scale1 = (scale1 == 0.0f) ? 0.0f : 1.0f / scale1;
+
+        int64_t input_idx1 = (int64_t)b * num_heads * cache_sequence_length * head_size +
+                             (int64_t)n * cache_sequence_length * head_size +
+                             (int64_t)s * head_size +
+                             h1;
+        float val1 = static_cast<float>(dequantized_data[input_idx1]) * inv_scale1;
+        q1 = static_cast<int8_t>(max(-8.0f, min(7.0f, rintf(val1))));
+      } else {
+         // Padding for odd head_size
+         q1 = 0;
+      }
+
+      uint8_t packed = ((q0 + 8) & 0x0F) | (((q1 + 8) & 0x0F) << 4);
+      reinterpret_cast<uint8_t*>(quantized_data)[i] = packed;
     }
   }
 }
@@ -294,12 +295,14 @@ Status LaunchQuantizeKV(cudaStream_t stream, T_QUANT* quantized_data,
                         KVQuantizationType quant_type) {
   if (cache_sequence_length == 0) return Status::OK();
 
-  int total_elements = batch_size * num_heads * cache_sequence_length * head_size;
+  int elements_per_head_packed = (bit_width == 4) ? (head_size + 1) / 2 : head_size;
+  int total_packed_elements = batch_size * num_heads * cache_sequence_length * elements_per_head_packed;
+
   const int threads_per_block = 256;
-  int blocks = (total_elements + threads_per_block - 1) / threads_per_block;
+  int blocks = (total_packed_elements + threads_per_block - 1) / threads_per_block;
 
   QuantizeKernel<T, T_QUANT, T_SCALE><<<blocks, threads_per_block, 0, stream>>>(
-      quantized_data, dequantized_data, scale, seqlens, total_elements,
+      quantized_data, dequantized_data, scale, seqlens, total_packed_elements,
       cache_sequence_length, num_heads, head_size, bit_width, quant_type);
 
   return CUDA_CALL(cudaGetLastError());
