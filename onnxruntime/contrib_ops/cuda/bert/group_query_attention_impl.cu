@@ -469,11 +469,13 @@ Status FlashAttention(
     if (manual_append_quant) {
       ORT_RETURN_IF_ERROR(LaunchGetSeqlensTotal(data.seqlens_k, data.seqlens_k_buff, batch_size, stream, max_threads_per_block));
 
-      // [DEBUG PRINT SEQLEN]
+#if DUMP_TENSOR_LEVEL > 0
       int32_t cpu_seqlen = 0;
       cudaMemcpyAsync(&cpu_seqlen, data.seqlens_k_buff, sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
       cudaStreamSynchronize(stream);  // Force wait to print
       printf("[GQA Impl] Batch0 Total SeqLen used for Append: %d (New Token Appended)\n", cpu_seqlen);
+#endif
+
     } else {
       ORT_RETURN_IF_ERROR(LaunchGetSeqlensInteractive(
           reinterpret_cast<const int32_t*>(data.seqlens_k),
@@ -484,11 +486,14 @@ Status FlashAttention(
   }
 
   bool is_quantized = parameters.k_quant_type != KVQuantizationType::NONE;
+
+#if DUMP_TENSOR_LEVEL > 0
   printf("[GQA Impl] is_quantized: %d, is_packed_qkv: %d, is_first_prompt: %d, kv_share_buffer: %d\n",
          static_cast<int>(is_quantized),
          static_cast<int>(parameters.is_packed_qkv),
          static_cast<int>(parameters.is_first_prompt),
          static_cast<int>(parameters.kv_share_buffer));
+#endif
 
   if (is_quantized) {
     // [Manual Append Logic]
