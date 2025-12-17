@@ -166,7 +166,7 @@ void run_mha_fwd_splitkv_dispatch(Flash_fwd_params& params, cudaStream_t stream)
 }
 
 
-template <typename Kernel_traits>
+template <typename Kernel_traits, int bits>
 void run_flash_splitkv_fwd_quant(Flash_fwd_params& params, cudaStream_t stream) {
   constexpr size_t smem_size = Kernel_traits::kSmemSize;
   const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
@@ -188,17 +188,19 @@ void run_flash_splitkv_fwd_quant(Flash_fwd_params& params, cudaStream_t stream) 
                   using kernel_t = void (*)(const Flash_fwd_params);
                   kernel_t kernel = nullptr;
 
-                  if (params.k_quant_type == 1 && params.v_quant_type == 1 && params.kv_cache_bit_width == 8) {
-                    kernel = &flash_fwd_splitkv_kernel < Kernel_traits, Is_causal, Is_Local_Const && !Is_causal, Has_alibi,
-                    IsEvenMNConst && !Append_KV_Const && IsEvenKConst && !Is_Local_Const && Kernel_traits::kHeadDim <= 128,
-                    IsEvenKConst, Is_softcap, SplitConst, Append_KV_Const, 1, 1, 8 > ;
-                  }
-
-                  if constexpr (ENABLE_FLASH_ATTENTION_4_BIT) {
-                    if (params.k_quant_type == 2 && params.v_quant_type == 2 && params.kv_cache_bit_width == 4) {
-                      kernel = &flash_fwd_splitkv_kernel < Kernel_traits, Is_causal, Is_Local_Const && !Is_causal, Has_alibi,
-                      IsEvenMNConst && !Append_KV_Const && IsEvenKConst && !Is_Local_Const && Kernel_traits::kHeadDim <= 128,
-                      IsEvenKConst, Is_softcap, SplitConst, Append_KV_Const, 2, 2, 4 > ;
+                  if constexpr (bits == 8) {
+                    if (params.k_quant_type == 1 && params.v_quant_type == 1 && params.kv_cache_bit_width == 8) {
+                        kernel = &flash_fwd_splitkv_kernel < Kernel_traits, Is_causal, Is_Local_Const && !Is_causal, Has_alibi,
+                        IsEvenMNConst && !Append_KV_Const && IsEvenKConst && !Is_Local_Const && Kernel_traits::kHeadDim <= 128,
+                        IsEvenKConst, Is_softcap, SplitConst, Append_KV_Const, 1, 1, 8 > ;
+                    }
+                  } else if constexpr (bits == 4) {
+                    if constexpr (ENABLE_FLASH_ATTENTION_4_BIT) {
+                        if (params.k_quant_type == 2 && params.v_quant_type == 2 && params.kv_cache_bit_width == 4) {
+                        kernel = &flash_fwd_splitkv_kernel < Kernel_traits, Is_causal, Is_Local_Const && !Is_causal, Has_alibi,
+                        IsEvenMNConst && !Append_KV_Const && IsEvenKConst && !Is_Local_Const && Kernel_traits::kHeadDim <= 128,
+                        IsEvenKConst, Is_softcap, SplitConst, Append_KV_Const, 2, 2, 4 > ;
+                        }
                     }
                   }
 
@@ -216,11 +218,6 @@ void run_flash_splitkv_fwd_quant(Flash_fwd_params& params, cudaStream_t stream) 
       });
     });
   });
-
-  // Note: combine_attn_seqk_parallel (output accumulation) is independent of quantization
-  // and is handled in the standard path or can be duplicated here if needed.
-  // Since it operates on float accumulation buffers, we can reuse the logic or call the separate kernel.
-  // For simplicity, duplicate the combine logic or extract it to a helper.
 
   if (params.num_splits > 1) {
     // We want kBlockM to be as small as possible for more parallelism.
@@ -249,11 +246,20 @@ void run_flash_splitkv_fwd_quant(Flash_fwd_params& params, cudaStream_t stream) 
 }
 
 template <typename T, int Headdim>
-void run_mha_fwd_splitkv_dispatch_quant(Flash_fwd_params& params, cudaStream_t stream) {
+void run_mha_fwd_splitkv_dispatch_quant_8bit(Flash_fwd_params& params, cudaStream_t stream) {
   if constexpr (Headdim == 128) { // Guard to prevent instantiating unused dims
       constexpr static int kBlockM = 64;
       constexpr static int kBlockN = 128;
-      run_flash_splitkv_fwd_quant<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>>(params, stream);
+      run_flash_splitkv_fwd_quant<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, 8>(params, stream);
+  }
+}
+
+template <typename T, int Headdim>
+void run_mha_fwd_splitkv_dispatch_quant_4bit(Flash_fwd_params& params, cudaStream_t stream) {
+  if constexpr (Headdim == 128) { // Guard to prevent instantiating unused dims
+      constexpr static int kBlockM = 64;
+      constexpr static int kBlockN = 128;
+      run_flash_splitkv_fwd_quant<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, 4>(params, stream);
   }
 }
 

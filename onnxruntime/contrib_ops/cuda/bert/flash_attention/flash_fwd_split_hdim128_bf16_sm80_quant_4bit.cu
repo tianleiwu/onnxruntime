@@ -8,8 +8,8 @@
 namespace onnxruntime {
 namespace flash {
 
-// Explicitly instantiate ONLY the quantized dispatcher
-template void run_mha_fwd_splitkv_dispatch_quant<cutlass::half_t, 128>(Flash_fwd_params& params, cudaStream_t stream);
+// Explicitly instantiate ONLY the 4-bit quantized dispatcher
+template void run_mha_fwd_splitkv_dispatch_quant_4bit<cutlass::bfloat16_t, 128>(Flash_fwd_params& params, cudaStream_t stream);
 
 }  // namespace flash
 }  // namespace onnxruntime

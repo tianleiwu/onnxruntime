@@ -12,7 +12,7 @@ namespace flash {
 constexpr int TOTAL_DIM = 0;
 constexpr int H_DIM = 1;
 constexpr int D_DIM = 2;
-constexpr bool ENABLE_FLASH_ATTENTION_4_BIT = false;
+constexpr bool ENABLE_FLASH_ATTENTION_4_BIT = true;
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct Qkv_params {
@@ -154,7 +154,11 @@ template <typename T, int Headdim>
 void run_mha_fwd_splitkv_dispatch(Flash_fwd_params& params, cudaStream_t stream);
 
 template <typename T, int Headdim>
-void run_mha_fwd_splitkv_dispatch_quant(Flash_fwd_params& params, cudaStream_t stream);
+void run_mha_fwd_splitkv_dispatch_quant_8bit(Flash_fwd_params& params, cudaStream_t stream);
+
+template <typename T, int Headdim>
+void run_mha_fwd_splitkv_dispatch_quant_4bit(Flash_fwd_params& params, cudaStream_t stream);
+
 
 }  // namespace flash
 }  // namespace onnxruntime

@@ -178,7 +178,11 @@ void run_mha_fwd(Flash_fwd_params& params, cudaStream_t stream, bool force_split
       } else {
         if (params.k_quant_type != 0) {
           if constexpr (kHeadDim == 128) {
-            run_mha_fwd_splitkv_dispatch_quant<elem_type, kHeadDim>(params, stream);
+            if (params.kv_cache_bit_width == 8) {
+              run_mha_fwd_splitkv_dispatch_quant_8bit<elem_type, kHeadDim>(params, stream);
+            } else if (params.kv_cache_bit_width == 4) {
+              run_mha_fwd_splitkv_dispatch_quant_4bit<elem_type, kHeadDim>(params, stream);
+            }
           } else {
             // This path should be unreachable if is_supported_quantization() works correctly.
             // Fallback to standard kernel to satisfy compiler/linker.
