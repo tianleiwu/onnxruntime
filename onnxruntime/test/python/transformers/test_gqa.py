@@ -16,9 +16,11 @@ import random
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
+from packaging import version
 
 import numpy
 import torch
+import onnxruntime
 from einops import rearrange, repeat
 from onnx import TensorProto, helper
 from parameterized import parameterized
@@ -31,6 +33,9 @@ random.seed(69)
 
 # Reduces number of tests to run for faster pipeline checks
 pipeline_mode = os.getenv("PIPELINE_MODE", "1") == "1"
+
+# Number of values per parameter (compared to pipeline mode)
+param_count = int(os.getenv("PARAM_COUNT", "2")) if not pipeline_mode else 1
 
 # #################################################################################################
 #  Configuration and Helper Classes
@@ -1237,7 +1242,8 @@ def parity_check_gqa_past(
 
 
 def get_cuda_rotary_options():
-    return [(False, False)] if pipeline_mode else [(True, False), (True, True), (False, False)]
+    options = [(False, False), (True, False), (True, True)]
+    return options[:param_count]
 
 
 def get_cpu_rotary_options():
@@ -1245,21 +1251,21 @@ def get_cpu_rotary_options():
 
 
 def get_softmax_options(allow_head_sink: bool = True):
-    head_sink_option = (False, True) if allow_head_sink else (False, False)
-    return [(False, False), head_sink_option] if pipeline_mode else [(False, False), (False, True), (True, False)]
+    options = [(False, False), (False, True), (True, False)]
+    return options[:2] if pipeline_mode else options[:param_count]
 
 
 def gqa_cuda_prompt_test_cases(allow_head_sink: bool = True):
-    batches = [3] if pipeline_mode else [1, 3, 5]
-    seqs = [(35, 35)] if pipeline_mode else [(35, 35), (127, 127), (240, 240), (2000, 2000)]
-    num_h = [(6, 3)] if pipeline_mode else [(6, 3), (9, 9), (32, 8)]
-    h_sizes = [128] if pipeline_mode else [32, 64, 128, 256]
+    batches = [3, 1, 5]
+    seqs = [(35, 35), (127, 127), (240, 240), (2000, 2000)]
+    heads = [(6, 3), (9, 9), (32, 8)]
+    h_sizes = [128, 32, 64, 256]
     smmoth_softmax__head_sink = get_softmax_options(allow_head_sink)
 
-    for b in batches:
-        for sq, skv in seqs:
-            for n, n2 in num_h:
-                for h in h_sizes:
+    for b in batches[:param_count]:
+        for sq, skv in seqs[:param_count]:
+            for n, n2 in heads[:param_count]:
+                for h in h_sizes[:param_count]:
                     for lws in [-1, random.randint(1, skv)]:
                         for rotary, rotary_interleaved in get_cuda_rotary_options():
                             for packed in [False, True]:
@@ -1291,18 +1297,18 @@ def gqa_cuda_prompt_test_cases(allow_head_sink: bool = True):
 
 
 def gqa_cuda_past_test_cases(allow_head_sink: bool = True):
-    batches = [5] if pipeline_mode else [1, 3, 5]
+    batches = [2, 1, 3]
     # s: new sequence length, s2: past sequence length
-    seqs = [(1, 1024)] if pipeline_mode else [(1, 128), (1, 1024), (1, 2048), (1, 5000)]
-    num_h = [(32, 8)] if pipeline_mode else [(6, 3), (9, 9), (32, 8)]
+    seqs = [(1, 128), (1, 1024), (1, 2048), (1, 5000)]
+    heads = [(32, 8), (6, 3), (9, 9)]
     # We test 128 in pipeline since quantized kv cache is only enabled for head_size=128 in flash attention.
-    h_sizes = [128] if pipeline_mode else [64, 128, 256]
+    h_sizes = [128, 64, 256]
     smmoth_softmax__head_sink = get_softmax_options(allow_head_sink)
 
-    for b in batches:
-        for s, s2 in seqs:
-            for n, n2 in num_h:
-                for h in h_sizes:
+    for b in batches[:param_count]:
+        for s, s2 in seqs[:param_count]:
+            for n, n2 in heads[:param_count]:
+                for h in h_sizes[:param_count]:
                     for lws in [-1, random.randint(1, s2)]:
                         for rotary, rotary_interleaved in get_cuda_rotary_options():
                             for packed in [False, True]:
@@ -1374,6 +1380,8 @@ def has_memory_efficient():
     major, _ = torch.cuda.get_device_capability()
     return major >= 5
 
+def has_quantized_kv_cache():
+    return version.parse(onnxruntime.__version__) >= version.parse("1.24.0")
 
 @unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
 class TestFlashGQA(unittest.TestCase):
@@ -1442,6 +1450,7 @@ class TestMemoryEfficientGQA(unittest.TestCase):
 
 
 @unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
+@unittest.skipIf(not has_quantized_kv_cache(), "Quantized KV Cache is not available, skipping tests.")
 class TestQuantizedGQA(unittest.TestCase):
     @parameterized.expand(gqa_cuda_quantized_test_cases(is_past=False))
     def test_gqa_quantized_prompt(self, name, config):
