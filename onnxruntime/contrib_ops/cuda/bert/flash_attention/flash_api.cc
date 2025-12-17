@@ -601,9 +601,10 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
     // FORTUNATELY, we can just pass `q` and handle the offset via `head_idx` logic OR adjust the pointer bytes.
     // Adjusting pointer bytes is safer given the kernel implementation.
 
-    size_t element_size = is_bf16 ? 2 : 2;  // fp16 or bf16
-    params.knew_ptr = static_cast<void*>(q_base + (num_heads * head_size * element_size));
-    params.vnew_ptr = static_cast<void*>(q_base + ((num_heads + num_heads_k) * head_size * element_size));
+    // We explicitly disable internal append for Packed QKV because of stride issues.
+    // ORT handles append externally via LaunchConcatNewToPastKV.
+    params.knew_ptr = nullptr;
+    params.vnew_ptr = nullptr;
   } else {
     params.seqlen_knew = 0;
     params.knew_ptr = nullptr;
