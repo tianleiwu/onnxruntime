@@ -555,6 +555,10 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
       params.vnew_batch_stride = (seqlen_q * num_heads * head_size) + (2 * seqlen_k_new * num_heads_k * head_size);
       params.knew_row_stride = (num_heads * head_size) + (2 * num_heads_k * head_size);
       params.vnew_row_stride = (num_heads * head_size) + (2 * num_heads_k * head_size);
+
+      // Disable kernel append for packed GQA
+      params.knew_ptr = nullptr;
+      params.vnew_ptr = nullptr;
     } else {
       params.knew_batch_stride = seqlen_k_new * num_heads_k * head_size;
       params.vnew_batch_stride = seqlen_k_new * num_heads_k * head_size;

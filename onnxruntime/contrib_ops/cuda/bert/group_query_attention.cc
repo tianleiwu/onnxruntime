@@ -431,6 +431,16 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
     data.softmax_lse_accum = reinterpret_cast<CudaT*>(softmax_lse_accum_buffer.get());
     data.out_accum = reinterpret_cast<CudaT*>(out_accum_buffer.get());
 
+    size_t unpacked_qkv_bytes = parameters.is_packed_qkv && (parameters.num_heads != parameters.kv_num_heads)
+                                    ? (static_cast<size_t>(parameters.batch_size) * parameters.sequence_length * (parameters.num_heads + 2 * parameters.kv_num_heads) * parameters.head_size * sizeof(T))
+                                    : 0;
+    if (unpacked_qkv_bytes > 0) {
+      unpacked_qkv_buffer = GetScratchBuffer<void>(unpacked_qkv_bytes, context->GetComputeStream());
+      data.unpacked_qkv_buffer = reinterpret_cast<CudaT*>(unpacked_qkv_buffer.get());
+    } else {
+      data.unpacked_qkv_buffer = nullptr;
+    }
+
   } else {
     // --- FALLBACK PATH ---
 

@@ -318,38 +318,47 @@ __global__ void UnpackQKV(const T* packed_qkv, T* unpacked_q, T* unpacked_k, T* 
     int b = tid / (d * sequence_length);
     int s = (tid % (d * sequence_length)) / d;
     int offset = tid % d;
-    if (output_bnsh) {  // output BNSH
-      int head_count = kv_num_heads;
-      T* unpacked;
-      if (offset < q_hidden) {
-        unpacked = unpacked_q;
-        head_count = num_heads;
-      } else if (offset < q_hidden + k_hidden) {
-        unpacked = unpacked_k;
-        offset -= q_hidden;
-      } else {
-        unpacked = unpacked_v;
-        offset -= (q_hidden + k_hidden);
-      }
-      int n = offset / head_size;
-      int h = offset % head_size;
+      if (output_bnsh) {  // output BNSH
+        int head_count = kv_num_heads;
+        T* unpacked = nullptr;
+        if (offset < q_hidden) {
+          unpacked = unpacked_q;
+          head_count = num_heads;
+        } else if (offset < q_hidden + k_hidden) {
+          unpacked = unpacked_k;
+          offset -= q_hidden;
+        } else {
+          unpacked = unpacked_v;
+          offset -= (q_hidden + k_hidden);
+        }
 
-      int unpacked_i = INDEX_4D(head_count, sequence_length, head_size, b, n, s, h);
-      unpacked[unpacked_i] = packed_qkv[tid];
-    } else {  // output BSNH
-      if (offset < q_hidden) {
-        int unpacked_i = b * sequence_length * num_heads * head_size + s * num_heads * head_size + offset;
-        unpacked_q[unpacked_i] = packed_qkv[tid];
-      } else if (offset < q_hidden + k_hidden) {
-        int unpacked_i = b * sequence_length * kv_num_heads * head_size +
-                         s * kv_num_heads * head_size + (offset - q_hidden);
-        unpacked_k[unpacked_i] = packed_qkv[tid];
-      } else {
-        int unpacked_i = b * sequence_length * kv_num_heads * head_size +
-                         s * kv_num_heads * head_size + (offset - q_hidden - k_hidden);
-        unpacked_v[unpacked_i] = packed_qkv[tid];
+        if (unpacked != nullptr) {
+          int n = offset / head_size;
+          int h = offset % head_size;
+
+          int unpacked_i = INDEX_4D(head_count, sequence_length, head_size, b, n, s, h);
+          unpacked[unpacked_i] = packed_qkv[tid];
+        }
+      } else {  // output BSNH
+        if (offset < q_hidden) {
+          if (unpacked_q != nullptr) {
+            int unpacked_i = b * sequence_length * num_heads * head_size + s * num_heads * head_size + offset;
+            unpacked_q[unpacked_i] = packed_qkv[tid];
+          }
+        } else if (offset < q_hidden + k_hidden) {
+          if (unpacked_k != nullptr) {
+            int unpacked_i = b * sequence_length * kv_num_heads * head_size +
+                             s * kv_num_heads * head_size + (offset - q_hidden);
+            unpacked_k[unpacked_i] = packed_qkv[tid];
+          }
+        } else {
+          if (unpacked_v != nullptr) {
+            int unpacked_i = b * sequence_length * kv_num_heads * head_size +
+                             s * kv_num_heads * head_size + (offset - q_hidden - k_hidden);
+            unpacked_v[unpacked_i] = packed_qkv[tid];
+          }
+        }
       }
-    }
   }
 }
 
@@ -523,11 +532,30 @@ Status FlashAttention(
     }
   } else {
     // [Standard FP16 Append Logic]
+    if (parameters.is_packed_qkv) {
+      // Unpack K and V from Packed QKV into temporary buffer
+      T* unpacked_buffer = reinterpret_cast<T*>(data.unpacked_qkv_buffer);
+      if (unpacked_buffer != nullptr) {
+          size_t q_size = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size;
+          T* unpacked_k = unpacked_buffer + q_size;
+          size_t k_size = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size;
+          T* unpacked_v = unpacked_k + k_size;
+
+          // Always unpack to BSNH as LaunchConcatNewToPastKV expects contiguous BSNH input
+          ORT_RETURN_IF_ERROR((LaunchUnpackQKV<T, false>(reinterpret_cast<const T*>(data.query), nullptr, unpacked_k, unpacked_v, num_heads, kv_num_heads, head_size, sequence_length, batch_size, stream, max_threads_per_block)));
+
+          // Update key/value to point to unpacked headers
+          key = unpacked_k;
+          value = unpacked_v;
+      }
+    }
+
     if (parameters.kv_share_buffer && !parameters.is_first_prompt) {
       constexpr bool is_new_kv_bnsh_format = false;
       ORT_RETURN_IF_ERROR(LaunchConcatKVInPlace(parameters, data, key, value, is_new_kv_bnsh_format, stream, max_threads_per_block));
     } else {
-      bool skip_new_append = data.use_flash_attention && parameters.is_packed_qkv;
+      // ORT MUST perform the append (using unpacked data for packed case)
+      bool skip_new_append = false;
       ORT_RETURN_IF_ERROR(LaunchConcatNewToPastKV(parameters, data, key, value, stream, max_threads_per_block, skip_new_append));
     }
   }
