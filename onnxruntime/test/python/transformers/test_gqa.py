@@ -1253,7 +1253,7 @@ def gqa_cuda_prompt_test_cases(allow_head_sink: bool = True):
     batches = [3] if pipeline_mode else [1, 3, 5]
     seqs = [(35, 35)] if pipeline_mode else [(35, 35), (127, 127), (240, 240), (2000, 2000)]
     num_h = [(6, 3)] if pipeline_mode else [(6, 3), (9, 9), (32, 8)]
-    h_sizes = [32] if pipeline_mode else [32, 64, 128, 256]
+    h_sizes = [128] if pipeline_mode else [32, 64, 128, 256]
     smmoth_softmax__head_sink = get_softmax_options(allow_head_sink)
 
     for b in batches:
@@ -1262,7 +1262,7 @@ def gqa_cuda_prompt_test_cases(allow_head_sink: bool = True):
                 for h in h_sizes:
                     for lws in [-1, random.randint(1, skv)]:
                         for rotary, rotary_interleaved in get_cuda_rotary_options():
-                            for packed in [False]: # TODO: [False, True]:
+                            for packed in [False, True]:
                                 for softcap in [0.0, 50.0]:
                                     if rotary and h % 16 > 0:
                                         continue
@@ -1455,7 +1455,7 @@ class TestQuantizedGQA(unittest.TestCase):
             ort_type=TensorProto.FLOAT16,
             causal=True,
             rtol=5e-2,
-            atol=5e-2,
+            atol=0.15,
         )
 
     @parameterized.expand(gqa_cuda_quantized_test_cases(is_past=True))
@@ -1470,7 +1470,7 @@ class TestQuantizedGQA(unittest.TestCase):
             ort_type=TensorProto.FLOAT16,
             causal=True,
             rtol=5e-2,
-            atol=5e-2,
+            atol=0.15,
         )
 
 

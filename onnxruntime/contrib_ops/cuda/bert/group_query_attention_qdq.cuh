@@ -198,68 +198,75 @@ template <typename T, typename T_QUANT, typename T_SCALE>
 __global__ void QuantizeAppendKernel(T_QUANT* cache_data,
                                      const T* new_data,
                                      const T_SCALE* scale,
-                                     const int* past_seqlens,
+                                     const int* total_seqlens,
                                      int max_seq_len,
                                      int num_heads,
                                      int head_size,
                                      int bit_width,
-                                     KVQuantizationType quant_type) {
+                                     int new_seq_len,
+                                     KVQuantizationType quant_type,
+                                     int batch_size) {
   int elements_per_head_packed = (bit_width == 4) ? (head_size + 1) / 2 : head_size;
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total_elements = gridDim.x * blockDim.x;
+  int total_elements = batch_size * num_heads * new_seq_len * elements_per_head_packed;
+
   if (idx >= total_elements) return;
 
   int h_packed = idx % elements_per_head_packed;
   int tmp = idx / elements_per_head_packed;
+  int s = tmp % new_seq_len;
+  tmp = tmp / new_seq_len;
   int n = tmp % num_heads;
   int b = tmp / num_heads;
 
-  if (b >= gridDim.x) return;
+  if (b >= batch_size) return;
 
-  int past_len = past_seqlens[b];
-
-  // [DEBUG PRINT]
-  // if (b == 0 && n == 0 && h_packed == 0) {
-  //     printf("[QuantAppend] B=%d N=%d PastLen=%d HeadSize=%d BitWidth=%d Type=%d\n",
-  //            b, num_heads, past_len, head_size, bit_width, (int)quant_type);
-  // }
+  int past_len = 0;
+  if (total_seqlens != nullptr) {
+      past_len = total_seqlens[b] - new_seq_len;
+  }
+  // For safety, ensure past_len >= 0. In prompt phase, it's 0.
+  if (past_len < 0) past_len = 0;
 
   int64_t cache_offset = (int64_t)b * num_heads * max_seq_len * elements_per_head_packed +
                          (int64_t)n * max_seq_len * elements_per_head_packed +
-                         (int64_t)past_len * elements_per_head_packed +
+                         (int64_t)(past_len + s) * elements_per_head_packed +
                          h_packed;
 
   if (bit_width == 8) {
     int h = h_packed;
-    int64_t src_idx = (int64_t)b * num_heads * head_size + n * head_size + h;
+    int64_t src_idx = (int64_t)b * num_heads * new_seq_len * head_size +
+                      (int64_t)n * new_seq_len * head_size +
+                      (int64_t)s * head_size +
+                      h;
     float val = static_cast<float>(new_data[src_idx]);
 
-    float s = 1.0f;
+    float s_scale = 1.0f;
     if (quant_type == KVQuantizationType::PER_TENSOR)
-      s = (float)scale[0];
+      s_scale = (float)scale[0];
     else if (quant_type == KVQuantizationType::PER_CHANNEL)
-      s = (float)scale[n * head_size + h];
+      s_scale = (float)scale[n * head_size + h];
 
-    float inv_s = (s == 0.0f) ? 0.0f : 1.0f / s;
+    float inv_s = (s_scale == 0.0f) ? 0.0f : 1.0f / s_scale;
     int8_t q_val = static_cast<int8_t>(max(-128.0f, min(127.0f, rintf(val * inv_s))));
     reinterpret_cast<int8_t*>(cache_data)[cache_offset] = q_val;
-
-    // [DEBUG PRINT DATA]
-    // if (b == 0 && n == 0 && h < 4) {
-    //     printf("[QuantAppend-8bit] H=%d Val=%f Scale=%f InvS=%f QVal=%d Offset=%lld\n",
-    //            h, val, s, inv_s, (int)q_val, cache_offset);
-    // }
 
   } else {  // Int4
     int h0 = h_packed * 2;
     int h1 = h0 + 1;
 
-    int64_t src_idx0 = (int64_t)b * num_heads * head_size + n * head_size + h0;
+    int64_t src_idx0 = (int64_t)b * num_heads * new_seq_len * head_size +
+                       (int64_t)n * new_seq_len * head_size +
+                       (int64_t)s * head_size +
+                       h0;
     float val0 = static_cast<float>(new_data[src_idx0]);
 
     float val1 = 0.0f;
     if (h1 < head_size) {
-      int64_t src_idx1 = (int64_t)b * num_heads * head_size + n * head_size + h1;
+      int64_t src_idx1 = (int64_t)b * num_heads * new_seq_len * head_size +
+                         (int64_t)n * new_seq_len * head_size +
+                         (int64_t)s * head_size +
+                         h1;
       val1 = static_cast<float>(new_data[src_idx1]);
     }
 
@@ -278,14 +285,9 @@ __global__ void QuantizeAppendKernel(T_QUANT* cache_data,
 
     uint8_t packed = ((q0 + 8) & 0x0F) | (((q1 + 8) & 0x0F) << 4);
     reinterpret_cast<uint8_t*>(cache_data)[cache_offset] = packed;
-
-    // [DEBUG PRINT DATA]
-    // if (b == 0 && n == 0 && h0 < 4) {
-    //     printf("[QuantAppend-4bit] H0=%d Val0=%f Scale0=%f Q0=%d | H1=%d Val1=%f Scale1=%f Q1=%d | Packed=%x\n",
-    //            h0, val0, s0, (int)q0, h1, val1, s1, (int)q1, (int)packed);
-    // }
   }
 }
+
 
 template <typename T, typename T_QUANT, typename T_SCALE>
 Status LaunchQuantizeKV(cudaStream_t stream, T_QUANT* quantized_data,
@@ -313,14 +315,15 @@ Status LaunchQuantizeAppendKV(cudaStream_t stream, T_QUANT* cache_data,
                               const T* new_data, const T_SCALE* scale,
                               const int* past_seqlens, int batch_size, int num_heads,
                               int max_seq_len, int head_size, int bit_width,
+                              int new_seq_len,
                               KVQuantizationType quant_type) {
   int elements_per_head_packed = (bit_width == 4) ? (head_size + 1) / 2 : head_size;
-  int total_threads = batch_size * num_heads * elements_per_head_packed;
+  int total_threads = batch_size * num_heads * new_seq_len * elements_per_head_packed;
   const int threads_per_block = 256;
   int blocks = (total_threads + threads_per_block - 1) / threads_per_block;
 
   QuantizeAppendKernel<T, T_QUANT, T_SCALE><<<blocks, threads_per_block, 0, stream>>>(
-      cache_data, new_data, scale, past_seqlens, max_seq_len, num_heads, head_size, bit_width, quant_type);
+      cache_data, new_data, scale, past_seqlens, max_seq_len, num_heads, head_size, bit_width, new_seq_len, quant_type, batch_size);
 
   return CUDA_CALL(cudaGetLastError());
 }
@@ -358,16 +361,16 @@ template Status LaunchQuantizeKV<BFloat16, uint8_t, BFloat16>(
 
 template Status LaunchQuantizeAppendKV<half, int8_t, half>(
     cudaStream_t, int8_t*, const half*, const half*, const int*, int, int, int, int,
-    int, KVQuantizationType);
+    int, int, KVQuantizationType);
 template Status LaunchQuantizeAppendKV<half, uint8_t, half>(
     cudaStream_t, uint8_t*, const half*, const half*, const int*, int, int, int, int,
-    int, KVQuantizationType);
+    int, int, KVQuantizationType);
 template Status LaunchQuantizeAppendKV<BFloat16, int8_t, BFloat16>(
     cudaStream_t, int8_t*, const BFloat16*, const BFloat16*, const int*, int, int, int,
-    int, int, KVQuantizationType);
+    int, int, int, KVQuantizationType);
 template Status LaunchQuantizeAppendKV<BFloat16, uint8_t, BFloat16>(
     cudaStream_t, uint8_t*, const BFloat16*, const BFloat16*, const int*, int, int, int,
-    int, int, KVQuantizationType);
+    int, int, int, KVQuantizationType);
 
 }  // namespace cuda
 }  // namespace contrib
