@@ -170,10 +170,12 @@ size_t get_out_accum_size(size_t num_splits, size_t batch_size, size_t num_heads
   return bytes;
 }
 
+
+
 void run_mha_fwd(Flash_fwd_params& params, cudaStream_t stream, bool force_split_kernel = false) {
   FP16_SWITCH(!params.is_bf16, [&] {
     HEADDIM_SWITCH(params.d, [&] {
-      if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
+      if (params.num_splits <= 1 && !force_split_kernel && params.k_quant_type == 0) {  // If we don't set it num_splits == 0
         run_mha_fwd_<elem_type, kHeadDim>(params, stream);
       } else {
         if (params.k_quant_type != 0) {
@@ -452,10 +454,12 @@ bool is_supported(const cudaDeviceProp& dprops, size_t head_size, size_t num_hea
 
 bool is_supported_quantization(bool is_causal, size_t head_size, int k_quant_type, int v_quant_type, int kv_cache_bit_width) {
   if constexpr (ENABLE_FLASH_ATTENTION_4_BIT) {
-    return (k_quant_type == 0 && v_quant_type == 0) ||  // no quantization supported for all head sizes
+    bool supported = (k_quant_type == 0 && v_quant_type == 0) ||  // no quantization supported for all head sizes
            (is_causal && head_size == 128 &&
             ((k_quant_type == 1 && v_quant_type == 1 && kv_cache_bit_width == 8) ||
              (k_quant_type == 2 && v_quant_type == 2 && kv_cache_bit_width == 4)));
+    printf("is_supported_quantization: causal=%d h=%zu k=%d v=%d bits=%d -> %d\n", is_causal, head_size, k_quant_type, v_quant_type, kv_cache_bit_width, supported);
+    return supported;
   } else {
     return (k_quant_type == 0 && v_quant_type == 0) ||  // no quantization supported for all head sizes
            (is_causal && head_size == 128 && k_quant_type == 1 && v_quant_type == 1 && kv_cache_bit_width == 8);
@@ -505,6 +509,7 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
                        int k_quant_type,
                        int v_quant_type,
                        int kv_cache_bit_width) {
+
   auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
   const int head_size_rounded = head_size <= 192 ? round_multiple(head_size, 32) : 256;
   const int seqlen_q_rounded = round_multiple(seqlen_q, 128);

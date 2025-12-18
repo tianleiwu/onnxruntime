@@ -6,6 +6,7 @@
 #include "contrib_ops/cuda/bert/flash_attention/static_switch.h"
 #include "contrib_ops/cuda/bert/flash_attention/flash.h"
 #include "contrib_ops/cuda/bert/flash_attention/flash_fwd_kernel.h"
+#include <stdio.h>
 
 namespace onnxruntime {
 namespace flash {
@@ -256,10 +257,16 @@ void run_mha_fwd_splitkv_dispatch_quant_8bit(Flash_fwd_params& params, cudaStrea
 
 template <typename T, int Headdim>
 void run_mha_fwd_splitkv_dispatch_quant_4bit(Flash_fwd_params& params, cudaStream_t stream) {
+  fprintf(stderr, "Entry dispatch 4bit H=%d T=%lu\n", Headdim, sizeof(T));
+  fflush(stderr);
   if constexpr (Headdim == 128) { // Guard to prevent instantiating unused dims
       constexpr static int kBlockM = 64;
       constexpr static int kBlockN = 128;
+      fprintf(stderr, "Dispatching 4bit kernel: Headdim=%d bits=%d\n", Headdim, params.kv_cache_bit_width);
       run_flash_splitkv_fwd_quant<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, 4>(params, stream);
+      cudaStreamSynchronize(stream);
+      fprintf(stderr, "Kernel finished sync\n");
+      fflush(stderr);
   }
 }
 

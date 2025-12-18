@@ -67,11 +67,13 @@ __noinline__ __device__ void copy_and_dequantize(
                  } else {
                      clear(tRrQ_raw);
                  }
-                 // Create a predicate for valid MN coordinates
-                 auto predicate = [&](auto coords) {
-                     return get<0>(identity_slice(coords)) < max_MN;
-                 };
-                 copy_if(tiled_copy, predicate, gmem_slice, tRrQ_raw);
+                 // Create a predicate tensor for valid MN coordinates
+                 auto tPred = make_tensor<bool>(shape(gmem_slice));
+                 #pragma unroll
+                 for (int i = 0; i < size(tPred); ++i) {
+                     tPred(i) = get<1>(identity_slice(i)) < max_MN;
+                 }
+                 copy_if(tiled_copy, tPred, gmem_slice, tRrQ_raw);
             }
 
             // Step 3: Dequantize the data now residing in registers.
@@ -107,14 +109,24 @@ __noinline__ __device__ void copy_and_dequantize(
 
 #pragma unroll 1
               for (int i = 0; i < size(tRsK); ++i) {
-                uint8_t packed_val = tRrQ_packed[i / 2];
-                int8_t unpacked_val = (i % 2 == 0)
+                // With Duplicate Layout in kernel, we load bytes as [B0, B0, B1, B1...].
+                // So for i=0, we want B0. index 0.
+                // For i=1, we want B0. index 1.
+                // For i=2, we want B1. index 2.
+                int coord_k = get<1>(identity_slice(i));
+#if DEQUANT_DEBUG
+                if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && i == 0) {
+                      printf("[DequantDebug] BIT_WIDTH=%d QUANT_TYPE=%d i=%d coord_k=%d d=%d packed=0x%x\n",
+                             BIT_WIDTH, QUANT_TYPE, i, coord_k, d, (int)tRrQ_packed[i]);
+                }
+#endif
+                uint8_t packed_val = tRrQ_packed[i];
+                int8_t unpacked_val = (coord_k % 2 == 0)
                                           ? static_cast<int8_t>((packed_val & 0x0F) - 8)
                                           : static_cast<int8_t>((packed_val >> 4) - 8);
 
                 float val = static_cast<float>(unpacked_val);
                 float current_scale = 1.0f;
-                int coord_k = get<1>(identity_slice(i));
 
                 if constexpr (QUANT_TYPE == 1) {  // PER_TENSOR
                   current_scale = static_cast<float>(scale[0]);
@@ -122,6 +134,12 @@ __noinline__ __device__ void copy_and_dequantize(
                   if (coord_k < d) {
                     int scale_idx = h_k_idx * d + coord_k;
                     current_scale = static_cast<float>(scale[scale_idx]);
+#if DEQUANT_DEBUG
+                    if (threadIdx.x == 0 && i < 4) {
+                      printf("[FlashDequant-4bit] B=(%d,%d,%d) T=%d i=%d CK=%d SIdx=%d Pkd=0x%x Unp=%d Sc=%f Res=%f\n",
+                             blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, i, coord_k, scale_idx, packed_val, unpacked_val, current_scale, val * current_scale);
+                    }
+#endif
                   }
                 }
                 tRsK(i) = static_cast<DQuantType>(val * current_scale);

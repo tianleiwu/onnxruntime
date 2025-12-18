@@ -128,6 +128,10 @@ inline __device__ void compute_attn_1rowblock(const Params& params, const int bi
   // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
   // might save us 1 register (we just need n_block instead of both n_block and n_block_max).
 
+  if (threadIdx.x == 0 && bidb == 0 && bidh == 0 && m_block == 0) {
+      printf("FLASH_FWD_KERNEL_RUNNING: Width=%d\n", params.kv_cache_bit_width);
+  }
+
   const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded + m_block * kBlockM) * params.seqlen_k_rounded + (n_block_max - 1) * kBlockN;  // We move K and V to the last block.
 
   Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr) + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
@@ -253,6 +257,7 @@ inline __device__ void compute_attn_1rowblock(const Params& params, const int bi
     CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));  // M
     cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
   }
+
 
   clear(acc_o);
   flash::Softmax<2 * size<1>(acc_o)> softmax;
@@ -604,15 +609,45 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
     // QUANTIZED PATH DEFINITIONS
     //
     // Initialize as View Tensors with nullptr to establish type
-    Tensor gK_quant = make_tensor(make_gmem_ptr(reinterpret_cast<QuantKV*>(params.k_ptr) + row_offset_k),
-                                  Shape<Int<kBlockN>, Int<KV_BIT_WIDTH == 4 ? kHeadDim / 2 : kHeadDim>>{},
-                                  make_stride(params.k_row_stride, _1{}));
-    Tensor gV_quant = make_tensor(make_gmem_ptr(reinterpret_cast<QuantKV*>(params.v_ptr) + row_offset_v),
-                                  Shape<Int<kBlockN>, Int<KV_BIT_WIDTH == 4 ? kHeadDim / 2 : kHeadDim>>{},
-                                  make_stride(params.v_row_stride, _1{}));
+    // For 4-bit, we use a "Duplicate Layout" to map 128 logical columns to 64 physical bytes.
+    // logical (m, n) -> physical (m, n/2). Inner stride 0 ensures we read the same byte twice.
+    auto gK_quant = [&] {
+        if constexpr (KV_BIT_WIDTH == 4) {
+             // For 4-bit, each byte stores TWO values (low/high nibbles).
+             // The layout (BlockN, HeadDim/2, 2) with stride (row_stride, 1, 0) creates a "duplicate" where stride=0 means we read the same byte twice.
+             // group_modes<1,3> flattens this to (BlockN, HeadDim).
+             auto layout_raw = make_layout(Shape<Int<kBlockN>, Int<kHeadDim / 2>, Int<2>>{},
+                                           make_stride(params.k_row_stride, _1{}, Int<0>{}));
+             auto t_raw = make_tensor(make_gmem_ptr(reinterpret_cast<QuantKV*>(params.k_ptr) + row_offset_k),
+                                      layout_raw);
+             return group_modes<1, 3>(t_raw);
+        } else {
+             return make_tensor(make_gmem_ptr(reinterpret_cast<QuantKV*>(params.k_ptr) + row_offset_k),
+                                Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                make_stride(params.k_row_stride, _1{}));
+        }
+    }();
+    auto gV_quant = [&] {
+        if constexpr (KV_BIT_WIDTH == 4) {
+             auto layout_raw = make_layout(Shape<Int<kBlockN>, Int<kHeadDim / 2>, Int<2>>{},
+                                           make_stride(params.v_row_stride, _1{}, Int<0>{}));
+             auto t_raw = make_tensor(make_gmem_ptr(reinterpret_cast<QuantKV*>(params.v_ptr) + row_offset_v),
+                                      layout_raw);
+             return group_modes<1, 3>(t_raw);
+        } else {
+             return make_tensor(make_gmem_ptr(reinterpret_cast<QuantKV*>(params.v_ptr) + row_offset_v),
+                                Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                make_stride(params.v_row_stride, _1{}));
+        }
+    }();
 
     // Define TiledCopy for quantization to match load size with element count.
-    using QuantValLayout = Layout<Shape<_1, _16>>;
+    // For 8-bit, 16 elements = 128 bits.
+    // For 4-bit, we want 32 logical elements (duplicates) = 16 physical bytes = 128 bits.
+    using QuantValLayout = std::conditional_t<
+        KV_BIT_WIDTH == 4,
+        Layout<Shape<_1, _32>>,
+        Layout<Shape<_1, _16>>>;
     using Gmem_copy_struct_quant = DefaultCopy;
 
     static constexpr int SafeBitWidth = (KV_BIT_WIDTH == 0) ? 16 : KV_BIT_WIDTH;
@@ -656,7 +691,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
     constexpr int R_Src = decltype(tKgK_quant)::layout_type::rank;
     constexpr int num_k_tiles = (R_Src >= 3) ? size<2>(tKgK_quant) : 1;
 
-    Tensor tKVpKV_dequant = make_tensor<int8_t>(make_shape(Int<num_k_tiles>{}));
+    auto tKVpKV_dequant = make_tensor<int8_t>(make_shape(Int<num_k_tiles>{}));
 
     if (!Is_even_K) {
   #pragma unroll
@@ -671,22 +706,31 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
     }
 
     if constexpr (K_QUANT_TYPE != 0) {
-      // Perform copy and dequantize
+      // Dequantize K
       flash::copy_and_dequantize<Is_even_MN, Is_even_K, K_QUANT_TYPE, KV_BIT_WIDTH>(
           gmem_tiled_copy_QKV_quant, tKgK_quant, tKsK_dequant, tKVcKV_dequant, tKVpKV_dequant,
           binfo.actual_seqlen_k - n_block * kBlockN,
           reinterpret_cast<const Element*>(params.k_scale_ptr),
           params.d, bidh / params.h_h_k_ratio);
 
-      //
-      // STANDARD PATH (K_QUANT_TYPE == 0)
-      //
-      // Clear_OOB_K must be false since we don't want to write zeros to gmem
+      // Dequantize V
+      if constexpr (V_QUANT_TYPE != 0) {
+        flash::copy_and_dequantize<Is_even_MN, Is_even_K, V_QUANT_TYPE, KV_BIT_WIDTH>(
+            gmem_tiled_copy_QKV_quant, tVgV_quant, tVsV_dequant, tKVcKV_dequant, tKVpKV_dequant,
+            binfo.actual_seqlen_k - n_block * kBlockN,
+            reinterpret_cast<const Element*>(params.v_scale_ptr),
+            params.d, bidh / params.h_h_k_ratio);
+      } else {
+        flash::copy</*Is_even_MN=*/true, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+            gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV,
+            binfo.actual_seqlen_k - n_block * kBlockN);
+      }
+    } else {
+      // Standard non-quantized path
       flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
           gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
           binfo.actual_seqlen_k - n_block * kBlockN);
 
-      // Copy V
       flash::copy</*Is_even_MN=*/true, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
           gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV,
           binfo.actual_seqlen_k - n_block * kBlockN);

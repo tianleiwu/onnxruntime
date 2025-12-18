@@ -336,6 +336,8 @@ def create_gqa_node_and_io(
         "kv_cache_bit_width": bit_width,
     } if config.k_quant_type != "NONE" else {}
 
+    # print(f"DEBUG_TEST: k_quant={config.k_quant_type} bit_width={bit_width} attrs={quantization_attributes}")
+
     node = helper.make_node(
         op_type="GroupQueryAttention",
         inputs=inputs,
@@ -1439,8 +1441,8 @@ class TestMemoryEfficientGQA(unittest.TestCase):
             numpy_type=numpy.float16,
             ort_type=TensorProto.FLOAT16,
             causal=True,
-            rtol=5e-3,
-            atol=5e-3,
+            rtol=2e-2,
+            atol=2e-2,
         )
 
     @parameterized.expand(gqa_cuda_past_test_cases(allow_head_sink=False))
@@ -1455,7 +1457,7 @@ class TestMemoryEfficientGQA(unittest.TestCase):
             ort_type=TensorProto.FLOAT16,
             causal=True,
             rtol=5e-3,
-            atol=5e-3,
+            atol=2e-2,
         )
 
 

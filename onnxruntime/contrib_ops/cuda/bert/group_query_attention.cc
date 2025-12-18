@@ -252,6 +252,9 @@ GroupQueryAttention<T>::GroupQueryAttention(const OpKernelInfo& info)
     zeros_ = this->GetScratchBuffer<int>(kZerosCount, nullptr);
     CUDA_CALL_THROW(cudaMemset(zeros_.get(), 0, kZerosCount * sizeof(int)));
   }
+  fprintf(stderr, "GQA_CTOR: T_size=%zu disable_flash=%d use_eff=%d bit=%d k=%d v=%d\n",
+          sizeof(T), disable_flash_attention_, disable_memory_efficient_attention_, kv_cache_bit_width_, (int)k_quant_type_, (int)v_quant_type_);
+  fflush(stderr);
 }
 
 template <typename T>
@@ -371,6 +374,11 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
                                                                            static_cast<int>(k_quant_type_),
                                                                            static_cast<int>(v_quant_type_),
                                                                            kv_cache_bit_width_);
+  fprintf(stderr, "GQA_Compute: use_flash=%d disabled=%d supported_hw=%d supported_quant=%d\n",
+          use_flash_attention, disable_flash_attention_,
+          onnxruntime::flash::is_supported(device_prop, parameters.head_size, parameters.num_heads, parameters.kv_num_heads),
+          onnxruntime::flash::is_supported_quantization(true, parameters.head_size, static_cast<int>(k_quant_type_), static_cast<int>(v_quant_type_), kv_cache_bit_width_));
+  fflush(stderr);
 #else
   constexpr bool use_flash_attention = false;
 #endif
