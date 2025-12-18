@@ -58,7 +58,21 @@ __noinline__ __device__ void copy_and_dequantize(
           auto process_slice = [&](auto gmem_slice, auto smem_slice, auto identity_slice) {
             // Step 1 & 2: Load raw quantized data from GMEM to registers.
             Tensor tRrQ_raw = make_tensor<QType>(shape(gmem_slice));
-            copy(tiled_copy, gmem_slice, tRrQ_raw);
+
+            if constexpr (Is_even_MN) {
+                 copy(tiled_copy, gmem_slice, tRrQ_raw);
+            } else {
+                 if constexpr (BIT_WIDTH == 4) {
+                     fill(tRrQ_raw, static_cast<QType>(0x88));
+                 } else {
+                     clear(tRrQ_raw);
+                 }
+                 // Create a predicate for valid MN coordinates
+                 auto predicate = [&](auto coords) {
+                     return get<0>(identity_slice(coords)) < max_MN;
+                 };
+                 copy_if(tiled_copy, predicate, gmem_slice, tRrQ_raw);
+            }
 
             // Step 3: Dequantize the data now residing in registers.
             Tensor tRsK = make_tensor<DQuantType>(shape(smem_slice));
@@ -107,11 +121,6 @@ __noinline__ __device__ void copy_and_dequantize(
                 } else if constexpr (QUANT_TYPE == 2) {  // PER_CHANNEL
                   if (coord_k < d) {
                     int scale_idx = h_k_idx * d + coord_k;
-#if DEQUANT_DEBUG
-                    if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && m == 0 && k == 0 && i < 4) {
-                      printf("  [DEBUG 4b] i=%d, coord_k=%d, scale_idx=%d, packed_val=0x%x\n", i, coord_k, scale_idx, (unsigned int)packed_val);
-                    }
-#endif
                     current_scale = static_cast<float>(scale[scale_idx]);
                   }
                 }

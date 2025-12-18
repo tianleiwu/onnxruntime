@@ -791,6 +791,7 @@ def parity_check_gqa_prompt(
     rtol,
     atol,
 ):
+    torch.manual_seed(0)
     std = 0.02
     q = (
         torch.randn(
@@ -832,6 +833,10 @@ def parity_check_gqa_prompt(
     new_v = torch.randn_like(new_k) * std
 
     k_scale, v_scale = get_static_scale(config, device, torch_type, std)
+    if k_scale is not None:
+        k_scale = k_scale.to(torch_type)
+    if v_scale is not None:
+        v_scale = v_scale.to(torch_type)
 
     head_sink = torch.rand(config.num_heads, dtype=torch_type, device=device) if config.has_head_sink else None
     window_size = (-1, -1)
@@ -1016,6 +1021,7 @@ def parity_check_gqa_past(
     rtol,
     atol,
 ):
+    torch.manual_seed(0)
     std = 0.02
     # --- Test Data Generation ---
     q = (
@@ -1043,6 +1049,10 @@ def parity_check_gqa_past(
     v = torch.randn_like(k) * std
 
     k_scale, v_scale = get_static_scale(config, device, torch_type, std)
+    if k_scale is not None:
+        k_scale = k_scale.to(torch_type)
+    if v_scale is not None:
+        v_scale = v_scale.to(torch_type)
 
     cache_seqlens = torch.randint(
         0,

@@ -465,7 +465,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
   Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)),
                           typename Kernel_traits::SmemLayoutQ{});
   // Careful we're using the same smem for sQ and sK | sV if Share_Q_K_smem;
-  Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)),
+  Tensor sK = make_tensor(sQ.data() + size(sQ),
                           typename Kernel_traits::SmemLayoutKV{});
   Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
   Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
@@ -904,7 +904,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
                                       ? 1
                                       : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
 #pragma unroll
-  for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
+  for (int masking_step = 0; masking_step < n_masking_steps && n_block >= n_block_min; ++masking_step, --n_block) {
     Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
     clear(acc_s);
     flash::cp_async_wait<0>();
@@ -932,9 +932,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
       }
 
       if constexpr (V_QUANT_TYPE != 0) {
-        flash::copy_and_dequantize</*Is_even_MN=*/true, Is_even_K, V_QUANT_TYPE, KV_BIT_WIDTH>(
+        flash::copy_and_dequantize<Is_even_MN, Is_even_K, V_QUANT_TYPE, KV_BIT_WIDTH>(
             gmem_tiled_copy_QKV_quant, tVgV_quant, tVsV_dequant, tKVcKV_dequant, tKVpKV_dequant,
-            binfo.actual_seqlen_k, reinterpret_cast<const Element*>(params.v_scale_ptr),
+            binfo.actual_seqlen_k - n_block * kBlockN, reinterpret_cast<const Element*>(params.v_scale_ptr),
             params.d, bidh / params.h_h_k_ratio);
       } else {
         flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
@@ -989,9 +989,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
       }
 
       if constexpr (K_QUANT_TYPE != 0) {
-        flash::copy_and_dequantize</*Is_even_MN=*/true, Is_even_K, K_QUANT_TYPE, KV_BIT_WIDTH>(
+        flash::copy_and_dequantize<Is_even_MN, Is_even_K, K_QUANT_TYPE, KV_BIT_WIDTH>(
             gmem_tiled_copy_QKV_quant, tKgK_quant, tKsK_dequant, tKVcKV_dequant, tKVpKV_dequant,
-            binfo.actual_seqlen_k,
+            binfo.actual_seqlen_k - n_block * kBlockN,
             reinterpret_cast<const Element*>(params.k_scale_ptr),
             params.d, bidh / params.h_h_k_ratio);
       } else {
@@ -1050,9 +1050,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
     }
 
       if constexpr (V_QUANT_TYPE != 0) {
-        flash::copy_and_dequantize</*Is_even_MN=*/true, Is_even_K, V_QUANT_TYPE, KV_BIT_WIDTH>(
+        flash::copy_and_dequantize<Is_even_MN, Is_even_K, V_QUANT_TYPE, KV_BIT_WIDTH>(
             gmem_tiled_copy_QKV_quant, tVgV_quant, tVsV_dequant, tKVcKV_dequant, tKVpKV_dequant,
-            binfo.actual_seqlen_k, reinterpret_cast<const Element*>(params.v_scale_ptr),
+            binfo.actual_seqlen_k - n_block * kBlockN, reinterpret_cast<const Element*>(params.v_scale_ptr),
             params.d, bidh / params.h_h_k_ratio);
       } else {
         flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
@@ -1090,7 +1090,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
         }
       }
       if constexpr (K_QUANT_TYPE != 0) {
-        flash::copy_and_dequantize</*Is_even_MN=*/true, Is_even_K, K_QUANT_TYPE, KV_BIT_WIDTH>(
+        flash::copy_and_dequantize<Is_even_MN, Is_even_K, K_QUANT_TYPE, KV_BIT_WIDTH>(
             gmem_tiled_copy_QKV_quant, tKgK_quant, tKsK_dequant, tKVcKV_dequant, tKVpKV_dequant,
             binfo.actual_seqlen_k,
             reinterpret_cast<const Element*>(params.k_scale_ptr),
