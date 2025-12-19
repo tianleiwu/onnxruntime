@@ -40,6 +40,7 @@ class TypeHelper:
             "tensor(float16)": numpy.float16,
             "tensor(bool)": bool,
             "tensor(uint8)": numpy.uint8,
+            "tensor(int8)": numpy.int8,
         }
         if ort_type not in ort_type_to_numpy_type_map:
             raise ValueError(f"{ort_type} not found in map")
@@ -56,6 +57,7 @@ class TypeHelper:
             "tensor(bfloat16)": torch.bfloat16,
             "tensor(bool)": torch.bool,
             "tensor(uint8)": torch.uint8,
+            "tensor(int8)": torch.int8,
         }
         if ort_type not in ort_type_to_torch_type_map:
             raise ValueError(f"{ort_type} not found in map")
@@ -72,6 +74,7 @@ class TypeHelper:
             numpy.float16: torch.float16,
             bool: torch.bool,
             numpy.uint8: torch.uint8,
+            numpy.int8: torch.int8,
         }
         if numpy_type not in numpy_type_to_torch_type_map:
             raise ValueError(f"{numpy_type} not found in map")
