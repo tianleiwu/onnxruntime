@@ -60,6 +60,10 @@ struct Flash_fwd_kernel_traits : public Base {
   static constexpr bool Share_Q_K_smem = Share_Q_K_smem_;
   static constexpr bool Is_Q_in_regs = Is_Q_in_regs_ || Share_Q_K_smem;
 
+  using ElementQuant = uint8_t;
+
+  // using SmemCopyAtomQuant = Copy_Atom<DefaultCopy, ElementQuant>; // Duplicated below
+
   // The number of threads.
   static constexpr int kNWarps = kNWarps_;
   static constexpr int kNThreads = kNWarps * 32;
@@ -88,6 +92,10 @@ struct Flash_fwd_kernel_traits : public Base {
       SmemLayoutAtomQ{},
       Shape<Int<kBlockN>, Int<kHeadDim>>{}));
 
+  // using SmemLayoutKVQuant = decltype(tile_to_shape(
+  //     SmemLayoutAtomQ{},
+  //     Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+
   // https://github.com/ColfaxResearch/cutlass-kernels/blob/a222587e6d59b93ba704853d3946fb686d8b8892/src/fmha/fmha_forward.cu#L434
   using SmemLayoutVtransposed = decltype(composition(SmemLayoutKV{}, make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
   using SmemLayoutVtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
@@ -100,9 +108,20 @@ struct Flash_fwd_kernel_traits : public Base {
       Shape<Int<kBlockM>, Int<kHeadDim>>{}));
   using SmemCopyAtomO = Copy_Atom<DefaultCopy, Element>;
   using SmemCopyAtomOaccum = Copy_Atom<DefaultCopy, ElementAccum>;
+  // JIT: Use Element (half/bf16) for copy atom to match tiled_mma expectations.
+  // We will interpret 2x uint8 as 1x half during copy.
+
+  // JIT: Type Aliasing Layouts (Moved up for dependencies)
+  using SmemLayoutAtomQuant = decltype(composition(Swizzle<kSwizzle, 3, 3>{},
+                                                   Layout<Shape<Int<8>, Int<kBlockKSmem / 2>>,
+                                                          Stride<Int<kBlockKSmem / 2>, _1>>{}));
+  using SmemLayoutKVQuant = decltype(tile_to_shape(
+      SmemLayoutAtomQuant{},
+      Shape<Int<kBlockN>, Int<kHeadDim / 2>>{}));
 
   static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
   static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
+  static constexpr int kSmemKVQuantSize = size(SmemLayoutKVQuant{}) * 2 * sizeof(ElementQuant);
   static constexpr int kSmemSize = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize;
 
   static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
@@ -126,6 +145,7 @@ struct Flash_fwd_kernel_traits : public Base {
   using GmemTiledCopyQKV = decltype(make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
                                                     GmemLayoutAtom{},
                                                     Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
+
   using GmemTiledCopyO = decltype(make_tiled_copy(Copy_Atom<DefaultCopy, elem_type>{},
                                                   GmemLayoutAtom{},
                                                   Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
@@ -139,6 +159,24 @@ struct Flash_fwd_kernel_traits : public Base {
   using GmemTiledCopyOaccum = decltype(make_tiled_copy(Copy_Atom<DefaultCopy, ElementAccum>{},
                                                        GmemLayoutAtomOaccum{},
                                                        Layout<Shape<_1, _4>>{}));  // Val layout, 4 vals per store
+
+  // JIT Optimization: Type Aliasing
+  // Alias INT8 data as HALVES (Element) to use LDSM/AsyncCopy pipelines.
+  // 128 INT8s (128 bytes) -> 64 HALVES (128 bytes).
+
+  // SmemCopyAtom: Use U32x2 (8 bytes = 4 halves).
+  // Standard FP16 uses U32x4 (16 bytes = 8 halves).
+  // We want to load half the data (128 bytes total instead of 256).
+  using SmemCopyAtomQuant = Copy_Atom<SM75_U32x2_LDSM_N, Element>;
+
+  // GmemCopy: Use Async Copy (16 bytes = 8 halves).
+  // Standard FP16 loads 16 bytes (8 halves).
+  // We also load 16 bytes (16 int8s).
+  // Since we alias to Element, the atom loads 8 Elements.
+  using GmemTiledCopyKVQuant = decltype(make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
+                                                        GmemLayoutAtom{},
+                                                        Layout<Shape<_1, Int<8>>>{}));  // 8 Elements = 16 bytes
+
   using GmemLayoutAtomRotcossin = GmemLayoutAtom;
   using GmemTiledCopyRotcossin = decltype(make_tiled_copy(Copy_Atom<UniversalCopy<uint64_t>, Element>{},
                                                           GmemLayoutAtomRotcossin{},

@@ -17,6 +17,8 @@
 
 #include <cute/tensor.hpp>
 
+#include <cute/algorithm/copy.hpp>
+
 #include <cutlass/cutlass.h>
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
@@ -55,7 +57,7 @@ __forceinline__ __device__ auto get_lse_tile(const Params& params, const int bid
   return local_tile(mLSE_slice, Shape<Int<kBlockM>>{}, make_coord(m_block));
 }
 
-template <typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template <typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, int K_QUANT_TYPE, int V_QUANT_TYPE, int KV_BIT_WIDTH, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params& params, const int bidb, const int bidh, const int m_block) {
   using Element = typename Kernel_traits::Element;
   using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -140,6 +142,9 @@ inline __device__ void compute_attn_1rowblock(const Params& params, const int bi
                           make_stride(params.k_row_stride, params.k_head_stride, _1{}));
   Tensor gK = local_tile(mK(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
                          make_coord(_, 0));  // (kBlockN, kHeadDim, nblocksN)
+
+  auto k_scale = (K_QUANT_TYPE == 1) ? reinterpret_cast<const Element*>(params.k_scale_ptr)[0] : 0.0f;
+
   Tensor mV = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.v_ptr) + binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb)),
                           make_shape(binfo.actual_seqlen_k, params.h_k, params.d),
                           make_stride(params.v_row_stride, params.v_head_stride, _1{}));
@@ -154,6 +159,10 @@ inline __device__ void compute_attn_1rowblock(const Params& params, const int bi
   // Careful we're using the same smem for sQ and sK | sV if Share_Q_K_smem;
   Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)),
                           typename Kernel_traits::SmemLayoutKV{});
+
+  // JIT Dequantization Tensors
+  Tensor sK_quant = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutKVQuant{});
+
   Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
   Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
   Tensor sVtNoSwizzle = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
@@ -242,8 +251,26 @@ inline __device__ void compute_attn_1rowblock(const Params& params, const int bi
 
   int n_block = n_block_max - 1;
   // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-  flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
-                                     binfo.actual_seqlen_k - n_block * kBlockN);
+  // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
+  if constexpr (K_QUANT_TYPE == 1 && KV_BIT_WIDTH == 8) {
+    typename Kernel_traits::GmemTiledCopyKVQuant gmem_tiled_copy_KV_quant;
+    auto gmem_thr_copy_KV_quant = gmem_tiled_copy_KV_quant.get_thread_slice(tidx);
+    // Reconstruct gK_quant_jit to ensure direct byte access
+    // Type Aliasing: Treat INT8 buffer as HALVES.
+    // Stride is in elements. 1 Element = 2 bytes.
+    // Original stride is in int8 elements (bytes). So we divide by 2.
+    Tensor gK_quant_jit = make_tensor(make_gmem_ptr(reinterpret_cast<const Element*>(params.k_ptr) + binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb) / 2),
+                                      make_shape(binfo.actual_seqlen_k, params.h_k, params.d),
+                                      make_stride(params.k_row_stride / 2, params.k_head_stride / 2, _1{}));
+    Tensor gK_quant_tile = local_tile(gK_quant_jit(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim / 2>>{}, make_coord(n_block, 0));
+    Tensor tKgK_quant_jit = gmem_thr_copy_KV_quant.partition_S(gK_quant_tile);
+    Tensor tKsK_quant_jit = gmem_thr_copy_KV_quant.partition_D(sK_quant);
+    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KV_quant, tKgK_quant_jit(_, _, _, n_block), tKsK_quant_jit, tKVcKV, tKVpKV,
+                                       binfo.actual_seqlen_k - n_block * kBlockN);
+  } else {
+    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
+                                       binfo.actual_seqlen_k - n_block * kBlockN);
+  }
   cute::cp_async_fence();
 
   if (Kernel_traits::Is_Q_in_regs && !Kernel_traits::Share_Q_K_smem) {
@@ -450,6 +477,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
   using Element = typename Kernel_traits::Element;
   using ElementAccum = typename Kernel_traits::ElementAccum;
   using index_t = typename Kernel_traits::index_t;
+  using SmemCopyAtomQuant = typename Kernel_traits::SmemCopyAtomQuant;
+  using GmemLayoutAtom = typename Kernel_traits::GmemLayoutAtom;
 
   // Shared memory.
   extern __shared__ char smem_[];
@@ -467,6 +496,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
   Tensor sK = make_tensor(sQ.data() + size(sQ),
                           typename Kernel_traits::SmemLayoutKV{});
   Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
+
+  // JIT Dequantization Tensors (Overlapping)
+  Tensor sK_quant = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutKVQuant{});
+  Tensor sV_quant = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutKVQuant{});
+
   Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
   Tensor sVtNoSwizzle = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
 
@@ -636,6 +670,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
     }
   }();
 
+  auto k_scale = (K_QUANT_TYPE == 1) ? reinterpret_cast<const Element*>(params.k_scale_ptr)[0] : 0.0f;
+
   // Define TiledCopy for quantization to match load size with element count.
   // For 8-bit, 16 elements = 128 bits.
   // For 4-bit, we want 32 logical elements (duplicates) = 16 physical bytes = 128 bits.
@@ -702,11 +738,60 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
 
   if constexpr (K_QUANT_TYPE != 0) {
     // Dequantize K
-    flash::copy_and_dequantize<Is_even_MN, Is_even_K, K_QUANT_TYPE, KV_BIT_WIDTH>(
-        gmem_tiled_copy_QKV_quant, tKgK_quant, tKsK_dequant, tKVcKV_dequant, tKVpKV_dequant,
-        binfo.actual_seqlen_k - n_block * kBlockN,
-        reinterpret_cast<const Element*>(params.k_scale_ptr),
-        params.d, bidh / params.h_h_k_ratio);
+    // JIT Aliasing ENABLED.
+    if constexpr (K_QUANT_TYPE == 1 && KV_BIT_WIDTH == 8) {
+      typename Kernel_traits::GmemTiledCopyKVQuant gmem_tiled_copy_KV_quant;
+      auto gmem_thr_copy_KV_quant = gmem_tiled_copy_KV_quant.get_thread_slice(tidx);
+      // Aliasing: View as Element (half), so divide K-dim and Stride by 2.
+      Tensor gK_quant_jit = make_tensor(make_gmem_ptr(reinterpret_cast<const Element*>(params.k_ptr) + row_offset_k / 2),
+                                        Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
+                                        make_stride(params.k_row_stride / 2, _1{}));
+      Tensor tKgK_quant_jit = gmem_thr_copy_KV_quant.partition_S(gK_quant_jit);
+      // Need sK_quant (defined in previous step)
+      // Need tKsK_quant logic.
+      // In Prologue here, tKsK_dequant is partition of sK.
+      // We need partition of sK_quant.
+      // Reuse smem_tiled_copy_K_quant defined at line 800 (via auto hoisting/forward ref? No, not valid C++).
+      // Wait, smem_tiled_copy_K_quant is defined LATER (line 800).
+      // So I must define it here LOCALLY or move definition up.
+      // Moving definition up to Definitions block (516) is best.
+      // But I only added sK_quant definition there.
+      // TiledCopy depends on `tiled_mma` which is defined at 781.
+      // Critical: `tiled_mma` is defined LATER.
+      // So I CANNOT define `smem_tiled_copy_K_quant` before 781.
+      // But Prologue Copy (750) is BEFORE 781.
+      // How does `copy_and_dequantize` work?
+      // It takes `tKsK_dequant` which comes from `smem_tiled_copy_dequant` (Line 718).
+      // `smem_tiled_copy_dequant` uses `DefaultCopy` (no mma dependency).
+      // Does my JIT copy need MMA dependency?
+      // `make_tiled_copy_B(SmemCopyAtomQuant{}, tiled_mma)` -> YES.
+      // If I use `tiled_mma` dependency, I align stores to MMA.
+      // Can I perform copy WITHOUT MMA dependency?
+      // Just Copy Global -> Smem.
+      // Use `make_tiled_copy(..., Copy_Atom<DefaultCopy...>, ...)`?
+      // Or `GmemTiledCopyKVQuant` writes to registers.
+      // Registers to Smem needs a TiledCopy?
+      // `flash::copy` takes `TiledCopy` for Gmem.
+      // Dst `tKsK` is partitioned by Gmem TiledCopy (D).
+      // `Tensor tKsK_quant_jit = gmem_thr_copy_KV_quant.partition_D(sK_quant);`
+      // This does NOT require `tiled_mma`.
+      // So I am safe!
+      // I don't need `smem_tiled_copy_K_quant` (which is for GEMM loading).
+      // I only need `gmem_tiled_copy_KV_quant`.
+
+      Tensor tKsK_quant_jit = gmem_thr_copy_KV_quant.partition_D(sK_quant);
+      flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KV_quant, tKgK_quant_jit, tKsK_quant_jit, tKVcKV, tKVpKV,
+                                         binfo.actual_seqlen_k - n_block * kBlockN);
+    } else
+    /*
+     */
+    {
+      flash::copy_and_dequantize<Is_even_MN, Is_even_K, K_QUANT_TYPE, KV_BIT_WIDTH>(
+          gmem_tiled_copy_QKV_quant, tKgK_quant, tKsK_dequant, tKVcKV_dequant, tKVpKV_dequant,
+          binfo.actual_seqlen_k - n_block * kBlockN,
+          reinterpret_cast<const Element*>(params.k_scale_ptr),
+          params.d, bidh / params.h_h_k_ratio);
+    }
 
     // Dequantize V
     if constexpr (V_QUANT_TYPE != 0) {
@@ -731,25 +816,35 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
         binfo.actual_seqlen_k - n_block * kBlockN);
   }
 
-  typename Kernel_traits::TiledMma tiled_mma;
-  auto thr_mma = tiled_mma.get_thread_slice(tidx);
+  typename Kernel_traits::TiledMma tiled_mma_x;
+  auto thr_mma = tiled_mma_x.get_thread_slice(tidx);
   Tensor tSrQ = thr_mma.partition_fragment_A(sQ);             // (MMA,MMA_M,MMA_K)
   Tensor tSrK = thr_mma.partition_fragment_B(sK);             // (MMA,MMA_N,MMA_K)
   Tensor tOrVt = thr_mma.partition_fragment_B(sVtNoSwizzle);  // (MMA, MMA_K,MMA_N)
 
-  Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
+  Tensor acc_o = partition_fragment_C(tiled_mma_x, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
 
-  auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
+  auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma_x);
   auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
   Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
 
-  auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
+  auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma_x);
   auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
   Tensor tSsK = smem_thr_copy_K.partition_S(sK);
 
-  auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
+  auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma_x);
   auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
   Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
+
+  // Use make_tiled_copy_B with Element (half) atom.
+  // It handles layout compatibility with MMA.
+  // We load sK_quant (uint8) as packed halves.
+  auto smem_tiled_copy_K_quant = make_tiled_copy_B(SmemCopyAtomQuant{}, tiled_mma_x);
+  auto smem_thr_copy_K_quant = smem_tiled_copy_K_quant.get_thread_slice(tidx);
+  // Recast sK_quant data pointer to Element* (half*) to match the copy atom
+  // This avoids finding 'recast' helper and ensures strict type match for copy.
+  // JIT: Partition sK_quant directly (keep as ElementQuant = int8)
+  Tensor tSsK_quant = smem_thr_copy_K_quant.partition_S(sK_quant);
 
   //
   // PREDICATES
@@ -893,22 +988,44 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
     Tensor tRgCosCont = gmem_thr_copy_rotary_cont.partition_S(gCosCont);
     Tensor tRgSinCont = gmem_thr_copy_rotary_cont.partition_S(gSinCont);
     if (params.is_rotary_interleaved) {
+      /*
       flash::copy_rotary_interleaved<Is_even_K>(
           tQgQ, tQsQ, tRgCos, tRgSin, tQcQ, binfo.actual_seqlen_q - m_block * kBlockM,
           0, params.d, params.rotary_dim);
+      */
     } else {
+      /*
       flash::copy_rotary_contiguous<Is_even_K>(
           tQgQ, tQsQ, tRgCosCont, tRgSinCont, tQcQ, binfo.actual_seqlen_q - m_block * kBlockM,
           0, params.d, params.rotary_dim);
+      */
     }
   }
 
   if constexpr (K_QUANT_TYPE != 0) {
-    flash::copy_and_dequantize<Is_even_MN, Is_even_K, K_QUANT_TYPE, KV_BIT_WIDTH>(
-        gmem_tiled_copy_QKV_quant, tKgK_quant, tKsK_dequant, tKVcKV_dequant, tKVpKV_dequant,
-        binfo.actual_seqlen_k - n_block * kBlockN,
-        reinterpret_cast<const Element*>(params.k_scale_ptr),
-        params.d, bidh / params.h_h_k_ratio);
+    // JIT Aliasing ENABLED.
+    if constexpr (K_QUANT_TYPE == 1 && KV_BIT_WIDTH == 8) {
+      typename Kernel_traits::GmemTiledCopyKVQuant gmem_tiled_copy_KV_quant;
+      auto gmem_thr_copy_KV_quant = gmem_tiled_copy_KV_quant.get_thread_slice(tidx);
+      // Aliasing: View as Element (half), so divide K-dim and Stride by 2.
+      Tensor tKgK_jit_view = make_tensor(make_gmem_ptr(reinterpret_cast<const typename Kernel_traits::Element*>(tKgK_quant.data().get())),
+                                         Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
+                                         make_stride(params.k_row_stride / 2, _1{}));
+
+      Tensor tKgK_jit_part = gmem_thr_copy_KV_quant.partition_S(tKgK_jit_view);
+
+      // sK_quant is available
+      Tensor tKsK_quant_jit = gmem_thr_copy_KV_quant.partition_D(sK_quant);
+
+      flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KV_quant, tKgK_jit_part, tKsK_quant_jit, tKVcKV, tKVpKV,
+                                         binfo.actual_seqlen_k - n_block * kBlockN);
+    } else {
+      flash::copy_and_dequantize<Is_even_MN, Is_even_K, K_QUANT_TYPE, KV_BIT_WIDTH>(
+          gmem_tiled_copy_QKV_quant, tKgK_quant, tKsK_dequant, tKVcKV_dequant, tKVpKV_dequant,
+          binfo.actual_seqlen_k - n_block * kBlockN,
+          reinterpret_cast<const Element*>(params.k_scale_ptr),
+          params.d, bidh / params.h_h_k_ratio);
+    }
   } else {
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
                                        binfo.actual_seqlen_k - n_block * kBlockN);
@@ -941,7 +1058,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
                                       : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
 #pragma unroll
   for (int masking_step = 0; masking_step < n_masking_steps && n_block >= n_block_min; ++masking_step, --n_block) {
-    Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+    Tensor acc_s = partition_fragment_C(tiled_mma_x, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
     clear(acc_s);
     flash::cp_async_wait<0>();
     __syncthreads();
@@ -989,9 +1106,18 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
     }
     cute::cp_async_fence();
 
-    flash::gemm(
-        acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
-        smem_thr_copy_Q, smem_thr_copy_K);
+    cute::cp_async_fence();
+
+    // JIT Aliasing ENABLED.
+    if constexpr (K_QUANT_TYPE == 1 && KV_BIT_WIDTH == 8) {
+      flash::gemm_quant(
+          acc_s, tSrQ, tSrK, tSsK_quant, tiled_mma_x, smem_tiled_copy_K_quant,
+          smem_thr_copy_K_quant, k_scale);
+    } else {
+      flash::gemm(
+          acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_x, smem_tiled_copy_Q, smem_tiled_copy_K,
+          smem_thr_copy_Q, smem_thr_copy_K);
+    }
     // if (cute::thread0()) { print(acc_s); }
     if constexpr (Is_softcap) {
       flash::apply_softcap(acc_s, params.softcap);
@@ -1025,11 +1151,27 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
       }
 
       if constexpr (K_QUANT_TYPE != 0) {
-        flash::copy_and_dequantize<Is_even_MN, Is_even_K, K_QUANT_TYPE, KV_BIT_WIDTH>(
-            gmem_tiled_copy_QKV_quant, tKgK_quant, tKsK_dequant, tKVcKV_dequant, tKVpKV_dequant,
-            binfo.actual_seqlen_k - n_block * kBlockN,
-            reinterpret_cast<const Element*>(params.k_scale_ptr),
-            params.d, bidh / params.h_h_k_ratio);
+        /*
+        if constexpr (false && K_QUANT_TYPE == 1 && KV_BIT_WIDTH == 8) {
+             typename Kernel_traits::GmemTiledCopyKVQuant gmem_tiled_copy_KV_quant;
+             auto gmem_thr_copy_KV_quant = gmem_tiled_copy_KV_quant.get_thread_slice(tidx);
+             // Reconstruct gK_quant_jit
+             Tensor tKgK_jit_view = make_tensor(make_gmem_ptr(reinterpret_cast<const typename Kernel_traits::ElementQuant*>(tKgK_quant.data().get())),
+                                          Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                          make_stride(params.k_row_stride, _1{}));
+             Tensor tKgK_jit_part = gmem_thr_copy_KV_quant.partition_S(tKgK_jit_view);
+             Tensor tKsK_quant_jit = gmem_thr_copy_KV_quant.partition_D(sK_quant);
+             flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KV_quant, tKgK_jit_part, tKsK_quant_jit, tKVcKV, tKVpKV,
+                                     binfo.actual_seqlen_k - n_block * kBlockN);
+        } else
+        */
+        {
+          flash::copy_and_dequantize<Is_even_MN, Is_even_K, K_QUANT_TYPE, KV_BIT_WIDTH>(
+              gmem_tiled_copy_QKV_quant, tKgK_quant, tKsK_dequant, tKVcKV_dequant, tKVpKV_dequant,
+              binfo.actual_seqlen_k - n_block * kBlockN,
+              reinterpret_cast<const Element*>(params.k_scale_ptr),
+              params.d, bidh / params.h_h_k_ratio);
+        }
       } else {
         flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
       }
@@ -1050,7 +1192,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
     // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
     Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
 
-    flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+    flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma_x, smem_tiled_copy_V, smem_thr_copy_V);
 
     // This check is at the end of the loop since we always have at least 1 iteration
     if (n_masking_steps > 1 && n_block <= n_block_min) {
@@ -1061,7 +1203,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
 
   // These are the iterations where we don't need masking on S
   for (; n_block >= n_block_min; --n_block) {
-    Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+    Tensor acc_s = partition_fragment_C(tiled_mma_x, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
     clear(acc_s);
     flash::cp_async_wait<0>();
     __syncthreads();
@@ -1095,9 +1237,18 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
     }
     cute::cp_async_fence();
 
-    flash::gemm(
-        acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
-        smem_thr_copy_Q, smem_thr_copy_K);
+    cute::cp_async_fence();
+
+    // JIT Aliasing ENABLED.
+    if constexpr (K_QUANT_TYPE == 1 && KV_BIT_WIDTH == 8) {
+      flash::gemm_quant(
+          acc_s, tSrQ, tSrK, tSsK_quant, tiled_mma_x, smem_tiled_copy_K_quant,
+          smem_thr_copy_K_quant, k_scale);
+    } else {
+      flash::gemm(
+          acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_x, smem_tiled_copy_Q, smem_tiled_copy_K,
+          smem_thr_copy_Q, smem_thr_copy_K);
+    }
     if constexpr (Is_softcap) {
       flash::apply_softcap(acc_s, params.softcap);
     }
@@ -1126,11 +1277,26 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
         }
       }
       if constexpr (K_QUANT_TYPE != 0) {
-        flash::copy_and_dequantize<Is_even_MN, Is_even_K, K_QUANT_TYPE, KV_BIT_WIDTH>(
-            gmem_tiled_copy_QKV_quant, tKgK_quant, tKsK_dequant, tKVcKV_dequant, tKVpKV_dequant,
-            binfo.actual_seqlen_k,
-            reinterpret_cast<const Element*>(params.k_scale_ptr),
-            params.d, bidh / params.h_h_k_ratio);
+        /*
+        if constexpr (false && K_QUANT_TYPE == 1 && KV_BIT_WIDTH == 8) {
+             typename Kernel_traits::GmemTiledCopyKVQuant gmem_tiled_copy_KV_quant;
+             auto gmem_thr_copy_KV_quant = gmem_tiled_copy_KV_quant.get_thread_slice(tidx);
+             Tensor tKgK_jit_view = make_tensor(make_gmem_ptr(reinterpret_cast<const typename Kernel_traits::ElementQuant*>(tKgK_quant.data().get())),
+                                          Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                          make_stride(params.k_row_stride, _1{}));
+             Tensor tKgK_jit_part = gmem_thr_copy_KV_quant.partition_S(tKgK_jit_view);
+             Tensor tKsK_quant_jit = gmem_thr_copy_KV_quant.partition_D(sK_quant);
+             flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KV_quant, tKgK_jit_part, tKsK_quant_jit, tKVcKV, tKVpKV,
+                                     binfo.actual_seqlen_k); // Mask handled by copy, but here we just copy
+        } else
+        */
+        {
+          flash::copy_and_dequantize<Is_even_MN, Is_even_K, K_QUANT_TYPE, KV_BIT_WIDTH>(
+              gmem_tiled_copy_QKV_quant, tKgK_quant, tKsK_dequant, tKVcKV_dequant, tKVpKV_dequant,
+              binfo.actual_seqlen_k,
+              reinterpret_cast<const Element*>(params.k_scale_ptr),
+              params.d, bidh / params.h_h_k_ratio);
+        }
       } else {
         flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
       }
@@ -1148,7 +1314,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
     // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
     Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
 
-    flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+    flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma_x, smem_tiled_copy_V, smem_thr_copy_V);
   }
 
   // Epilogue
@@ -1163,7 +1329,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
       !Split,
       typename Kernel_traits::SmemCopyAtomO,
       typename Kernel_traits::SmemCopyAtomOaccum>;
-  auto smem_tiled_copy_Oaccum = make_tiled_copy_C(SmemTiledCopyO{}, tiled_mma);
+  auto smem_tiled_copy_Oaccum = make_tiled_copy_C(SmemTiledCopyO{}, tiled_mma_x);
   auto smem_thr_copy_Oaccum = smem_tiled_copy_Oaccum.get_thread_slice(tidx);
   Tensor rO = flash::convert_type<ElementO>(acc_o);
   Tensor taccOrOaccum = smem_thr_copy_Oaccum.retile_S(rO);          // ((Atom,AtomNum), MMA_M, MMA_N)
@@ -1231,7 +1397,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template <typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax,
+          int K_QUANT_TYPE = 0, int V_QUANT_TYPE = 0, int KV_BIT_WIDTH = 16, typename Params>
 inline __device__ void compute_attn(const Params& params) {
   const int m_block = blockIdx.x;
   // The block index for the batch.
@@ -1239,15 +1406,15 @@ inline __device__ void compute_attn(const Params& params) {
   // The block index for the head.
   const int bidh = blockIdx.z;
 
-  // We want the fwd and bwd to generate the same dropout pattern (RNG), without restricting
-  // them to have the same number of threads or have to traverse the attention matrix
-  // in the same order.
+  // We want the fwd and bwd to generate the same dropout pattern (RNG). Without splitting,
+  // each batch and head generate the pattern of size (seqlen_q, seqlen_k). With splitting,
+  // We want to generate the pattern based on (bidb, bidh).
   // In the Philox RNG, we use the offset to store the batch, head, and the lane id
   // (within a warp). We use the subsequence to store the location of the 16 x 32 blocks within
   // the attention matrix. This way, as long as we have the batch, head, and the location of
   // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
-  flash::compute_attn_1rowblock<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
+  flash::compute_attn_1rowblock<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, K_QUANT_TYPE, V_QUANT_TYPE, KV_BIT_WIDTH>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

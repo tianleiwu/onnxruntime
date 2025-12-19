@@ -29,7 +29,7 @@ namespace flash {
 DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_kernel, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax) {
 #if defined(ARCH_SUPPORTS_FLASH)
   static_assert(!(Is_causal && Is_local));  // Enforce constraints
-  flash::compute_attn<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params);
+  flash::compute_attn<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, 0, 0, 16>(params);
 #else
   FLASH_UNSUPPORTED_ARCH
 #endif

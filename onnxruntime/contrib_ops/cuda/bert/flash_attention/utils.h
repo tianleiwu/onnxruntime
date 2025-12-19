@@ -196,6 +196,91 @@ __forceinline__ __device__ void gemm_rs(Tensor0& acc, Tensor1& tCrA, Tensor2& tC
   }
 }
 
+template <typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
+          typename TiledMma, typename TiledCopy, typename ThrCopy, typename ScaleType>
+__forceinline__ __device__ void gemm_quant(Tensor0& acc, Tensor1& tCrA, Tensor2& tCrB, Tensor3 const& tCsB,
+                                           TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
+                                           ThrCopy smem_thr_copy_B, ScaleType scale) {
+  CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));   // MMA_M
+  CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));   // MMA_N
+  CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));  // MMA_K
+
+  // Create register tensor for quantized data
+  // Assuming tCrB is FP16, we want tCrB_quant to be ElementQuant (uint8)
+  using ElementQuant = typename TiledCopy::ValType;
+  Tensor tCrB_quant = make_tensor<ElementQuant>(layout(tCrB));
+
+  Tensor tCrB_quant_copy_view = smem_thr_copy_B.retile_D(tCrB_quant);
+  CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_quant_copy_view));  // N
+
+  cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_quant_copy_view(_, _, _0{}));
+
+// Loop over K-tiles
+#pragma unroll
+  for (int i = 0; i < size<2>(tCrA); ++i) {
+    if (i < size<2>(tCrA) - 1) {
+      cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_quant_copy_view(_, _, i + 1));
+    }
+
+    // Dequantize JIT: tCrB_quant(_, _, i) -> tCrB(_, _, i)
+    // tCrB is FP16. tCrB_quant is UINT8.
+    // Scale is provided.
+    // INT4 unpacking handling?
+    // If ElementQuant is uint8 (1 byte), and we have INT8 or INT4.
+    // For INT8: Just cast and scale.
+    // For INT4: Packed. One uint8 contains two int4s.
+    // But JIT implies we are about to feed MMA.
+    // MMA consumes FP16.
+    // We need to unpack into tCrB (FP16).
+    // How many elements in tCrB vs tCrB_quant?
+    // If INT8: 1-to-1 mapping. Layout identical.
+    // If INT4: 2-to-1 mapping?
+    // User requested "Per Tensor" quantization. Assuming INT8 first as primary target.
+    // INT4 JIT is complex because layout of quantized registers changes.
+    // Let's implement INT8 JIT first.
+
+    // tCrB_quant contains PACKED halves (each half = 2 int8s).
+    // The aliased, halved-K shape results in tCrB_quant having half as many K-tiles as tCrB.
+    // Each tCrB_quant tile covers 32 logical K-elements (16 packed halves).
+    // Each tCrB tile covers 16 logical K-elements (Standard MMA tile).
+    // Thus, 1 tCrB_quant tile supplies data for 2 tCrB tiles (Even and Odd).
+
+    // Map current tCrB tile 'i' to tCrB_quant tile 'i/2'.
+    int quant_i = i / 2;
+    Tensor tCrB_quant_frag_full = tCrB_quant(_, _, quant_i);
+
+    // Split: Even 'i' takes lower half, Odd 'i' takes upper half of the packed source.
+    int frag_size = size(tCrB_quant_frag_full);  // Typically 8 elements (for m16n8k16)
+    int half_size = frag_size / 2;
+    int offset_src = (i % 2 == 0) ? 0 : half_size;
+
+    // tCrB_frag is the destination Fragment B for this MMA step (FP16).
+    // It has the same size as tCrB_quant_frag_full (e.g. 8 halves).
+    // We fill it by unpacking 'half_size' (e.g. 4) packed values -> 'frag_size' (e.g. 8) result values.
+    Tensor tCrB_frag = tCrB(_, _, i);
+    using DQuantType = typename Tensor2::value_type;
+
+#pragma unroll
+    for (int j = 0; j < half_size; ++j) {
+      // Read packed value
+      auto packed_val = tCrB_quant_frag_full(offset_src + j);  // Layout-aware access
+
+      // Reinterpret
+      uint16_t raw_bits = reinterpret_cast<uint16_t&>(packed_val);
+      int8_t v0 = static_cast<int8_t>(raw_bits & 0xFF);
+      int8_t v1 = static_cast<int8_t>((raw_bits >> 8) & 0xFF);
+
+      // Dequantize and Store
+      // We assume 2x expansion factor matches the register layout stride (2*j, 2*j+1).
+      // For standard MMA layouts (swizzled K), logical K 2*j and 2*j+1 are usually adjacent in the fragment definition.
+      tCrB_frag(2 * j) = static_cast<DQuantType>(float(v0) * float(scale));
+      tCrB_frag(2 * j + 1) = static_cast<DQuantType>(float(v1) * float(scale));
+    }
+
+    cute::gemm(tiled_mma, tCrA(_, _, i), tCrB_frag, acc);
+  }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
