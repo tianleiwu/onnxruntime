@@ -132,32 +132,34 @@ __noinline__ __device__ void copy_and_dequantize(
             if constexpr (BIT_WIDTH == 8) {
               auto const* tRrQ_quant = reinterpret_cast<int8_t const*>(&tRrQ_raw(0));
 
-#pragma unroll 1
+#pragma unroll
               for (int i = 0; i < size(tRsK); ++i) {
-                float val = static_cast<float>(tRrQ_quant[i]);
-                float current_scale = 1.0f;
+                DQuantType val = static_cast<DQuantType>(tRrQ_quant[i]);
+                DQuantType current_scale = static_cast<DQuantType>(1.0f);
                 int coord_k = get<1>(identity_slice(i));
 
                 if constexpr (QUANT_TYPE == 1) {  // PER_TENSOR
-                  current_scale = static_cast<float>(scale[0]);
+                  current_scale = static_cast<DQuantType>(scale[0]);
                 } else if constexpr (QUANT_TYPE == 2) {  // PER_CHANNEL
                   if (coord_k < d) {
                     int scale_idx = h_k_idx * d + coord_k;
 #if DEQUANT_DEBUG
                     if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && m == 0 && k == 0 && i == 0) {
+                      float val_f = static_cast<float>(val);
+                      float scale_f = static_cast<float>(current_scale);
                       printf("[FlashDequant-8bit] Thread=%d CoordK=%d ScaleIdx=%d Raw=%f Scale=%f Result=%f\n",
-                             threadIdx.x, coord_k, scale_idx, val, current_scale, val * current_scale);
+                             threadIdx.x, coord_k, scale_idx, val_f, scale_f, val_f * scale_f);
                     }
 #endif
-                    current_scale = static_cast<float>(scale[scale_idx]);
+                    current_scale = static_cast<DQuantType>(scale[scale_idx]);
                   }
                 }
-                tRsK(i) = static_cast<DQuantType>(val * current_scale);
+                tRsK(i) = val * current_scale;
               }
             } else if constexpr (BIT_WIDTH == 4) {
               auto const* tRrQ_packed = reinterpret_cast<uint8_t const*>(&tRrQ_raw(0));
 
-#pragma unroll 1
+#pragma unroll
               for (int i = 0; i < size(tRsK); ++i) {
                 // With Duplicate Layout in kernel, we load bytes as [B0, B0, B1, B1...].
                 // So for i=0, we want B0. index 0.
@@ -178,24 +180,26 @@ __noinline__ __device__ void copy_and_dequantize(
                                           ? static_cast<int8_t>((packed_val & 0x0F) - 8)
                                           : static_cast<int8_t>((packed_val >> 4) - 8);
 
-                float val = static_cast<float>(unpacked_val);
-                float current_scale = 1.0f;
+                DQuantType val = static_cast<DQuantType>(unpacked_val);
+                DQuantType current_scale = static_cast<DQuantType>(1.0f);
 
                 if constexpr (QUANT_TYPE == 1) {  // PER_TENSOR
-                  current_scale = static_cast<float>(scale[0]);
+                  current_scale = static_cast<DQuantType>(scale[0]);
                 } else if constexpr (QUANT_TYPE == 2) {  // PER_CHANNEL
                   if (coord_k < d) {
                     int scale_idx = h_k_idx * d + coord_k;
-                    current_scale = static_cast<float>(scale[scale_idx]);
+                    current_scale = static_cast<DQuantType>(scale[scale_idx]);
 #if DEQUANT_DEBUG
                     if (threadIdx.x == 0 && i < 4) {
+                      float val_f = static_cast<float>(val);
+                      float scale_f = static_cast<float>(current_scale);
                       printf("[FlashDequant-4bit] B=(%d,%d,%d) T=%d i=%d CK=%d SIdx=%d Pkd=0x%x Unp=%d Sc=%f Res=%f\n",
-                             blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, i, coord_k, scale_idx, packed_val, unpacked_val, current_scale, val * current_scale);
+                             blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, i, coord_k, scale_idx, packed_val, unpacked_val, scale_f, val_f * scale_f);
                     }
 #endif
                   }
                 }
-                tRsK(i) = static_cast<DQuantType>(val * current_scale);
+                tRsK(i) = val * current_scale;
               }
             }
             // Step 4: Perform an efficient copy from registers to shared memory.
