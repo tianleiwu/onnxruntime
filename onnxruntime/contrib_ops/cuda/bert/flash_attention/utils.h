@@ -280,7 +280,6 @@ __forceinline__ __device__ void gemm_quant(Tensor0& acc, Tensor1& tCrA, Tensor2&
   }
 }
 
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))

@@ -159,5 +159,9 @@ void run_mha_fwd_splitkv_dispatch_quant_8bit(Flash_fwd_params& params, cudaStrea
 template <typename T, int Headdim>
 void run_mha_fwd_splitkv_dispatch_quant_4bit(Flash_fwd_params& params, cudaStream_t stream);
 
+// Native INT8 dequant kernel dispatch (uses FP16 GEMM with inline dequantization)
+template <typename T, int Headdim>
+void run_mha_fwd_dequant_dispatch(Flash_fwd_params& params, cudaStream_t stream);
+
 }  // namespace flash
 }  // namespace onnxruntime

@@ -6,6 +6,8 @@
 #include "contrib_ops/cuda/bert/flash_attention/static_switch.h"
 #include "contrib_ops/cuda/bert/flash_attention/flash.h"
 #include "contrib_ops/cuda/bert/flash_attention/flash_fwd_kernel.h"
+#include "contrib_ops/cuda/bert/flash_attention/flash_dq_fwd_kernel.h"
+
 
 namespace onnxruntime {
 namespace flash {
@@ -249,8 +251,10 @@ template <typename T, int Headdim>
 void run_mha_fwd_splitkv_dispatch_quant_8bit(Flash_fwd_params& params, cudaStream_t stream) {
   if constexpr (Headdim == 128) { // Guard to prevent instantiating unused dims
       constexpr static int kBlockM = 64;
-      constexpr static int kBlockN = 128;
-      run_flash_splitkv_fwd_quant<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, 8>(params, stream);
+      constexpr static int kBlockN = 64; // BlockN for QK GEMM (matches PV K)
+      // Call the new Native Dequant Kernel Dispatcher
+      run_mha_fwd_dequant_dispatch<T, Headdim>(params, stream);
+      // Previous: run_flash_splitkv_fwd_quant<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, 8>(params, stream);
   }
 }
 
@@ -413,6 +417,62 @@ void run_mha_fwd_hdim256(Flash_fwd_params& params, cudaStream_t stream) {
     // 96 KB
     // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 8, false, false, T>, Is_causal>(params, stream);
   });
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Dequant Kernel Launch and Dispatch (INT8 KV Cache with FP16 dequantization)
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_dequant_kernel, bool Is_causal, bool Is_local, bool Has_alibi,
+                            bool Is_even_MN, bool Is_even_K, bool Is_softcap) {
+#if defined(ARCH_SUPPORTS_FLASH)
+  static_assert(!(Is_causal && Is_local));  // Enforce constraints
+  flash::compute_attn_1rowblock_int8mma<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap>(
+      params, blockIdx.x, blockIdx.z, blockIdx.y);
+#else
+  FLASH_UNSUPPORTED_ARCH
+#endif
+}
+
+template <typename Kernel_traits>
+void run_flash_dequant_fwd(Flash_fwd_params& params, cudaStream_t stream) {
+  constexpr size_t smem_size = sizeof(typename Kernel_traits::Element) *
+      (Kernel_traits::kBlockM * Kernel_traits::kHeadDim +   // Q
+       Kernel_traits::kBlockN * Kernel_traits::kHeadDim +   // K
+       Kernel_traits::kBlockN * Kernel_traits::kHeadDim);   // V
+
+  const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
+  dim3 grid(num_m_block, params.b, params.h);
+
+  const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr &&
+                          params.seqlen_k % Kernel_traits::kBlockN == 0 &&
+                          params.seqlen_q % Kernel_traits::kBlockM == 0;
+  const bool is_even_K = params.d == Kernel_traits::kHeadDim;
+
+  BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+    BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
+      EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
+        SOFTCAP_SWITCH(params.softcap > 0.0, Is_softcap, [&] {
+          auto kernel = &flash_fwd_dequant_kernel<Kernel_traits, Is_causal, false, false,
+                                                   IsEvenMNConst && IsEvenKConst, IsEvenKConst, Is_softcap>;
+          if (smem_size >= 48 * 1024) {
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_size));
+          }
+          kernel<<<grid, Kernel_traits::kNThreads, static_cast<int>(smem_size), stream>>>(params);
+        });
+      });
+    });
+  });
+}
+
+template <typename T, int Headdim>
+void run_mha_fwd_dequant_dispatch(Flash_fwd_params& params, cudaStream_t stream) {
+  // For HeadDim=128, use kBlockM=64, kBlockN=64, kNWarps=4
+  static_assert(Headdim == 128, "Dequant kernel currently only supports HeadDim=128");
+  constexpr int kBlockM = 64;
+  constexpr int kBlockN = 64;
+  constexpr int kNWarps = 4;
+  run_flash_dequant_fwd<Flash_dq_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, T>>(params, stream);
 }
 
 }  // namespace flash
