@@ -16,15 +16,40 @@ Usage:
   ncu --set full -o gqa_fp16 python profile_gqa.py --mode fp16 --warmup 5 --repeat 1
   ncu --set full -o gqa_int8 python profile_gqa.py --mode int8 --warmup 5 --repeat 1
 
-  # Profile with Nsight Systems (timeline analysis)
-  nsys profile -o gqa_fp16 python profile_gqa.py --mode fp16
-  nsys profile -o gqa_int8 python profile_gqa.py --mode int8
+  # Profile with Nsight Systems (timeline analysis) and extract kernel timings
+  nsys profile -o gqa_int8 --export=sqlite python profile_gqa.py --mode int8 --warmup 5 --repeat 10
+  python parse_nsys.py gqa_int8.sqlite
 """
 
 import argparse
 import time
+
 import torch
 from test_sparse_attention import GroupQueryAttentionConfig, OrtGroupQueryAttention
+
+# Optional NVTX support for nsys range markers
+try:
+    import nvtx
+
+    HAS_NVTX = True
+except ImportError:
+    HAS_NVTX = False
+
+    # Dummy context manager when NVTX is not available
+    class DummyNvtxRange:
+        def __init__(self, name):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    class nvtx:  # noqa: N801
+        @staticmethod
+        def annotate(name, color=None):
+            return DummyNvtxRange(name)
 
 
 def create_gqa_config(
@@ -74,21 +99,23 @@ def create_gqa_config(
     return config
 
 
-def benchmark_gqa(config: GroupQueryAttentionConfig, warmup: int = 50, repeat: int = 100):
+def benchmark_gqa(config: GroupQueryAttentionConfig, warmup: int = 50, repeat: int = 100, mode: str = ""):
     """Run benchmark and return average time in ms."""
     obj = OrtGroupQueryAttention(config)
 
-    # Warmup
-    for _ in range(warmup):
-        obj.infer()
-    torch.cuda.synchronize()
+    # Warmup phase with NVTX annotation
+    with nvtx.annotate(f"warmup_{mode}", color="yellow"):
+        for _ in range(warmup):
+            obj.infer()
+        torch.cuda.synchronize()
 
-    # Benchmark
-    start = time.perf_counter()
-    for _ in range(repeat):
-        obj.infer()
-    torch.cuda.synchronize()
-    end = time.perf_counter()
+    # Benchmark phase with NVTX annotation
+    with nvtx.annotate(f"benchmark_{mode}", color="green"):
+        start = time.perf_counter()
+        for _ in range(repeat):
+            obj.infer()
+        torch.cuda.synchronize()
+        end = time.perf_counter()
 
     avg_ms = (end - start) * 1000 / repeat
     return avg_ms
@@ -96,15 +123,13 @@ def benchmark_gqa(config: GroupQueryAttentionConfig, warmup: int = 50, repeat: i
 
 def run_comparison(args):
     """Compare FP16 vs quantized performance."""
-    print(f"\n{'='*70}")
-    print(f"GQA Performance Comparison")
-    print(f"{'='*70}")
-    print(f"Config: batch={args.batch_size}, seq_len={args.sequence_length}, "
-          f"past_seq={args.past_sequence_length}")
-    print(f"        num_heads={args.num_heads}, kv_heads={args.kv_num_heads}, "
-          f"head_size={args.head_size}")
+    print(f"\n{'=' * 70}")
+    print("GQA Performance Comparison")
+    print(f"{'=' * 70}")
+    print(f"Config: batch={args.batch_size}, seq_len={args.sequence_length}, past_seq={args.past_sequence_length}")
+    print(f"        num_heads={args.num_heads}, kv_heads={args.kv_num_heads}, head_size={args.head_size}")
     print(f"        warmup={args.warmup}, repeat={args.repeat}")
-    print(f"{'='*70}\n")
+    print(f"{'=' * 70}\n")
 
     modes = ["fp16", "int8", "int4"] if args.mode == "all" else [args.mode]
     results = {}
@@ -120,13 +145,13 @@ def run_comparison(args):
             kv_num_heads=args.kv_num_heads,
             head_size=args.head_size,
         )
-        avg_ms = benchmark_gqa(config, warmup=args.warmup, repeat=args.repeat)
+        avg_ms = benchmark_gqa(config, warmup=args.warmup, repeat=args.repeat, mode=mode)
         results[mode] = avg_ms
         print(f"  {mode.upper():6s}: {avg_ms:.4f} ms")
 
     # Print comparison if we have baseline
     if "fp16" in results and len(results) > 1:
-        print(f"\n  Relative to FP16:")
+        print("\n  Relative to FP16:")
         for mode, ms in results.items():
             if mode != "fp16":
                 ratio = ms / results["fp16"]
@@ -135,15 +160,13 @@ def run_comparison(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Profile GQA with quantized KV cache")
-    parser.add_argument("--mode", choices=["fp16", "int8", "int4", "all"], default="all",
-                        help="Quantization mode to test")
+    parser.add_argument(
+        "--mode", choices=["fp16", "int8", "int4", "all"], default="all", help="Quantization mode to test"
+    )
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size")
-    parser.add_argument("--sequence-length", type=int, default=1,
-                        help="Query sequence length (1 for token generation)")
-    parser.add_argument("--past-sequence-length", type=int, default=2048,
-                        help="Past KV cache sequence length")
-    parser.add_argument("--max-sequence-length", type=int, default=4096,
-                        help="Max sequence length for KV cache buffer")
+    parser.add_argument("--sequence-length", type=int, default=1, help="Query sequence length (1 for token generation)")
+    parser.add_argument("--past-sequence-length", type=int, default=2048, help="Past KV cache sequence length")
+    parser.add_argument("--max-sequence-length", type=int, default=4096, help="Max sequence length for KV cache buffer")
     parser.add_argument("--num-heads", type=int, default=32, help="Number of query heads")
     parser.add_argument("--kv-num-heads", type=int, default=8, help="Number of KV heads")
     parser.add_argument("--head-size", type=int, default=128, help="Head dimension")
