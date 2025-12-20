@@ -263,7 +263,6 @@ inline __device__ void compute_attn_1rowblock_int8mma(
   Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ);
   Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
 
-
   // ============================================================================
   // MMA Setup
   // ============================================================================
@@ -315,31 +314,49 @@ inline __device__ void compute_attn_1rowblock_int8mma(
   bool is_first_block = true;
   for (int n_block = n_block_max - 1; n_block >= n_block_min; --n_block) {
     // ------------------------------------------------------------------------
-    // 1. Load K INT8 -> Smem K FP16 (Dequantize)
+    // 1. Load K INT8 -> Smem K FP16 (Vectorized Dequantize using half2)
     // ------------------------------------------------------------------------
     Tensor gK_int8 = local_tile(mK_int8(_, bidh / params.h_h_k_ratio, _),
                                 Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
     Tensor tKgK_int8 = gmem_thr_copy_QKV.partition_S(gK_int8);
     Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
 
+    // Vectorized dequantization: process 2 elements at a time using half2
+    static_assert(size(tKgK_int8) % 2 == 0, "K tensor size must be even for half2 vectorization");
+    const __half2 k_scale_h2 = __float2half2_rn(k_scale);
 #pragma unroll
-    for (int i = 0; i < size(tKgK_int8); ++i) {
-      ElementInt8 val_int8 = tKgK_int8(i);
-      tKsK(i) = static_cast<Element>(static_cast<float>(val_int8) * k_scale);
+    for (int i = 0; i < size(tKgK_int8) / 2; ++i) {
+      // Load 2 int8 values
+      int8_t val0 = tKgK_int8(2 * i);
+      int8_t val1 = tKgK_int8(2 * i + 1);
+      // Convert to half2 and multiply by scale
+      __half2 fp16_pair = __floats2half2_rn(static_cast<float>(val0), static_cast<float>(val1));
+      fp16_pair = __hmul2(fp16_pair, k_scale_h2);
+      // Store to shared memory
+      reinterpret_cast<__half2*>(&tKsK(2 * i))[0] = fp16_pair;
     }
 
     // ------------------------------------------------------------------------
-    // 2. Load V INT8 -> Smem V FP16 (Dequantize)
+    // 2. Load V INT8 -> Smem V FP16 (Vectorized Dequantize using half2)
     // ------------------------------------------------------------------------
     Tensor gV_int8 = local_tile(mV_int8(_, bidh / params.h_h_k_ratio, _),
                                 Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
     Tensor tVgV_int8 = gmem_thr_copy_QKV.partition_S(gV_int8);
     Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
 
+    // Vectorized dequantization: process 2 elements at a time using half2
+    static_assert(size(tVgV_int8) % 2 == 0, "V tensor size must be even for half2 vectorization");
+    const __half2 v_scale_h2 = __float2half2_rn(v_scale);
 #pragma unroll
-    for (int i = 0; i < size(tVgV_int8); ++i) {
-      ElementInt8 val_int8 = tVgV_int8(i);
-      tVsV(i) = static_cast<Element>(static_cast<float>(val_int8) * v_scale);
+    for (int i = 0; i < size(tVgV_int8) / 2; ++i) {
+      // Load 2 int8 values
+      int8_t val0 = tVgV_int8(2 * i);
+      int8_t val1 = tVgV_int8(2 * i + 1);
+      // Convert to half2 and multiply by scale
+      __half2 fp16_pair = __floats2half2_rn(static_cast<float>(val0), static_cast<float>(val1));
+      fp16_pair = __hmul2(fp16_pair, v_scale_h2);
+      // Store to shared memory
+      reinterpret_cast<__half2*>(&tVsV(2 * i))[0] = fp16_pair;
     }
 
     __syncthreads();
@@ -353,7 +370,6 @@ inline __device__ void compute_attn_1rowblock_int8mma(
     flash::gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma,
                 smem_tiled_copy_Q, smem_tiled_copy_K,
                 smem_thr_copy_Q, smem_thr_copy_K);
-
 
     // Masking
     if constexpr (Is_causal) {
