@@ -135,13 +135,13 @@ def list_all_kernels(db_path: str) -> list[str]:
         conn.close()
 
 
-def format_table(results: list[dict]) -> str:
+def format_table(results: list[dict], prefix: str) -> str:
     """Format results as a human-readable table."""
     if not results:
         return "No matching kernels found."
 
     lines = []
-    lines.append(f"{'Kernel Name':<60} {'Total(ms)':>10} {'Calls':>8} {'Avg(us)':>10} {'Min(us)':>10} {'Max(us)':>10}")
+    lines.append(f"{prefix}{'Kernel Name':<55} {'Total(ms)':>10} {'Calls':>8} {'Avg(us)':>10} {'Min(us)':>10} {'Max(us)':>10}")
     lines.append("-" * 110)
 
     for r in results:
@@ -190,6 +190,7 @@ Examples:
     parser.add_argument("--output", "-o", help="Output file (default: stdout)")
     parser.add_argument("--list-kernels", action="store_true", help="List all kernel names in the database")
     parser.add_argument("--pattern", action="append", help="Add custom kernel name pattern (SQL LIKE syntax)")
+    parser.add_argument("--tag", default="", help="Tag for kernel name in output table. Example tag: 'fp16' or 'int8'")
     parser.add_argument(
         "--skip-first",
         type=int,
@@ -224,7 +225,7 @@ Examples:
     elif args.format == "csv":
         output = format_csv(results)
     else:
-        output = format_table(results)
+        output = format_table(results, args.tag + " " if args.tag else "")
 
     # Write output
     if args.output:

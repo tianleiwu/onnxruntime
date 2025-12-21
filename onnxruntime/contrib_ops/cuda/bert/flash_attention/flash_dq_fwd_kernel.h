@@ -171,64 +171,6 @@ __forceinline__ __device__ void dequant_scores(
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// Vectorized INT8 -> FP16 Dequantization (optimized for 16 elements at once)
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// Dequantize 16 INT8 values to 16 FP16 values using vectorized operations
-// Input: int4 (128 bits = 16 int8 values)
-// Output: 16 half values written to dst
-template <typename Element>
-__forceinline__ __device__ void dequantize_int8x16_to_fp16(
-    const int4& packed_int8,
-    Element* dst,
-    const float scale) {
-  const int8_t* vals = reinterpret_cast<const int8_t*>(&packed_int8);
-  __half2* dst_h2 = reinterpret_cast<__half2*>(dst);
-  const __half2 scale_h2 = __float2half2_rn(scale);
-
-#pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    // Convert two int8 values to float, then to half2
-    __half2 fp16_pair = __floats2half2_rn(
-        static_cast<float>(vals[2 * i]),
-        static_cast<float>(vals[2 * i + 1]));
-    // Multiply by scale
-    dst_h2[i] = __hmul2(fp16_pair, scale_h2);
-  }
-}
-
-// Vectorized copy from INT8 global memory with dequantization to FP16 shared memory
-// Uses 128-bit loads (16 INT8 values at once) instead of scalar loads
-// This function respects the CUTE tensor partitioning but uses optimized loads internally
-template <typename TensorSrc, typename TensorDst, typename Element>
-__forceinline__ __device__ void vectorized_copy_and_dequantize_int8(
-    TensorSrc const& gmem_src,   // Thread-local partition of INT8 global memory
-    TensorDst& smem_dst,         // Thread-local partition of FP16 shared memory
-    const float scale) {
-
-  // Get tensor size at runtime
-  const int tensor_size = size(gmem_src);
-  const __half2 scale_h2 = __float2half2_rn(scale);
-
-  // For CUTE tensors, element access may not be contiguous in memory.
-  // We need to use the tensor's element access pattern, not raw pointer arithmetic.
-  // Therefore, we stick with the element-by-element approach but optimize the inner loop.
-
-  // Process 2 elements at a time using half2
-#pragma unroll
-  for (int i = 0; i < tensor_size / 2; ++i) {
-    // Load 2 int8 values using tensor element access
-    int8_t val0 = gmem_src(2 * i);
-    int8_t val1 = gmem_src(2 * i + 1);
-    // Convert to half2 and multiply by scale
-    __half2 fp16_pair = __floats2half2_rn(static_cast<float>(val0), static_cast<float>(val1));
-    fp16_pair = __hmul2(fp16_pair, scale_h2);
-    // Store to shared memory
-    reinterpret_cast<__half2*>(&smem_dst(2 * i))[0] = fp16_pair;
-  }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 // Main Kernel: Native INT8 MMA Flash Attention (Minimal Version for HeadDim=128)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -321,6 +263,7 @@ inline __device__ void compute_attn_1rowblock_int8mma(
   Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ);
   Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
 
+
   // ============================================================================
   // MMA Setup
   // ============================================================================
@@ -372,28 +315,32 @@ inline __device__ void compute_attn_1rowblock_int8mma(
   bool is_first_block = true;
   for (int n_block = n_block_max - 1; n_block >= n_block_min; --n_block) {
     // ------------------------------------------------------------------------
-    // 1. Load K INT8 -> Smem K FP16 (Vectorized 128-bit loads with dequantization)
+    // 1. Load K INT8 -> Smem K FP16 (Dequantize)
     // ------------------------------------------------------------------------
     Tensor gK_int8 = local_tile(mK_int8(_, bidh / params.h_h_k_ratio, _),
                                 Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
     Tensor tKgK_int8 = gmem_thr_copy_QKV.partition_S(gK_int8);
     Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
 
-    // Use vectorized copy with dequantization (128-bit loads when possible)
-    vectorized_copy_and_dequantize_int8<decltype(tKgK_int8), decltype(tKsK), Element>(
-        tKgK_int8, tKsK, k_scale);
+#pragma unroll
+    for (int i = 0; i < size(tKgK_int8); ++i) {
+      ElementInt8 val_int8 = tKgK_int8(i);
+      tKsK(i) = static_cast<Element>(static_cast<float>(val_int8) * k_scale);
+    }
 
     // ------------------------------------------------------------------------
-    // 2. Load V INT8 -> Smem V FP16 (Vectorized 128-bit loads with dequantization)
+    // 2. Load V INT8 -> Smem V FP16 (Dequantize)
     // ------------------------------------------------------------------------
     Tensor gV_int8 = local_tile(mV_int8(_, bidh / params.h_h_k_ratio, _),
                                 Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
     Tensor tVgV_int8 = gmem_thr_copy_QKV.partition_S(gV_int8);
     Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
 
-    // Use vectorized copy with dequantization (128-bit loads when possible)
-    vectorized_copy_and_dequantize_int8<decltype(tVgV_int8), decltype(tVsV), Element>(
-        tVgV_int8, tVsV, v_scale);
+#pragma unroll
+    for (int i = 0; i < size(tVgV_int8); ++i) {
+      ElementInt8 val_int8 = tVgV_int8(i);
+      tVsV(i) = static_cast<Element>(static_cast<float>(val_int8) * v_scale);
+    }
 
     __syncthreads();
 
@@ -406,6 +353,7 @@ inline __device__ void compute_attn_1rowblock_int8mma(
     flash::gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma,
                 smem_tiled_copy_Q, smem_tiled_copy_K,
                 smem_thr_copy_Q, smem_thr_copy_K);
+
 
     // Masking
     if constexpr (Is_causal) {

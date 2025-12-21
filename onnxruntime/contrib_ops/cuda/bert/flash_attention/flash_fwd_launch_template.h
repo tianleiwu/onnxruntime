@@ -250,11 +250,13 @@ void run_flash_splitkv_fwd_quant(Flash_fwd_params& params, cudaStream_t stream) 
 template <typename T, int Headdim>
 void run_mha_fwd_splitkv_dispatch_quant_8bit(Flash_fwd_params& params, cudaStream_t stream) {
   if constexpr (Headdim == 128) { // Guard to prevent instantiating unused dims
-      constexpr static int kBlockM = 64;
-      constexpr static int kBlockN = 64; // BlockN for QK GEMM (matches PV K)
-      // Call the new Native Dequant Kernel Dispatcher
+      // Old Dispatcher passed parity test
+      // constexpr static int kBlockM = 64;
+      // constexpr static int kBlockN = 128;
+      // run_flash_splitkv_fwd_quant<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, 8>(params, stream);
+
+      // New Native Dequant Kernel Dispatcher (failed parity test!)
       run_mha_fwd_dequant_dispatch<T, Headdim>(params, stream);
-      // Previous: run_flash_splitkv_fwd_quant<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, 8>(params, stream);
   }
 }
 
@@ -436,10 +438,15 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_dequant_kernel, bool Is_causal, bool Is_lo
 
 template <typename Kernel_traits>
 void run_flash_dequant_fwd(Flash_fwd_params& params, cudaStream_t stream) {
+  // FP16 smem: Q + K + V
+  // INT8 smem: K_int8 + V_int8 (for async copy staging)
   constexpr size_t smem_size = sizeof(typename Kernel_traits::Element) *
       (Kernel_traits::kBlockM * Kernel_traits::kHeadDim +   // Q
        Kernel_traits::kBlockN * Kernel_traits::kHeadDim +   // K
-       Kernel_traits::kBlockN * Kernel_traits::kHeadDim);   // V
+       Kernel_traits::kBlockN * Kernel_traits::kHeadDim) +  // V
+      sizeof(typename Kernel_traits::ElementInt8) *
+      (Kernel_traits::kBlockN * Kernel_traits::kHeadDim +   // K_int8
+       Kernel_traits::kBlockN * Kernel_traits::kHeadDim);   // V_int8
 
   const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
   dim3 grid(num_m_block, params.b, params.h);
