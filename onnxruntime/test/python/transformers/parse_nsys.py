@@ -141,7 +141,9 @@ def format_table(results: list[dict], prefix: str) -> str:
         return "No matching kernels found."
 
     lines = []
-    lines.append(f"{prefix}{'Kernel Name':<55} {'Total(ms)':>10} {'Calls':>8} {'Avg(us)':>10} {'Min(us)':>10} {'Max(us)':>10}")
+    lines.append(
+        f"{prefix}{'Kernel Name':<55} {'Total(ms)':>10} {'Calls':>8} {'Avg(us)':>10} {'Min(us)':>10} {'Max(us)':>10}"
+    )
     lines.append("-" * 110)
 
     for r in results:

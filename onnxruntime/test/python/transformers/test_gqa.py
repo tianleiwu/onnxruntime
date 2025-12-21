@@ -929,6 +929,10 @@ def parity_check_gqa_prompt(
     v_quant = quantize_tensor_with_scale(v, v_scale, config.v_quant_type, config.kv_cache_type)
 
     ort_seqlens = cache_seqlens - 1
+    if config.packed:
+        print(f"DEBUG_INPUT_PACKED: q_ort[0,0,0,:10] = {q_ort[0,0,0,:10]}")
+    else:
+        print(f"DEBUG_INPUT: q_ort[0,0,0,:10] = {q_ort[0,0,0,:10]}")
     out, present_k, present_v = gqa_prompt_func(
         q=q_ort,
         k=k_quant,
@@ -954,6 +958,30 @@ def parity_check_gqa_prompt(
     out_np = out.detach().cpu().numpy()
 
     # --- Comparison ---
+    # DEBUG: Print the first 10 elements of the output to see hijacked values
+    # Shape is (batch, seqlen, num_heads, head_dim)
+    # We hijacked block (0,0,0), thread 0 => batch 0, seq 0, head 0.
+    if config.batch_size > 0 and config.q_sequence_length > 0:
+        print(f"DEBUG_HIJACK: out_np[0,0,0,:10] = {out_np[0,0,0,:10]}")
+    # Print batch 1 debug values if batch_size > 1
+    if config.batch_size > 1 and config.q_sequence_length > 0:
+        print(f"DEBUG_BATCH1: out_np[1,0,0,:10] = {out_np[1,0,0,:10]}")
+        print(f"  (seqlen_q, seqlen_k, sum_s_q, sum_s_k, seqlen_k_cache, n_block_max, n_block_min, gQ)")
+    # Print head 2 debug values (where NaN appears)
+    if config.batch_size > 1 and config.num_heads > 2 and config.q_sequence_length > 0:
+        print(f"DEBUG_HEAD2: out_np[1,0,2,:10] = {out_np[1,0,2,:10]}")
+        print(f"  (seqlen_q, seqlen_k, gQ, sK, sV, acc_s, kv_head_idx, k_scale)")
+
+    # Check for NaN in output
+    nan_count = numpy.sum(numpy.isnan(out_np))
+    if nan_count > 0:
+        nan_indices = numpy.argwhere(numpy.isnan(out_np))
+        print(f"DEBUG_NAN: Found {nan_count} NaN values in output!")
+        print(f"DEBUG_NAN: First 5 NaN indices: {nan_indices[:5]}")
+        # Also check where non-nan exists in reference
+        ref_nan_count = numpy.sum(numpy.isnan(out_ref_np))
+        print(f"DEBUG_NAN: Reference has {ref_nan_count} NaN values")
+
     numpy.testing.assert_allclose(out_np, out_ref_np, rtol=rtol, atol=atol)
 
     # Compare quantized cache with proper masking per batch

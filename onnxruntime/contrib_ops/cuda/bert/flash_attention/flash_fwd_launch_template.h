@@ -250,12 +250,12 @@ void run_flash_splitkv_fwd_quant(Flash_fwd_params& params, cudaStream_t stream) 
 template <typename T, int Headdim>
 void run_mha_fwd_splitkv_dispatch_quant_8bit(Flash_fwd_params& params, cudaStream_t stream) {
   if constexpr (Headdim == 128) { // Guard to prevent instantiating unused dims
-      // Old Dispatcher passed parity test
+      // Old Dispatcher - passes tests
       // constexpr static int kBlockM = 64;
       // constexpr static int kBlockN = 128;
       // run_flash_splitkv_fwd_quant<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, 8>(params, stream);
 
-      // New Native Dequant Kernel Dispatcher (failed parity test!)
+      // New Native Dequant Kernel Dispatcher
       run_mha_fwd_dequant_dispatch<T, Headdim>(params, stream);
   }
 }
@@ -429,8 +429,10 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_dequant_kernel, bool Is_causal, bool Is_lo
                             bool Is_even_MN, bool Is_even_K, bool Is_softcap) {
 #if defined(ARCH_SUPPORTS_FLASH)
   static_assert(!(Is_causal && Is_local));  // Enforce constraints
+  // Grid is dim3(num_m_block, params.b, params.h) => (m_block, batch, head)
+  // So: blockIdx.x = m_block, blockIdx.y = batch (bidb), blockIdx.z = head (bidh)
   flash::compute_attn_1rowblock_int8mma<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap>(
-      params, blockIdx.x, blockIdx.z, blockIdx.y);
+      params, blockIdx.y, blockIdx.z, blockIdx.x);
 #else
   FLASH_UNSUPPORTED_ARCH
 #endif

@@ -41,7 +41,8 @@ Status LaunchQuantizeKV(cudaStream_t stream, T_QUANT* quantized_data,
                         const T* dequantized_data, const T_SCALE* scale,
                         const int* seqlens, int batch_size, int num_heads,
                         int sequence_length, int head_size, int bit_width,
-                        KVQuantizationType quant_type);
+                        KVQuantizationType quant_type,
+                        bool is_input_bsnh = false);
 
 }  // namespace cuda
 }  // namespace contrib

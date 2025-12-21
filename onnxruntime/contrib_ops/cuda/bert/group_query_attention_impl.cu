@@ -519,12 +519,12 @@ Status FlashAttention(
           return LaunchQuantizeAppendKV<T, int8_t, T>(
               stream, reinterpret_cast<int8_t*>(dst), src, scale,
               data.seqlens_k, batch_size, kv_num_heads,
-              parameters.seqlen_present_kv_cache, head_size, 8, sequence_length, q_type);
+              parameters.seqlen_present_kv_cache, head_size, 8, sequence_length, q_type, true);
         } else {
           return LaunchQuantizeAppendKV<T, uint8_t, T>(
               stream, reinterpret_cast<uint8_t*>(dst), src, scale,
               data.seqlens_k, batch_size, kv_num_heads,
-              parameters.seqlen_present_kv_cache, head_size, 4, sequence_length, q_type);
+              parameters.seqlen_present_kv_cache, head_size, 4, sequence_length, q_type, true);
         }
       };
       ORT_RETURN_IF_ERROR(LaunchQuantAppend(data.present_key, reinterpret_cast<const T*>(key), data.k_scale, parameters.k_quant_type));

@@ -160,12 +160,12 @@ Status HandleRequantization(
       status = LaunchQuantizeKV<CudaT, int8_t, CudaT>(
           stream, present_key->MutableData<int8_t>(), data.present_key, quant_data.k_scale_ptr, data.seqlens_k,
           params.batch_size, params.kv_num_heads, params.seqlen_present_kv_cache, params.head_size,
-          params.kv_cache_bit_width, params.k_quant_type);
+          params.kv_cache_bit_width, params.k_quant_type, false);
     } else if (params.kv_cache_bit_width == 4) {
       status = LaunchQuantizeKV<CudaT, uint8_t, CudaT>(
           stream, present_key->MutableData<uint8_t>(), data.present_key, quant_data.k_scale_ptr, data.seqlens_k,
           params.batch_size, params.kv_num_heads, params.seqlen_present_kv_cache, params.head_size,
-          params.kv_cache_bit_width, params.k_quant_type);
+          params.kv_cache_bit_width, params.k_quant_type, false);
     } else {
       return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Quantized KV cache requires kv_cache_bit_width to be 4 or 8.");
     }
@@ -178,12 +178,12 @@ Status HandleRequantization(
       status = LaunchQuantizeKV<CudaT, int8_t, CudaT>(
           stream, present_value->MutableData<int8_t>(), data.present_value, quant_data.v_scale_ptr, data.seqlens_k,
           params.batch_size, params.kv_num_heads, params.seqlen_present_kv_cache, params.head_size,
-          params.kv_cache_bit_width, params.v_quant_type);
+          params.kv_cache_bit_width, params.v_quant_type, false);
     } else if (params.kv_cache_bit_width == 4) {
       status = LaunchQuantizeKV<CudaT, uint8_t, CudaT>(
           stream, present_value->MutableData<uint8_t>(), data.present_value, quant_data.v_scale_ptr, data.seqlens_k,
           params.batch_size, params.kv_num_heads, params.seqlen_present_kv_cache, params.head_size,
-          params.kv_cache_bit_width, params.v_quant_type);
+          params.kv_cache_bit_width, params.v_quant_type, false);
     } else {
       return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Quantized KV cache requires kv_cache_bit_width to be 4 or 8.");
     }

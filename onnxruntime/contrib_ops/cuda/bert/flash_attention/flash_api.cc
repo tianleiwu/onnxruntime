@@ -598,6 +598,7 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
     // V is at offset (num_heads + num_heads_k) * head_size
     char* q_base = static_cast<char*>(q);
     params.knew_ptr = static_cast<void*>(q_base + num_heads * head_size * sizeof(half));  // Assuming half/bf16 type size handled by stride?
+
     // WAIT: flash_fwd_params uses void*, but strides are in elements.
     // The kernel does `reinterpret_cast<Element*>(params.knew_ptr) + ...`
     // So we must pass the pointer adjusted by ELEMENT count if we cast to Element* inside.
@@ -624,6 +625,7 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
   params.is_seqlens_k_cumulative = seqlens_k_ == nullptr;
   if (seqlens_k_ != nullptr) {
     params.cu_seqlens_k = static_cast<int*>(seqlens_k_);
+    params.seqused_k = static_cast<int*>(seqlens_k_);
   }
 
   if (rotary_cos != nullptr) {
