@@ -413,15 +413,15 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
 
 #if USE_FLASH_ATTENTION
   bool use_flash_attention = !disable_flash_attention_ &&
-                             onnxruntime::flash::is_supported(device_prop,
-                                                              parameters.head_size,
-                                                              parameters.num_heads,
-                                                              parameters.kv_num_heads) &&
-                             onnxruntime::flash::is_supported_quantization(true /*is_causal*/,
-                                                                           parameters.head_size,
-                                                                           static_cast<int>(k_quant_type_),
-                                                                           static_cast<int>(v_quant_type_),
-                                                                           kv_cache_bit_width_);
+                             onnxruntime::flash::is_supported<CudaT>(device_prop,
+                                                                     parameters.head_size,
+                                                                     parameters.num_heads,
+                                                                     parameters.kv_num_heads) &&
+                             onnxruntime::flash::is_supported_quantization<CudaT>(true /*is_causal*/,
+                                                                                  parameters.head_size,
+                                                                                  static_cast<int>(k_quant_type_),
+                                                                                  static_cast<int>(v_quant_type_),
+                                                                                  kv_cache_bit_width_);
 #else
   constexpr bool use_flash_attention = false;
 #endif

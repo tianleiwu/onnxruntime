@@ -13,9 +13,24 @@ pip uninstall onnxruntime-gpu onnxruntime -y
 
 LD_LIBRARY_PATH=/usr/lib64/openmpi/lib:/home/tlwu/anaconda3/envs/py312/lib:/home/tlwu/cudnn9.8/lib64:/home/tlwu/cudnn9.8/lib
 
-rm -rf build
+# rm -rf build
+rm -f build/cuda/Release/CMakeFiles/onnxruntime_providers_cuda.dir/home/tlwu/onnxruntime/onnxruntime/contrib_ops/cuda/bert/flash_attention/flash_fwd_split_hdim128_bf16_sm80_quant_*
+rm -f build/cuda/Release/CMakeFiles/onnxruntime_providers_cuda.dir/home/tlwu/onnxruntime/onnxruntime/contrib_ops/cuda/bert/flash_attention/flash_fwd_split_hdim128_fp16_sm80_quant_*
+rm -f build/cuda/Release/CMakeFiles/onnxruntime_providers_cuda.dir/home/tlwu/onnxruntime/onnxruntime/contrib_ops/cuda/bert/flash_attention/flash_fwd_dequant_*
+
+# Format code with clang-format.
+lintrunner -a
 
 start_build=$(date +%s)
+
+# Parse --quick_build flag for faster development builds (hdim128 only)
+QUICK_BUILD_FLAG=""
+QUICK_BUILD_ENV=""
+if [[ "$*" == *"--quick_build"* ]]; then
+    QUICK_BUILD_FLAG="--cmake_extra_defines onnxruntime_QUICK_BUILD=ON"
+    QUICK_BUILD_ENV="QUICK_BUILD=1"
+    echo "==== 🚀 Quick build mode enabled (hdim128 only) ===="
+fi
 
 sh build.sh --config Release  --build_dir build/cuda --parallel  --use_cuda \
             --cuda_version 12.8 --cuda_home  /home/tlwu/cuda12.8/  \
@@ -27,7 +42,9 @@ sh build.sh --config Release  --build_dir build/cuda --parallel  --use_cuda \
             --cmake_extra_defines onnxruntime_DEBUG_NODE_INPUTS_OUTPUTS=0 \
             --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES=90 \
             --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF onnxruntime_ENABLE_CUDA_EP_INTERNAL_TESTS=OFF \
-            --cmake_extra_defines onnxruntime_USE_FPA_INTB_GEMM=OFF
+            --cmake_extra_defines onnxruntime_USE_FPA_INTB_GEMM=OFF \
+            $QUICK_BUILD_FLAG
+
 
 if [ $? -ne 0 ]; then
     echo "==== ❌ Build failed! Exiting. ===="
@@ -41,7 +58,7 @@ echo "==== ✅ Build completed in $total_time seconds ($(echo "scale=2; $total_t
 pip install build/cuda/Release/dist/onnxruntime_gpu-1.24.0-cp312-cp312-linux_x86_64.whl --force-reinstall
 
 cd onnxruntime/test/python/transformers
-python test_gqa.py
+env $QUICK_BUILD_ENV python test_gqa.py
 test_exit_code=$?
 if [ $test_exit_code -ne 0 ]; then
     echo "==== ❌ test_gqa.py failed with exit code $test_exit_code! Exiting. ===="

@@ -37,6 +37,9 @@ pipeline_mode = os.getenv("PIPELINE_MODE", "1") == "1"
 # Number of values per parameter (compared to pipeline mode)
 param_count = int(os.getenv("PARAM_COUNT", "2")) if not pipeline_mode else 1
 
+# Quick build mode: only test hdim128 for faster development iteration
+quick_build = os.getenv("QUICK_BUILD", "0") == "1"
+
 # #################################################################################################
 #  Configuration and Helper Classes
 # #################################################################################################
@@ -930,9 +933,9 @@ def parity_check_gqa_prompt(
 
     ort_seqlens = cache_seqlens - 1
     if config.packed:
-        print(f"DEBUG_INPUT_PACKED: q_ort[0,0,0,:10] = {q_ort[0,0,0,:10]}")
+        print(f"DEBUG_INPUT_PACKED: q_ort[0,0,0,:10] = {q_ort[0, 0, 0, :10]}")
     else:
-        print(f"DEBUG_INPUT: q_ort[0,0,0,:10] = {q_ort[0,0,0,:10]}")
+        print(f"DEBUG_INPUT: q_ort[0,0,0,:10] = {q_ort[0, 0, 0, :10]}")
     out, present_k, present_v = gqa_prompt_func(
         q=q_ort,
         k=k_quant,
@@ -962,15 +965,15 @@ def parity_check_gqa_prompt(
     # Shape is (batch, seqlen, num_heads, head_dim)
     # We hijacked block (0,0,0), thread 0 => batch 0, seq 0, head 0.
     if config.batch_size > 0 and config.q_sequence_length > 0:
-        print(f"DEBUG_HIJACK: out_np[0,0,0,:10] = {out_np[0,0,0,:10]}")
+        print(f"DEBUG_HIJACK: out_np[0,0,0,:10] = {out_np[0, 0, 0, :10]}")
     # Print batch 1 debug values if batch_size > 1
     if config.batch_size > 1 and config.q_sequence_length > 0:
-        print(f"DEBUG_BATCH1: out_np[1,0,0,:10] = {out_np[1,0,0,:10]}")
-        print(f"  (seqlen_q, seqlen_k, sum_s_q, sum_s_k, seqlen_k_cache, n_block_max, n_block_min, gQ)")
+        print(f"DEBUG_BATCH1: out_np[1,0,0,:10] = {out_np[1, 0, 0, :10]}")
+        print("  (seqlen_q, seqlen_k, sum_s_q, sum_s_k, seqlen_k_cache, n_block_max, n_block_min, gQ)")
     # Print head 2 debug values (where NaN appears)
     if config.batch_size > 1 and config.num_heads > 2 and config.q_sequence_length > 0:
-        print(f"DEBUG_HEAD2: out_np[1,0,2,:10] = {out_np[1,0,2,:10]}")
-        print(f"  (seqlen_q, seqlen_k, gQ, sK, sV, acc_s, kv_head_idx, k_scale)")
+        print(f"DEBUG_HEAD2: out_np[1,0,2,:10] = {out_np[1, 0, 2, :10]}")
+        print("  (seqlen_q, seqlen_k, gQ, sK, sV, acc_s, kv_head_idx, k_scale)")
 
     # Check for NaN in output
     nan_count = numpy.sum(numpy.isnan(out_np))
@@ -1301,7 +1304,7 @@ def gqa_cuda_prompt_test_cases(allow_head_sink: bool = True):
     batches = [3, 1, 5]
     seqs = [(35, 35), (127, 127), (240, 240), (2000, 2000)]
     heads = [(6, 3), (9, 9), (32, 8)]
-    h_sizes = [128, 32, 64, 256]
+    h_sizes = [128] if quick_build else [128, 32, 64, 256]
     smmoth_softmax__head_sink = get_softmax_options(allow_head_sink)
 
     for b in batches[:param_count]:
@@ -1344,7 +1347,7 @@ def gqa_cuda_past_test_cases(allow_head_sink: bool = True):
     seqs = [(1, 128), (1, 1024), (1, 2048), (1, 5000)]
     heads = [(32, 8), (6, 3), (9, 9)]
     # We test 128 in pipeline since quantized kv cache is only enabled for head_size=128 in flash attention.
-    h_sizes = [128, 64, 256]
+    h_sizes = [128] if quick_build else [128, 64, 256]
     smmoth_softmax__head_sink = get_softmax_options(allow_head_sink)
 
     for b in batches[:param_count]:
