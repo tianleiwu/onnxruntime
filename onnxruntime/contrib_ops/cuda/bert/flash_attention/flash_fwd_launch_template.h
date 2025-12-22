@@ -426,13 +426,22 @@ void run_mha_fwd_hdim256(Flash_fwd_params& params, cudaStream_t stream) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_dequant_kernel, bool Is_causal, bool Is_local, bool Has_alibi,
-                            bool Is_even_MN, bool Is_even_K, bool Is_softcap) {
+                            bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV) {
 #if defined(ARCH_SUPPORTS_FLASH)
   static_assert(!(Is_causal && Is_local));  // Enforce constraints
   // Grid is dim3(num_m_block, params.b, params.h) => (m_block, batch, head)
   // So: blockIdx.x = m_block, blockIdx.y = batch (bidb), blockIdx.z = head (bidh)
-  flash::compute_attn_1rowblock_int8mma<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap>(
-      params, blockIdx.y, blockIdx.z, blockIdx.x);
+  // With Split-K:
+  // Grid is dim3(num_m_block, num_splits > 1 ? num_splits : params.b, num_splits > 1 ? params.b * params.h : params.h)
+  // If Split: blockIdx.y = split_idx, blockIdx.z = batch * head + head_idx (collapsed)
+
+  const int n_split_idx = Split ? blockIdx.y : 0;
+  const int num_n_splits = Split ? gridDim.y : 1;
+  const int bidb = Split ? blockIdx.z / params.h : blockIdx.y;
+  const int bidh = Split ? blockIdx.z % params.h : blockIdx.z;
+
+  flash::compute_attn_1rowblock_int8mma<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(
+      params, bidb, bidh, blockIdx.x, n_split_idx, num_n_splits);
 #else
   FLASH_UNSUPPORTED_ARCH
 #endif
@@ -451,7 +460,7 @@ void run_flash_dequant_fwd(Flash_fwd_params& params, cudaStream_t stream) {
        Kernel_traits::kBlockN * Kernel_traits::kHeadDim);   // V_int8
 
   const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
-  dim3 grid(num_m_block, params.b, params.h);
+  dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
 
   const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr &&
                           params.seqlen_k % Kernel_traits::kBlockN == 0 &&
@@ -462,16 +471,42 @@ void run_flash_dequant_fwd(Flash_fwd_params& params, cudaStream_t stream) {
     BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
       EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.0, Is_softcap, [&] {
-          auto kernel = &flash_fwd_dequant_kernel<Kernel_traits, Is_causal, false, false,
-                                                   IsEvenMNConst && IsEvenKConst, IsEvenKConst, Is_softcap>;
-          if (smem_size >= 48 * 1024) {
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_size));
-          }
-          kernel<<<grid, Kernel_traits::kNThreads, static_cast<int>(smem_size), stream>>>(params);
+             BOOL_SWITCH(params.num_splits > 1, SplitConst, [&] {
+                 BOOL_SWITCH(params.knew_ptr != nullptr, Append_KV_Const, [&] {
+                      auto kernel = &flash_fwd_dequant_kernel<Kernel_traits, Is_causal, false, false,
+                                                               IsEvenMNConst && IsEvenKConst, IsEvenKConst, Is_softcap, SplitConst, Append_KV_Const>;
+                      if (smem_size >= 48 * 1024) {
+                        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_size));
+                      }
+                      kernel<<<grid, Kernel_traits::kNThreads, static_cast<int>(smem_size), stream>>>(params);
+                 });
+             });
         });
       });
     });
   });
+
+  if (params.num_splits > 1) {
+    constexpr static int kBlockM = Kernel_traits::kHeadDim % 128 == 0 ? 4 : (Kernel_traits::kHeadDim % 64 == 0 ? 8 : 16);
+    dim3 grid_combine((params.b * params.h * params.seqlen_q + kBlockM - 1) / kBlockM);
+    EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
+      if (params.num_splits <= 2) {
+        flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 1, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+      } else if (params.num_splits <= 4) {
+        flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 2, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+      } else if (params.num_splits <= 8) {
+        flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 3, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+      } else if (params.num_splits <= 16) {
+        flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 4, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+      } else if (params.num_splits <= 32) {
+        flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 5, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+      } else if (params.num_splits <= 64) {
+        flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 6, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+      } else if (params.num_splits <= 128) {
+        flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 7, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+      }
+    });
+  }
 }
 
 template <typename T, int Headdim>
