@@ -199,6 +199,13 @@ inline __device__ void compute_attn_1rowblock_int8mma(
 
   const BlockInfo<!Is_even_MN> binfo(params, bidb);
 
+  // DEBUG: Print key parameters for first block of first batch
+  if (tidx == 0 && bidb == 0 && bidh == 0 && m_block == 0) {
+    printf("[DQ_KERNEL] Is_causal=%d Is_softcap=%d actual_seqlen_q=%d actual_seqlen_k=%d scale_log2=%f softcap=%f\\n",
+           Is_causal, Is_softcap, binfo.actual_seqlen_q, binfo.actual_seqlen_k,
+           params.scale_softmax_log2, params.softcap);
+  }
+
   if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
   // Compute n_block range
@@ -244,17 +251,37 @@ inline __device__ void compute_attn_1rowblock_int8mma(
                           make_stride(params.q_row_stride, params.q_head_stride, _1{}));
   Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
 
-  // K is INT8 in global memory
-  Tensor mK_int8 = make_tensor(make_gmem_ptr(reinterpret_cast<const ElementInt8*>(params.k_ptr) +
-                                             binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb)),
-                               make_shape(binfo.actual_seqlen_k, params.h_k, params.d),
-                               make_stride(params.k_row_stride, params.k_head_stride, _1{}));
+  // Compute KV head index (for GQA)
+  const int kv_head_idx = bidh / params.h_h_k_ratio;
 
-  // V is INT8 in global memory
-  Tensor mV_int8 = make_tensor(make_gmem_ptr(reinterpret_cast<const ElementInt8*>(params.v_ptr) +
-                                             binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb)),
-                               make_shape(binfo.actual_seqlen_k, params.h_k, params.d),
-                               make_stride(params.v_row_stride, params.v_head_stride, _1{}));
+  // K is INT8 in global memory - include head offset in base pointer like old kernel
+  // Base offset: batch_offset + head_offset
+  const index_t k_base_offset = binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb) +
+                                kv_head_idx * params.k_head_stride;
+  Tensor mK_int8 = make_tensor(make_gmem_ptr(reinterpret_cast<const ElementInt8*>(params.k_ptr) + k_base_offset),
+                               make_shape(binfo.actual_seqlen_k, params.d),
+                               make_stride(params.k_row_stride, _1{}));
+
+  // V is INT8 in global memory - include head offset in base pointer like old kernel
+  const index_t v_base_offset = binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb) +
+                                kv_head_idx * params.v_head_stride;
+  Tensor mV_int8 = make_tensor(make_gmem_ptr(reinterpret_cast<const ElementInt8*>(params.v_ptr) + v_base_offset),
+                               make_shape(binfo.actual_seqlen_k, params.d),
+                               make_stride(params.v_row_stride, _1{}));
+
+  // DEBUG: Print batch 1 K/V strides and offsets
+  if (tidx == 0 && bidh == 0 && m_block == 0 && bidb == 1) {
+    printf("[DQ_BATCH1] k_batch_stride=%ld k_row_stride=%ld k_head_stride=%ld k_base_offset=%ld\\n",
+           (long)params.k_batch_stride, (long)params.k_row_stride, (long)params.k_head_stride,
+           (long)k_base_offset);
+    printf("[DQ_BATCH1] h_k=%d seqlen_k=%d actual_seqlen_k=%d d=%d kv_head_idx=%d\\n",
+           params.h_k, params.seqlen_k, binfo.actual_seqlen_k, params.d, kv_head_idx);
+  }
+  // DEBUG: Print batch 2 K/V strides and offsets
+  if (tidx == 0 && bidh == 0 && m_block == 0 && bidb == 2) {
+    printf("[DQ_BATCH2] k_batch_stride=%ld k_base_offset=%ld actual_seqlen_k=%d\\n",
+           (long)params.k_batch_stride, (long)k_base_offset, binfo.actual_seqlen_k);
+  }
 
   // Output
   Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr) +
@@ -262,6 +289,14 @@ inline __device__ void compute_attn_1rowblock_int8mma(
                           make_shape(binfo.actual_seqlen_q, params.h, params.d),
                           make_stride(params.o_row_stride, params.o_head_stride, _1{}));
   Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
+
+  // DEBUG: Print output offset info for Batch 1
+  if (tidx == 0 && bidh == 0 && m_block == 0 && bidb == 1) {
+    long q_off = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb);
+    printf("[DQ_OUT_B1] q_offset=%ld o_batch_stride=%ld o_row_stride=%ld o_head_stride=%ld q_ptr=%p o_ptr=%p\n",
+           q_off, (long)params.o_batch_stride, (long)params.o_row_stride, (long)params.o_head_stride,
+           params.q_ptr, params.o_ptr);
+  }
 
   // ============================================================================
   // Copy Setup (QKV)
@@ -299,6 +334,13 @@ inline __device__ void compute_attn_1rowblock_int8mma(
   // Accumulator for output (Global over HeadDim)
   Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
   clear(acc_o);
+
+  // DEBUG: Print acc_o layout info for first thread
+  if (tidx == 0 && bidb == 0 && bidh == 0 && m_block == 0) {
+    printf("[DQ_ACC_O_LAYOUT] acc_o size=%d rank=%d shape=(%d,%d,%d)\\n",
+           (int)size(acc_o), (int)rank(acc_o),
+           (int)size<0>(acc_o), (int)size<1>(acc_o), (int)size<2>(acc_o));
+  }
 
   // Softmax
   constexpr int kNRows = 2 * decltype(size<1>(acc_o))::value;
@@ -340,8 +382,14 @@ inline __device__ void compute_attn_1rowblock_int8mma(
     // Each thread processes a portion of the (kBlockN x kHeadDim) tile.
     // Use direct 2D tensor indexing, NOT TiledCopy partitioning (which has element size mismatch).
     // ------------------------------------------------------------------------
-    Tensor gK_int8 = local_tile(mK_int8(_, bidh / params.h_h_k_ratio, _),
-                                Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
+    // Note: mK_int8 is now 2D (seqlen_k, d) with head offset already in base pointer
+    Tensor gK_int8 = local_tile(mK_int8, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
+
+    // DEBUG: Print n_block info for batch 1
+    if (tidx == 0 && bidh == 0 && bidb == 1 && n_block == n_block_max - 1) {
+      printf("[DQ_B1_LOOP] n_block=%d n_block_max=%d n_block_min=%d actual_seqlen_k=%d first_K[0]=%d\\n",
+             n_block, n_block_max, n_block_min, binfo.actual_seqlen_k, (int)gK_int8(0, 0));
+    }
 
     // Each thread handles (kBlockN * kHeadDim) / kNThreads elements
     constexpr int kTotalElems = kBlockN * kHeadDim;
@@ -363,8 +411,8 @@ inline __device__ void compute_attn_1rowblock_int8mma(
     // ------------------------------------------------------------------------
     // 2. Load V INT8 -> Smem V FP16 (Dequantize)
     // ------------------------------------------------------------------------
-    Tensor gV_int8 = local_tile(mV_int8(_, bidh / params.h_h_k_ratio, _),
-                                Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
+    // Note: mV_int8 is now 2D (seqlen_k, d) with head offset already in base pointer
+    Tensor gV_int8 = local_tile(mV_int8, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
 
 #pragma unroll
     for (int i = 0; i < kElemsPerThread; ++i) {
@@ -379,6 +427,23 @@ inline __device__ void compute_attn_1rowblock_int8mma(
     }
 
     __syncthreads();
+
+    // DEBUG: Compare sV vs sVt to verify transposition
+    if (tidx == 0 && bidb == 0 && bidh == 0 && n_block == n_block_max - 1) {
+      // sV is (BlockN=64, HeadDim=128) - row=seq, col=dim
+      // sVt is (HeadDim=128, BlockN=64) - row=dim, col=seq
+      // So sV(0,1) should equal sVt(1,0)
+      float v_00 = static_cast<float>(sV(0, 0));
+      float v_01 = static_cast<float>(sV(0, 1));
+      float v_10 = static_cast<float>(sV(1, 0));
+      float vt_00 = static_cast<float>(sVt(0, 0));
+      float vt_10 = static_cast<float>(sVt(1, 0));
+      float vt_01 = static_cast<float>(sVt(0, 1));
+      printf("[DQ_VT_DEBUG] sV(0,0)=%f sV(0,1)=%f sV(1,0)=%f | sVt(0,0)=%f sVt(1,0)=%f sVt(0,1)=%f\\n",
+             v_00, v_01, v_10, vt_00, vt_10, vt_01);
+      printf("[DQ_VT_DEBUG] Expected: sV(0,1)==sVt(1,0)? %d, sV(1,0)==sVt(0,1)? %d\\n",
+             (v_01 == vt_10), (v_10 == vt_01));
+    }
 
     // ------------------------------------------------------------------------
     // 3. Q @ K^T
@@ -405,6 +470,15 @@ inline __device__ void compute_attn_1rowblock_int8mma(
     mask.template apply_mask<Is_causal, Is_even_MN>(
         acc_s, col_idx_offset, row_idx_offset, warp_row_stride);
 
+    // DEBUG: Check acc_s for batch 1 head 0 after mask
+    if (tidx == 0 && bidb == 1 && bidh == 0 && n_block == n_block_max - 1) {
+      float acc_s_val = acc_s(0);
+      bool is_nan = isnan(acc_s_val);
+      bool is_inf = isinf(acc_s_val);
+      printf("[DQ_ACC_S_H0] bidb=1 bidh=0 kv_head_idx=%d acc_s[0]=%f is_nan=%d is_inf=%d\\n",
+             kv_head_idx, acc_s_val, is_nan, is_inf);
+    }
+
     // Apply softcap (tanh-based capping) if enabled
     if constexpr (Is_softcap) {
       flash::apply_softcap(acc_s, params.softcap);
@@ -418,6 +492,12 @@ inline __device__ void compute_attn_1rowblock_int8mma(
       softmax.template softmax_rescale_o</*Is_first=*/false>(acc_s, acc_o, params.scale_softmax_log2);
     }
 
+    // DEBUG: Check acc_o after softmax for head 3
+    if (tidx == 0 && bidb == 1 && bidh == 3 && n_block == n_block_max - 1) {
+      float acc_o_val = acc_o(0);
+      printf("[DQ_ACC_O_H3] acc_o[0]=%f is_nan=%d\\n", acc_o_val, isnan(acc_o_val));
+    }
+
     // ------------------------------------------------------------------------
     // 4. P @ V
     // ------------------------------------------------------------------------
@@ -428,29 +508,64 @@ inline __device__ void compute_attn_1rowblock_int8mma(
     // Use flash::gemm_rs for P×V GEMM (same approach as old kernel)
     flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
 
+    // DEBUG: Check acc_o after P×V GEMM for head 2/4 (where NaN appears)
+    if (tidx == 0 && bidb == 1 && (bidh == 2 || bidh == 4) && n_block == n_block_min) {
+      float acc_o_val = acc_o(0);
+      printf("[DQ_POST_PV] bidb=1 bidh=%d acc_o[0]=%f is_nan=%d\\n", bidh, acc_o_val, isnan(acc_o_val));
+    }
+
   }  // End n_block loop
 
   // ============================================================================
   // Finalize
   // ============================================================================
   // Normalize acc_o (full N=128)
-  softmax.template normalize_softmax_lse</*Split=*/false>(acc_o, params.scale_softmax, -flash::kInfinity);
+  // Handle sink parameter correctly for smooth softmax (same as old kernel)
+  float sink = (params.head_sink_ptr != nullptr)
+                   ? static_cast<float>(reinterpret_cast<const Element*>(params.head_sink_ptr)[bidh])
+                   : (params.smooth_softmax ? 0.0f : -flash::kInfinity);
+  softmax.template normalize_softmax_lse</*Split=*/false>(acc_o, params.scale_softmax, sink);
 
-  // Store Reg -> Smem
-  using SmemCopyAtomO = Copy_Atom<DefaultCopy, half_t>;
-  auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
-
-  CUTE_UNROLL
-  for (int ni = 0; ni < Kernel_traits::kHeadDim / 16; ++ni) {
-    auto acc_slice = local_tile(acc_o, Shape<Int<1>, Int<2>>{}, make_coord(0, ni));
-    auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
-    auto tSsO = smem_thr_copy_O.partition_D(sO);
-    auto tSsO_ni = tSsO(_, _, ni);
-
-    Tensor rO = flash::convert_type<Element>(acc_slice);
-    cute::copy(smem_tiled_copy_O, rO, tSsO_ni);
+  // DEBUG: Check first 4 acc_o values for pairwise pattern
+  if (tidx == 0 && bidb == 0 && bidh == 0) {
+    printf("[DQ_ACC_O_VALS] acc_o[0-3]=%f %f %f %f\\n",
+           (float)acc_o(0), (float)acc_o(1), (float)acc_o(2), (float)acc_o(3));
   }
+
+  // DEBUG: Check acc_o after normalize for failing heads (scan all elements)
+  if (tidx == 0 && bidb == 1 && bidh == 0) {
+    bool found_nan = false;
+    for (int i = 0; i < size(acc_o); ++i) {
+      if (isnan((float)acc_o(i))) {
+        printf("[DQ_POST_NORM_NAN] bidb=1 bidh=0 kv_head_idx=%d acc_o[%d]=%f is_nan=1\n",
+               kv_head_idx, i, (float)acc_o(i));
+        found_nan = true;
+        break;  // Print just first one to avoid spam
+      }
+    }
+    if (!found_nan) {
+      printf("[DQ_POST_NORM_OK] bidb=1 bidh=0 kv_head_idx=%d acc_o clean\n", kv_head_idx);
+    }
+  }
+
+  // Store Reg -> Smem (use same approach as old kernel with retile_S)
+  Tensor rO = flash::convert_type<Element>(acc_o);
+
+  using SmemCopyAtomO = Copy_Atom<DefaultCopy, Element>;
+  auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
+  auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
+  Tensor taccOrO = smem_thr_copy_O.retile_S(rO);     // ((Atom,AtomNum), MMA_M, MMA_N)
+  Tensor taccOsO = smem_thr_copy_O.partition_D(sO);  // ((Atom,AtomNum),PIPE_M,PIPE_N)
+
+  cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
   __syncthreads();
+
+  // DEBUG: Print sO after Reg->Smem copy
+  if (tidx == 0 && bidb == 0 && bidh == 0) {
+    // sO layout is (BlockM=64, HeadDim=128) for output
+    printf("[DQ_sO_VALS] sO(0,0:3)=%f %f %f %f\\n",
+           (float)sO(0, 0), (float)sO(0, 1), (float)sO(0, 2), (float)sO(0, 3));
+  }
 
   // Copy Smem -> Global
   typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
