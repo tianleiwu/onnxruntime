@@ -117,10 +117,13 @@ struct Flash_dq_kernel_traits {
                                                     GmemLayoutAtom{},
                                                     Layout<Shape<_1, _8>>{}));
 
-  // INT8 global copy (direct INT8 without aliasing)
   using GmemTiledCopyKInt8 = decltype(make_tiled_copy(Copy_Atom<Gmem_copy_struct, ElementInt8>{},
                                                       GmemLayoutAtom{},
                                                       Layout<Shape<_1, _16>>{}));  // 16 int8s = 16 bytes
+
+  // Output Smem Layout (Row-Major for Vectorized Global Copy)
+  using SmemLayoutO = decltype(make_layout(Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                                           Stride<Int<kHeadDim>, _1>{}));
 
   using SmemCopyAtomO = Copy_Atom<DefaultCopy, Element>;
   using SmemTiledCopyO = decltype(make_tiled_copy_C(SmemCopyAtomO{}, TiledMma_PV{}));
@@ -199,13 +202,6 @@ inline __device__ void compute_attn_1rowblock_int8mma(
 
   const BlockInfo<!Is_even_MN> binfo(params, bidb);
 
-  // DEBUG: Print key parameters for first block of first batch
-  if (tidx == 0 && bidb == 0 && bidh == 0 && m_block == 0) {
-    printf("[DQ_KERNEL] Is_causal=%d Is_softcap=%d actual_seqlen_q=%d actual_seqlen_k=%d scale_log2=%f softcap=%f\\n",
-           Is_causal, Is_softcap, binfo.actual_seqlen_q, binfo.actual_seqlen_k,
-           params.scale_softmax_log2, params.softcap);
-  }
-
   if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
   // Compute n_block range
@@ -236,7 +232,7 @@ inline __device__ void compute_attn_1rowblock_int8mma(
 
   // Define sO early (reusing Q memory) for Output Staging (FP16)
   Tensor sO = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)),
-                          typename Kernel_traits::SmemLayoutQ{});
+                          typename Kernel_traits::SmemLayoutO{});
 
   // Get scales
   const float k_scale = params.k_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.k_scale_ptr)[0]) : 1.0f;
@@ -269,34 +265,12 @@ inline __device__ void compute_attn_1rowblock_int8mma(
                                make_shape(binfo.actual_seqlen_k, params.d),
                                make_stride(params.v_row_stride, _1{}));
 
-  // DEBUG: Print batch 1 K/V strides and offsets
-  if (tidx == 0 && bidh == 0 && m_block == 0 && bidb == 1) {
-    printf("[DQ_BATCH1] k_batch_stride=%ld k_row_stride=%ld k_head_stride=%ld k_base_offset=%ld\\n",
-           (long)params.k_batch_stride, (long)params.k_row_stride, (long)params.k_head_stride,
-           (long)k_base_offset);
-    printf("[DQ_BATCH1] h_k=%d seqlen_k=%d actual_seqlen_k=%d d=%d kv_head_idx=%d\\n",
-           params.h_k, params.seqlen_k, binfo.actual_seqlen_k, params.d, kv_head_idx);
-  }
-  // DEBUG: Print batch 2 K/V strides and offsets
-  if (tidx == 0 && bidh == 0 && m_block == 0 && bidb == 2) {
-    printf("[DQ_BATCH2] k_batch_stride=%ld k_base_offset=%ld actual_seqlen_k=%d\\n",
-           (long)params.k_batch_stride, (long)k_base_offset, binfo.actual_seqlen_k);
-  }
-
   // Output
   Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr) +
                                         binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
                           make_shape(binfo.actual_seqlen_q, params.h, params.d),
                           make_stride(params.o_row_stride, params.o_head_stride, _1{}));
   Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
-
-  // DEBUG: Print output offset info for Batch 1
-  if (tidx == 0 && bidh == 0 && m_block == 0 && bidb == 1) {
-    long q_off = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb);
-    printf("[DQ_OUT_B1] q_offset=%ld o_batch_stride=%ld o_row_stride=%ld o_head_stride=%ld q_ptr=%p o_ptr=%p\n",
-           q_off, (long)params.o_batch_stride, (long)params.o_row_stride, (long)params.o_head_stride,
-           params.q_ptr, params.o_ptr);
-  }
 
   // ============================================================================
   // Copy Setup (QKV)
@@ -334,13 +308,6 @@ inline __device__ void compute_attn_1rowblock_int8mma(
   // Accumulator for output (Global over HeadDim)
   Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
   clear(acc_o);
-
-  // DEBUG: Print acc_o layout info for first thread
-  if (tidx == 0 && bidb == 0 && bidh == 0 && m_block == 0) {
-    printf("[DQ_ACC_O_LAYOUT] acc_o size=%d rank=%d shape=(%d,%d,%d)\\n",
-           (int)size(acc_o), (int)rank(acc_o),
-           (int)size<0>(acc_o), (int)size<1>(acc_o), (int)size<2>(acc_o));
-  }
 
   // Softmax
   constexpr int kNRows = 2 * decltype(size<1>(acc_o))::value;
@@ -385,12 +352,6 @@ inline __device__ void compute_attn_1rowblock_int8mma(
     // Note: mK_int8 is now 2D (seqlen_k, d) with head offset already in base pointer
     Tensor gK_int8 = local_tile(mK_int8, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
 
-    // DEBUG: Print n_block info for batch 1
-    if (tidx == 0 && bidh == 0 && bidb == 1 && n_block == n_block_max - 1) {
-      printf("[DQ_B1_LOOP] n_block=%d n_block_max=%d n_block_min=%d actual_seqlen_k=%d first_K[0]=%d\\n",
-             n_block, n_block_max, n_block_min, binfo.actual_seqlen_k, (int)gK_int8(0, 0));
-    }
-
     // Each thread handles (kBlockN * kHeadDim) / kNThreads elements
     constexpr int kTotalElems = kBlockN * kHeadDim;
     constexpr int kElemsPerThread = kTotalElems / Kernel_traits::kNThreads;
@@ -428,23 +389,6 @@ inline __device__ void compute_attn_1rowblock_int8mma(
 
     __syncthreads();
 
-    // DEBUG: Compare sV vs sVt to verify transposition
-    if (tidx == 0 && bidb == 0 && bidh == 0 && n_block == n_block_max - 1) {
-      // sV is (BlockN=64, HeadDim=128) - row=seq, col=dim
-      // sVt is (HeadDim=128, BlockN=64) - row=dim, col=seq
-      // So sV(0,1) should equal sVt(1,0)
-      float v_00 = static_cast<float>(sV(0, 0));
-      float v_01 = static_cast<float>(sV(0, 1));
-      float v_10 = static_cast<float>(sV(1, 0));
-      float vt_00 = static_cast<float>(sVt(0, 0));
-      float vt_10 = static_cast<float>(sVt(1, 0));
-      float vt_01 = static_cast<float>(sVt(0, 1));
-      printf("[DQ_VT_DEBUG] sV(0,0)=%f sV(0,1)=%f sV(1,0)=%f | sVt(0,0)=%f sVt(1,0)=%f sVt(0,1)=%f\\n",
-             v_00, v_01, v_10, vt_00, vt_10, vt_01);
-      printf("[DQ_VT_DEBUG] Expected: sV(0,1)==sVt(1,0)? %d, sV(1,0)==sVt(0,1)? %d\\n",
-             (v_01 == vt_10), (v_10 == vt_01));
-    }
-
     // ------------------------------------------------------------------------
     // 3. Q @ K^T
     // ------------------------------------------------------------------------
@@ -471,13 +415,6 @@ inline __device__ void compute_attn_1rowblock_int8mma(
         acc_s, col_idx_offset, row_idx_offset, warp_row_stride);
 
     // DEBUG: Check acc_s for batch 1 head 0 after mask
-    if (tidx == 0 && bidb == 1 && bidh == 0 && n_block == n_block_max - 1) {
-      float acc_s_val = acc_s(0);
-      bool is_nan = isnan(acc_s_val);
-      bool is_inf = isinf(acc_s_val);
-      printf("[DQ_ACC_S_H0] bidb=1 bidh=0 kv_head_idx=%d acc_s[0]=%f is_nan=%d is_inf=%d\\n",
-             kv_head_idx, acc_s_val, is_nan, is_inf);
-    }
 
     // Apply softcap (tanh-based capping) if enabled
     if constexpr (Is_softcap) {
@@ -492,12 +429,6 @@ inline __device__ void compute_attn_1rowblock_int8mma(
       softmax.template softmax_rescale_o</*Is_first=*/false>(acc_s, acc_o, params.scale_softmax_log2);
     }
 
-    // DEBUG: Check acc_o after softmax for head 3
-    if (tidx == 0 && bidb == 1 && bidh == 3 && n_block == n_block_max - 1) {
-      float acc_o_val = acc_o(0);
-      printf("[DQ_ACC_O_H3] acc_o[0]=%f is_nan=%d\\n", acc_o_val, isnan(acc_o_val));
-    }
-
     // ------------------------------------------------------------------------
     // 4. P @ V
     // ------------------------------------------------------------------------
@@ -507,12 +438,6 @@ inline __device__ void compute_attn_1rowblock_int8mma(
 
     // Use flash::gemm_rs for P×V GEMM (same approach as old kernel)
     flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
-
-    // DEBUG: Check acc_o after P×V GEMM for head 2/4 (where NaN appears)
-    if (tidx == 0 && bidb == 1 && (bidh == 2 || bidh == 4) && n_block == n_block_min) {
-      float acc_o_val = acc_o(0);
-      printf("[DQ_POST_PV] bidb=1 bidh=%d acc_o[0]=%f is_nan=%d\\n", bidh, acc_o_val, isnan(acc_o_val));
-    }
 
   }  // End n_block loop
 
@@ -526,28 +451,6 @@ inline __device__ void compute_attn_1rowblock_int8mma(
                    : (params.smooth_softmax ? 0.0f : -flash::kInfinity);
   softmax.template normalize_softmax_lse</*Split=*/false>(acc_o, params.scale_softmax, sink);
 
-  // DEBUG: Check first 4 acc_o values for pairwise pattern
-  if (tidx == 0 && bidb == 0 && bidh == 0) {
-    printf("[DQ_ACC_O_VALS] acc_o[0-3]=%f %f %f %f\\n",
-           (float)acc_o(0), (float)acc_o(1), (float)acc_o(2), (float)acc_o(3));
-  }
-
-  // DEBUG: Check acc_o after normalize for failing heads (scan all elements)
-  if (tidx == 0 && bidb == 1 && bidh == 0) {
-    bool found_nan = false;
-    for (int i = 0; i < size(acc_o); ++i) {
-      if (isnan((float)acc_o(i))) {
-        printf("[DQ_POST_NORM_NAN] bidb=1 bidh=0 kv_head_idx=%d acc_o[%d]=%f is_nan=1\n",
-               kv_head_idx, i, (float)acc_o(i));
-        found_nan = true;
-        break;  // Print just first one to avoid spam
-      }
-    }
-    if (!found_nan) {
-      printf("[DQ_POST_NORM_OK] bidb=1 bidh=0 kv_head_idx=%d acc_o clean\n", kv_head_idx);
-    }
-  }
-
   // Store Reg -> Smem (use same approach as old kernel with retile_S)
   Tensor rO = flash::convert_type<Element>(acc_o);
 
@@ -560,23 +463,19 @@ inline __device__ void compute_attn_1rowblock_int8mma(
   cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
   __syncthreads();
 
-  // DEBUG: Print sO after Reg->Smem copy
-  if (tidx == 0 && bidb == 0 && bidh == 0) {
-    // sO layout is (BlockM=64, HeadDim=128) for output
-    printf("[DQ_sO_VALS] sO(0,0:3)=%f %f %f %f\\n",
-           (float)sO(0, 0), (float)sO(0, 1), (float)sO(0, 2), (float)sO(0, 3));
-  }
-
   // Copy Smem -> Global
   typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
   auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
   Tensor tOsO = gmem_thr_copy_O.partition_S(sO);
   Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
 
+  Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));
+  Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+  Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOsO)));
+
   flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
       gmem_tiled_copy_O, tOsO, tOgO,
-      cute::make_identity_tensor(Shape<Int<kBlockM>, Int<1>, Int<1>>{}),
-      cute::make_tensor<bool>(Shape<Int<kHeadDim>, Int<1>, Int<1>>{}, Stride<_1, _0, _0>{}),
+      tOcO, tOpO,
       binfo.actual_seqlen_q - m_block * kBlockM);
 }
 
