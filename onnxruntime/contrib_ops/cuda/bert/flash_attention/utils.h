@@ -320,6 +320,7 @@ __forceinline__ __device__ void gemm_quant_manual(Tensor0& acc, Tensor1& tCrA, T
     if constexpr (Is_Int4) {
       // Int4 Path (Duplicate Layout): Pairs of elements share a byte.
       // tCrB_quant_frag contains [b0, b0, b1, b1...]
+      // Branchless unpacking + vectorized dequantization has perf regression so we use simple logic here
       CUTE_UNROLL
       for (int j = 0; j < size(tCrB_frag); j += 2) {
         // Read duplicated byte (take even index)
@@ -346,16 +347,46 @@ __forceinline__ __device__ void gemm_quant_manual(Tensor0& acc, Tensor1& tCrA, T
       }
     } else {
       // Int8 Path: 1-to-1 mapping
-      CUTE_UNROLL
-      for (int j = 0; j < size(tCrB_frag); ++j) {
-        auto val_q = tCrB_quant_frag(j);
-        DQuantType s;
-        if constexpr (Is_Scale_Tensor) {
-          s = scale(j, 0, qi);
-        } else {
-          s = scale;
+      // Optimization: Vectorized dequantization using __half2 for 2x throughput
+      if constexpr (std::is_same_v<DQuantType, cutlass::half_t>) {
+        // Vectorized FP16 path for BOTH per-tensor and per-channel
+        CUTE_UNROLL
+        for (int j = 0; j < size(tCrB_frag); j += 2) {
+          int8_t v0 = tCrB_quant_frag(j);
+          int8_t v1 = tCrB_quant_frag(j + 1);
+
+          __half2 vals_h2 = __halves2half2(__int2half_rn(v0), __int2half_rn(v1));
+          __half2 result_h2;
+
+          if constexpr (Is_Scale_Tensor) {
+            // Per-channel: load 2 different scales
+            __half2 scale_pair = __halves2half2(
+                static_cast<__half>(scale(j, 0, qi)),
+                static_cast<__half>(scale(j + 1, 0, qi)));
+            result_h2 = __hmul2(vals_h2, scale_pair);
+          } else {
+            // Per-tensor: broadcast single scale
+            __half scale_h = __float2half(static_cast<float>(scale));
+            __half2 scale_h2 = __half2half2(scale_h);
+            result_h2 = __hmul2(vals_h2, scale_h2);
+          }
+
+          tCrB_frag(j) = result_h2.x;
+          tCrB_frag(j + 1) = result_h2.y;
         }
-        tCrB_frag(j) = static_cast<DQuantType>(static_cast<float>(val_q) * s);
+      } else {
+        // Fallback for BF16 (scalar path)
+        CUTE_UNROLL
+        for (int j = 0; j < size(tCrB_frag); ++j) {
+          auto val_q = tCrB_quant_frag(j);
+          DQuantType s;
+          if constexpr (Is_Scale_Tensor) {
+            s = scale(j, 0, qi);
+          } else {
+            s = scale;
+          }
+          tCrB_frag(j) = static_cast<DQuantType>(static_cast<float>(val_q) * s);
+        }
       }
     }
 

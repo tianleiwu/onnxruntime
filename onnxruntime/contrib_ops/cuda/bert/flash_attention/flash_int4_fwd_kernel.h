@@ -104,8 +104,11 @@ struct Flash_dq_kernel_traits {
   using SmemLayoutVtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
 
   // INT8 layout for K (no dequantization - native INT8)
+  // Use swizzling to avoid bank conflicts when writing dequantized FP16 data
   using SmemLayoutKInt8 = decltype(tile_to_shape(
-      SmemLayoutAtom{},
+      composition(Swizzle<kSwizzle, 3, 3>{},  // Same swizzle as FP16 layout
+                  Layout<Shape<_8, Int<kBlockKSmem>>,
+                         Stride<Int<kBlockKSmem>, _1>>{}),
       Shape<Int<kBlockN>, Int<kHeadDim>>{}));
 
   // Copy atoms
