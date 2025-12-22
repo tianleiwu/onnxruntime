@@ -14,8 +14,8 @@ pip uninstall onnxruntime-gpu onnxruntime -y
 LD_LIBRARY_PATH=/usr/lib64/openmpi/lib:/home/tlwu/anaconda3/envs/py312/lib:/home/tlwu/cudnn9.8/lib64:/home/tlwu/cudnn9.8/lib
 
 # rm -rf build
-rm -f build/cuda/Release/CMakeFiles/onnxruntime_providers_cuda.dir/home/tlwu/onnxruntime/onnxruntime/contrib_ops/cuda/bert/flash_attention/flash_fwd_split_hdim128_bf16_sm80_quant_*
-rm -f build/cuda/Release/CMakeFiles/onnxruntime_providers_cuda.dir/home/tlwu/onnxruntime/onnxruntime/contrib_ops/cuda/bert/flash_attention/flash_fwd_split_hdim128_fp16_sm80_quant_*
+# rm -f build/cuda/Release/CMakeFiles/onnxruntime_providers_cuda.dir/home/tlwu/onnxruntime/onnxruntime/contrib_ops/cuda/bert/flash_attention/flash_fwd_split_hdim128_bf16_sm80_quant_*
+# rm -f build/cuda/Release/CMakeFiles/onnxruntime_providers_cuda.dir/home/tlwu/onnxruntime/onnxruntime/contrib_ops/cuda/bert/flash_attention/flash_fwd_split_hdim128_fp16_sm80_quant_*
 rm -f build/cuda/Release/CMakeFiles/onnxruntime_providers_cuda.dir/home/tlwu/onnxruntime/onnxruntime/contrib_ops/cuda/bert/flash_attention/flash_fwd_dequant_*
 
 # Format code with clang-format.
@@ -65,20 +65,5 @@ if [ $test_exit_code -ne 0 ]; then
     exit $test_exit_code
 fi
 echo "==== ✅ test_gqa.py passed! ===="
-
-rm -f gqa_fp16.nsys-rep
-rm -f gqa_fp16.sqlite
-nsys profile -o gqa_fp16 --export=sqlite python profile_gqa.py --mode fp16 --warmup 5 --repeat 100
-python parse_nsys.py gqa_fp16.sqlite --skip-first 5 --tag Fp16
-
-rm -f gqa_int8.nsys-rep
-rm -f gqa_int8.sqlite
-nsys profile -o gqa_int8 --export=sqlite python profile_gqa.py --mode int8 --warmup 5 --repeat 100
-python parse_nsys.py gqa_int8.sqlite --skip-first 5 --tag Int8
-
-rm -f gqa_int4.nsys-rep
-rm -f gqa_int4.sqlite
-nsys profile -o gqa_int4 --export=sqlite python profile_gqa.py --mode int4 --warmup 5 --repeat 100
-python parse_nsys.py gqa_int4.sqlite --skip-first 5 --tag Int4
 
 cd -
