@@ -259,11 +259,11 @@ __forceinline__ __device__ void gemm_quant(Tensor0& acc, Tensor1& tCrA, Tensor2&
 // - O5: Process 2 logical K-tiles per quantized tile (Int8 has 2x elements packed)
 // - Vectorized dequantization using __half2 intrinsics
 //
-template <typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
-          typename TiledMma, typename TiledCopy, typename ThrCopy, typename ScaleType>
+template <bool Is_Int4, typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
+          typename TiledMma, typename TiledCopy, typename ThrCopy, typename ScaleArg>
 __forceinline__ __device__ void gemm_quant_manual(Tensor0& acc, Tensor1& tCrA, Tensor2& tCrB, Tensor3 const& tCsB,
                                                   TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
-                                                  ThrCopy smem_thr_copy_B, ScaleType scale) {
+                                                  ThrCopy smem_thr_copy_B, ScaleArg scale) {
   // NOTE: Static assertions are intentionally disabled for this variant.
   // The tile shapes may not match cute::gemm's expectations due to the N=8 TiledMma
   // configuration used in the dequantization kernel.
@@ -282,13 +282,19 @@ __forceinline__ __device__ void gemm_quant_manual(Tensor0& acc, Tensor1& tCrA, T
 
   // O3: Precompute scale as __half to avoid repeated float->half conversion
   using DQuantType = typename Tensor2::value_type;
-  const __half scale_h = __float2half(static_cast<float>(scale));
-  const __half2 scale_h2 = __half2half2(scale_h);
 
-  // O5: Restructure loop - process 2 logical tiles per quant tile
-  // Each quant tile 'qi' feeds logical tiles 2*qi and 2*qi+1
+  // Check if ScaleArg is a Tensor (Per-Channel) or Scalar (Per-Tensor)
+  static constexpr bool Is_Scale_Tensor = cute::is_tensor<ScaleArg>::value;
+
+  // For Scalar Scale (Per-Tensor)
+  __half2 scale_h2_scalar;
+  if constexpr (!Is_Scale_Tensor) {
+    const __half scale_h = __float2half(static_cast<float>(scale));
+    scale_h2_scalar = __half2half2(scale_h);
+  }
+
+  // O5: Process tiles
   constexpr int num_k_tiles = decltype(size<2>(tCrA))::value;
-  constexpr int num_quant_tiles = num_k_tiles / 2;
 
   // Helper to bypass cute::gemm static assertions on shape
   auto manual_gemm_helper = [&](auto const& tA_k, auto const& tB_k) {
@@ -302,59 +308,58 @@ __forceinline__ __device__ void gemm_quant_manual(Tensor0& acc, Tensor1& tCrA, T
     }
   };
 
-#pragma unroll
-  for (int qi = 0; qi < num_quant_tiles; ++qi) {
-    // Prefetch next quant tile
-    if (qi < num_quant_tiles - 1) {
+  CUTE_UNROLL
+  for (int qi = 0; qi < num_k_tiles; ++qi) {
+    if (qi < num_k_tiles - 1) {
       cute::copy(smem_tiled_copy_B, tCsB(_, _, qi + 1), tCrB_quant_copy_view(_, _, qi + 1));
     }
 
     Tensor tCrB_quant_frag = tCrB_quant(_, _, qi);
-    constexpr int frag_size = decltype(size(tCrB_quant_frag))::value;
-    constexpr int half_size = frag_size / 2;
+    Tensor tCrB_frag = tCrB(_, _, qi);
 
-    // Process even tile (2*qi) - lower half of packed data
-    {
-      Tensor tCrB_frag = tCrB(_, _, 2 * qi);
-#pragma unroll
-      for (int j = 0; j < half_size; ++j) {
-        // Read packed value (2 int8s aliased as half)
+    if constexpr (Is_Int4) {
+      // Int4 Path (Duplicate Layout): Pairs of elements share a byte.
+      // tCrB_quant_frag contains [b0, b0, b1, b1...]
+      CUTE_UNROLL
+      for (int j = 0; j < size(tCrB_frag); j += 2) {
+        // Read duplicated byte (take even index)
         auto packed_val = tCrB_quant_frag(j);
-        uint16_t raw_bits = reinterpret_cast<uint16_t&>(packed_val);
+        uint8_t ub = static_cast<uint8_t>(packed_val);
 
-        // O1: Use __half2 for vectorized conversion and multiply
-        int8_t v0 = static_cast<int8_t>(raw_bits & 0xFF);
-        int8_t v1 = static_cast<int8_t>((raw_bits >> 8) & 0xFF);
+        // Unpack 2's complement 4-bit values
+        // v0: lower 4 bits (sign-extended)
+        // v1: upper 4 bits (sign-extended)
+        // Robust Int4 Unpacking (2s Complement)
+        int8_t v0_raw = ub & 0xF;
+        int8_t v0 = v0_raw >= 8 ? v0_raw - 16 : v0_raw;
 
-        // Convert to half2 and multiply by scale in one vectorized op
-        __half2 unpacked = __halves2half2(__short2half_rn(v0), __short2half_rn(v1));
-        __half2 scaled = __hmul2(unpacked, scale_h2);
+        int8_t v1_raw = (ub >> 4) & 0xF;
+        int8_t v1 = v1_raw >= 8 ? v1_raw - 16 : v1_raw;
 
-        // Store as half2 (vectorized store)
-        *reinterpret_cast<__half2*>(&tCrB_frag(2 * j)) = scaled;
+        if constexpr (Is_Scale_Tensor) {
+          tCrB_frag(j) = static_cast<DQuantType>(static_cast<float>(v0) * static_cast<float>(scale(j, 0, qi)));
+          tCrB_frag(j + 1) = static_cast<DQuantType>(static_cast<float>(v1) * static_cast<float>(scale(j + 1, 0, qi)));
+        } else {
+          tCrB_frag(j) = static_cast<DQuantType>(static_cast<float>(v0) * static_cast<float>(scale));
+          tCrB_frag(j + 1) = static_cast<DQuantType>(static_cast<float>(v1) * static_cast<float>(scale));
+        }
       }
-      manual_gemm_helper(tCrA(_, _, 2 * qi), tCrB_frag);
+    } else {
+      // Int8 Path: 1-to-1 mapping
+      CUTE_UNROLL
+      for (int j = 0; j < size(tCrB_frag); ++j) {
+        auto val_q = tCrB_quant_frag(j);
+        DQuantType s;
+        if constexpr (Is_Scale_Tensor) {
+          s = scale(j, 0, qi);
+        } else {
+          s = scale;
+        }
+        tCrB_frag(j) = static_cast<DQuantType>(static_cast<float>(val_q) * s);
+      }
     }
 
-    // Process odd tile (2*qi+1) - upper half of packed data
-    {
-      Tensor tCrB_frag = tCrB(_, _, 2 * qi + 1);
-#pragma unroll
-      for (int j = 0; j < half_size; ++j) {
-        // Read from upper half of the packed fragment
-        auto packed_val = tCrB_quant_frag(half_size + j);
-        uint16_t raw_bits = reinterpret_cast<uint16_t&>(packed_val);
-
-        int8_t v0 = static_cast<int8_t>(raw_bits & 0xFF);
-        int8_t v1 = static_cast<int8_t>((raw_bits >> 8) & 0xFF);
-
-        __half2 unpacked = __halves2half2(__short2half_rn(v0), __short2half_rn(v1));
-        __half2 scaled = __hmul2(unpacked, scale_h2);
-
-        *reinterpret_cast<__half2*>(&tCrB_frag(2 * j)) = scaled;
-      }
-      manual_gemm_helper(tCrA(_, _, 2 * qi + 1), tCrB_frag);
-    }
+    manual_gemm_helper(tCrA(_, _, qi), tCrB_frag);
   }
 }
 

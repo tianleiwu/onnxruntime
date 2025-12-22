@@ -125,8 +125,8 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
                        bool is_packed_qkv = false,
                        int max_num_blocks_per_seq = 0,
                        int page_block_size = 1,
-                       void* k_scale = nullptr,
-                       void* v_scale = nullptr,
+                       void* k_scale = nullptr,  // one element for per tensor, num_heads_k x head_size for per channel
+                       void* v_scale = nullptr,  // one element for per tensor, num_heads_k x head_size for per channel
                        int k_quant_type = 0,
                        int v_quant_type = 0,
                        int kv_cache_bit_width = 0);

@@ -6,7 +6,8 @@
 #include "contrib_ops/cuda/bert/flash_attention/static_switch.h"
 #include "contrib_ops/cuda/bert/flash_attention/flash.h"
 #include "contrib_ops/cuda/bert/flash_attention/flash_fwd_kernel.h"
-#include "contrib_ops/cuda/bert/flash_attention/flash_dq_fwd_kernel.h"
+#include "contrib_ops/cuda/bert/flash_attention/flash_int8_fwd_kernel.h"
+#include "contrib_ops/cuda/bert/flash_attention/flash_int4_fwd_kernel.h"
 
 
 namespace onnxruntime {
@@ -250,11 +251,6 @@ void run_flash_splitkv_fwd_quant(Flash_fwd_params& params, cudaStream_t stream) 
 template <typename T, int Headdim>
 void run_mha_fwd_splitkv_dispatch_quant_8bit(Flash_fwd_params& params, cudaStream_t stream) {
   if constexpr (Headdim == 128) { // Guard to prevent instantiating unused dims
-      // Old Dispatcher - passes tests
-      // constexpr static int kBlockM = 64;
-      // constexpr static int kBlockN = 128;
-      // run_flash_splitkv_fwd_quant<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, 8>(params, stream);
-
       // New Native Dequant Kernel Dispatcher
       run_mha_fwd_dequant_dispatch<T, Headdim>(params, stream);
   }
@@ -263,9 +259,12 @@ void run_mha_fwd_splitkv_dispatch_quant_8bit(Flash_fwd_params& params, cudaStrea
 template <typename T, int Headdim>
 void run_mha_fwd_splitkv_dispatch_quant_4bit(Flash_fwd_params& params, cudaStream_t stream) {
   if constexpr (Headdim == 128) { // Guard to prevent instantiating unused dims
-      constexpr static int kBlockM = 64;
-      constexpr static int kBlockN = 128;
-      run_flash_splitkv_fwd_quant<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, 4>(params, stream);
+      // constexpr static int kBlockM = 64;
+      // constexpr static int kBlockN = 128;
+      // run_flash_splitkv_fwd_quant<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, 4>(params, stream);
+
+      // New Native Dequant Kernel Dispatcher
+      run_mha_fwd_dequant_dispatch<T, Headdim>(params, stream);
   }
 }
 
@@ -426,7 +425,8 @@ void run_mha_fwd_hdim256(Flash_fwd_params& params, cudaStream_t stream) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_dequant_kernel, bool Is_causal, bool Is_local, bool Has_alibi,
-                            bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV) {
+                            bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV,
+                            int KV_BIT_WIDTH, int QUANT_TYPE) {
 #if defined(ARCH_SUPPORTS_FLASH)
   static_assert(!(Is_causal && Is_local));  // Enforce constraints
   // Grid is dim3(num_m_block, params.b, params.h) => (m_block, batch, head)
@@ -440,24 +440,31 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_dequant_kernel, bool Is_causal, bool Is_lo
   const int bidb = Split ? blockIdx.z / params.h : blockIdx.y;
   const int bidh = Split ? blockIdx.z % params.h : blockIdx.z;
 
-  flash::compute_attn_1rowblock_int8mma<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(
-      params, bidb, bidh, blockIdx.x, n_split_idx, num_n_splits);
+  if constexpr (KV_BIT_WIDTH == 8) {
+      flash::int8::compute_attn_1rowblock_int8mma<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(
+          params, bidb, bidh, blockIdx.x, n_split_idx, num_n_splits);
+  } else {
+      flash::int4::compute_attn_1rowblock_int8mma<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV, KV_BIT_WIDTH, QUANT_TYPE>(
+          params, bidb, bidh, blockIdx.x, n_split_idx, num_n_splits);
+  }
 #else
   FLASH_UNSUPPORTED_ARCH
 #endif
 }
 
-template <typename Kernel_traits>
+template <typename Kernel_traits, int KV_BIT_WIDTH, int QUANT_TYPE>
 void run_flash_dequant_fwd(Flash_fwd_params& params, cudaStream_t stream) {
   // FP16 smem: Q + K + V
   // INT8 smem: K_int8 + V_int8 (for async copy staging)
+  // Scale Smem: K_Scale + V_Scale (HeadDim each) (fp16)
   constexpr size_t smem_size = sizeof(typename Kernel_traits::Element) *
       (Kernel_traits::kBlockM * Kernel_traits::kHeadDim +   // Q
        Kernel_traits::kBlockN * Kernel_traits::kHeadDim +   // K
        Kernel_traits::kBlockN * Kernel_traits::kHeadDim) +  // V
       sizeof(typename Kernel_traits::ElementInt8) *
       (Kernel_traits::kBlockN * Kernel_traits::kHeadDim +   // K_int8
-       Kernel_traits::kBlockN * Kernel_traits::kHeadDim);   // V_int8
+       Kernel_traits::kBlockN * Kernel_traits::kHeadDim) +  // V_int8
+      sizeof(typename Kernel_traits::Element) * 2 * Kernel_traits::kHeadDim;
 
   const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
   dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
@@ -474,7 +481,7 @@ void run_flash_dequant_fwd(Flash_fwd_params& params, cudaStream_t stream) {
              BOOL_SWITCH(params.num_splits > 1, SplitConst, [&] {
                  BOOL_SWITCH(params.knew_ptr != nullptr, Append_KV_Const, [&] {
                       auto kernel = &flash_fwd_dequant_kernel<Kernel_traits, Is_causal, false, false,
-                                                               IsEvenMNConst && IsEvenKConst, IsEvenKConst, Is_softcap, SplitConst, Append_KV_Const>;
+                                                               IsEvenMNConst && IsEvenKConst, IsEvenKConst, Is_softcap, SplitConst, Append_KV_Const, KV_BIT_WIDTH, QUANT_TYPE>;
                       if (smem_size >= 48 * 1024) {
                         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_size));
                       }
@@ -490,19 +497,20 @@ void run_flash_dequant_fwd(Flash_fwd_params& params, cudaStream_t stream) {
     constexpr static int kBlockM = Kernel_traits::kHeadDim % 128 == 0 ? 4 : (Kernel_traits::kHeadDim % 64 == 0 ? 8 : 16);
     dim3 grid_combine((params.b * params.h * params.seqlen_q + kBlockM - 1) / kBlockM);
     EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
-      if (params.num_splits <= 2) {
+      int split_combine_num = params.num_splits;
+      if (split_combine_num <= 2) {
         flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 1, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-      } else if (params.num_splits <= 4) {
+      } else if (split_combine_num <= 4) {
         flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 2, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-      } else if (params.num_splits <= 8) {
+      } else if (split_combine_num <= 8) {
         flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 3, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-      } else if (params.num_splits <= 16) {
+      } else if (split_combine_num <= 16) {
         flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 4, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-      } else if (params.num_splits <= 32) {
+      } else if (split_combine_num <= 32) {
         flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 5, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-      } else if (params.num_splits <= 64) {
+      } else if (split_combine_num <= 64) {
         flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 6, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-      } else if (params.num_splits <= 128) {
+      } else if (split_combine_num <= 128) {
         flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 7, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
       }
     });
@@ -516,7 +524,20 @@ void run_mha_fwd_dequant_dispatch(Flash_fwd_params& params, cudaStream_t stream)
   constexpr int kBlockM = 64;
   constexpr int kBlockN = 64;
   constexpr int kNWarps = 4;
-  run_flash_dequant_fwd<Flash_dq_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, T>>(params, stream);
+
+  if (params.kv_cache_bit_width == 8) {
+      if (params.k_quant_type == 2) {
+          run_flash_dequant_fwd<flash::int8::Flash_dq_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, T>, 8, 2>(params, stream);
+      } else {
+          run_flash_dequant_fwd<flash::int8::Flash_dq_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, T>, 8, 1>(params, stream);
+      }
+  } else if (params.kv_cache_bit_width == 4) {
+      if (params.k_quant_type == 2) {
+          run_flash_dequant_fwd<flash::int4::Flash_dq_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, T>, 4, 2>(params, stream);
+      } else {
+          run_flash_dequant_fwd<flash::int4::Flash_dq_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, T>, 4, 1>(params, stream);
+      }
+  }
 }
 
 }  // namespace flash
