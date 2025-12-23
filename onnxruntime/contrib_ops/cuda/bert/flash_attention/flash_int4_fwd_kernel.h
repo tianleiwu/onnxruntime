@@ -1,6 +1,6 @@
 /******************************************************************************
  * Copyright (c) 2023, Tri Dao.
- * Copyright (c) 2025, Microsoft.
+ * Copyright (c) 2024, Microsoft.
  * Flash Attention Kernel with Int4 Quantized KV Cache
  ******************************************************************************/
 #pragma once
@@ -99,18 +99,6 @@ struct Flash_dq_kernel_traits {
                          Stride<Int<kBlockKSmem>, _1>>{}),
       Shape<Int<kBlockN>, Int<kHeadDim>>{}));
 
-  // INT4 PHYSICAL layout for packed data (HeadDim/2 bytes per row)
-  // ================================================================
-  // Physical INT4 data uses padded row-major layout for 128-bit cp.async efficiency
-  // Physical row size: HeadDim/2 = 64 bytes for HeadDim=128
-  // Add 16-byte padding for 128-bit alignment -> stride = 80 bytes
-  static constexpr int kSmemRowPaddingInt4 = 16;                                 // 16 bytes for 128-bit alignment
-  static constexpr int kSmemRowStrideInt4 = kHeadDim / 2 + kSmemRowPaddingInt4;  // 80 for HeadDim=128
-
-  using SmemLayoutKInt4Physical = decltype(make_layout(
-      Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
-      Stride<Int<kSmemRowStrideInt4>, _1>{}));  // Padded row-major, 16-byte aligned rows
-
   // Copy atoms
   using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
   using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;  // For V transposition
@@ -127,20 +115,21 @@ struct Flash_dq_kernel_traits {
                                                     GmemLayoutAtom{},
                                                     Layout<Shape<_1, _8>>{}));
 
-  // INT4 Physical Layout Copy Configuration
-  // ========================================
-  // Physical INT4 data is HeadDim/2 bytes per row = 64 bytes for HeadDim=128
-  // Use 128-bit cp.async (16 bytes per load) for maximum bandwidth
-  static constexpr int kGmemInt4ElemsPerLoad = sizeof(cute::uint128_t);                  // 16 bytes
-  static constexpr int kGmemInt4ThreadsPerRow = (kHeadDim / 2) / kGmemInt4ElemsPerLoad;  // 4 for HeadDim=128
+  // For Int8 global-to-shared memory copy:
+  // - cp.async (SM80_CP_ASYNC_CACHEGLOBAL) requires 128-bit aligned contiguous memory
+  // - Swizzle<3> breaks 128-bit contiguity, causing cp.async to fail validation
+  // - Solution: Use UniversalCopy (standard load/store) with 64-bit vectorization
+  // - This is slightly slower than cp.async but works correctly with swizzled layouts
+  // - 64-bit (8 bytes) = 8 int8 elements, which is safe with Swizzle<3>
+  using GmemTiledCopyKInt8 = decltype(make_tiled_copy(Copy_Atom<UniversalCopy<cute::uint64_t>, ElementInt8>{},
+                                                      GmemLayoutAtom{},
+                                                      Layout<Shape<_1, _8>>{}));  // 8 int8s = 8 bytes
 
-  using GmemLayoutAtomInt4 = Layout<Shape<Int<kNThreads / kGmemInt4ThreadsPerRow>, Int<kGmemInt4ThreadsPerRow>>,
-                                    Stride<Int<kGmemInt4ThreadsPerRow>, _1>>;  // (32, 4) for 128 threads
-
-  // Use 128-bit cp.async for INT4 packed data (loads 16 bytes = 32 INT4 values)
-  using GmemTiledCopyKInt4 = decltype(make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, ElementInt8>{},
-                                                      GmemLayoutAtomInt4{},
-                                                      Layout<Shape<_1, _16>>{}));  // 16 bytes per copy
+  // For Int4 duplicate layout (non-contiguous physical access), we use scalar copy for safety
+  // Slow but correct. Optimization: Load packed then unpacking in registers.
+  using GmemTiledCopyKInt4 = decltype(make_tiled_copy(Copy_Atom<DefaultCopy, ElementInt8>{},
+                                                      GmemLayoutAtom{},
+                                                      Layout<Shape<_1, _1>>{}));
 
   // Output Smem Layout (Row-Major for Vectorized Global Copy)
   using SmemLayoutO = decltype(make_layout(Shape<Int<kBlockM>, Int<kHeadDim>>{},
@@ -173,27 +162,11 @@ inline __device__ void compute_attn_1rowblock(
 
   Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)),
                           typename Kernel_traits::SmemLayoutQ{});
-
-  // INT4 Physical Shared Memory Layout
-  // ============================================================================
-  // Physical INT4 data uses padded row-major layout for cp.async efficiency
-  // Physical row size: HeadDim/2 = 64 bytes for HeadDim=128
-  // Padded stride: kSmemRowStrideInt4 = 80 bytes (includes 16-byte alignment padding)
-  constexpr int kSmemSizeQ = Kernel_traits::kBlockM * Kernel_traits::kHeadDim * sizeof(Element);
-  constexpr int kSmemSizeKInt4 = Kernel_traits::kBlockN * Kernel_traits::kSmemRowStrideInt4 * sizeof(ElementInt8);
-
-  // Physical layout tensors for global->smem copy (packed INT4 data)
-  Tensor sK_phys = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ)),
-                               typename Kernel_traits::SmemLayoutKInt4Physical{});
-  Tensor sV_phys = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ + kSmemSizeKInt4)),
-                               typename Kernel_traits::SmemLayoutKInt4Physical{});
-
-  // Dummy tensors with logical layout for MMA fragment partitioning
-  // These are used only for shape calculations, not actual memory access
-  Tensor sK_dummy = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ)),
-                                typename Kernel_traits::SmemLayoutKInt8{});
-  Tensor sV_dummy = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ + kSmemSizeKInt4)),
-                                typename Kernel_traits::SmemLayoutV{});
+  // Int8/Int4 Shared Memory Buffers
+  Tensor sK = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + sizeof(Element) * size(sQ))),
+                          typename Kernel_traits::SmemLayoutKInt8{});
+  Tensor sV = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + sizeof(Element) * size(sQ) + sizeof(ElementInt8) * size(sK))),
+                          typename Kernel_traits::SmemLayoutV{});
 
   const int tidx = threadIdx.x;
 
@@ -245,15 +218,16 @@ inline __device__ void compute_attn_1rowblock(
   }
 
   // Duplicate Layout Logic for Int4:
-  // We load physical INT4 data (HeadDim/2 bytes per row) directly with cp.async.
-  // The nibble unpacking is handled in gemm_quant_manual_physical_int4.
+  // We want to load 128 logical columns (HeadDim) which physically map to 64 bytes (HeadDim/2).
+  // A "duplicate layout" (HeadDim/2, 2) with inner stride 0 allows reading the same byte twice for pairs of columns.
+  // mK/mV moved to after offsets calculation
 
   // Scales in Smem (for Per-Channel quantization)
-  // Allocated after sV_phys. Size: HeadDim elements (Half)
+  // Allocated after sV. Size: HeadDim elements (Half)
   // Scale Tensors in Shared Memory
-  // Place sKScale AFTER sV_phys physical buffer with PADDING
-  // Offset = kSmemSizeQ + 2*kSmemSizeKInt4 + 1024 (Padding)
-  Tensor sKScale = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ + 2 * kSmemSizeKInt4 + 1024)),
+  // Place sKScale AFTER sV_int8 with PADDING to account for Swizzled Layout gaps
+  // Offset = size(sQ)*2 (FP16) + size(sK)*1 + size(sK)*1 + 1024 (Padding)
+  Tensor sKScale = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + sizeof(Element) * size(sQ) + 2 * sizeof(ElementInt8) * size(sK) + 1024)),
                                make_layout(Shape<Int<kHeadDim>>{}, Stride<_1>{}));
 
   // Place sVScale after sKScale
@@ -286,19 +260,24 @@ inline __device__ void compute_attn_1rowblock(
                              make_layout(Shape<Int<kHeadDim>>{}, Stride<_1>{}));
 
   // ============================================================================
-  // Global K/V Tensors - Physical INT4 Layout for cp.async
+  // Global K/V Tensors (Unified Int8/Int4)
   // ============================================================================
-  // Use PHYSICAL layout (HeadDim/2 bytes per row) for efficient vectorized global loads.
-  // The nibble unpacking is handled during dequantization in gemm_quant_manual_physical_int4.
-  // Shape: (SeqLen, HeadDim/2)
-  // Stride: (RowStride, 1) - contiguous columns for cp.async
-  auto layout_physical = make_layout(
-      make_shape(binfo.actual_seqlen_k, Int<kHeadDim / 2>{}),
-      make_stride(params.k_row_stride, _1{}));
-  Tensor mK_int4_phys = make_tensor(make_gmem_ptr(reinterpret_cast<const ElementInt8*>(params.k_ptr) + k_base_offset),
-                                    layout_physical);
-  Tensor mV_int4_phys = make_tensor(make_gmem_ptr(reinterpret_cast<const ElementInt8*>(params.v_ptr) + v_base_offset),
-                                    layout_physical);
+  // These are defined as (SeqLen, Dim) for the specific head.
+  // For Int4, Dim is hierarchical (Dim/2, 2).
+  // Shape: (SeqLen, (HeadDim/2, 2))
+  // Stride: (RowStride, (1, 0))
+  // Pointer: base + offset
+  auto layout_dup = make_layout(
+      make_shape(binfo.actual_seqlen_k, make_shape(Int<kHeadDim / 2>{}, Int<2>{})),
+      make_stride(params.k_row_stride, make_stride(_1{}, _0{})));
+  Tensor mK_int8 = make_tensor(make_gmem_ptr(reinterpret_cast<const ElementInt8*>(params.k_ptr) + k_base_offset),
+                               layout_dup);
+
+  auto v_layout_dup = make_layout(
+      make_shape(binfo.actual_seqlen_k, make_shape(Int<kHeadDim / 2>{}, Int<2>{})),
+      make_stride(params.v_row_stride, make_stride(_1{}, _0{})));
+  Tensor mV_int8 = make_tensor(make_gmem_ptr(reinterpret_cast<const ElementInt8*>(params.v_ptr) + v_base_offset),
+                               v_layout_dup);
 
   // ============================================================================
   // Global Memory Tensors
@@ -337,7 +316,9 @@ inline __device__ void compute_attn_1rowblock(
     }
   }
 
-  // Note: INT4 uses physical layout with GmemTiledCopyKInt4 (128-bit cp.async) defined in main loop
+  // Tiled Copy for K/V INT8 loading
+  typename Kernel_traits::GmemTiledCopyKInt8 gmem_tiled_copy_KInt8;
+  auto gmem_thr_copy_KInt8 = gmem_tiled_copy_KInt8.get_thread_slice(tidx);
 
   // ============================================================================
   // MMA Setup
@@ -348,10 +329,9 @@ inline __device__ void compute_attn_1rowblock(
   Tensor tSrQ = thr_mma.partition_fragment_A(sQ);
 
   // Register fragments for K and V (FP16 structure for MMA)
-  // Use dummy FP16 tensor with logical layout to get correct partitioning
-  Tensor sK_fp16_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ)),
-                                     typename Kernel_traits::SmemLayoutK{});
-  Tensor tSrK = thr_mma.partition_fragment_B(sK_fp16_dummy);
+  Tensor sK_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + sizeof(Element) * size(sQ))),
+                                typename Kernel_traits::SmemLayoutK{});
+  Tensor tSrK = thr_mma.partition_fragment_B(sK_dummy);
 
   // Scale Partitioning (Broadcast along N)
   // sKScale is (HeadDim). Treat as (BlockN, HeadDim) with stride (0, 1).
@@ -360,18 +340,18 @@ inline __device__ void compute_attn_1rowblock(
 
   auto tSrKScale = thr_mma.partition_fragment_B(sKScale_broadcast);
 
-  // For V, P@V. V matches K layout in structure (BlockN, HeadDim) via sV_fp16_dummy.
-  Tensor sV_fp16_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ + kSmemSizeKInt4)),
-                                     typename Kernel_traits::SmemLayoutV{});
-  Tensor tOrVt = thr_mma.partition_fragment_B(sV_fp16_dummy);
+  // For V, P@V. V matches K layout in structure (BlockN, HeadDim) via sV.
+  Tensor sV_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + sizeof(Element) * (size(sQ) + size(sK)))),
+                                typename Kernel_traits::SmemLayoutV{});
+  Tensor tOrVt = thr_mma.partition_fragment_B(sV_dummy);
 
   // We also partition V-Scale using same pattern
   auto tSrVScale = thr_mma.partition_fragment_B(sVScale_broadcast);
 
-  // Smem-to-Register copy for Physical INT4 data
+  // Smem-to-Register copy for Int8 K/V data
   using SmemCopyAtomInt8Default = Copy_Atom<DefaultCopy, typename Kernel_traits::ElementInt8>;
-  auto smem_tiled_copy_KInt4Phys = make_tiled_copy_B(SmemCopyAtomInt8Default{}, tiled_mma);
-  auto smem_thr_copy_KInt4Phys = smem_tiled_copy_KInt4Phys.get_thread_slice(tidx);
+  auto smem_tiled_copy_KInt8 = make_tiled_copy_B(SmemCopyAtomInt8Default{}, tiled_mma);
+  auto smem_thr_copy_KInt8 = smem_tiled_copy_KInt8.get_thread_slice(tidx);
 
   Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
   clear(acc_o);
@@ -410,47 +390,49 @@ inline __device__ void compute_attn_1rowblock(
   auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
   Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
 
-  // Note: Physical INT4 K/V tensors (sK_phys, sV_phys) are partitioned inside the main loop
+  // K/V Int8 Copier
+  Tensor tSsK = smem_thr_copy_KInt8.partition_S(sK);
+  Tensor tSsV = smem_thr_copy_KInt8.partition_S(sV);
 
   // ============================================================================
   // Main Attention Loop
   // ============================================================================
   bool is_first_block = true;
   for (int n_block = n_block_max - 1; n_block >= n_block_min; --n_block) {
-    // INT4 Physical Layout Load using 128-bit cp.async
-    // ================================================
-    // Use physical contiguous layout (HeadDim/2 bytes per row) for efficient vectorized loads.
-    // The nibble unpacking is handled in gemm_quant_manual_physical_int4.
+    // Int4 Load with Duplicate Layout using Scalar Copy
+    // We use GmemTiledCopyKInt4 (Scalar) to handle the non-contiguous nature of duplicate layout.
     typename Kernel_traits::GmemTiledCopyKInt4 gmem_tiled_copy_KInt4;
     auto gmem_thr_copy_KInt4 = gmem_tiled_copy_KInt4.get_thread_slice(tidx);
 
-    // Slice Global Tensor using physical layout (no duplication)
-    // Shape: (kBlockN, kHeadDim/2)
-    Tensor gK_int4_phys = local_tile(mK_int4_phys, Shape<Int<kBlockN>, Int<kHeadDim / 2>>{}, make_coord(n_block, 0));
-    Tensor gV_int4_phys = local_tile(mV_int4_phys, Shape<Int<kBlockN>, Int<kHeadDim / 2>>{}, make_coord(n_block, 0));
+    // Slice Global Tensor (Hierarchical)
+    // mK_int8 is (SeqLen, H, (Dim/2, 2)), but here we view as (SeqLen, (Dim/2, 2)) [head handling implicit in ptr]
+    // Actually mK_int8 defined above is (SeqLen, (Dim/2, 2)).
+    // local_tile slices first dim.
+    Tensor gK_int4 = local_tile(mK_int8, Shape<Int<kBlockN>, Shape<Int<kHeadDim / 2>, Int<2>>>{}, make_coord(n_block, _0{}));
+    Tensor gV_int4 = local_tile(mV_int8, Shape<Int<kBlockN>, Shape<Int<kHeadDim / 2>, Int<2>>>{}, make_coord(n_block, _0{}));
 
-    // Partition for 128-bit cp.async to physical smem layout
-    Tensor tKgK_int4 = gmem_thr_copy_KInt4.partition_S(gK_int4_phys);
-    Tensor tKsK_int4 = gmem_thr_copy_KInt4.partition_D(sK_phys);
-    Tensor tVgV_int4 = gmem_thr_copy_KInt4.partition_S(gV_int4_phys);
-    Tensor tVsV_int4 = gmem_thr_copy_KInt4.partition_D(sV_phys);
+    Tensor tKgK_int4 = gmem_thr_copy_KInt4.partition_S(gK_int4);
+    Tensor tKsK_int4 = gmem_thr_copy_KInt4.partition_D(sK);
+    Tensor tVgV_int4 = gmem_thr_copy_KInt4.partition_S(gV_int4);
+    Tensor tVsV_int4 = gmem_thr_copy_KInt4.partition_D(sV);
 
-    // Predicates for physical layout
-    Tensor cK_phys = make_identity_tensor(make_shape(size<0>(sK_phys), size<1>(sK_phys)));
-    Tensor tKcK = gmem_thr_copy_KInt4.partition_D(cK_phys);
+    // Predicates
+    Tensor cK = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));
+    Tensor tKcK = gmem_thr_copy_KInt4.partition_D(cK);
 
-    // Build predicate tensor for K dimension bounds checking
+    // For scalar copy, tKpK might be rank 1 or 2 depending on partitioning.
+    // We construct it safely.
     auto tKpK = [&] {
       if constexpr (!Is_even_K) {
         constexpr int R = cute::rank_v<decltype(tKsK_int4)>;
         if constexpr (R >= 3) {
           auto t = make_tensor<bool>(make_shape(size<2>(tKsK_int4)));
 #pragma unroll
-          for (int k = 0; k < size(t); ++k) t(k) = get<1>(tKcK(0, 0, k)) < params.d / 2;  // Physical dim is HeadDim/2
+          for (int k = 0; k < size(t); ++k) t(k) = get<1>(tKcK(0, 0, k)) < params.d;
           return t;
         } else {
           auto t = make_tensor<bool>(make_shape(_1{}));
-          t(0) = get<1>(tKcK(0, 0)) < params.d / 2;
+          t(0) = get<1>(tKcK(0, 0)) < params.d;
           return t;
         }
       } else {
@@ -458,7 +440,9 @@ inline __device__ void compute_attn_1rowblock(
       }
     }();
 
-    // Execute 128-bit cp.async for K and V
+    // Use flash::copy_w_min_idx which is more generic or standard copy
+    // Given the custom layout, we might just use cute::copy if Is_even_K is true
+    // But checking predicates safely:
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KInt4, tKgK_int4, tKsK_int4, tKcK, tKpK, binfo.actual_seqlen_k - n_block * kBlockN);
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KInt4, tVgV_int4, tVsV_int4, tKcK, tKpK, binfo.actual_seqlen_k - n_block * kBlockN);
 
@@ -469,14 +453,10 @@ inline __device__ void compute_attn_1rowblock(
     Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
     clear(acc_s);
 
-    // Partition physical smem for gemm_quant_manual_physical_int4
-    Tensor tSsK_phys = smem_thr_copy_KInt4Phys.partition_S(sK_phys);
-    Tensor tSsV_phys = smem_thr_copy_KInt4Phys.partition_S(sV_phys);
-
     if constexpr (QUANT_TYPE == 2) {
-      flash::gemm_quant_manual_physical_int4(acc_s, tSrQ, tSrK, tSsK_phys, tiled_mma, smem_tiled_copy_KInt4Phys, smem_thr_copy_KInt4Phys, tSrKScale);
+      flash::gemm_quant_manual<true>(acc_s, tSrQ, tSrK, tSsK, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, tSrKScale);
     } else {
-      flash::gemm_quant_manual_physical_int4(acc_s, tSrQ, tSrK, tSsK_phys, tiled_mma, smem_tiled_copy_KInt4Phys, smem_thr_copy_KInt4Phys, k_scale);
+      flash::gemm_quant_manual<true>(acc_s, tSrQ, tSrK, tSsK, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, k_scale);
     }
 
     // Masking
@@ -503,14 +483,14 @@ inline __device__ void compute_attn_1rowblock(
       softmax.template softmax_rescale_o</*Is_first=*/false>(acc_s, acc_o, params.scale_softmax_log2);
     }
 
-    // 3. P @ V (Gemm Quant with Physical INT4 Layout)
+    // 3. P @ V (Gemm Quant)
     Tensor rP = flash::convert_type<Element>(acc_s);
     Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma_PV>(rP.layout()));
 
     if constexpr (QUANT_TYPE == 2) {
-      flash::gemm_quant_manual_physical_int4(acc_o, tOrP, tOrVt, tSsV_phys, tiled_mma, smem_tiled_copy_KInt4Phys, smem_thr_copy_KInt4Phys, tSrVScale);
+      flash::gemm_quant_manual<true>(acc_o, tOrP, tOrVt, tSsV, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, tSrVScale);
     } else {
-      flash::gemm_quant_manual_physical_int4(acc_o, tOrP, tOrVt, tSsV_phys, tiled_mma, smem_tiled_copy_KInt4Phys, smem_thr_copy_KInt4Phys, v_scale);
+      flash::gemm_quant_manual<true>(acc_o, tOrP, tOrVt, tSsV, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, v_scale);
     }
 
     __syncthreads();

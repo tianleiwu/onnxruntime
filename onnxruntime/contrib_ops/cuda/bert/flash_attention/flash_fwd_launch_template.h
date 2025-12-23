@@ -358,15 +358,15 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_int8_dequant_kernel, bool Is_causal, bool 
 
 template <typename Kernel_traits, int QUANT_TYPE>
 void run_flash_int4_dequant_fwd(Flash_fwd_params& params, cudaStream_t stream) {
-  // Smem layout: [sQ (FP16)] [sK (Int4, padded physical)] [sV (Int4, padded physical)] [Scale buffers]
-  // Note: INT4 K/V buffers use kSmemRowStrideInt4 (80 for HeadDim=128) for 128-bit aligned cp.async
   constexpr size_t smem_size = sizeof(typename Kernel_traits::Element) *
-      (Kernel_traits::kBlockM * Kernel_traits::kHeadDim) +                              // Q (FP16)
+      (Kernel_traits::kBlockM * Kernel_traits::kHeadDim +   // Q
+       Kernel_traits::kBlockN * Kernel_traits::kHeadDim +   // K
+       Kernel_traits::kBlockN * Kernel_traits::kHeadDim) +  // V
       sizeof(typename Kernel_traits::ElementInt8) *
-      (Kernel_traits::kBlockN * Kernel_traits::kSmemRowStrideInt4 +                     // K_int4 (padded physical)
-       Kernel_traits::kBlockN * Kernel_traits::kSmemRowStrideInt4) +                    // V_int4 (padded physical)
-      sizeof(typename Kernel_traits::Element) * 2 * Kernel_traits::kHeadDim +           // K_Scale + V_Scale
-      1024;  // Padding for alignment
+      (Kernel_traits::kBlockN * Kernel_traits::kHeadDim +   // K_int8
+       Kernel_traits::kBlockN * Kernel_traits::kHeadDim) +  // V_int8
+      sizeof(typename Kernel_traits::Element) * 2 * Kernel_traits::kHeadDim + // K_Scale + V_Scale
+      2048; // Padding (1024 bytes) and extra buffer for safety (alignment etc.)
 
   const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
   dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
