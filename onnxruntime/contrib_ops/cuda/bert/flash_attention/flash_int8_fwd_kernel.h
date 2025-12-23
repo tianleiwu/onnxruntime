@@ -1,7 +1,30 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+//
 /******************************************************************************
- * Copyright (c) 2023, Tri Dao.
- * Copyright (c) 2024, Microsoft.
- * Flash Attention Kernel with Int8 Quantized KV Cache
+ * Flash Attention Kernel with INT8 Quantized KV Cache
+ *
+ * This kernel implements Flash Attention with on-the-fly dequantization of
+ * INT8 quantized Key and Value tensors. It is optimized for inference with
+ * quantized KV-cache to reduce memory bandwidth and storage requirements.
+ *
+ * Architecture Overview:
+ * - Uses FP16/BF16 MMA (Matrix Multiply-Accumulate) Tensor Core operations
+ * - INT8 K/V data is loaded from global memory using cp.async (128-bit)
+ * - Dequantization from INT8 to FP16/BF16 happens in registers before MMA
+ * - Supports both per-tensor and per-channel quantization scales
+ *
+ * Key Features:
+ * - 128-bit asynchronous global memory loads (cp.async) for K/V
+ * - Padded shared memory layout for bank conflict avoidance
+ * - Compatible with SM80+ (Ampere and newer GPUs)
+ * - Supports causal masking, local attention, and softcap
+ *
+ * Memory Layout:
+ * - K/V stored as INT8 (1 byte per element)
+ * - Row-major with padding for 128-bit alignment
+ * - Shared memory: [Q (FP16)] [K (INT8, padded)] [V (INT8, padded)]
+ *
  ******************************************************************************/
 #pragma once
 

@@ -1,7 +1,37 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+//
 /******************************************************************************
- * Copyright (c) 2023, Tri Dao.
- * Copyright (c) 2024, Microsoft.
- * Flash Attention Kernel with Int4 Quantized KV Cache
+ * Flash Attention Kernel with INT4 Quantized KV Cache
+ *
+ * This kernel implements Flash Attention with on-the-fly dequantization of
+ * INT4 quantized Key and Value tensors. INT4 provides 2x compression compared
+ * to INT8, further reducing memory bandwidth requirements.
+ *
+ * Architecture Overview:
+ * - Uses FP16/BF16 MMA (Matrix Multiply-Accumulate) Tensor Core operations
+ * - INT4 K/V data packed as 2 nibbles per byte (hi/lo 4-bit values)
+ * - Dequantization unpacks nibbles and converts to FP16/BF16 before MMA
+ * - Supports both per-tensor and per-channel quantization scales
+ *
+ * Key Differences from INT8 Kernel:
+ * - Physical storage: HeadDim/2 bytes per row (vs HeadDim for INT8)
+ * - Uses "duplicate layout" (HeadDim/2, 2) with inner stride 0 for broadcast
+ * - Scalar copy from global memory due to non-contiguous physical layout
+ * - Nibble unpacking in gemm_quant_manual: lo nibble (bits 0-3), hi nibble (bits 4-7)
+ * - INT4 values are 2's complement: range [-8, 7]
+ *
+ * Memory Layout:
+ * - K/V stored as packed INT4 (2 elements per byte)
+ * - Each byte contains: [hi_nibble:4][lo_nibble:4]
+ * - Logical view (duplicate layout) maps physical bytes to 2 logical elements
+ * - Shared memory: [Q (FP16)] [K (INT8/INT4, swizzled)] [V (INT8/INT4, swizzled)]
+ *
+ * Performance Note:
+ * - Scalar copy is slower than INT8's vectorized cp.async
+ * - Trade-off: 2x memory compression vs lower copy bandwidth
+ * - Net benefit depends on memory-bound vs compute-bound regime
+ *
  ******************************************************************************/
 #pragma once
 
