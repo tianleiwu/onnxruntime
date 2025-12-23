@@ -103,14 +103,21 @@ struct Flash_dq_kernel_traits {
   using SmemLayoutVtransposed = decltype(composition(SmemLayoutV{}, make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
   using SmemLayoutVtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
 
-  // INT8 layout for K (no dequantization - native INT8)
-  // Use swizzling to avoid bank conflicts when writing dequantized FP16 data
-  // The swizzle pattern ensures that consecutive threads write to different banks
-  using SmemLayoutKInt8 = decltype(tile_to_shape(
-      composition(Swizzle<kSwizzle, 3, 3>{},  // Same swizzle as FP16 layout
-                  Layout<Shape<_8, Int<kBlockKSmem>>,
-                         Stride<Int<kBlockKSmem>, _1>>{}),
-      Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+  // INT8 layout for K/V: Padded row-major (no swizzle)
+  // =====================================================
+  // Bank conflict avoidance strategy:
+  // - Row-major with kHeadDim=128 has all rows starting at bank 0 (128 % 128 = 0)
+  // - This causes 32-way bank conflicts when threads access the same column
+  // - Solution: Add 16-byte padding per row -> stride = 144
+  // - Bank(row r, col c) = (r * 144 + c) / 4 % 32 = (r * 36 + c/4) % 32
+  // - Now consecutive rows map to different banks: row 0->bank 0, row 1->bank 4, etc.
+  // - 16-byte padding ensures each row is 128-bit aligned for cp.async!
+  static constexpr int kSmemRowPaddingInt8 = 16;                             // 16 bytes for 128-bit alignment
+  static constexpr int kSmemRowStrideInt8 = kHeadDim + kSmemRowPaddingInt8;  // 144 for HeadDim=128
+
+  using SmemLayoutKInt8 = decltype(make_layout(
+      Shape<Int<kBlockN>, Int<kHeadDim>>{},
+      Stride<Int<kSmemRowStrideInt8>, _1>{}));  // Padded row-major, 16-byte aligned rows
 
   // Copy atoms
   using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
@@ -129,14 +136,12 @@ struct Flash_dq_kernel_traits {
                                                     Layout<Shape<_1, _8>>{}));
 
   // For Int8 global-to-shared memory copy:
-  // - cp.async (SM80_CP_ASYNC_CACHEGLOBAL) requires 128-bit aligned contiguous memory
-  // - Swizzle<3> breaks 128-bit contiguity, causing cp.async to fail validation
-  // - Solution: Use UniversalCopy (standard load/store) with 64-bit vectorization
-  // - This is slightly slower than cp.async but works correctly with swizzled layouts
-  // - 64-bit (8 bytes) = 8 int8 elements, which is safe with Swizzle<3>
-  using GmemTiledCopyKInt8 = decltype(make_tiled_copy(Copy_Atom<UniversalCopy<cute::uint64_t>, ElementInt8>{},
+  // - Use 128-bit cp.async (16 bytes = 16 int8 elements per instruction)
+  // - The padded row-major layout preserves 128-bit column contiguity
+  // - cp.async provides latency hiding by overlapping memory access with compute
+  using GmemTiledCopyKInt8 = decltype(make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, ElementInt8>{},
                                                       GmemLayoutAtom{},
-                                                      Layout<Shape<_1, _8>>{}));  // 8 int8s = 8 bytes
+                                                      Layout<Shape<_1, _16>>{}));  // 16 int8s = 16 bytes
 
   // Output Smem Layout (Row-Major for Vectorized Global Copy)
   using SmemLayoutO = decltype(make_layout(Shape<Int<kBlockM>, Int<kHeadDim>>{},
@@ -282,15 +287,21 @@ inline __device__ void compute_attn_1rowblock(
     return;
   }
 
-  // Layout: [sQ (FP16)] [sK (Int8)] [sV (Int8)]
+  // Layout: [sQ (FP16)] [sK (Int8, padded)] [sV (Int8, padded)]
   // ============================================================================
+  // Note: SmemLayoutKInt8 uses padded stride (kSmemRowStrideInt8 = 144 for HeadDim=128)
+  // size(layout) returns logical size (64 × 128 = 8192), not physical size (64 × 144 = 9216)
+  // We must use physical size for tensor placement to avoid overlap.
+  constexpr int kSmemSizeQ = kBlockM * kHeadDim * sizeof(Element);
+  constexpr int kSmemSizeKInt8 = kBlockN * Kernel_traits::kSmemRowStrideInt8 * sizeof(ElementInt8);
+
   Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)),
                           typename Kernel_traits::SmemLayoutQ{});
-  // sK: Normal Int8 Layout (BlockN, HeadDim) for efficient vectorized Global->Smem load
-  Tensor sK = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + sizeof(Element) * size(sQ))),
+  // sK: INT8 Layout with padding for 128-bit aligned cp.async
+  Tensor sK = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ)),
                           typename Kernel_traits::SmemLayoutKInt8{});
-  Tensor sV = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + sizeof(Element) * size(sQ) + sizeof(ElementInt8) * size(sK))),
-                          typename Kernel_traits::SmemLayoutKInt8{});  // Reuse KInt8 layout for V
+  Tensor sV = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ + kSmemSizeKInt8)),
+                          typename Kernel_traits::SmemLayoutKInt8{});
 
   // Define sO early (reusing Q memory) for Output Staging (FP16)
   Tensor sO = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)),

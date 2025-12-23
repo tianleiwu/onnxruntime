@@ -412,14 +412,14 @@ void run_flash_int4_dequant_fwd(Flash_fwd_params& params, cudaStream_t stream) {
 
 template <typename Kernel_traits>
 void run_flash_int8_dequant_fwd(Flash_fwd_params& params, cudaStream_t stream) {
+  // Smem layout: [sQ (FP16)] [sK (Int8, padded)] [sV (Int8, padded)]
+  // Note: INT8 K/V buffers use kSmemRowStrideInt8 (144 for HeadDim=128) instead of kHeadDim (128)
+  // to ensure 128-bit alignment for cp.async and avoid bank conflicts.
   constexpr size_t smem_size = sizeof(typename Kernel_traits::Element) *
-      (Kernel_traits::kBlockM * Kernel_traits::kHeadDim +   // Q
-       Kernel_traits::kBlockN * Kernel_traits::kHeadDim +   // K
-       Kernel_traits::kBlockN * Kernel_traits::kHeadDim) +  // V
+      (Kernel_traits::kBlockM * Kernel_traits::kHeadDim) +  // Q (FP16, no padding)
       sizeof(typename Kernel_traits::ElementInt8) *
-      (Kernel_traits::kBlockN * Kernel_traits::kHeadDim +   // K_int8
-       Kernel_traits::kBlockN * Kernel_traits::kHeadDim) +  // V_int8
-      sizeof(typename Kernel_traits::Element) * 2 * Kernel_traits::kHeadDim; // K_Scale + V_Scale
+      (Kernel_traits::kBlockN * Kernel_traits::kSmemRowStrideInt8 +   // K_int8 (padded stride)
+       Kernel_traits::kBlockN * Kernel_traits::kSmemRowStrideInt8);   // V_int8 (padded stride)
 
   const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
   dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
