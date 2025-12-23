@@ -314,7 +314,8 @@ void run_mha_fwd_hdim256(Flash_fwd_params& params, cudaStream_t stream) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// Dequant Kernel Launch and Dispatch
+// INT4/INT8 Dequantization Kernel Launch and Dispatch
+// These kernels use FP16/BF16 MMA with on-the-fly dequantization from quantized KV cache
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_int4_dequant_kernel, bool Is_causal, bool Is_local, bool Has_alibi,

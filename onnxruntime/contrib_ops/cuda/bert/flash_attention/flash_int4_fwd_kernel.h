@@ -50,36 +50,28 @@ struct Flash_dq_kernel_traits {
   static constexpr int kBlockN = kBlockN_;
   static constexpr int kHeadDim = kHeadDim_;
 
-  static_assert(kHeadDim % 32 == 0, "kHeadDim must be multiple of 32 for INT8 MMA");
+  static_assert(kHeadDim % 32 == 0, "kHeadDim must be multiple of 32");
 
   static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
   static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
 
-  // Standard FP16 MMA for P×V (m16n8k16)
+  // FP16/BF16 MMA for all GEMM operations (Q×K^T and P×V)
+  // INT4 K/V data is dequantized in registers before MMA, not using native INT8 Tensor Cores.
   // NOTE: We use N=8 tiling (matching MMA Atom's native N dimension) rather than N=16.
   // This is critical for the dequantization pipeline because:
-  // 1. Int8 data is loaded into FP16-shaped register fragments using dummy tensors
+  // 1. Int4 data is loaded into FP16-shaped register fragments using dummy tensors
   // 2. With N=8, each tile contains exactly one MMA atom, simplifying the mapping
   // 3. N=16 creates a 2-atom-per-tile structure that causes cute::gemm shape mismatches
   // The trade-off: gemm_quant_manual uses a manual loop to bypass cute::gemm's assertions.
-  using MMA_Atom_PV = std::conditional_t<
+  using MMA_Atom_Arch = std::conditional_t<
       std::is_same_v<elem_type, cutlass::half_t>,
       MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
       MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>>;
 
   using TiledMma_PV = TiledMMA<
-      MMA_Atom_PV,
+      MMA_Atom_Arch,
       Layout<Shape<Int<kNWarps>, _1, _1>>,
       Tile<Int<16 * kNWarps>, _8, _16>>;  // N=8 matches MMA Atom N dimension
-
-  // INT8 MMA for Q×K^T (m16n8k32 s8s8s32)
-  // Note: This MMA has K=32, twice the K dimension of FP16 MMA
-  using MMA_Atom_QK_Int8 = MMA_Atom<SM80_16x8x32_S32S8S8S32_TN>;
-
-  using TiledMma_QK_Int8 = TiledMMA<
-      MMA_Atom_QK_Int8,
-      Layout<Shape<Int<kNWarps>, _1, _1>>,
-      Tile<Int<16 * kNWarps>, _16, _32>>;
 
   // Shared memory layouts
   using SmemLayoutAtom = decltype(composition(Swizzle<kSwizzle, 3, 3>{},
@@ -99,10 +91,10 @@ struct Flash_dq_kernel_traits {
   using SmemLayoutVtransposed = decltype(composition(SmemLayoutV{}, make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
   using SmemLayoutVtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
 
-  // INT8 layout for K (no dequantization - native INT8)
-  // Use swizzling to avoid bank conflicts when writing dequantized FP16 data
+  // INT4 packed layout for K (INT4 pairs packed into INT8 bytes)
+  // Use swizzling to avoid bank conflicts when reading data for MMA
   using SmemLayoutKInt8 = decltype(tile_to_shape(
-      composition(Swizzle<kSwizzle, 3, 3>{},  // Same swizzle as FP16 layout
+      composition(Swizzle<kSwizzle, 3, 3>{},
                   Layout<Shape<_8, Int<kBlockKSmem>>,
                          Stride<Int<kBlockKSmem>, _1>>{}),
       Shape<Int<kBlockN>, Int<kHeadDim>>{}));
