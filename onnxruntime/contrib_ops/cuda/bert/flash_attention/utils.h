@@ -396,6 +396,96 @@ __forceinline__ __device__ void gemm_quant_manual(Tensor0& acc, Tensor1& tCrA, T
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// gemm_quant_manual_physical_int4: Variant for INT4 with physical smem layout (HeadDim/2 bytes per row)
+//
+// This function is designed for the optimized INT4 kernel where:
+// - Physical data is loaded to smem using cp.async (HeadDim/2 bytes per row)
+// - tCsB_phys has shape (kBlockN, kHeadDim/2) - HALF the logical dimension
+// - Internal index remapping handles the logical→physical mapping:
+//   * Logical index j maps to physical index j/2
+//   * j%2 == 0: extract lo nibble, j%2 == 1: extract hi nibble
+//
+template <typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
+          typename TiledMma, typename TiledCopy, typename ThrCopy, typename ScaleArg>
+__forceinline__ __device__ void gemm_quant_manual_physical_int4(
+    Tensor0& acc, Tensor1& tCrA, Tensor2& tCrB, Tensor3 const& tCsB_phys,
+    TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
+    ThrCopy smem_thr_copy_B, ScaleArg scale) {
+  // For physical INT4: tCsB_phys has HALF the K dimension of logical tCrB
+  // We need to map logical indices to physical indices with nibble extraction
+
+  using ElementQuant = typename TiledCopy::ValType;  // int8_t
+  using DQuantType = typename Tensor2::value_type;   // half_t
+
+  // Create temp register tensor for physical quantized data (half size)
+  // tCsB_phys has shape (N, K/2) where K is logical HeadDim
+  Tensor tCrB_quant_phys = make_tensor<ElementQuant>(layout(tCsB_phys));
+
+  Tensor tCrB_quant_phys_copy_view = smem_thr_copy_B.retile_D(tCrB_quant_phys);
+
+  // Load first tile of physical data
+  cute::copy(smem_tiled_copy_B, tCsB_phys(_, _, _0{}), tCrB_quant_phys_copy_view(_, _, _0{}));
+
+  // Check if ScaleArg is a Tensor (Per-Channel) or Scalar (Per-Tensor)
+  static constexpr bool Is_Scale_Tensor = cute::is_tensor<ScaleArg>::value;
+
+  // Helper lambda for manual GEMM to bypass shape assertions
+  auto manual_gemm_helper = [&](auto const& tA_k, auto const& tB_k) {
+    typename TiledMma::Atom atom_mma;
+    CUTE_UNROLL
+    for (int m = 0; m < size<1>(tA_k); ++m) {
+      CUTE_UNROLL
+      for (int n = 0; n < size<1>(tB_k); ++n) {
+        cute::gemm(atom_mma, tA_k(_, m), tB_k(_, n), acc(_, m, n));
+      }
+    }
+  };
+
+  constexpr int num_k_tiles = decltype(size<2>(tCrA))::value;
+
+  CUTE_UNROLL
+  for (int qi = 0; qi < num_k_tiles; ++qi) {
+    // Prefetch next physical tile
+    if (qi < num_k_tiles - 1) {
+      cute::copy(smem_tiled_copy_B, tCsB_phys(_, _, qi + 1), tCrB_quant_phys_copy_view(_, _, qi + 1));
+    }
+
+    Tensor tCrB_quant_phys_frag = tCrB_quant_phys(_, _, qi);
+    Tensor tCrB_frag = tCrB(_, _, qi);
+
+    // INT4 Physical Layout Unpacking:
+    // - Physical tensor has HeadDim/2 elements (each byte contains 2 nibbles)
+    // - Logical tensor has HeadDim elements
+    // - Map: logical j -> physical j/2, nibble j%2 (0=lo, 1=hi)
+    CUTE_UNROLL
+    for (int j = 0; j < size(tCrB_frag); j += 2) {
+      int phys_idx = j / 2;
+      uint8_t packed_byte = static_cast<uint8_t>(tCrB_quant_phys_frag(phys_idx));
+
+      // Unpack 2's complement 4-bit values
+      // v0: lower 4 bits (for logical index j)
+      // v1: upper 4 bits (for logical index j+1)
+      int8_t v0_raw = packed_byte & 0xF;
+      int8_t v0 = v0_raw >= 8 ? v0_raw - 16 : v0_raw;
+
+      int8_t v1_raw = (packed_byte >> 4) & 0xF;
+      int8_t v1 = v1_raw >= 8 ? v1_raw - 16 : v1_raw;
+
+      if constexpr (Is_Scale_Tensor) {
+        tCrB_frag(j) = static_cast<DQuantType>(static_cast<float>(v0) * static_cast<float>(scale(j, 0, qi)));
+        tCrB_frag(j + 1) = static_cast<DQuantType>(static_cast<float>(v1) * static_cast<float>(scale(j + 1, 0, qi)));
+      } else {
+        tCrB_frag(j) = static_cast<DQuantType>(static_cast<float>(v0) * static_cast<float>(scale));
+        tCrB_frag(j + 1) = static_cast<DQuantType>(static_cast<float>(v1) * static_cast<float>(scale));
+      }
+    }
+
+    manual_gemm_helper(tCrA(_, _, qi), tCrB_frag);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
 template <typename Layout>
 __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {

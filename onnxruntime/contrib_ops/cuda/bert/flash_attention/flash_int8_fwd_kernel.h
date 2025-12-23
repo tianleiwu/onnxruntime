@@ -1,8 +1,7 @@
-/******************************************************************************
- * Copyright (c) 2023, Tri Dao.
- * Copyright (c) 2024, Microsoft.
- * Flash Attention Kernel with Int8 Quantized KV Cache
- ******************************************************************************/
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+//
+// Flash Attention Kernel with Int8 Quantized KV Cache
 #pragma once
 
 #if defined(__GNUC__)
