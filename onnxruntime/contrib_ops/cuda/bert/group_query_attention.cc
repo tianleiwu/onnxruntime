@@ -245,8 +245,8 @@ GroupQueryAttention<T>::GroupQueryAttention(const OpKernelInfo& info)
 
   disable_flash_attention_ = sizeof(T) != 2 || !kernel_options_->UseFlashAttention();
 
-  // Memory efficient attention only supports float and float16, not bfloat16.
-  disable_memory_efficient_attention_ = std::is_same<T, BFloat16>::value || !kernel_options_->UseEfficientAttention();
+  // Memory efficient attention supports float and float16. BFloat16 support added for SM80+.
+  disable_memory_efficient_attention_ = !kernel_options_->UseEfficientAttention();
 
   if (!disable_flash_attention_) {
     zeros_ = this->GetScratchBuffer<int>(kZerosCount, nullptr);
@@ -500,7 +500,7 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
     bool use_memory_efficient_attention =
         !use_flash_attention &&
         !disable_memory_efficient_attention_ &&
-        has_memory_efficient_attention(sm, sizeof(T) == 2, parameters.head_size, parameters.head_size);
+        has_memory_efficient_attention(sm, std::is_same<T, MLFloat16>::value, std::is_same<T, BFloat16>::value, parameters.head_size, parameters.head_size);
 
     size_t kv_buffer_bytes = (use_memory_efficient_attention && (parameters.num_heads != parameters.kv_num_heads))
                                  ? (sizeof(T) * parameters.batch_size * parameters.num_heads * parameters.seqlen_present_kv_cache * parameters.head_size)

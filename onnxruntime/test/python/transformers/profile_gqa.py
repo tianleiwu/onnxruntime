@@ -68,6 +68,10 @@ def create_gqa_config(
         k_quant_type = "NONE"
         v_quant_type = "NONE"
         kv_cache_type = "float16"
+    elif mode == "bf16":
+        k_quant_type = "NONE"
+        v_quant_type = "NONE"
+        kv_cache_type = "bfloat16"
     elif mode == "int8":
         k_quant_type = "PER_TENSOR"
         v_quant_type = "PER_TENSOR"
@@ -122,7 +126,7 @@ def benchmark_gqa(config: GroupQueryAttentionConfig, warmup: int = 50, repeat: i
 
 
 def run_comparison(args):
-    """Compare FP16 vs quantized performance."""
+    """Compare FP16/BF16 vs quantized performance."""
     print(f"\n{'=' * 70}")
     print("GQA Performance Comparison")
     print(f"{'=' * 70}")
@@ -131,7 +135,7 @@ def run_comparison(args):
     print(f"        warmup={args.warmup}, repeat={args.repeat}")
     print(f"{'=' * 70}\n")
 
-    modes = ["fp16", "int8", "int4"] if args.mode == "all" else [args.mode]
+    modes = ["fp16", "bf16", "int8", "int4"] if args.mode == "all" else [args.mode]
     results = {}
 
     for mode in modes:
@@ -150,18 +154,19 @@ def run_comparison(args):
         print(f"  {mode.upper():6s}: {avg_ms:.4f} ms")
 
     # Print comparison if we have baseline
-    if "fp16" in results and len(results) > 1:
-        print("\n  Relative to FP16:")
+    baseline = "fp16" if "fp16" in results else ("bf16" if "bf16" in results else None)
+    if baseline and len(results) > 1:
+        print(f"\n  Relative to {baseline.upper()}:")
         for mode, ms in results.items():
-            if mode != "fp16":
-                ratio = ms / results["fp16"]
+            if mode != baseline:
+                ratio = ms / results[baseline]
                 print(f"    {mode.upper()}: {ratio:.2f}x slower")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Profile GQA with quantized KV cache")
     parser.add_argument(
-        "--mode", choices=["fp16", "int8", "int4", "all"], default="all", help="Quantization mode to test"
+        "--mode", choices=["fp16", "bf16", "int8", "int4", "all"], default="all", help="Quantization mode to test"
     )
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size")
     parser.add_argument("--sequence-length", type=int, default=1, help="Query sequence length (1 for token generation)")

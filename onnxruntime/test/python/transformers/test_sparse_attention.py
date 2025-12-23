@@ -125,8 +125,8 @@ class AttentionConfig:
 
     def random_inputs(self):
         device = self.device
-        # Since bfloat16 is not supported in ORT python I/O binding API, we always use float16 as model inputs.
-        dtype = torch.float16 if self.dtype == torch.bfloat16 else self.dtype
+        # ORT python I/O binding API supports bf16 via torch tensor.
+        dtype = self.dtype
 
         # Always use non-packed qkv to generate same inputs for Torch and ORT.
         packed = self.is_packed_qkv  # Save the original value.
@@ -559,9 +559,14 @@ def create_sparse_attention_onnx_model(config: SparseAttentionConfig):
 
 
 def create_group_query_attention_onnx_model(config: GroupQueryAttentionConfig):
-    assert config.dtype in [torch.float16, torch.float32]
+    assert config.dtype in [torch.float16, torch.float32, torch.bfloat16]
 
-    float_type = TensorProto.FLOAT16 if config.dtype in [torch.float16] else TensorProto.FLOAT
+    if config.dtype == torch.float16:
+        float_type = TensorProto.FLOAT16
+    elif config.dtype == torch.bfloat16:
+        float_type = TensorProto.BFLOAT16
+    else:
+        float_type = TensorProto.FLOAT
 
     # Determine cache tensor type based on quantization
     cache_type = float_type
@@ -1095,10 +1100,6 @@ class TestSparseAttention(unittest.TestCase):
             obj = TorchGroupQueryAttention(gqa_config)
             expected_out = obj.infer()
         else:
-            if config.dtype == torch.bfloat16:
-                # Skip test since create_group_query_attention_onnx_model does not support bfloat16 right now.
-                return
-
             # Run QGA by ORT (support packed QKV, rotary and very long sequence, but no mask so dense only).
             gqa_config: GroupQueryAttentionConfig = config.get_comparable_ort_gqa_config(use_local=False)
             obj = OrtGroupQueryAttention(gqa_config)
