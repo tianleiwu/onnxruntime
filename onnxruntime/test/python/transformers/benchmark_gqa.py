@@ -11,20 +11,31 @@ import torch
 from test_sparse_attention import GroupQueryAttentionConfig, OrtGroupQueryAttention
 
 
-def get_plot_algos(sm: int, local_window_size: int | None):
+def get_plot_algos(sm: int, local_window_size: int | None, test_quantization: bool = False):
     # GQA with local windows only works in sm=8x
     if sm >= 80 and local_window_size:
-        return {
-            "line_vals": ["ort_gqa", "ort_gqa_local", "ort_gqa_packed", "ort_gqa_local_packed"],
-            "line_names": ["ORT-GQA-Dense", "ORT-GQA-Local", "ORT-GQA-Dense-PackedQKV", "ORT-GQA-Local-PackedQKV"],
-            "styles": [("red", "solid"), ("yellow", "dashdot"), ("blue", "dashed"), ("green", "dotted")],
-        }
+        line_vals = ["ort_gqa", "ort_gqa_local", "ort_gqa_packed", "ort_gqa_local_packed"]
+        line_names = ["ORT-GQA-Dense", "ORT-GQA-Local", "ORT-GQA-Dense-PackedQKV", "ORT-GQA-Local-PackedQKV"]
+        styles = [("red", "solid"), ("yellow", "dashdot"), ("blue", "dashed"), ("green", "dotted")]
     else:
-        return {
-            "line_vals": ["ort_gqa", "ort_gqa_packed"],
-            "line_names": ["ORT-GQA-Dense", "ORT-GQA-Dense-PackedQKV"],
-            "styles": [("red", "solid"), ("blue", "dashed")],
-        }
+        line_vals = ["ort_gqa", "ort_gqa_packed"]
+        line_names = ["ORT-GQA-Dense", "ORT-GQA-Dense-PackedQKV"]
+        styles = [("red", "solid"), ("blue", "dashed")]
+
+    # Add quantized variants if requested
+    if test_quantization:
+        quant_vals = ["ort_gqa_int4", "ort_gqa_int8"]
+        quant_names = ["ORT-GQA-INT4", "ORT-GQA-INT8"]
+        quant_styles = [("purple", "dotted"), ("orange", "dashdot")]
+        line_vals.extend(quant_vals)
+        line_names.extend(quant_names)
+        styles.extend(quant_styles)
+
+    return {
+        "line_vals": line_vals,
+        "line_names": line_names,
+        "styles": styles,
+    }
 
 
 def plot_prompt_performance(
@@ -37,10 +48,11 @@ def plot_prompt_performance(
     max_seq_len: int,
     local_window_size: int | None = None,
     use_smooth_softmax: bool = False,
+    test_quantization: bool = False,
 ):
     import triton  # noqa: PLC0415
 
-    algos = get_plot_algos(sm, local_window_size)
+    algos = get_plot_algos(sm, local_window_size, test_quantization)
     configs = [
         triton.testing.Benchmark(
             x_names=["sequence_length"],
@@ -75,6 +87,17 @@ def plot_prompt_performance(
         warmup = 15
         repeat = 100
 
+        # Determine quantization settings based on provider
+        k_quant_type = "NONE"
+        v_quant_type = "NONE"
+        kv_cache_type = "float16"
+        if "_int4" in provider:
+            k_quant_type = v_quant_type = "PER_CHANNEL"
+            kv_cache_type = "int4"
+        elif "_int8" in provider:
+            k_quant_type = v_quant_type = "PER_TENSOR"
+            kv_cache_type = "int8"
+
         config: GroupQueryAttentionConfig = GroupQueryAttentionConfig(
             batch_size=batch_size,
             sequence_length=sequence_length,
@@ -87,6 +110,9 @@ def plot_prompt_performance(
             use_smooth_softmax=use_smooth_softmax,
             device=device,
             is_packed_qkv=provider in ["ort_gqa_packed", "ort_gqa_local_packed"],
+            k_quant_type=k_quant_type,
+            v_quant_type=v_quant_type,
+            kv_cache_type=kv_cache_type,
         )
 
         obj = OrtGroupQueryAttention(config)
@@ -107,10 +133,11 @@ def plot_token_performance(
     max_seq_len: int,
     local_window_size: int | None = None,
     use_smooth_softmax: bool = False,
+    test_quantization: bool = False,
 ):
     import triton  # noqa: PLC0415
 
-    algos = get_plot_algos(sm, local_window_size)
+    algos = get_plot_algos(sm, local_window_size, test_quantization)
     configs = [
         triton.testing.Benchmark(
             x_names=["past_sequence_length"],
@@ -145,6 +172,17 @@ def plot_token_performance(
         warmup = 15
         repeat = 100
 
+        # Determine quantization settings based on provider
+        k_quant_type = "NONE"
+        v_quant_type = "NONE"
+        kv_cache_type = "float16"
+        if "_int4" in provider:
+            k_quant_type = v_quant_type = "PER_CHANNEL"
+            kv_cache_type = "int4"
+        elif "_int8" in provider:
+            k_quant_type = v_quant_type = "PER_TENSOR"
+            kv_cache_type = "int8"
+
         config: GroupQueryAttentionConfig = GroupQueryAttentionConfig(
             batch_size=batch_size,
             sequence_length=1,
@@ -158,6 +196,9 @@ def plot_token_performance(
             is_packed_qkv=provider in ["ort_gqa_packed", "ort_gqa_local_packed"],
             use_smooth_softmax=use_smooth_softmax,
             device=device,
+            k_quant_type=k_quant_type,
+            v_quant_type=v_quant_type,
+            kv_cache_type=kv_cache_type,
         )
 
         obj = OrtGroupQueryAttention(config)
@@ -168,7 +209,7 @@ def plot_token_performance(
     benchmark.run(save_path=".", print_data=True)
 
 
-def run_performance_test(sm: int):
+def run_performance_test(sm: int, fast: bool = False, test_quantization: bool = False):
     """
     Run performance tests for prompt and token generation.
 
@@ -188,12 +229,17 @@ def run_performance_test(sm: int):
         (40, 128, 10, 131072, None, "Phi-3-medium-128K"),
     ]
 
+    if fast:
+        configures = configures[:1]
+    batch_sizes = [1] if fast else [1, 4]
+    smooth_softmax_options = [False] if fast else [False, True]
+
     # Reduce max sequence length when GPU memory is not enough.
     threshold = 131072 if memory_in_gb > 24 else 65536 if memory_in_gb > 12 else 32768
 
     for num_heads, head_size, kv_num_heads, max_seq_len, local_window_size, model_name in configures:
-        for batch_size in [1, 4]:
-            for use_smooth_softmax in [False, True]:
+        for batch_size in batch_sizes:
+            for use_smooth_softmax in smooth_softmax_options:
                 plot_prompt_performance(
                     sm=sm,
                     batch_size=batch_size,
@@ -204,6 +250,7 @@ def run_performance_test(sm: int):
                     local_window_size=local_window_size,
                     use_smooth_softmax=use_smooth_softmax,
                     model_name=model_name,
+                    test_quantization=test_quantization,
                 )
                 plot_token_performance(
                     sm=sm,
@@ -215,6 +262,7 @@ def run_performance_test(sm: int):
                     local_window_size=local_window_size,
                     use_smooth_softmax=use_smooth_softmax,
                     model_name=model_name,
+                    test_quantization=test_quantization,
                 )
 
 
@@ -224,4 +272,4 @@ if __name__ == "__main__":
 
     s = torch.cuda.Stream()
     with torch.cuda.stream(s), torch.no_grad():
-        run_performance_test(sm)
+        run_performance_test(sm, fast=True, test_quantization=True)

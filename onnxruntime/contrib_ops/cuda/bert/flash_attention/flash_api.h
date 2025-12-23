@@ -32,6 +32,9 @@
 
 #include "core/providers/cuda/cuda_common.h"
 #include <tuple>
+#include <type_traits>
+#include <cutlass/numeric_types.h>
+#include <cuda_bf16.h>
 
 namespace onnxruntime {
 namespace flash {
@@ -121,7 +124,12 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
                        bool is_rotary_interleaved = false,
                        bool is_packed_qkv = false,
                        int max_num_blocks_per_seq = 0,
-                       int page_block_size = 1);
+                       int page_block_size = 1,
+                       void* k_scale = nullptr,  // one element for per tensor, num_heads_k x head_size for per channel
+                       void* v_scale = nullptr,  // one element for per tensor, num_heads_k x head_size for per channel
+                       int k_quant_type = 0,
+                       int v_quant_type = 0,
+                       int kv_cache_bit_width = 0);
 
 size_t get_softmax_lse_size(size_t max_seqlen_q, size_t batch_size, size_t num_heads);
 size_t get_softmax_lse_size(size_t token_count, size_t num_heads);
@@ -130,6 +138,43 @@ std::tuple<size_t, size_t, size_t> get_num_splits_and_buffer_sizes(size_t batch_
                                                                    size_t head_size, size_t num_SMs);
 
 bool is_supported(const cudaDeviceProp& dprops, size_t head_size, size_t num_heads, size_t num_heads_k);
+
+// Template version that checks for bf16 type in quick build mode
+template <typename T>
+bool is_supported(const cudaDeviceProp& dprops, size_t head_size, size_t num_heads, size_t num_heads_k) {
+#ifdef QUICK_BUILD_FP16_ONLY
+  // In quick build mode, only fp16 flash attention is built
+  constexpr bool is_bf16 = std::is_same<T, cutlass::bfloat16_t>::value ||
+                           std::is_same<T, nv_bfloat16>::value;
+  if (is_bf16) {
+    return false;
+  }
+
+  if (head_size != 128) {
+    return false;
+  }
+#endif
+  return is_supported(dprops, head_size, num_heads, num_heads_k);
+}
+
+bool is_supported_quantization(bool is_causal, size_t head_size, int k_quant_type, int v_quant_type, int kv_cache_bit_width);
+
+// Template version that checks for bf16 type in quick build mode
+template <typename T>
+bool is_supported_quantization(bool is_causal, size_t head_size, int k_quant_type, int v_quant_type, int kv_cache_bit_width) {
+#ifdef QUICK_BUILD_FP16_ONLY
+  // In quick build mode, only fp16 flash attention is built
+  constexpr bool is_bf16 = std::is_same<T, cutlass::bfloat16_t>::value ||
+                           std::is_same<T, nv_bfloat16>::value;
+  if (is_bf16) {
+    return false;
+  }
+  if (head_size != 128) {  // <-- Add this too
+    return false;
+  }
+#endif
+  return is_supported_quantization(is_causal, head_size, k_quant_type, v_quant_type, kv_cache_bit_width);
+}
 
 }  // namespace flash
 }  // namespace onnxruntime
