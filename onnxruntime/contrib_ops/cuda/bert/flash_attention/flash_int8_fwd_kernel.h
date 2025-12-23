@@ -453,8 +453,113 @@ inline __device__ void compute_attn_1rowblock_int8mma(
       for (int k = 0; k < size(tKpK); ++k) tKpK(k) = get<1>(tKcK(0, 0, k)) < params.d;
     }
 
-    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KInt8, tKgK_int8, tKsK_int8, tKcK, tKpK, binfo.actual_seqlen_k - n_block * kBlockN);
-    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KInt8, tVgV_int8, tVsV_int8, tKcK, tKpK, binfo.actual_seqlen_k - n_block * kBlockN);
+    // Check if we are in the 'New K' territory (appended data)
+    // For now we assume knew is appended at the very end
+    bool is_knew_block = (params.knew_ptr != nullptr) && (n_block * kBlockN >= binfo.seqlen_k_cache);
+
+    if (is_knew_block) {
+      // [Write-Back Setup] Define Write Tensor for K (Global INT8 Cache)
+      Tensor mK_int8_write = make_tensor(make_gmem_ptr(reinterpret_cast<ElementInt8*>(params.k_ptr) + k_base_offset),
+                                         make_shape(binfo.actual_seqlen_k, params.d),
+                                         make_stride(params.k_row_stride, _1{}));
+      Tensor gK_int8_write = local_tile(mK_int8_write, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
+      Tensor tKgK_write = gmem_thr_copy_KInt8.partition_S(gK_int8_write);  // Thread partition for Global Write
+
+      // [New K/V Base Pointers] Hoist invariant offset calculation
+      const int bidh_kv = bidh / params.h_h_k_ratio;
+      size_t k_batch_head_offset = (bidb * params.knew_batch_stride) + (bidh_kv * params.knew_head_stride);
+      size_t v_batch_head_offset = (bidb * params.vnew_batch_stride) + (bidh_kv * params.vnew_head_stride);
+      Element* knew_base_ptr = reinterpret_cast<Element*>(params.knew_ptr) + k_batch_head_offset;
+      Element* vnew_base_ptr = reinterpret_cast<Element*>(params.vnew_ptr) + v_batch_head_offset;
+
+      // [Scale Pointers]
+      const float* k_scale_base = reinterpret_cast<const float*>(params.k_scale_ptr);
+      const float* v_scale_base = reinterpret_cast<const float*>(params.v_scale_ptr);
+
+      // Optimize scale access: if per-tensor, load once.
+      float k_scale_val = 1.0f;
+      float v_scale_val = 1.0f;
+      if (params.k_quant_type != 2 && params.k_scale_ptr) k_scale_val = k_scale_base[0];
+      if (params.v_quant_type != 2 && params.v_scale_ptr) v_scale_val = v_scale_base[0];
+
+      // K Load + Quantize
+      Tensor tKsK_dst = gmem_thr_copy_KInt8.partition_D(sK);
+      int start_row = n_block * kBlockN;
+
+#pragma unroll
+      for (int i = 0; i < size(tKsK_dst); ++i) {
+        auto coord = tKcK(i);
+        int row_in_block = get<0>(coord);
+        int h_idx = get<1>(coord);
+        int global_k_row = start_row + row_in_block;
+
+        ElementInt8 val_int8 = 0;
+        if (global_k_row >= binfo.seqlen_k_cache && global_k_row < binfo.actual_seqlen_k) {
+          int knew_relative_row = global_k_row - binfo.seqlen_k_cache;
+
+          // Optimized load
+          Element val_fp16 = knew_base_ptr[knew_relative_row * params.knew_row_stride + h_idx];
+
+          float scale = k_scale_val;
+          if (params.k_quant_type == 2) {  // Per-channel
+            scale = k_scale_base[bidh_kv * kHeadDim + h_idx];
+          }
+
+          // Quantize: INT8 = FP16 * DivScale (or FP16 / Scale).
+          val_int8 = static_cast<int8_t>(static_cast<float>(val_fp16) / scale);
+
+          // [Write-Back] Store to Global INT8 Cache
+          // tKgK_write(i) corresponds to the same global element as the one we just quantized
+          if (i < size(tKgK_write)) {
+            tKgK_write(i) = val_int8;
+          }
+        }
+        tKsK_dst(i) = val_int8;
+      }
+
+      // [Write-Back Setup] Define Write Tensor for V (Global INT8 Cache)
+      Tensor mV_int8_write = make_tensor(make_gmem_ptr(reinterpret_cast<ElementInt8*>(params.v_ptr) + v_base_offset),
+                                         make_shape(binfo.actual_seqlen_k, params.d),
+                                         make_stride(params.v_row_stride, _1{}));
+      Tensor gV_int8_write = local_tile(mV_int8_write, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
+      Tensor tVgV_write = gmem_thr_copy_KInt8.partition_S(gV_int8_write);
+
+      // V Load + Quantize
+      Tensor tVsV_dst = gmem_thr_copy_KInt8.partition_D(sV);
+
+#pragma unroll
+      for (int i = 0; i < size(tVsV_dst); ++i) {
+        auto coord = tKcK(i);  // Use same coordinates as K for simplicity if layout matches
+        int row_in_block = get<0>(coord);
+        int h_idx = get<1>(coord);
+        int global_v_row = start_row + row_in_block;
+
+        ElementInt8 val_int8 = 0;
+        if (global_v_row >= binfo.seqlen_k_cache && global_v_row < binfo.actual_seqlen_k) {
+          int knew_relative_row = global_v_row - binfo.seqlen_k_cache;
+
+          // Optimized load
+          Element val_fp16 = vnew_base_ptr[knew_relative_row * params.vnew_row_stride + h_idx];
+
+          float scale = v_scale_val;
+          if (params.v_quant_type == 2) {  // Per-channel
+            scale = v_scale_base[bidh_kv * kHeadDim + h_idx];
+          }
+
+          val_int8 = static_cast<int8_t>(static_cast<float>(val_fp16) / scale);
+
+          // [Write-Back] Store to Global INT8 Cache
+          if (i < size(tVgV_write)) {
+            tVgV_write(i) = val_int8;
+          }
+        }
+        tVsV_dst(i) = val_int8;
+      }
+
+    } else {
+      flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KInt8, tKgK_int8, tKsK_int8, tKcK, tKpK, binfo.actual_seqlen_k - n_block * kBlockN);
+      flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KInt8, tVgV_int8, tVsV_int8, tKcK, tKpK, binfo.actual_seqlen_k - n_block * kBlockN);
+    }
 
     cute::cp_async_fence();
     cute::cp_async_wait<0>();

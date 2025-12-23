@@ -514,21 +514,26 @@ Status FlashAttention(
     }
 
     if (!parameters.is_packed_qkv) {
-      auto LaunchQuantAppend = [&](void* dst, const T* src, const T* scale, KVQuantizationType q_type) {
-        if (parameters.kv_cache_bit_width == 8) {
-          return LaunchQuantizeAppendKV<T, int8_t, T>(
-              stream, reinterpret_cast<int8_t*>(dst), src, scale,
-              data.seqlens_k, batch_size, kv_num_heads,
-              parameters.seqlen_present_kv_cache, head_size, 8, sequence_length, q_type, true);
-        } else {
-          return LaunchQuantizeAppendKV<T, uint8_t, T>(
-              stream, reinterpret_cast<uint8_t*>(dst), src, scale,
-              data.seqlens_k, batch_size, kv_num_heads,
-              parameters.seqlen_present_kv_cache, head_size, 4, sequence_length, q_type, true);
-        }
-      };
-      ORT_RETURN_IF_ERROR(LaunchQuantAppend(data.present_key, reinterpret_cast<const T*>(key), data.k_scale, parameters.k_quant_type));
-      ORT_RETURN_IF_ERROR(LaunchQuantAppend(data.present_value, reinterpret_cast<const T*>(value), data.v_scale, parameters.v_quant_type));
+      // For Int8, we want to perform on-the-fly quantization in the attention kernel (Fused).
+      // So we skip the separate LaunchQuantAppend call here.
+      // For Int4, we still use the separate LaunchQuantAppend call as the kernel update is not yet ready.
+      if (parameters.kv_cache_bit_width == 4) {
+        auto LaunchQuantAppend = [&](void* dst, const T* src, const T* scale, KVQuantizationType q_type) {
+          if (parameters.kv_cache_bit_width == 8) {
+            return LaunchQuantizeAppendKV<T, int8_t, T>(
+                stream, reinterpret_cast<int8_t*>(dst), src, scale,
+                data.seqlens_k, batch_size, kv_num_heads,
+                parameters.seqlen_present_kv_cache, head_size, 8, sequence_length, q_type, true);
+          } else {
+            return LaunchQuantizeAppendKV<T, uint8_t, T>(
+                stream, reinterpret_cast<uint8_t*>(dst), src, scale,
+                data.seqlens_k, batch_size, kv_num_heads,
+                parameters.seqlen_present_kv_cache, head_size, 4, sequence_length, q_type, true);
+          }
+        };
+        ORT_RETURN_IF_ERROR(LaunchQuantAppend(data.present_key, reinterpret_cast<const T*>(key), data.k_scale, parameters.k_quant_type));
+        ORT_RETURN_IF_ERROR(LaunchQuantAppend(data.present_value, reinterpret_cast<const T*>(value), data.v_scale, parameters.v_quant_type));
+      }
     }
   } else {
     // [Standard FP16 Append Logic]
@@ -583,8 +588,14 @@ Status FlashAttention(
 
   // We have already appended (and quantized if needed) the new tokens into present_key/value.
   // Pass nullptr for new_k/new_v to disable the kernel's internal Append_KV logic.
+  // Pass new_k/new_v (key/value) to enable the kernel's internal Append_KV logic if quantization is needed.
+  // We only enable this for INT8 as INT4 support is not yet added to the fused kernel.
+  void* kernel_new_k = (is_quantized && parameters.kv_cache_bit_width == 8) ? key : nullptr;
+  void* kernel_new_v = (is_quantized && parameters.kv_cache_bit_width == 8) ? value : nullptr;
+
   ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd_kvcache(
-      device_prop, stream, query, present_key, present_value, nullptr, nullptr,
+      device_prop, stream, query, present_key, present_value,
+      kernel_new_k, kernel_new_v,
       data.output, reinterpret_cast<void*>(data.softmax_lse), seqlens_k,
       cos_cache, sin_cache, head_sink, /*block_table*/ nullptr, batch_size,
       num_heads, kv_num_heads, head_size, sequence_length,
