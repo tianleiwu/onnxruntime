@@ -493,8 +493,8 @@ Status EfficientAttention(
 
   MemoryEfficientAttentionParams p;
   p.sm = device_prop.major * 10 + device_prop.minor;
-  p.is_half = std::is_same<T, MLFloat16>::value;
   p.is_bf16 = std::is_same<T, BFloat16>::value;
+  p.is_half = !p.is_bf16 && (sizeof(T) == 2);
   p.batch_size = parameters.batch_size;
   p.num_heads = parameters.num_heads;
   p.sequence_length = parameters.sequence_length;
