@@ -582,8 +582,28 @@ def gqa_prompt_func(
 
     # 6. Quantization scales
     if k_scale is not None:
+        target_dtype = {
+            TensorProto.FLOAT: torch.float32,
+            TensorProto.FLOAT16: torch.float16,
+            TensorProto.BFLOAT16: torch.bfloat16,
+        }.get(ort_type, torch.float32)
+
+        if k_scale.dtype != target_dtype:
+            k_scale = k_scale.to(target_dtype)
+        if debug_gqa:
+            print(
+                f"DEBUG: Binding k_scale dtype={k_scale.dtype} ort_type={ort_type} shape={k_scale.shape} val={k_scale.flatten()[:4]}"
+            )
         bind_tensor(io_binding, "k_scale", k_scale, device, ort_type)
     if v_scale is not None:
+        target_dtype = {
+            TensorProto.FLOAT: torch.float32,
+            TensorProto.FLOAT16: torch.float16,
+            TensorProto.BFLOAT16: torch.bfloat16,
+        }.get(ort_type, torch.float32)
+
+        if v_scale.dtype != target_dtype:
+            v_scale = v_scale.to(target_dtype)
         bind_tensor(io_binding, "v_scale", v_scale, device, ort_type)
 
     # 7. Bind Outputs
@@ -725,8 +745,24 @@ def gqa_past_func(
 
     # 6. Quantization
     if k_scale is not None:
+        target_dtype = {
+            TensorProto.FLOAT: torch.float32,
+            TensorProto.FLOAT16: torch.float16,
+            TensorProto.BFLOAT16: torch.bfloat16,
+        }.get(ort_type, torch.float32)
+
+        if k_scale.dtype != target_dtype:
+            k_scale = k_scale.to(target_dtype)
         bind_tensor(io_binding, "k_scale", k_scale, device, ort_type)
     if v_scale is not None:
+        target_dtype = {
+            TensorProto.FLOAT: torch.float32,
+            TensorProto.FLOAT16: torch.float16,
+            TensorProto.BFLOAT16: torch.bfloat16,
+        }.get(ort_type, torch.float32)
+
+        if v_scale.dtype != target_dtype:
+            v_scale = v_scale.to(target_dtype)
         bind_tensor(io_binding, "v_scale", v_scale, device, ort_type)
 
     # 7. Outputs
@@ -1067,8 +1103,8 @@ def parity_check_gqa_prompt(
         position_ids=position_ids,
         attention_bias=attention_bias,
         head_sink=head_sink,
-        k_scale=k_scale,
-        v_scale=v_scale,
+        k_scale=k_scale.to(dtype=torch_type) if k_scale is not None else None,
+        v_scale=v_scale.to(dtype=torch_type) if v_scale is not None else None,
         ep=ep,
         device=device,
         share_buffer=True,
@@ -1186,6 +1222,12 @@ def parity_check_gqa_past(
     rtol,
     atol,
 ):
+    if ort_type == TensorProto.FLOAT16:
+        torch_type = torch.float16
+    elif ort_type == TensorProto.BFLOAT16:
+        torch_type = torch.bfloat16
+    else:
+        torch_type = torch.float32
     torch.manual_seed(0)
     std = 0.02
     # --- Test Data Generation ---
@@ -1313,6 +1355,13 @@ def parity_check_gqa_past(
     out_ref_np = out_ref.to(torch.float32).detach().cpu().numpy()
 
     # --- ONNX Runtime Path ---
+    if ort_type == TensorProto.FLOAT16:
+        torch_type = torch.float16
+    elif ort_type == TensorProto.BFLOAT16:
+        torch_type = torch.bfloat16
+    else:
+        torch_type = torch.float32
+
     q_ort, new_k_ort, new_v_ort = q, new_k, new_v
     if config.packed:
         q_ort = torch.cat([q, new_k, new_v], dim=2)
@@ -1335,8 +1384,8 @@ def parity_check_gqa_past(
         position_ids=position_ids,
         attention_bias=attention_bias,
         head_sink=head_sink,
-        k_scale=k_scale,
-        v_scale=v_scale,
+        k_scale=k_scale.to(dtype=torch_type) if k_scale is not None else None,
+        v_scale=v_scale.to(dtype=torch_type) if v_scale is not None else None,
         ep=ep,
         device=device,
         share_buffer=True,
@@ -1739,6 +1788,41 @@ class TestQuantizedGQABF16(unittest.TestCase):
             causal=True,
             rtol=1e-1,
             atol=2e-1,
+        )
+
+
+@unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
+@unittest.skipIf(not has_quantized_kv_cache(), "Quantized KV Cache is not available, skipping tests.")
+class TestGQAInt8MMA(unittest.TestCase):
+    def setUp(self):
+        self.original_env = os.environ.get("ORT_FLASH_ATTENTION_QUERY_DYNAMIC_QUANT")
+        os.environ["ORT_FLASH_ATTENTION_QUERY_DYNAMIC_QUANT"] = "1"
+
+    def tearDown(self):
+        if self.original_env is None:
+            if "ORT_FLASH_ATTENTION_QUERY_DYNAMIC_QUANT" in os.environ:
+                del os.environ["ORT_FLASH_ATTENTION_QUERY_DYNAMIC_QUANT"]
+        else:
+            os.environ["ORT_FLASH_ATTENTION_QUERY_DYNAMIC_QUANT"] = self.original_env
+
+    @parameterized.expand(gqa_cuda_quantized_test_cases(is_past=False))
+    def test_gqa_int8_mma_prompt(self, name, config):
+        if config.kv_cache_bit_width != 8:
+            self.skipTest("Int8 MMA only supports 8-bit KV Cache")
+        if config.k_quant_type != 1:  # 1 = PER_TENSOR, 2 = PER_CHANNEL
+            self.skipTest("Int8 MMA only supports PER_TENSOR quantization (PER_CHANNEL uses EFFICIENT_ATTENTION)")
+
+        # Test correctness with Int8 MMA
+        os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
+        parity_check_gqa_prompt(
+            config=config,
+            ep="CUDAExecutionProvider",
+            device="cuda",
+            torch_type=torch.float16,
+            ort_type=TensorProto.FLOAT16,
+            causal=True,
+            rtol=0.2,  # Looser tolerance for Int8 Dynamic Quant
+            atol=0.2,
         )
 
 

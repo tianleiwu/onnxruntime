@@ -517,7 +517,7 @@ Status FlashAttention(
       // For Int8, we want to perform on-the-fly quantization in the attention kernel (Fused).
       // So we skip the separate LaunchQuantAppend call here.
       // For Int4, we still use the separate LaunchQuantAppend call as the kernel update is not yet ready.
-      if (parameters.kv_cache_bit_width == 4) {
+      if (parameters.kv_cache_bit_width == 4 || parameters.kv_cache_bit_width == 8) {
         auto LaunchQuantAppend = [&](void* dst, const T* src, const T* scale, KVQuantizationType q_type) {
           if (parameters.kv_cache_bit_width == 8) {
             return LaunchQuantizeAppendKV<T, int8_t, T>(
@@ -590,8 +590,8 @@ Status FlashAttention(
   // Pass nullptr for new_k/new_v to disable the kernel's internal Append_KV logic.
   // Pass new_k/new_v (key/value) to enable the kernel's internal Append_KV logic if quantization is needed.
   // We only enable this for INT8 as INT4 support is not yet added to the fused kernel.
-  void* kernel_new_k = (is_quantized && parameters.kv_cache_bit_width == 8) ? key : nullptr;
-  void* kernel_new_v = (is_quantized && parameters.kv_cache_bit_width == 8) ? value : nullptr;
+  void* kernel_new_k = nullptr;
+  void* kernel_new_v = nullptr;
 
   ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd_kvcache(
       device_prop, stream, query, present_key, present_value,
@@ -607,7 +607,8 @@ Status FlashAttention(
       parameters.rotary_interleaved, parameters.is_packed_qkv, 0, 1, k_scale,
       v_scale, static_cast<int>(parameters.k_quant_type),
       static_cast<int>(parameters.v_quant_type),
-      parameters.kv_cache_bit_width));
+      parameters.kv_cache_bit_width,
+      parameters.query_dynamic_quant));
 
   DUMP_TENSOR("flash attention output", data.output, batch_size, sequence_length, num_heads, head_size);
 

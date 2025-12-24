@@ -143,6 +143,7 @@ struct Flash_fwd_params : public Qkv_params {
   int v_quant_type = 0;
 
   int kv_cache_bit_width = 0;
+  bool query_dynamic_quant = false;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

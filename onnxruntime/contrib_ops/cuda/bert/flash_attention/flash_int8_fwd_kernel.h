@@ -323,9 +323,14 @@ inline __device__ void compute_attn_1rowblock(
   Tensor sO = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)),
                           typename Kernel_traits::SmemLayoutO{});
 
+  // Compute KV head index (for GQA)
+  const int kv_head_idx = bidh / params.h_h_k_ratio;
+
   // Get scales
-  const float k_scale = params.k_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.k_scale_ptr)[0]) : 1.0f;
-  const float v_scale = params.v_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.v_scale_ptr)[0]) : 1.0f;
+  // For PER_TENSOR (1): use index 0. For PER_CHANNEL (2): use kv_head_idx.
+  const int scale_idx = (params.k_quant_type == 2) ? kv_head_idx : 0;
+  const float k_scale = params.k_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.k_scale_ptr)[scale_idx]) : 1.0f;
+  const float v_scale = params.v_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.v_scale_ptr)[scale_idx]) : 1.0f;
 
   // ============================================================================
   // Global Memory Tensors
@@ -335,9 +340,6 @@ inline __device__ void compute_attn_1rowblock(
                           make_shape(binfo.actual_seqlen_q, params.h, params.d),
                           make_stride(params.q_row_stride, params.q_head_stride, _1{}));
   Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
-
-  // Compute KV head index (for GQA)
-  const int kv_head_idx = bidh / params.h_h_k_ratio;
 
   // K is INT8 in global memory
   const index_t k_base_offset = binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb) +

@@ -6,6 +6,7 @@
 #include "contrib_ops/cuda/bert/group_query_attention_impl.h"
 #include "contrib_ops/cuda/bert/group_query_attention.h"
 #include "contrib_ops/cpu/bert/group_query_attention_helper.h"
+#include "core/platform/env_var_utils.h"
 #include "contrib_ops/cuda/bert/cutlass_fmha/memory_efficient_attention.h"
 #include "contrib_ops/cuda/bert/flash_attention/flash_api.h"
 #include "contrib_ops/cuda/utils/dump_cuda_tensor.h"
@@ -241,6 +242,8 @@ GroupQueryAttention<T>::GroupQueryAttention(const OpKernelInfo& info)
   ORT_ENFORCE(kv_cache_bit_width_ == 0 || kv_cache_bit_width_ == 4 || kv_cache_bit_width_ == 8,
               "kv_cache_bit_width must be 0 (no quantization), 4 or 8.");
 
+  query_dynamic_quant_ = ParseEnvironmentVariableWithDefault<int>("ORT_FLASH_ATTENTION_QUERY_DYNAMIC_QUANT", 0) != 0;
+
   kernel_options_ = this->GetAttentionKernelOptions();
 
   disable_flash_attention_ = sizeof(T) != 2 || !kernel_options_->UseFlashAttention();
@@ -312,6 +315,7 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
   parameters.kv_cache_bit_width = kv_cache_bit_width_;
   parameters.do_rotary = do_rotary_;
   parameters.rotary_interleaved = rotary_interleaved_;
+  parameters.query_dynamic_quant = query_dynamic_quant_;
 
   // The current GQA CUDA implementation will never be able to have a QK output.
   // GQA CUDA uses either flash attention or memory efficient attention. Neither kernel supports returning the QK output.

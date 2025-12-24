@@ -279,9 +279,10 @@ inline __device__ void compute_attn_1rowblock(
   const index_t v_base_offset = binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb) +
                                 kv_head_idx * params.v_head_stride;
 
-  // Get scalar scales (for Per-Tensor)
-  const float k_scale = params.k_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.k_scale_ptr)[0]) : 1.0f;
-  const float v_scale = params.v_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.v_scale_ptr)[0]) : 1.0f;
+  // Get scalar scales (for Per-Tensor or Per-Channel as scalar)
+  const int scale_idx = (QUANT_TYPE == 2) ? kv_head_idx : 0;
+  const float k_scale = params.k_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.k_scale_ptr)[scale_idx]) : 1.0f;
+  const float v_scale = params.v_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.v_scale_ptr)[scale_idx]) : 1.0f;
 
   // Global Scale Tensors (for Per-Channel)
   auto gKScale = make_tensor(make_gmem_ptr(reinterpret_cast<const Element*>(params.k_scale_ptr) + kv_head_idx * params.d),

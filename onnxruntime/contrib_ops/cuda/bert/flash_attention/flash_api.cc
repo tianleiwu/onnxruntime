@@ -173,7 +173,8 @@ size_t get_out_accum_size(size_t num_splits, size_t batch_size, size_t num_heads
 void run_mha_fwd(Flash_fwd_params& params, cudaStream_t stream, bool force_split_kernel = false) {
   FP16_SWITCH(!params.is_bf16, [&] {
     HEADDIM_SWITCH(params.d, [&] {
-      if (params.num_splits <= 1 && !force_split_kernel && params.k_quant_type == 0) {  // If we don't set it num_splits == 0
+      // Use split/dequant path if: force_split, or quantization active
+      if (params.num_splits <= 1 && !force_split_kernel && params.k_quant_type == 0) {
         run_mha_fwd_<elem_type, kHeadDim>(params, stream);
       } else {
         if constexpr (kHeadDim == 128) {
@@ -500,7 +501,8 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
                        void* v_scale,
                        int k_quant_type,
                        int v_quant_type,
-                       int kv_cache_bit_width) {
+                       int kv_cache_bit_width,
+                       bool query_dynamic_quant) {
   auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
   const int head_size_rounded = head_size <= 192 ? round_multiple(head_size, 32) : 256;
   const int seqlen_q_rounded = round_multiple(seqlen_q, 128);
@@ -660,6 +662,7 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
   params.k_quant_type = k_quant_type;
   params.v_quant_type = v_quant_type;
   params.kv_cache_bit_width = kv_cache_bit_width;
+  params.query_dynamic_quant = query_dynamic_quant;
 
   // Force split kernel if quantization is active (k_quant_type != 0)
   // because only the split kernel instantiation supports dequantization logic.

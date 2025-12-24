@@ -101,6 +101,7 @@ struct GroupQueryAttentionParameters : AttentionParameters {
   KVQuantizationType k_quant_type = KVQuantizationType::NONE;
   KVQuantizationType v_quant_type = KVQuantizationType::NONE;
   int kv_cache_bit_width = 0;
+  bool query_dynamic_quant = false;
 };
 
 // Parameters deduced from node attributes and inputs/outputs.

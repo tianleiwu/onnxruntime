@@ -129,7 +129,8 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
                        void* v_scale = nullptr,  // one element for per tensor, num_heads_k x head_size for per channel
                        int k_quant_type = 0,
                        int v_quant_type = 0,
-                       int kv_cache_bit_width = 0);
+                       int kv_cache_bit_width = 0,
+                       bool query_dynamic_quant = false);
 
 size_t get_softmax_lse_size(size_t max_seqlen_q, size_t batch_size, size_t num_heads);
 size_t get_softmax_lse_size(size_t token_count, size_t num_heads);
