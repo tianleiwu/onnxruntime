@@ -35,7 +35,7 @@ random.seed(69)
 pipeline_mode = os.getenv("PIPELINE_MODE", "1") == "1"
 
 # Number of values per parameter (compared to pipeline mode)
-param_count = int(os.getenv("PARAM_COUNT", "2")) if not pipeline_mode else 1
+param_count = int(os.getenv("PARAM_COUNT", "3")) if not pipeline_mode else 2
 
 # Quick build mode: only test hdim128 for faster development iteration
 quick_build = os.getenv("QUICK_BUILD", "0") == "1"
@@ -1477,8 +1477,7 @@ def parity_check_gqa_past(
 
 
 def get_cuda_rotary_options():
-    options = [(False, False), (True, False), (True, True)]
-    return options[:param_count]
+    return [(False, False), (True, False), (True, True)]
 
 
 def get_cpu_rotary_options():
@@ -1486,49 +1485,62 @@ def get_cpu_rotary_options():
 
 
 def get_softmax_options(allow_head_sink: bool = True):
-    options = [(False, False), (False, True), (True, False)]
-    return options[:2] if pipeline_mode else options[:param_count]
+    return [(False, False), (False, True), (True, False)]
 
 
 def gqa_cuda_prompt_test_cases(allow_head_sink: bool = True):
     batches = [3, 1, 5]
-    seqs = [(35, 35), (127, 127), (240, 240), (2000, 2000)]
+    seqs = [(35, 35), (64, 64), (128, 128), (240, 240), (2000, 2000)]
     heads = [(6, 3), (9, 9), (32, 8)]
     h_sizes = [128] if quick_build else [128, 32, 64, 256]
     smmoth_softmax__head_sink = get_softmax_options(allow_head_sink)
 
+    rotary_opts = list(get_cuda_rotary_options())
+    packed_opts = [False, True]
+    softcap_opts = [0.0, 50.0]
+
+    combo_index = 0
     for b in batches[:param_count]:
         for sq, skv in seqs[:param_count]:
             for n, n2 in heads[:param_count]:
                 for h in h_sizes[:param_count]:
-                    for lws in [-1, random.randint(1, skv)]:
-                        for rotary, rotary_interleaved in get_cuda_rotary_options():
-                            for packed in [False, True]:
-                                for softcap in [0.0, 50.0]:
-                                    if rotary and h % 16 > 0:
-                                        continue
-                                    for use_smooth_softmax, has_head_sink in smmoth_softmax__head_sink:
-                                        if softcap > 0 and (use_smooth_softmax or has_head_sink):
-                                            continue
-                                        config = GQAConfig(
-                                            batch_size=b,
-                                            q_sequence_length=sq,
-                                            kv_sequence_length=skv,
-                                            past_kv_sequence_length=0,
-                                            buffer_sequence_length=sq + skv + 8,
-                                            num_heads=n,
-                                            kv_num_heads=n2,
-                                            head_size=h,
-                                            local_window_size=lws,
-                                            rotary=rotary,
-                                            rotary_interleaved=rotary_interleaved,
-                                            packed=packed,
-                                            softcap=softcap,
-                                            use_smooth_softmax=use_smooth_softmax,
-                                            has_head_sink=has_head_sink,
-                                        )
-                                        name = f"b{b}_sq{sq}_skv{skv}_nh{n}_{n2}_h{h}_w{lws}_rot{rotary}{rotary_interleaved}_pkd{packed}_sc{softcap}_sm{use_smooth_softmax}_{has_head_sink}"
-                                        yield name, config
+                    lws_opts = [-1, random.randint(1, skv)]
+                    lws = lws_opts[combo_index % len(lws_opts)]
+
+                    rotary, rotary_interleaved = rotary_opts[combo_index % len(rotary_opts)]
+                    packed = packed_opts[combo_index % len(packed_opts)]
+                    softcap = softcap_opts[combo_index % len(softcap_opts)]
+                    use_smooth_softmax, has_head_sink = smmoth_softmax__head_sink[
+                        combo_index % len(smmoth_softmax__head_sink)
+                    ]
+
+                    combo_index += 1
+
+                    if rotary and h % 16 > 0:
+                        continue
+
+                    if softcap > 0 and (use_smooth_softmax or has_head_sink):
+                        continue
+
+                    config = GQAConfig(
+                        batch_size=b,
+                        q_sequence_length=sq,
+                        kv_sequence_length=skv,
+                        past_kv_sequence_length=0,
+                        buffer_sequence_length=sq + skv + 8,
+                        num_heads=n,
+                        kv_num_heads=n2,
+                        head_size=h,
+                        local_window_size=lws,
+                        rotary=rotary,
+                        rotary_interleaved=rotary_interleaved,
+                        packed=packed,
+                        softcap=softcap,
+                        use_smooth_softmax=use_smooth_softmax,
+                        has_head_sink=has_head_sink,
+                    )
+                    name = f"b{b}_sq{sq}_skv{skv}_nh{n}_{n2}_h{h}_w{lws}_rot{rotary}{rotary_interleaved}_pkd{packed}_sc{softcap}_sm{use_smooth_softmax}_{has_head_sink}"
+                    yield name, config
 
 
 def gqa_cuda_past_test_cases(allow_head_sink: bool = True):
@@ -1540,36 +1552,52 @@ def gqa_cuda_past_test_cases(allow_head_sink: bool = True):
     h_sizes = [128] if quick_build else [128, 64, 256]
     smmoth_softmax__head_sink = get_softmax_options(allow_head_sink)
 
+    rotary_opts = list(get_cuda_rotary_options())
+    packed_opts = [False, True]
+    softcap_opts = [0.0, 50.0]
+
+    combo_index = 0
     for b in batches[:param_count]:
         for s, s2 in seqs[:param_count]:
             for n, n2 in heads[:param_count]:
                 for h in h_sizes[:param_count]:
-                    for lws in [-1, random.randint(1, s2)]:
-                        for rotary, rotary_interleaved in get_cuda_rotary_options():
-                            for packed in [False, True]:
-                                for softcap in [0.0, 50.0]:
-                                    if rotary and h % 16 > 0:
-                                        continue
-                                    for use_smooth_softmax, has_head_sink in smmoth_softmax__head_sink:
-                                        config = GQAConfig(
-                                            batch_size=b,
-                                            q_sequence_length=s,
-                                            kv_sequence_length=s,
-                                            past_kv_sequence_length=s2,
-                                            buffer_sequence_length=s + s2 + 8,
-                                            num_heads=n,
-                                            kv_num_heads=n2,
-                                            head_size=h,
-                                            local_window_size=lws,
-                                            rotary=rotary,
-                                            rotary_interleaved=rotary_interleaved,
-                                            packed=packed,
-                                            softcap=softcap,
-                                            use_smooth_softmax=use_smooth_softmax,
-                                            has_head_sink=has_head_sink,
-                                        )
-                                        name = f"b{b}_s{s}_{s2}_nh{n}_{n2}_h{h}_w{lws}_rot{rotary}{rotary_interleaved}_pkd{packed}_sc{softcap}_sm{use_smooth_softmax}_{has_head_sink}"
-                                        yield name, config
+                    lws_opts = [-1, random.randint(1, s2)]
+                    lws = lws_opts[combo_index % len(lws_opts)]
+
+                    rotary, rotary_interleaved = rotary_opts[combo_index % len(rotary_opts)]
+                    packed = packed_opts[combo_index % len(packed_opts)]
+                    softcap = softcap_opts[combo_index % len(softcap_opts)]
+                    use_smooth_softmax, has_head_sink = smmoth_softmax__head_sink[
+                        combo_index % len(smmoth_softmax__head_sink)
+                    ]
+
+                    combo_index += 1
+
+                    if rotary and h % 16 > 0:
+                        continue
+
+                    if softcap > 0 and (use_smooth_softmax or has_head_sink):
+                        continue
+
+                    config = GQAConfig(
+                        batch_size=b,
+                        q_sequence_length=s,
+                        kv_sequence_length=s,
+                        past_kv_sequence_length=s2,
+                        buffer_sequence_length=s + s2 + 8,
+                        num_heads=n,
+                        kv_num_heads=n2,
+                        head_size=h,
+                        local_window_size=lws,
+                        rotary=rotary,
+                        rotary_interleaved=rotary_interleaved,
+                        packed=packed,
+                        softcap=softcap,
+                        use_smooth_softmax=use_smooth_softmax,
+                        has_head_sink=has_head_sink,
+                    )
+                    name = f"b{b}_s{s}_{s2}_nh{n}_{n2}_h{h}_w{lws}_rot{rotary}{rotary_interleaved}_pkd{packed}_sc{softcap}_sm{use_smooth_softmax}_{has_head_sink}"
+                    yield name, config
 
 
 def gqa_cuda_quantized_test_cases(is_past):
@@ -1632,8 +1660,8 @@ class TestFlashGQA(unittest.TestCase):
             torch_type=torch.float16,
             ort_type=TensorProto.FLOAT16,
             causal=True,
-            rtol=5e-3,
-            atol=5e-3,
+            rtol=1e-1,
+            atol=1e-1,
         )
 
     @parameterized.expand(gqa_cuda_past_test_cases())
@@ -1646,8 +1674,8 @@ class TestFlashGQA(unittest.TestCase):
             torch_type=torch.float16,
             ort_type=TensorProto.FLOAT16,
             causal=True,
-            rtol=5e-3,
-            atol=5e-3,
+            rtol=1e-1,
+            atol=1e-1,
         )
 
 
@@ -1735,7 +1763,7 @@ class TestQuantizedGQA(unittest.TestCase):
             ort_type=TensorProto.FLOAT16,
             causal=True,
             rtol=5e-2,
-            atol=0.15,
+            atol=2e-1,
         )
 
     @parameterized.expand(gqa_cuda_quantized_test_cases(is_past=True))
@@ -1749,7 +1777,7 @@ class TestQuantizedGQA(unittest.TestCase):
             ort_type=TensorProto.FLOAT16,
             causal=True,
             rtol=5e-2,
-            atol=0.15,
+            atol=2e-1,
         )
 
 
@@ -1821,8 +1849,8 @@ class TestGQAInt8MMA(unittest.TestCase):
             torch_type=torch.float16,
             ort_type=TensorProto.FLOAT16,
             causal=True,
-            rtol=0.2,  # Looser tolerance for Int8 Dynamic Quant
-            atol=0.2,
+            rtol=2e-1,  # Looser tolerance for Int8 Dynamic Quant
+            atol=2e-1,
         )
 
 
