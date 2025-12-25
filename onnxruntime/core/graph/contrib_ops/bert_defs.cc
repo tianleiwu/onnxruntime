@@ -355,10 +355,9 @@ void BaseGroupQueryAttentionTypeAndShapeInference(ONNX_NAMESPACE::InferenceConte
         // An empty string placeholder for an optional output will not have a tensor type proto.
         bool did_supply_qk_buffer = false;
         if (ctx.hasOutput(output_qk_index)) {
-          const auto* type_proto = ctx.getOutputType(output_qk_index);
-          if (type_proto != nullptr && type_proto->has_tensor_type()) {
-            did_supply_qk_buffer = true;
-          }
+          // The output is considered "supplied" if it is present in the node.
+          // Note: TypeProto might not be fully populated yet during initial inference.
+          did_supply_qk_buffer = true;
         }
 
         const int64_t qk_output_type = getAttribute(ctx, "qk_output", static_cast<int64_t>(QKOutputType::NO_OUTPUT));
