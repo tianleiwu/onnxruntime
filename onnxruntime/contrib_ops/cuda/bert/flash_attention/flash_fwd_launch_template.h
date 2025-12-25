@@ -536,7 +536,7 @@ void run_mha_fwd_dequant_dispatch(Flash_fwd_params& params, cudaStream_t stream)
     } else if (params.k_quant_type != 0) {
       run_flash_int8_dequant_fwd<flash::int8::Flash_dq_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, T>>(params, stream);
     }
-  } else if constexpr (ENABLE_FLASH_ATTENTION_4_BIT) {
+  } else if constexpr (kEnableFlashAttention4Bit) {
     if (params.kv_cache_bit_width == 4) {
       // if (params.k_quant_type == 1) {
       //   run_flash_int4_dequant_fwd<flash::int4::Flash_dq_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, T>, 1>(params, stream);

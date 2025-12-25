@@ -12,7 +12,8 @@ namespace flash {
 constexpr int TOTAL_DIM = 0;
 constexpr int H_DIM = 1;
 constexpr int D_DIM = 2;
-constexpr bool ENABLE_FLASH_ATTENTION_4_BIT = true;
+constexpr bool kEnableFlashAttention4Bit = true;
+constexpr bool kEnableOnTheFlyNewKVQuantization = false;
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct Qkv_params {

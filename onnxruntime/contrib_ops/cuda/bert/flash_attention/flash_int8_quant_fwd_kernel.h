@@ -4,16 +4,16 @@
 /******************************************************************************
  * Flash Attention Kernel with Int8 MMA and Int8 KV Cache
  *
- * This kernel implements Flash Attention using Int8 Tensor Cores (MMA).
+ * This kernel implements Flash Attention using a Hybrid Int8/FP16 approach:
  * - Q is quantized on-the-fly from FP16/BF16 to Int8.
  * - K and V are loaded as Int8.
- * - Computation uses SM80 Int8 MMA (16x8x32), accumulating into Int32.
- * - Output is converted back to FP16/BF16.
+ * - Q@K^T computation uses SM80 Int8 MMA (16x8x32), accumulating into Int32.
+ * - P@V computation uses SM80 FP16 MMA (16x8x16), with V dequantized on-the-fly.
  *
- * Key Differences from Dequantization Kernel:
- * - Uses Int8 MMA instructions not FP16 MMA.
- * - Quantizes Q online instead of dequantizing K/V.
- * - Accumulates in Int32.
+ * Key Difference from Dequantization Kernel:
+ * - Uses Native Int8 MMA for Q@K (Speedup).
+ * - Only P@V requires Dequantization (FP16 MMA).
+ * - "Fake Quantization": V is stored as Int8 but converted to FP16 for P@V to preserve accuracy.
  *
  ******************************************************************************/
 #pragma once
@@ -156,35 +156,57 @@ struct Flash_int8_quant_kernel_traits {
 // Q Quantization Helper
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename TensorSrc, typename TensorDst>
-__forceinline__ __device__ float quantize_q_block(TensorSrc const& src, TensorDst& dst) {
-  // src: FP16/BF16 fragment
-  // dst: Int8 fragment
-  // Return scale (absmax / 127)
+// Max-Per-Row, Broadcast, and Quantize Logic
+template <typename Kernel_traits, typename TensorSmemQ, typename TensorSrQFp16, typename TensorSrQInt8, typename TiledMma, typename SmemThrCopyQ, typename SmemTiledCopyQ, typename TensorSmemScales>
+__device__ __forceinline__ void quantize_q_per_token(
+    TensorSmemQ& sQ,                 // Shared Memory Q (BlockM, HeadDim)
+    TensorSrQFp16 const& tSrQ_fp16,  // Register Fragment Q (FP16)
+    TensorSrQInt8& tSrQ_int8,        // Register Fragment Q (Int8)
+    TensorSmemScales& sQ_scales,     // Shared Memory Scales (BlockM)
+    TiledMma& tiled_mma,
+    SmemThrCopyQ& smem_thr_copy_Q,
+    SmemTiledCopyQ& smem_tiled_copy_Q,
+    int tidx) {
+  using namespace cute;
+  constexpr int kBlockM = Kernel_traits::kBlockM;
+  constexpr int kHeadDim = Kernel_traits::kHeadDim;
 
-  float absmax = 1e-6f;
-  for (int i = 0; i < size(src); ++i) {
-    absmax = fmaxf(absmax, fabsf(static_cast<float>(src(i))));
+  // 1. Compute Max per Row (Collaborative)
+  // Initialize sQ_scales to 0
+  for (int m = tidx; m < kBlockM; m += Kernel_traits::kNThreads) {
+    sQ_scales(m) = 0.0f;
   }
+  __syncthreads();
 
-// Warp-wide reduction to find a common max for all threads in the warp.
-// This is necessary because Tensor Core MMA operations spread work across threads
-// that must share a consistent scale for correct accumulation.
-#pragma unroll
-  for (int offset = 16; offset > 0; offset /= 2) {
-    absmax = fmaxf(absmax, __shfl_xor_sync(0xFFFFFFFF, absmax, offset));
+  // Reduce over HeadDim for each row
+  for (int m = tidx; m < kBlockM; m += Kernel_traits::kNThreads) {
+    float row_max = 0.0f;
+    for (int k = 0; k < kHeadDim; ++k) {
+      row_max = fmaxf(row_max, fabsf(static_cast<float>(sQ(m, k))));
+    }
+    sQ_scales(m) = row_max / 127.0f;
   }
+  __syncthreads();
 
-  float scale = absmax / 127.0f;
-  float scale_inv = 127.0f / absmax;
+  // 2. Load Broadcast Scales (aligned with tSrQ)
+  auto sQ_scales_broadcast_K_layout = make_layout(make_shape(Int<kBlockM>{}, Int<kHeadDim>{}), make_stride(_1{}, _0{}));
+  Tensor sQ_scales_broadcast_K = make_tensor(sQ_scales.data(), sQ_scales_broadcast_K_layout);
 
-  for (int i = 0; i < size(src); ++i) {
-    float val = static_cast<float>(src(i)) * scale_inv;
-    val = fmaxf(-127.0f, fminf(127.0f, roundf(val)));
-    dst(i) = static_cast<int8_t>(val);
+  // Create register fragment for scales
+  Tensor tSrQ_scales = make_fragment_like<float>(tSrQ_int8);
+  Tensor tSsQ_scales = smem_thr_copy_Q.partition_S(sQ_scales_broadcast_K);
+  cute::copy(smem_tiled_copy_Q, tSsQ_scales, tSrQ_scales);
+
+  // 3. Quantize
+  for (int i = 0; i < size(tSrQ_int8); ++i) {
+    float val = static_cast<float>(tSrQ_fp16(i));
+    float scale = tSrQ_scales(i);
+    scale = scale > 1e-6f ? scale : 1.0f;
+    float q_val = val / scale;
+    q_val = roundf(q_val);
+    q_val = fminf(fmaxf(q_val, -127.0f), 127.0f);
+    tSrQ_int8(i) = static_cast<int8_t>(q_val);
   }
-
-  return scale;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -253,13 +275,15 @@ inline __device__ void compute_attn_1rowblock(
 
   // Shared Memory Tensors
   constexpr int kSmemSizeQ = kBlockM * kHeadDim * sizeof(Element);
+  constexpr int kSmemSizeQScales = kBlockM * sizeof(float);
   constexpr int kSmemSizeKInt8 = kBlockN * Kernel_traits::kSmemRowStrideInt8 * sizeof(ElementInt8);
 
   Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)),
                           typename Kernel_traits::SmemLayoutQ{});
-  Tensor sK = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ)),
+  // sK follows sQ_scales
+  Tensor sK = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ + kSmemSizeQScales)),
                           typename Kernel_traits::SmemLayoutKInt8{});
-  Tensor sV = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ + kSmemSizeKInt8)),
+  Tensor sV = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ + kSmemSizeQScales + kSmemSizeKInt8)),
                           typename Kernel_traits::SmemLayoutKInt8{});
   Tensor sO = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)),
                           typename Kernel_traits::SmemLayoutO{});
@@ -354,9 +378,31 @@ inline __device__ void compute_attn_1rowblock(
   constexpr int kNRows = 2 * decltype(size<1>(acc_o))::value;
   Softmax<kNRows> softmax;
 
-  // Load Q tile (FP16) and Quantize
+  // Load Q tile (FP16)
   cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_fp16_storage);
-  float q_scale_frf = quantize_q_block(tSrQ_fp16_storage, tSrQ_int8);
+
+  // --- Per-Token Q Quantization Start ---
+
+  // Allocate sQ_scales (Float) in Smem
+  // Placed after sQ. sQ size is kBlockM * kHeadDim (half).
+  // sQ_scales size is kBlockM (float).
+  // Defined earlier: kSmemSizeQ
+  float* sQ_scales_ptr = reinterpret_cast<float*>(smem_ + kSmemSizeQ);
+  Tensor sQ_scales = make_tensor(make_smem_ptr(sQ_scales_ptr), make_shape(Int<kBlockM>{}));
+
+  // Quantize Q using helper
+  quantize_q_per_token<Kernel_traits>(sQ, tSrQ_fp16_storage, tSrQ_int8, sQ_scales, tiled_mma, smem_thr_copy_Q, smem_tiled_copy_Q, tidx);
+
+  // Prepare Scales for Accumulator (aligned with acc_s_int32)
+  // acc_s_int32 is (M, N). We need to broadcast sQ_scales over N.
+  auto sQ_scales_int32_layout = make_layout(make_shape(Int<kBlockM>{}, Int<kBlockN>{}), make_stride(_1{}, _0{}));
+  Tensor sQ_scales_int32 = make_tensor(make_smem_ptr(sQ_scales_ptr), sQ_scales_int32_layout);
+  Tensor tSacc_scales = thr_mma.partition_C(sQ_scales_int32);  // Use Partition C
+  // Provide fragment for these scales (float)
+  auto tSacc_scales_frag = make_fragment_like<float>(acc_s_int32);
+  cute::copy(tSacc_scales, tSacc_scales_frag);
+
+  // --- Per-Token Q Quantization End ---
 
   // 3. Loop
   bool is_first_block = true;
@@ -400,12 +446,15 @@ inline __device__ void compute_attn_1rowblock(
     // Execute Int8 MMA
     cute::gemm(tiled_mma, acc_s_int32, tSrQ_int8, tSrK_int8, acc_s_int32);
 
-    // Process Accumulators (Int32 -> FP16) for Softmax
-    float combined_scale = q_scale_frf * k_scale_global;
+    // Process Accumulators (Int32 -> FP16) for Softmax with Per-Token Scaling
+    // q_scale is now per-row (tSacc_scales_frag, computed outside loop).
 
     auto acc_s_fp = make_fragment_like<ElementAccum>(acc_s_int32);
     for (int i = 0; i < size(acc_s_int32); ++i) {
-      acc_s_fp(i) = static_cast<float>(acc_s_int32(i)) * combined_scale;
+      float q_scale_i = tSacc_scales_frag(i);
+      // Combine scales: per-token Q scale * global K scale
+      float total_scale = q_scale_i * k_scale_global;
+      acc_s_fp(i) = static_cast<float>(acc_s_int32(i)) * total_scale;
     }
 
 #if FLASH_INT8_QUANT_DEBUG
@@ -420,11 +469,11 @@ inline __device__ void compute_attn_1rowblock(
       }
       if (has_nan && tidx == 0) {
         printf("DEBUG Q@K NaN FOUND: bidb=%d bidh=%d n_block=%d q_scale=%.6f k_scale=%.6f\n",
-               bidb, bidh, n_block, q_scale_frf, k_scale_global);
+               bidb, bidh, n_block, static_cast<float>(tSacc_scales_frag(0)), k_scale_global);
       }
       // Sanity check print
       if (bidb == 0 && bidh == 0 && m_block == 0 && n_block == n_block_max - 1 && tidx == 0) {
-        printf("DEBUG Q@K SANITY: q_scale=%.6f k_scale=%.6f\n", q_scale_frf, k_scale_global);
+        printf("DEBUG Q@K SANITY: q_scale=%.6f k_scale=%.6f\n", static_cast<float>(tSacc_scales_frag(0)), k_scale_global);
       }
     }
 #endif
@@ -477,7 +526,7 @@ inline __device__ void compute_attn_1rowblock(
     // We need to reshuffle P (acc_s_fp) from Q@K layout to P@V A-operand layout via Smem (sP)
 
     // 1. Store P (acc_s_fp) to sP
-    constexpr int kSmemOffsetP = kSmemSizeQ + kSmemSizeKInt8 + kSmemSizeKInt8;
+    constexpr int kSmemOffsetP = kSmemSizeQ + kSmemSizeQScales + kSmemSizeKInt8 + kSmemSizeKInt8;
     Tensor sP = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemOffsetP)),
                             Layout<Shape<Int<kBlockM>, Int<kBlockN>>, Stride<Int<kBlockN>, _1>>{});  // RowMajor P
 
@@ -501,6 +550,10 @@ inline __device__ void compute_attn_1rowblock(
     auto sV_transposed = make_tensor(sV.data(), make_layout(make_shape(size<1>(sV), size<0>(sV)), make_stride(_1{}, get<0>(sV.stride()))));
 
     // Use DefaultCopy for safe fallback (keep gemm_quant_manual)
+    // Note: DefaultCopy is used for V loading to avoid swizzling/layout issues with LDSM.
+    // While LDSM (Load Shared Memory) would be faster, it requires strict layout compatibility
+    // with the target Fragment type. Since we load Int8 to be dequantized into FP16 fragments,
+    // the types mismatch for direct LDSM usage. DefaultCopy works but is bandwidth-limited.
     using SmemCopyAtomInt8PV = Copy_Atom<DefaultCopy, ElementInt8>;
     auto smem_tiled_copy_V_quant = make_tiled_copy_B(SmemCopyAtomInt8PV{}, tiled_mma_pv);
     auto smem_thr_copy_V_quant = smem_tiled_copy_V_quant.get_thread_slice(tidx);
@@ -510,6 +563,9 @@ inline __device__ void compute_attn_1rowblock(
     auto tOrVt_fp16 = make_fragment_like<Element>(thr_mma_pv.partition_fragment_B(sV_transposed));
 
     // 4. MMA P@V (with on-the-fly vectorized dequantization)
+    // We use gemm_quant_manual to perform:
+    // 1. Vectorized Dequantization: Convert 2xInt8 -> 2xFP16 using __half2 instructions.
+    // 2. Standard Mixed-Precision MMA (FP16 * FP16 + FP32).
     flash::gemm_quant_manual<false>(acc_o, tOrP, tOrVt_fp16, tSsVt_quant, tiled_mma_pv, smem_tiled_copy_V_quant, smem_thr_copy_V_quant, v_scale_global);
 
     __syncthreads();

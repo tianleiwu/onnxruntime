@@ -448,7 +448,7 @@ bool is_supported(const cudaDeviceProp& dprops, size_t head_size, size_t num_hea
 }
 
 bool is_supported_quantization(bool is_causal, size_t head_size, int k_quant_type, int v_quant_type, int kv_cache_bit_width) {
-  if constexpr (ENABLE_FLASH_ATTENTION_4_BIT) {
+  if constexpr (kEnableFlashAttention4Bit) {
     return (k_quant_type == 0 && v_quant_type == 0) ||  // no quantization supported for all head sizes
            (is_causal && head_size == 128 &&
             ((k_quant_type == 1 && v_quant_type == 1 && kv_cache_bit_width == 8) ||
@@ -533,7 +533,7 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
                    is_causal ? 0 : -1);
   params.dprops = &dprops;
 
-  if constexpr (ENABLE_FLASH_ATTENTION_4_BIT) {
+  if constexpr (kEnableFlashAttention4Bit) {
     if (kv_cache_bit_width == 4) {
       // Adjust strides for packed Int4 (2 elements per byte)
       params.k_batch_stride /= 2;

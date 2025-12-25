@@ -514,9 +514,9 @@ Status FlashAttention(
     }
 
     if (!parameters.is_packed_qkv) {
-      // For Int8, we want to perform on-the-fly quantization in the attention kernel (Fused).
-      // So we skip the separate LaunchQuantAppend call here.
-      // For Int4, we still use the separate LaunchQuantAppend call as the kernel update is not yet ready.
+      // Int8 flash attention kernel are able to perform on-the-fly quantization (see kEnableOnTheFlyNewKVQuantization).
+      // That has only slight performance benefit while make code complicated. So we still use the separate LaunchQuantAppend
+      // to make it consistent among int4, int8 and int8_quant cases.
       if (parameters.kv_cache_bit_width == 4 || parameters.kv_cache_bit_width == 8) {
         auto LaunchQuantAppend = [&](void* dst, const T* src, const T* scale, KVQuantizationType q_type) {
           if (parameters.kv_cache_bit_width == 8) {
