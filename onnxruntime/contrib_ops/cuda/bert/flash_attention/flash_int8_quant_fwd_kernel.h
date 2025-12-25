@@ -500,36 +500,17 @@ inline __device__ void compute_attn_1rowblock(
     // 3. Load V (Int8) from sV, transpose to ColMajor for MMA, Dequantize
     auto sV_transposed = make_tensor(sV.data(), make_layout(make_shape(size<1>(sV), size<0>(sV)), make_stride(_1{}, get<0>(sV.stride()))));
 
+    // Use DefaultCopy for safe fallback (keep gemm_quant_manual)
     using SmemCopyAtomInt8PV = Copy_Atom<DefaultCopy, ElementInt8>;
-    auto smem_tiled_copy_V_PV = make_tiled_copy_B(SmemCopyAtomInt8PV{}, tiled_mma_pv);
-    auto smem_thr_copy_V_PV = smem_tiled_copy_V_PV.get_thread_slice(tidx);
-    Tensor tSsVt = smem_thr_copy_V_PV.partition_S(sV_transposed);
-    auto tOrVt_int8 = thr_mma_pv.partition_fragment_B(sV_transposed);
-    cute::copy(smem_tiled_copy_V_PV, tSsVt, tOrVt_int8);
+    auto smem_tiled_copy_V_quant = make_tiled_copy_B(SmemCopyAtomInt8PV{}, tiled_mma_pv);
+    auto smem_thr_copy_V_quant = smem_tiled_copy_V_quant.get_thread_slice(tidx);
 
-    auto tOrVt_fp = make_fragment_like<Element>(tOrVt_int8);
-    for (int i = 0; i < size(tOrVt_int8); ++i) {
-      tOrVt_fp(i) = static_cast<Element>(static_cast<float>(tOrVt_int8(i)) * v_scale_global);
-    }
+    Tensor tSsVt_quant = smem_thr_copy_V_quant.partition_S(sV_transposed);
+    // Allocate buffer for Dequantized V (FP16)
+    auto tOrVt_fp16 = make_fragment_like<Element>(thr_mma_pv.partition_fragment_B(sV_transposed));
 
-    // 4. MMA P@V
-    cute::gemm(tiled_mma_pv, acc_o, tOrP, tOrVt_fp, acc_o);
-
-#if FLASH_INT8_QUANT_DEBUG
-    // DEBUG: Check for NaN after P@V
-    {
-      bool has_nan = false;
-      for (int i = 0; i < size(acc_o); ++i) {
-        if (isnan(acc_o(i)) || isinf(acc_o(i))) {
-          has_nan = true;
-          break;
-        }
-      }
-      if (has_nan && tidx == 0) {
-        printf("DEBUG P@V NaN FOUND: bidh=%d n_block=%d\n", bidh, n_block);
-      }
-    }
-#endif
+    // 4. MMA P@V (with on-the-fly vectorized dequantization)
+    flash::gemm_quant_manual<false>(acc_o, tOrP, tOrVt_fp16, tSsVt_quant, tiled_mma_pv, smem_tiled_copy_V_quant, smem_thr_copy_V_quant, v_scale_global);
 
     __syncthreads();
   }
