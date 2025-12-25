@@ -576,10 +576,11 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
   ORT_ENFORCE(sm_ >= 90 || !inputs.gemm_config.is_tma_warp_specialized,
               "Hopper configuration provided for non-Hopper architecture");
 
-  if (sm_ >= 75 && sm_ < 80) {
+  /*if (sm_ >= 75 && sm_ < 80) {
     dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm75, EpilogueTag>(
         inputs, multi_processor_count_);
-  } else if (sm_ >= 80 && sm_ < 90) {
+  } else*/
+  if (sm_ >= 80 && sm_ < 90) {
     if constexpr (use_fp8 || use_w4afp8) {
 #if defined(ENABLE_FP8)
       static_assert(!std::is_same_v<OutputType, __nv_fp8_e4m3> && !std::is_same_v<OutputType, __nv_fp8_e5m2>,

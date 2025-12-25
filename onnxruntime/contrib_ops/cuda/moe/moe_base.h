@@ -3,10 +3,16 @@
 
 #pragma once
 
+#ifdef __GNUC__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wunused-local-typedefs"
+#endif
+
 #include "core/common/common.h"
 #include "core/framework/op_kernel.h"
-#include "contrib_ops/cuda/moe/ft_moe/moe_gemm_kernels.h"
-#include "contrib_ops/cpu/quantization/moe_helper.h"
+#include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_kernels.h"
+#include "contrib_ops/cpu/moe/moe_helper.h"
 #include "core/providers/cuda/cuda_common.h"
 #include "contrib_ops/cuda/llm/moe_gemm/common.h"
 
@@ -27,9 +33,9 @@ class MoEBase {
     } else if (activation_type_str == "gelu") {
       activation_type_ = ActivationType::Gelu;
     } else if (activation_type_str == "silu") {
-      activation_type_ = ort_fastertransformer::ActivationType::Silu;
+      activation_type_ = ActivationType::Silu;
     } else if (activation_type_str == "swiglu") {
-      activation_type_ = ort_fastertransformer::ActivationType::SwiGLU;
+      activation_type_ = ActivationType::Swiglu;
     } else if (activation_type_str == "identity") {
       activation_type_ = ActivationType::Identity;
     } else {

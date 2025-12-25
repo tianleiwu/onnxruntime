@@ -48,7 +48,7 @@
 #include "contrib_ops/cuda/llm/common/memory_utils.h"
 #include "contrib_ops/cuda/llm/common/cuda_runtime_utils.h"
 #include "contrib_ops/cuda/llm/common/data_type.h"
-// #include "contrib_ops/cuda/llm/common/env_utils.h"
+#include "contrib_ops/cuda/llm/common/env_utils.h"
 #include "contrib_ops/cuda/llm/common/workspace.h"
 #include "contrib_ops/cuda/llm/cutlass_type_conversion.h"
 #include "contrib_ops/cuda/llm/kernels/pre_quant_scale_kernel.h"
@@ -2208,6 +2208,11 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
       normalize_routing_weights_(normalize_routing_weights),
       use_sparse_mixer_(use_sparse_mixer),
       blockscale_gemm_runner_{std::make_unique<kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunner<__nv_bfloat16, __nv_fp8_e4m3, __nv_bfloat16>>()} {
+  auto tactics = getTactics(sm_);
+  if (!tactics.empty()) {
+    gemm1_config_ = tactics[0];
+    gemm2_config_ = tactics[0];
+  }
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>

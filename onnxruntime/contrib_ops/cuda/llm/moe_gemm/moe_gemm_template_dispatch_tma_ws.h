@@ -345,6 +345,8 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecialized(int num_experts, cutlass_extension
   // Most of the values are ignored for WS size calculation. We reuse the function to reduce the template bloat
   dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType, OutputType, cutlass_extensions::EpilogueOpDefault,
                                                    FUSION>(input, num_experts, gemm_config, multi_processor_count, cudaStream_t{0}, nullptr, &count);
+
+  count += TmaWarpSpecializedGroupedGemmInput::workspaceSize(num_experts, fpX_block_scaling_type);
   return count;
 }
 

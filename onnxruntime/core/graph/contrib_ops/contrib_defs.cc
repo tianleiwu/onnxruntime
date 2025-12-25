@@ -1497,6 +1497,10 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
               "Otherwise, there is no blocking and a whole column shares one scaling factor. ",
               AttributeProto::INT,
               OPTIONAL_VALUE)
+        .Attr("swiglu_interleaved",
+              "Whether to use interleaved SwiGLU.",
+              AttributeProto::INT,
+              static_cast<int64_t>(0))
         .Input(0,
                "input",
                "2D tensor with shape (num_tokens, hidden_size), or "

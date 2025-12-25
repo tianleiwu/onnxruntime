@@ -441,6 +441,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   bool has_fc3_;
   bool normalize_routing_weights_;
   bool use_sparse_mixer_;
+  int sm_;
 
   static constexpr bool use_block_scaling = use_fp4 || use_wfp4afp8;
 
@@ -848,6 +849,6 @@ void populateRandomBuffer(void* buffer_void, size_t size, cudaStream_t stream);
 }  // namespace cutlass_kernels
 }  // namespace onnxruntime::llm::kernels
 
-#ifdef __GNUC__ 
+#ifdef __GNUC__
 #pragma GCC diagnostic pop
 #endif

@@ -5,6 +5,8 @@
 #include "core/providers/cuda/cuda_common.h"
 #include "core/providers/cuda/cuda_type_conversion.h"
 #include "contrib_ops/cuda/moe/moe.h"
+#include "contrib_ops/cuda/moe/qmoe_kernels.h"
+#include "contrib_ops/cuda/llm/moe_gemm/moe_kernels.h"
 
 using namespace onnxruntime::cuda;
 using namespace ::onnxruntime::common;
@@ -19,7 +21,7 @@ namespace cuda {
       MoE, kMSDomain, 1, T, kCudaExecutionProvider, \
       (*KernelDefBuilder::Create()).MayInplace(0, 0).TypeConstraint("T", DataTypeImpl::GetTensorType<T>()), MoE<T>);
 
-REGISTER_KERNEL_TYPED(float)
+// REGISTER_KERNEL_TYPED(float)
 REGISTER_KERNEL_TYPED(MLFloat16)
 REGISTER_KERNEL_TYPED(BFloat16)
 
@@ -29,8 +31,6 @@ MoE<T>::MoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), Mo
 
 template <typename T>
 Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
-    ORT_UNUSED_PARAMETER(context);
-/*    
   const Tensor* input = context->Input<Tensor>(0);
   const Tensor* router_probs = context->Input<Tensor>(1);
   const Tensor* fc1_experts_weights = context->Input<Tensor>(2);
@@ -47,82 +47,126 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
       fc2_experts_weights, fc2_experts_bias_optional, nullptr, nullptr,
       fc3_experts_weights_optional, fc3_experts_bias_optional, nullptr, nullptr,
       1,  //  no quantization so pack size is 1
-      activation_type_ == ort_fastertransformer::ActivationType::SwiGLU,
+      activation_type_ == onnxruntime::llm::kernels::cutlass_kernels::ActivationType::Swiglu,
       0));  // no block-wise quantization for regular MoE
 
   using CudaT = typename OrtToCudaType<T>::type;
-  auto stream = context->GetComputeStream();
+  auto stream_obj = context->GetComputeStream();
+  cudaStream_t stream = static_cast<cudaStream_t>(stream_obj->GetHandle());
 
   auto& device_prop = GetDeviceProp();
   const int sm = device_prop.major * 10 + device_prop.minor;
 
-  ort_fastertransformer::CutlassMoeFCRunner<CudaT, CudaT> moe_runner(sm,
-                                                                     activation_type_,
-                                                                     fc3_experts_weights_optional != nullptr,
-                                                                     normalize_routing_weights_,
-                                                                     use_sparse_mixer_);
+  onnxruntime::llm::kernels::cutlass_kernels::CutlassMoeFCRunner<CudaT, CudaT> moe_runner(sm,
+                                                                                          activation_type_,
+                                                                                          fc3_experts_weights_optional != nullptr,
+                                                                                          normalize_routing_weights_,
+                                                                                          use_sparse_mixer_);
+
+  constexpr bool use_lora = false;
+  constexpr bool use_deepseek_block_scale = false;
+  constexpr bool min_latency_mode = false;
+  constexpr bool use_awq = false;
+  onnxruntime::llm::kernels::cutlass_kernels::MOEParallelismConfig parallelism_config{};
 
   size_t ws_size = moe_runner.getWorkspaceSize(
       static_cast<size_t>(moe_params.num_rows), static_cast<size_t>(moe_params.hidden_size),
-      static_cast<size_t>(moe_params.inter_size), static_cast<size_t>(moe_params.num_experts), static_cast<size_t>(k_));
-  size_t fc2_output_size = k_ * moe_params.num_rows * moe_params.hidden_size * sizeof(CudaT);
-  size_t expert_scales_size = k_ * moe_params.num_rows * sizeof(CudaT);
-  size_t expanded_source_row_to_expanded_dest_row_size = k_ * moe_params.num_rows * sizeof(int);
-  size_t expert_for_source_row_size = k_ * moe_params.num_rows * sizeof(int);
+      static_cast<size_t>(moe_params.inter_size), static_cast<size_t>(moe_params.num_experts), static_cast<size_t>(k_),
+      activation_type_, parallelism_config, use_lora, use_deepseek_block_scale, min_latency_mode, use_awq);
 
-  AllocatorPtr allocator;
-  ORT_RETURN_IF_ERROR(context->GetTempSpaceAllocator(&allocator));
+  // Scratch buffer for workspace + expert_scales + expert_indices + permutation_map
+  size_t scales_bytes = moe_params.num_rows * k_ * sizeof(float);
+  size_t indices_bytes = moe_params.num_rows * k_ * sizeof(int);
+  size_t permutation_bytes = moe_params.num_rows * k_ * sizeof(int);
+  size_t total_scratch_bytes = ws_size + scales_bytes + indices_bytes + permutation_bytes;
 
-  // TODO: allocate one buffer and reuse it.
-  IAllocatorUniquePtr<void> work_space = IAllocator::MakeUniquePtr<void>(allocator, ws_size, false, stream);
-  IAllocatorUniquePtr<void> fc2_output = IAllocator::MakeUniquePtr<void>(allocator, fc2_output_size, false, stream);
-  IAllocatorUniquePtr<void> expert_scales =
-      IAllocator::MakeUniquePtr<void>(allocator, expert_scales_size, false, stream);
-  IAllocatorUniquePtr<void> expanded_source_row_to_expanded_dest_row =
-      IAllocator::MakeUniquePtr<void>(allocator, expanded_source_row_to_expanded_dest_row_size, false, stream);
-  IAllocatorUniquePtr<void> expert_for_source_row =
-      IAllocator::MakeUniquePtr<void>(allocator, expert_for_source_row_size, false, stream);
+  auto work_space = GetScratchBuffer<void>(total_scratch_bytes, stream_obj);
+  char* workspace_ptr = reinterpret_cast<char*>(work_space.get());
+  float* expert_scales = reinterpret_cast<float*>(workspace_ptr + ws_size);
+  int* expert_indices = reinterpret_cast<int*>(workspace_ptr + ws_size + scales_bytes);
+  int* unpermuted_row_to_permuted_row = reinterpret_cast<int*>(workspace_ptr + ws_size + scales_bytes + indices_bytes);
 
-  const CudaT* fc_scales_ptr = nullptr;
-
-  moe_runner.run_moe_fc(
-      reinterpret_cast<const CudaT*>(input->template Data<T>()),
-      reinterpret_cast<const CudaT*>(router_probs->template Data<T>()),
-      reinterpret_cast<const CudaT*>(fc1_experts_weights->DataRaw()), fc_scales_ptr,
-      fc1_experts_bias_optional == nullptr
-          ? nullptr
-          : reinterpret_cast<const CudaT*>(fc1_experts_bias_optional->template Data<T>()),
-      activation_type_,
-      fc3_experts_weights_optional == nullptr ? nullptr
-                                              : reinterpret_cast<const CudaT*>(fc3_experts_weights_optional->DataRaw()),
-      fc_scales_ptr,
-      fc3_experts_bias_optional == nullptr
-          ? nullptr
-          : reinterpret_cast<const CudaT*>(fc3_experts_bias_optional->template Data<T>()),
-      reinterpret_cast<const CudaT*>(fc2_experts_weights->DataRaw()), fc_scales_ptr,
-      static_cast<int>(moe_params.num_rows), static_cast<int>(moe_params.hidden_size),
-      static_cast<int>(moe_params.inter_size), static_cast<int>(moe_params.num_experts),
-      static_cast<int>(moe_params.local_num_experts), 
-      0, //local_experts_start_index_ used in sharded
-      static_cast<int>(k_), reinterpret_cast<char*>(work_space.get()), reinterpret_cast<CudaT*>(fc2_output.get()),
-      reinterpret_cast<CudaT*>(expert_scales.get()),
-      reinterpret_cast<int*>(expanded_source_row_to_expanded_dest_row.get()),
-      reinterpret_cast<int*>(expert_for_source_row.get()), Stream(context));
+  // Perform Softmax + TopK
+  bool is_fp16 = input->IsDataType<MLFloat16>();
+  if (is_fp16) {
+    LaunchSoftmaxTopK(
+        reinterpret_cast<const half*>(router_probs->DataRaw()),
+        expert_scales,
+        expert_indices,
+        static_cast<int>(moe_params.num_rows),
+        static_cast<int>(moe_params.num_experts),
+        static_cast<int>(k_),
+        normalize_routing_weights_,
+        stream);
+  } else {
+    LaunchSoftmaxTopK(
+        reinterpret_cast<const float*>(router_probs->DataRaw()),
+        expert_scales,
+        expert_indices,
+        static_cast<int>(moe_params.num_rows),
+        static_cast<int>(moe_params.num_experts),
+        static_cast<int>(k_),
+        normalize_routing_weights_,
+        stream);
+  }
 
   Tensor* output = context->Output(0, input->Shape());
 
-  ort_fastertransformer::finalize_moe_routing_kernelLauncher(
-      reinterpret_cast<CudaT*>(fc2_output.get()), reinterpret_cast<CudaT*>(output->template MutableData<T>()),
-      fc2_experts_bias_optional == nullptr
-          ? nullptr
-          : reinterpret_cast<const CudaT*>(fc2_experts_bias_optional->template Data<T>()),
-      reinterpret_cast<CudaT*>(expert_scales.get()),
-      reinterpret_cast<int*>(expanded_source_row_to_expanded_dest_row.get()),
-      reinterpret_cast<int*>(expert_for_source_row.get()), static_cast<int>(moe_params.num_rows),
-      static_cast<int>(moe_params.hidden_size), static_cast<int>(k_), Stream(context));
-*/
-  return Status::OK();
+  onnxruntime::llm::kernels::cutlass_kernels::QuantParams quant_params{};  // Default constructor
+  onnxruntime::llm::kernels::LoraParams lora_params{};
+  onnxruntime::llm::kernels::cutlass_kernels::MoeMinLatencyParams min_latency_params;
 
+  const CudaT* fc1_weights_ptr = reinterpret_cast<const CudaT*>(fc1_experts_weights->DataRaw());
+
+  // Fuse FC1 and FC3 if needed (SwiGLU)
+  IAllocatorUniquePtr<void> fused_fc1_buffer;
+  if (fc3_experts_weights_optional != nullptr) {
+    size_t fused_size = moe_params.num_experts * moe_params.hidden_size * moe_params.inter_size * 2 * sizeof(CudaT);
+    fused_fc1_buffer = GetScratchBuffer<void>(fused_size, stream_obj);
+    CudaT* fused_ptr = reinterpret_cast<CudaT*>(fused_fc1_buffer.get());
+    const CudaT* fc3_ptr = reinterpret_cast<const CudaT*>(fc3_experts_weights_optional->DataRaw());
+
+    size_t width_bytes = moe_params.inter_size * sizeof(CudaT);
+    size_t height = moe_params.num_experts * moe_params.hidden_size;
+    size_t src_pitch = width_bytes;
+    size_t dst_pitch = 2 * width_bytes;
+
+    // Copy FC1
+    CUDA_RETURN_IF_ERROR(cudaMemcpy2DAsync(fused_ptr, dst_pitch, fc1_weights_ptr, src_pitch, width_bytes, height, cudaMemcpyDeviceToDevice, stream));
+
+    // Copy FC3
+    CUDA_RETURN_IF_ERROR(cudaMemcpy2DAsync(reinterpret_cast<uint8_t*>(fused_ptr) + width_bytes, dst_pitch, fc3_ptr, src_pitch, width_bytes, height, cudaMemcpyDeviceToDevice, stream));
+
+    fc1_weights_ptr = fused_ptr;
+  }
+
+  moe_runner.runMoe(
+      reinterpret_cast<const CudaT*>(input->template Data<T>()),
+      nullptr,         // input_sf
+      expert_indices,  // token_selected_experts
+      expert_scales,   // token_final_scales
+      fc1_weights_ptr,
+      fc1_experts_bias_optional == nullptr ? nullptr : reinterpret_cast<const CudaT*>(fc1_experts_bias_optional->template Data<T>()),
+      activation_type_,
+      reinterpret_cast<const CudaT*>(fc2_experts_weights->DataRaw()),
+      fc2_experts_bias_optional == nullptr ? nullptr : reinterpret_cast<const CudaT*>(fc2_experts_bias_optional->template Data<T>()),
+      quant_params,
+      static_cast<int>(moe_params.num_rows), static_cast<int>(moe_params.hidden_size),
+      static_cast<int>(moe_params.inter_size), static_cast<int>(moe_params.num_experts),
+      static_cast<int>(k_),
+      workspace_ptr,
+      reinterpret_cast<void*>(output->template MutableData<T>()),
+      unpermuted_row_to_permuted_row,
+      parallelism_config,
+      false,  // enable_alltoall
+      use_lora,
+      lora_params,
+      use_deepseek_block_scale,
+      min_latency_mode,
+      min_latency_params,
+      stream);
+
+  return Status::OK();
 }
 
 }  // namespace cuda
