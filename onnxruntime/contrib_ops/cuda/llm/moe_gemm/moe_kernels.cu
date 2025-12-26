@@ -21,6 +21,9 @@
 #include <math.h>
 #include <memory>
 #include <numeric>
+#include <cmath>
+#include <type_traits>
+#include <limits>
 #include <random>
 #include <sstream>
 
@@ -1748,7 +1751,8 @@ constexpr static int ACTIVATION_THREADS_PER_BLOCK = 256;
 
 template <class ActivationOutputType, class GemmOutputType, template <class> class ActFn>
 __global__ void doGatedActivationKernel(ActivationOutputType* output, GemmOutputType const* gemm_result,
-                                        int64_t const* num_valid_tokens_ptr, int64_t inter_size) {
+                                        int64_t const* num_valid_tokens_ptr, int64_t inter_size,
+                                        ActivationParameters activation_params = {}) {
   int64_t const tid = threadIdx.x;
   int64_t const token = blockIdx.x;
   if (num_valid_tokens_ptr && token >= *num_valid_tokens_ptr) {
@@ -1772,11 +1776,33 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output, GemmOutput
   int64_t const inter_size_vec = inter_size / ACTIVATION_ELEM_PER_THREAD;
 
   ActFn<ComputeElem> fn{};
+  bool const use_custom_swiglu = std::is_same_v<ActFn<float>, cutlass::epilogue::thread::SiLu<float>> &&
+                                 (activation_params.alpha != 1.0f || activation_params.beta != 0.0f || isfinite(activation_params.swiglu_limit));
+
   for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
     auto fc1_value = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index]);
-    // BF16 isn't supported, use FP32 for activation function
     auto gate_value = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + inter_size_vec]);
-    auto gate_act = fn(gate_value);
+
+    ComputeElem gate_act;
+    if (use_custom_swiglu) {
+      for (int i = 0; i < ACTIVATION_ELEM_PER_THREAD; ++i) {
+        float g = gate_value[i];
+        if (isfinite(activation_params.swiglu_limit)) {
+          g = fminf(g, activation_params.swiglu_limit);
+        }
+        float sigmoid = 1.0f / (1.0f + expf(-activation_params.alpha * g));
+        gate_act[i] = g * sigmoid;
+
+        float l = fc1_value[i];
+        if (isfinite(activation_params.swiglu_limit)) {
+          l = fminf(fmaxf(l, -activation_params.swiglu_limit), activation_params.swiglu_limit);
+        }
+        l += activation_params.beta;
+        fc1_value[i] = l;
+      }
+    } else {
+      gate_act = fn(gate_value);
+    }
     output_vec[elem_index] = arrayConvert<ComputeElem, OutputElem>(fc1_value * gate_act);
   }
 }
@@ -1784,14 +1810,33 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output, GemmOutput
 template <typename ActivationOutputType, typename GemmOutputType>
 void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_result,
                        int64_t const* num_valid_tokens_ptr, int64_t inter_size, int64_t num_tokens, ActivationType activation_type,
-                       cudaStream_t stream) {
+                       cudaStream_t stream, ActivationParameters activation_params) {
   int64_t const blocks = num_tokens;
   int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
 
-  auto* fn = activation_type == ActivationType::Swiglu
-                 ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, cutlass::epilogue::thread::SiLu>
-                 : &doGatedActivationKernel<ActivationOutputType, GemmOutputType, cutlass::epilogue::thread::GELU>;
-  fn<<<blocks, threads, 0, stream>>>(output, gemm_result, num_valid_tokens_ptr, inter_size);
+  /*
+   * We need a full dispatch table similar to doActivation to handle all ActivationType values,
+   * specifically Relu which was defaulting to GELU.
+   */
+  auto* fn = [&]() {
+    using namespace cutlass::epilogue::thread;
+    auto fn_list = std::array{
+        &doGatedActivationKernel<ActivationOutputType, GemmOutputType, GELU>,      // Gelu = 0
+        &doGatedActivationKernel<ActivationOutputType, GemmOutputType, ReLu>,      // Relu = 1
+        &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SiLu>,      // Silu = 2
+        &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SiLu>,      // Swiglu = 3 (uses SiLu internally)
+        &doGatedActivationKernel<ActivationOutputType, GemmOutputType, GELU>,      // Geglu = 4 (uses GELU internally)
+        &doGatedActivationKernel<ActivationOutputType, GemmOutputType, Identity>,  // Identity = 5
+    };
+    // Safety check for bounds? Assuming ActivationType is valid and < 6.
+    // InvalidType might cause issues, but static_cast handles enum.
+    int idx = static_cast<int>(activation_type);
+    if (idx < 0 || idx >= static_cast<int>(fn_list.size())) {
+      return fn_list[0];  // Default to Gelu if OOB
+    }
+    return fn_list[idx];
+  }();
+  fn<<<blocks, threads, 0, stream>>>(output, gemm_result, num_valid_tokens_ptr, inter_size, activation_params);
 }
 
 // ============================== Activation =================================
@@ -1801,7 +1846,9 @@ template <class T, class GemmOutputType, class ScaleBiasType, template <class> c
 __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result, float const* fp8_quant,
                                    ScaleBiasType const* bias_ptr, bool bias_is_broadcast, int64_t const* expert_first_token_offset,
                                    int num_experts_per_node, int64_t inter_size, bool gated, float const* fc2_act_global_scale,
-                                   bool use_per_expert_act_scale, TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat) {
+                                   bool use_per_expert_act_scale, TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat,
+
+                                   ActivationParameters activation_params = {}) {
 #ifdef ENABLE_FP4
   constexpr bool IsNVFP4 = std::is_same_v<T, __nv_fp4_e2m1> && BlockScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
   constexpr bool IsMXFP8 = std::is_same_v<T, __nv_fp8_e4m3> && BlockScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
@@ -1872,18 +1919,46 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
     int64_t const gated_off_vec = gated_off / ACTIVATION_ELEM_PER_THREAD;
 
     ActFn<ComputeElem> fn{};
+    constexpr bool IsSiLu = std::is_same_v<ActFn<float>, cutlass::epilogue::thread::SiLu<float>>;
+    bool const use_custom_swiglu = gated && IsSiLu && (activation_params.alpha != 1.0f || activation_params.beta != 0.0f || isfinite(activation_params.swiglu_limit));  // Check for non-default parameters.
+
     for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
       auto fc1_value = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + gated_off_vec]);
       if (bias_ptr) {
         fc1_value = fc1_value + arrayConvert<BiasElem, ComputeElem>(bias_ptr_vec[elem_index + gated_off_vec]);
       }
 
-      auto gate_act = fn(fc1_value);
+      ComputeElem gate_act;
+      if (use_custom_swiglu) {
+        for (int i = 0; i < ACTIVATION_ELEM_PER_THREAD; ++i) {
+          float g = fc1_value[i];
+          if (isfinite(activation_params.swiglu_limit)) {
+            g = fminf(g, activation_params.swiglu_limit);
+          }
+          float sigmoid = 1.0f / (1.0f + expf(-activation_params.alpha * g));
+          gate_act[i] = g * sigmoid;
+        }
+      } else {
+        gate_act = fn(fc1_value);
+      }
 
       if (gated) {
         auto gate_mul = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index]);
         if (bias_ptr_vec) {
           gate_mul = gate_mul + arrayConvert<BiasElem, ComputeElem>(bias_ptr_vec[elem_index]);
+        }
+
+        if (use_custom_swiglu) {
+          for (int i = 0; i < ACTIVATION_ELEM_PER_THREAD; ++i) {
+            float l = gate_mul[i];
+            if (isfinite(activation_params.swiglu_limit)) {
+              l = fminf(fmaxf(l, -activation_params.swiglu_limit), activation_params.swiglu_limit);
+            }
+            if (activation_params.beta != 0.0f) {
+              l += activation_params.beta;
+            }
+            gate_mul[i] = l;
+          }
         }
         gate_act = gate_act * gate_mul;
       }
@@ -1964,7 +2039,8 @@ template <class T, class GemmOutputType, class ScaleBiasType>
 void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8_quant, ScaleBiasType const* bias,
                   bool bias_is_broadcast, int64_t const* expert_first_token_offset, int num_experts_per_node, int64_t inter_size,
                   int64_t expanded_num_tokens, ActivationType activation_type, QuantParams const& quant_params,
-                  bool use_per_expert_act_scale, TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat, cudaStream_t stream) {
+                  bool use_per_expert_act_scale, TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat, cudaStream_t stream,
+                  ActivationParameters activation_params) {
 #ifdef ENABLE_FP4
   constexpr int64_t min_num_tokens_alignment = std::is_same_v<T, __nv_fp4_e2m1>
                                                    ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4
@@ -2028,8 +2104,9 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
   config.numAttrs = 1;
   config.attrs = attrs;
   cudaLaunchKernelEx(&config, fn, output, gemm_result, fp8_quant, bias, bias_is_broadcast, expert_first_token_offset,
+
                      num_experts_per_node, inter_size, isGatedActivation(activation_type), quant_params.fp4.fc2.act_global_scale,
-                     use_per_expert_act_scale, fc2_act_sf_flat);
+                     use_per_expert_act_scale, fc2_act_sf_flat, activation_params);
 }
 
 // ============================== Lora Add Bias =================================
@@ -2195,8 +2272,8 @@ void dequantFP8(OutputType* output, InputType const* input, int64_t const* num_v
       <<<blocks, threads, 0, stream>>>(output, input, num_valid_tokens_ptr, inter_size, scale, scale_is_dequant);
 }
 
-template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
-CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::CutlassMoeFCRunner(
+template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType, class Enable>
+CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>::CutlassMoeFCRunner(
     int sm_version,
     ActivationType activation_type,
     bool has_fc3,
@@ -2215,9 +2292,9 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
   }
 }
 
-template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
+template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType, class Enable>
 std::map<std::string, std::pair<size_t, size_t>>
-CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::getWorkspaceDeviceBufferSizes(
+CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>::getWorkspaceDeviceBufferSizes(
     int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
     int const experts_per_token, ActivationType activation_type, bool use_lora, bool use_deepseek_fp8_block_scale,
     bool min_latency_mode, bool use_awq) {
@@ -2360,8 +2437,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
 #undef ADD
 }
 
-template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
-size_t CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::getWorkspaceSize(
+template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType, class Enable>
+size_t CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>::getWorkspaceSize(
     int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size, int const num_experts,
     int const experts_per_token, ActivationType activation_type, MOEParallelismConfig parallelism_config, bool use_lora,
     bool use_deepseek_fp8_block_scale, bool min_latency_mode, bool use_awq) {
@@ -2376,11 +2453,11 @@ size_t CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, En
   return size;
 }
 
-template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
-void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::configureWsPtrs(char* ws_ptr,
-                                                                                                     int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
-                                                                                                     int const experts_per_token, ActivationType activation_type, MOEParallelismConfig parallelism_config, bool use_lora,
-                                                                                                     bool use_deepseek_fp8_block_scale, bool min_latency_mode, bool use_awq) {
+template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType, class Enable>
+void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>::configureWsPtrs(char* ws_ptr,
+                                                                                                      int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
+                                                                                                      int const experts_per_token, ActivationType activation_type, MOEParallelismConfig parallelism_config, bool use_lora,
+                                                                                                      bool use_deepseek_fp8_block_scale, bool min_latency_mode, bool use_awq) {
   auto workspaces = getWorkspaceDeviceBufferSizes(num_rows, hidden_size, inter_size, num_experts_per_node,
                                                   experts_per_token, activation_type, use_lora, use_deepseek_fp8_block_scale, min_latency_mode, use_awq);
 
@@ -2499,7 +2576,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     int64_t const* const expert_first_token_offset, WeightType const* const fc1_expert_weights,
     ScaleBiasType const* const fc1_expert_biases, float const* const fc2_fp8_quant, int64_t const num_rows,
     int64_t const expanded_num_rows, int64_t const hidden_size, int64_t const inter_size,
-    int const num_experts_per_node, ActivationType fc1_activation_type, QuantParams& quant_params, cudaStream_t stream) {
+    int const num_experts_per_node, ActivationType fc1_activation_type, QuantParams& quant_params, cudaStream_t stream,
+    ActivationParameters activation_params) {
   bool const is_gated_activation = isGatedActivation(fc1_activation_type);
 
   int shape_n = is_gated_activation ? inter_size * 2 : inter_size;
@@ -2514,7 +2592,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
   constexpr bool use_per_expert_act_scale = false;
   doActivation<T, UnfusedGemmOutputType>(output, static_cast<UnfusedGemmOutputType const*>(gemm_output),
                                          fc2_fp8_quant, fc1_expert_biases, bias_is_broadcast, expert_first_token_offset, num_experts_per_node,
-                                         inter_size, expanded_num_rows, fc1_activation_type, quant_params, use_per_expert_act_scale, nullptr, stream);
+                                         inter_size, expanded_num_rows, fc1_activation_type, quant_params, use_per_expert_act_scale, nullptr, stream,
+                                         activation_params);
 
   sync_check_cuda_error(stream);
 }
@@ -2569,8 +2648,8 @@ T const* CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType,
   return gemm_input;
 }
 
-template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
-void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::gemm1(
+template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType, class Enable>
+void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>::gemm1(
     MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
     DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input, T* const output,
     void* const intermediate_result, int64_t const* const expert_first_token_offset,
@@ -2582,12 +2661,14 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     int64_t const expanded_num_rows, int64_t const hidden_size, int64_t const inter_size,
     int const num_experts_per_node, ActivationType fc1_activation_type, float const** alpha_scale_ptr_array,
     bool bias_is_broadcast, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-    int* num_active_experts_per, int* active_expert_global_ids) {
+    int* num_active_experts_per, int* active_expert_global_ids,
+    ActivationParameters activation_params) {
   if (fp8_blockscale_gemm_runner) {
     ORT_ENFORCE(!min_latency_mode);
     Self::BlockScaleFC1(*fp8_blockscale_gemm_runner, input, output, intermediate_result, expert_first_token_offset,
                         fc1_expert_weights, fc1_expert_biases, fc2_fp8_quant, num_rows, expanded_num_rows, hidden_size, inter_size,
-                        num_experts_per_node, fc1_activation_type, quant_params, stream);
+                        num_experts_per_node, fc1_activation_type, quant_params, stream,
+                        activation_params);
     return;
   }
 
@@ -2635,7 +2716,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     sync_check_cuda_error(stream);
 
     // TODO: when bias_is_broadcast is false, fuse bias to gemm
-    using GatedActOutputType = std::conditional_t<use_w4afp8, BackBoneType, T>;
+    using GatedActOutputType = std::conditional_t<use_w4afp8, ScaleBiasType, T>;
     bool use_per_expert_act_scale = use_fp4        ? quant_params.fp4.fc2.use_per_expert_act_scale
                                     : use_wfp4afp8 ? quant_params.fp8_mxfp4.fc2.use_per_expert_act_scale
                                     : use_fp8      ? quant_params.fp8.fc2_use_per_expert_act_scale
@@ -2644,7 +2725,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     doActivation<GatedActOutputType, UnfusedGemmOutputType>(reinterpret_cast<GatedActOutputType*>(output),
                                                             static_cast<UnfusedGemmOutputType const*>(gemm_output), fc2_fp8_quant, fc1_expert_biases, bias_is_broadcast,
                                                             expert_first_token_offset, num_experts_per_node, inter_size, expanded_num_rows, fc1_activation_type,
-                                                            quant_params, use_per_expert_act_scale, fc2_fp4_act_flat, stream);
+                                                            quant_params, use_per_expert_act_scale, fc2_fp4_act_flat, stream,
+                                                            activation_params);
 
     sync_check_cuda_error(stream);
   } else if (use_fp8) {
@@ -2666,7 +2748,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     doActivation<T, UnfusedGemmOutputType>(output, static_cast<UnfusedGemmOutputType const*>(intermediate_result),
                                            fc2_fp8_quant, fc1_expert_biases, bias_is_broadcast, expert_first_token_offset, num_experts_per_node,
                                            inter_size, expanded_num_rows, fc1_activation_type, quant_params, use_per_expert_act_scale, nullptr,
-                                           stream);
+                                           stream, activation_params);
 
     sync_check_cuda_error(stream);
   } else if (!is_gated_activation) {
@@ -2722,18 +2804,18 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     sync_check_cuda_error(stream);
 
     if (!use_ampere_activation_fusion) {
-      using GatedActOutputType = std::conditional_t<use_w4afp8, BackBoneType, T>;
+      using GatedActOutputType = std::conditional_t<use_w4afp8, ScaleBiasType, T>;
       doGatedActivation<GatedActOutputType, UnfusedGemmOutputType>(reinterpret_cast<GatedActOutputType*>(output),
                                                                    static_cast<UnfusedGemmOutputType const*>(intermediate_result), num_valid_tokens_ptr, inter_size,
-                                                                   expanded_num_rows, fc1_activation_type, stream);
+                                                                   expanded_num_rows, fc1_activation_type, stream, activation_params);
 
       sync_check_cuda_error(stream);
     }
   }
 }
 
-template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
-void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::gemm2(
+template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType, class Enable>
+void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>::gemm2(
     MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
     DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input, void* const gemm_output,
     OutputType* const final_output, int64_t const* const expert_first_token_offset,
@@ -2747,7 +2829,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     int const num_experts_per_node, int64_t const k, float const** alpha_scale_ptr_array, bool use_lora, void* fc2_lora,
     cudaStream_t stream, MOEParallelismConfig parallelism_config, bool const enable_alltoall,
     cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode, int* num_active_experts_per,
-    int* active_expert_global_ids) {
+    int* active_expert_global_ids, ActivationParameters activation_params) {
   int64_t const* total_tokens_including_expert = expert_first_token_offset + 1;
 
   bool const using_tma_ws_gemm2 = gemm_runner.isTmaWarpSpecialized(config);
@@ -2812,7 +2894,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     loraBiasApplyFunc(static_cast<UnfusedGemmOutputType*>(gemm_output),
                       static_cast<UnfusedGemmOutputType const*>(gemm_output), nullptr,
                       static_cast<ScaleBiasType const*>(fc2_lora), false, expert_first_token_offset, num_experts_per_node,
-                      hidden_size, expanded_num_rows, ActivationType::Identity, {}, false, nullptr, stream);
+                      hidden_size, expanded_num_rows, ActivationType::Identity, {}, false, nullptr,
+                      stream, activation_params);
     sync_check_cuda_error(stream);
   }
 
@@ -2835,8 +2918,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   sync_check_cuda_error(stream);
 }
 
-template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
-bool CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::setupLoraWorkspace(
+template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType, class Enable>
+bool CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>::setupLoraWorkspace(
     int64_t expanded_num_rows, int64_t num_rows, int64_t inter_size, int64_t hidden_size, int start_expert,
     bool is_gated_activation, int num_experts_per_node, bool needs_num_valid, LoraParams& lora_params,
     cudaStream_t stream) {
@@ -2900,11 +2983,11 @@ bool CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   return all_token_without_lora;
 }
 
-template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
-auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::loraFC1(int64_t expanded_num_rows,
-                                                                                             int64_t inter_size, int64_t hidden_size, int num_experts_per_node, int start_expert,
-                                                                                             int64_t const* num_valid_tokens_ptr, bool is_gated_activation, ScaleBiasType const* fc1_expert_biases,
-                                                                                             LoraParams& lora_params, float const* input_fp8_dequant, cudaStream_t stream) -> ScaleBiasType const* {
+template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType, class Enable>
+auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>::loraFC1(int64_t expanded_num_rows,
+                                                                                              int64_t inter_size, int64_t hidden_size, int num_experts_per_node, int start_expert,
+                                                                                              int64_t const* num_valid_tokens_ptr, bool is_gated_activation, ScaleBiasType const* fc1_expert_biases,
+                                                                                              LoraParams& lora_params, float const* input_fp8_dequant, cudaStream_t stream) -> ScaleBiasType const* {
   ORT_ENFORCE(!act_fp4, "LoRA does not support FP4 activations");
   std::vector<void const*>& host_permuted_fc1_weight_ptrs = host_lora_workspace_.host_permuted_fc1_weight_ptrs;
   std::vector<void const*>& host_permuted_gated_weight_ptrs = host_lora_workspace_.host_permuted_gated_weight_ptrs;
@@ -2967,10 +3050,10 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   }
 }
 
-template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
-void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::loraFC2(int64_t inter_size,
-                                                                                             int64_t hidden_size, int num_experts_per_node, int start_expert, int64_t const* num_valid_tokens_ptr,
-                                                                                             int64_t num_tokens, LoraParams& lora_params, float const* fc2_fp8_quant, cudaStream_t stream) {
+template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType, class Enable>
+void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>::loraFC2(int64_t inter_size,
+                                                                                              int64_t hidden_size, int num_experts_per_node, int start_expert, int64_t const* num_valid_tokens_ptr,
+                                                                                              int64_t num_tokens, LoraParams& lora_params, float const* fc2_fp8_quant, cudaStream_t stream) {
   std::vector<void const*>& host_permuted_fc2_weight_ptrs = host_lora_workspace_.host_permuted_fc2_weight_ptrs;
   std::vector<int32_t>& host_permuted_fc2_lora_ranks = host_lora_workspace_.host_permuted_fc2_lora_ranks;
   std::vector<int64_t>& host_expert_first_token_offset = host_lora_workspace_.host_expert_first_token_offset;
@@ -3001,8 +3084,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   sync_check_cuda_error(stream);
 }
 
-template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
-void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::runMoe(
+template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType, class Enable>
+void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>::runMoe(
     void const* input_activations_void, void const* input_sf_void, int const* token_selected_experts,
     float const* token_final_scales, void const* fc1_expert_weights_void, void const* fc1_expert_biases_void,
     ActivationType fc1_activation_type, void const* fc2_expert_weights_void, void const* fc2_expert_biases_void,
@@ -3010,7 +3093,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     int const full_num_experts, int const experts_per_token, char* workspace_ptr, void* final_output_void,
     int* unpermuted_row_to_permuted_row, MOEParallelismConfig parallelism_config, bool const enable_alltoall,
     bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale, bool min_latency_mode,
-    MoeMinLatencyParams& min_latency_params, cudaStream_t stream) {
+    MoeMinLatencyParams& min_latency_params,
+    ActivationParameters activation_params,
+    cudaStream_t stream) {
   static constexpr bool int_scales_required = std::is_same<WeightType, uint8_t>::value || std::is_same<WeightType, cutlass::uint4b_t>::value;
   static constexpr bool fp8_scales_required = std::is_same<WeightType, __nv_fp8_e4m3>::value || std::is_same<WeightType, __nv_fp8_e5m2>::value;
 
@@ -3236,7 +3321,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                 fc1_int_scales, fc1_fp8_dequant, use_wfp4afp8 ? fc2_wfp4afp8_quant_scale : fc2_fp8_quant,
                 fc1_fp4_act_scale_, fc2_fp4_act_scale_, quant_params, num_rows, expanded_num_rows, hidden_size, inter_size,
                 num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array_fc1_, !use_lora, stream, *gemm1_config_,
-                false, nullptr, nullptr);
+                false, nullptr, nullptr, activation_params);
     sync_check_cuda_error(stream);
 
     if (use_lora) {
@@ -3259,9 +3344,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   }
 }
 
-template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
+template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType, class Enable>
 std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
-CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::computeStridesTmaWarpSpecialized(
+CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>::computeStridesTmaWarpSpecialized(
     int64_t const* expert_first_token_offset, TmaWarpSpecializedGroupedGemmInput layout_info1,
     TmaWarpSpecializedGroupedGemmInput layout_info2, int64_t num_tokens, int64_t expanded_num_tokens, int64_t gemm1_n,
     int64_t gemm1_k, int64_t gemm2_n, int64_t gemm2_k, int const num_experts_per_node, T const* gemm1_in,
@@ -3318,9 +3403,9 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
   return std::make_pair(layout_info1, layout_info2);
 }
 
-template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
+template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType, class Enable>
 std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
-CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
+CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType,
                    Enable>::computeStridesTmaWarpSpecializedLowLatency(TmaWarpSpecializedGroupedGemmInput layout_info1,
                                                                        TmaWarpSpecializedGroupedGemmInput layout_info2, int64_t num_tokens, int64_t gemm1_n, int64_t gemm1_k,
                                                                        int64_t gemm2_n, int64_t gemm2_k, int const num_experts, T const* input1, T const* input2,
@@ -3376,9 +3461,9 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
   return std::make_pair(layout_info1, layout_info2);
 }
 
-template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
+template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType, class Enable>
 std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
-CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::setupTmaWarpSpecializedInputs(
+CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>::setupTmaWarpSpecializedInputs(
     int64_t num_rows, int64_t expanded_num_rows, ActivationType fc1_activation_type, int64_t hidden_size,
     int64_t inter_size, int64_t num_experts_per_node, void const* input_activations_void,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, void* final_output,

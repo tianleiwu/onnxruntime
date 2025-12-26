@@ -170,17 +170,57 @@ struct genericMoeGemmKernelLauncher {
                                            reinterpret_cast<CutlassGemmOutputType*>(inputs.C), inputs.total_tokens_including_expert, inputs.n,
                                            inputs.k);
 
-      // Debug: Print GEMM dimensions for float types
+      // Debug: Print GEMM dimensions and samples for float types
       if constexpr (std::is_same_v<T, float>) {
-        printf("DEBUG [GEMM float]: num_experts=%d, N=%lld, K=%lld, num_rows=%lld\\n",
+        printf("DEBUG [GEMM float]: num_experts=%d, N=%lld, K=%lld, num_rows=%lld\n",
                inputs.num_experts, (long long)inputs.n, (long long)inputs.k, (long long)inputs.num_rows);
-        printf("DEBUG [GEMM float]: A_ptr=%p, B_ptr=%p, C_ptr=%p\\n",
-               (void*)inputs.A, (void*)inputs.B, (void*)inputs.C);
-        // Sample first element of A and B (copy from device to host for inspection)
-        float a_sample = 0, b_sample = 0;
-        cudaMemcpy(&a_sample, inputs.A, sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&b_sample, inputs.B, sizeof(float), cudaMemcpyDeviceToHost);
-        printf("DEBUG [GEMM float]: A[0]=%f, B[0]=%f\\n", a_sample, b_sample);
+
+        // Copy offsets to host
+        std::vector<int64_t> host_offsets(inputs.num_experts);
+        // inputs.total_tokens_including_expert points to expert_first_token_offset + 1
+        // correct pointer to start is inputs.total_tokens_including_expert - 1?
+        // Wait, passing `expert_first_token_offset + 1` means [0] is offset of expert 1 start?
+        // No, expert_first_token_offset[0] is 0.
+        // expert_first_token_offset[1] is end of E0.
+        // inputs.total_tokens_including_expert[0] is expert_first_token_offset[1] (end of E0).
+        // inputs.total_tokens_including_expert[e] is end of E_e.
+        // So start of E_e is (e==0) ? 0 : inputs.total_tokens_including_expert[e-1].
+
+        cudaMemcpy(host_offsets.data(), inputs.total_tokens_including_expert, inputs.num_experts * sizeof(int64_t), cudaMemcpyDeviceToHost);
+
+        for (int e = 0; e < inputs.num_experts; ++e) {
+          int64_t start_row = (e == 0) ? 0 : host_offsets[e - 1];
+          int64_t end_row = host_offsets[e];
+          int64_t valid_rows = end_row - start_row;
+
+          printf("DEBUG [GEMM float] Expert %d: Valid Rows=%lld, Start Row=%lld\n", e, (long long)valid_rows, (long long)start_row);
+
+          if (valid_rows > 0) {
+            // Sample Input A (Row `start_row`)
+            float a_sample = 0;
+            // A is [TotalRows, K] (row major)
+            // ptr = A + start_row * K
+            const float* a_ptr = reinterpret_cast<const float*>(inputs.A) + start_row * inputs.k;
+            cudaMemcpy(&a_sample, a_ptr, sizeof(float), cudaMemcpyDeviceToHost);
+
+            // Sample Weight B for expert e
+            // B is [Experts, N, K] or similar?
+            // Weights are usually laid out contiguously per expert?
+            // inputs.B matches [Experts * N * K]?
+            // Check stride.
+            // arguments constructor uses `ptr_B`.
+            // In MoeFCGemm, `byte_ptr_B` calculation: `problem_idx * bytes_per_expert_matrix`.
+            // So contiguous.
+            const float* b_ptr = reinterpret_cast<const float*>(inputs.B) + e * inputs.n * inputs.k;
+
+            float b_sample = 0;
+            cudaMemcpy(&b_sample, b_ptr, sizeof(float), cudaMemcpyDeviceToHost);
+
+            printf("DEBUG [GEMM float] Expert %d: A[%lld]=%f, B[0]=%f\n", e, (long long)(start_row * inputs.k), a_sample, b_sample);
+          } else {
+            printf("DEBUG [GEMM float] Expert %d: NO VALID ROWS\n", e);
+          }
+        }
         fflush(stdout);
       }
 
@@ -197,6 +237,33 @@ struct genericMoeGemmKernelLauncher {
       auto run_status = gemm.run(inputs.stream);
       ORT_ENFORCE(run_status == cutlass::Status::kSuccess,
                   "Failed to run cutlass grouped gemm. Error: " + std::string(cutlassGetStatusString(run_status)));
+
+      // Debug: Sample output after GEMM for float types
+      if constexpr (std::is_same_v<T, float>) {
+        cudaStreamSynchronize(inputs.stream);
+
+        // Re-use offsets copied earlier
+        std::vector<int64_t> host_offsets(inputs.num_experts);
+        cudaMemcpy(host_offsets.data(), inputs.total_tokens_including_expert, inputs.num_experts * sizeof(int64_t), cudaMemcpyDeviceToHost);
+
+        for (int e = 0; e < inputs.num_experts; ++e) {
+          int64_t start_row = (e == 0) ? 0 : host_offsets[e - 1];
+          int64_t end_row = host_offsets[e];
+          int64_t valid_rows = end_row - start_row;
+
+          if (valid_rows > 0) {
+            // C is [TotalRows, N]
+            // ptr = C + start_row * N
+            // inputs.C is void*? Cast to float*.
+            const float* c_ptr = reinterpret_cast<const float*>(inputs.C) + start_row * inputs.n;
+            float c_sample = 0;
+            cudaMemcpy(&c_sample, c_ptr, sizeof(float), cudaMemcpyDeviceToHost);
+            printf("DEBUG [GEMM float] Expert %d: C[%lld]=%f (after GEMM)\n", e, (long long)(start_row * inputs.n), c_sample);
+          }
+        }
+        fflush(stdout);
+      }
+
     } else if constexpr (sizeof(ElementType) == 2 && sizeof(CutlassWeightType) == 2 && (std::is_same_v<EpilogueTag, cutlass_extensions::EpilogueOpDefaultSilu> || std::is_same_v<EpilogueTag, cutlass_extensions::EpilogueOpDefaultFtGelu>))  // use fused moe gemm
                                                                                                                                                                                                                                               // kernel.. (only support
                                                                                                                                                                                                                                               // fp16 or bf16)

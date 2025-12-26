@@ -35,6 +35,7 @@
 #include <cuda_fp4.h>
 #endif
 #include <cuda_runtime_api.h>
+#include <limits>
 
 #include <array>
 #include <map>
@@ -80,6 +81,13 @@ struct LoraParams {
              int32_t const* gated_lora_ranks = nullptr, void const* const* gated_lora_weight_ptrs = nullptr)
       : fc1_lora_ranks(fc1_lora_ranks), fc1_lora_weight_ptrs(fc1_lora_weight_ptrs), fc2_lora_ranks(fc2_lora_ranks), fc2_lora_weight_ptrs(fc2_lora_weight_ptrs), gated_lora_ranks(gated_lora_ranks), gated_lora_weight_ptrs(gated_lora_weight_ptrs), num_reqs(num_reqs), fc1_lora_impl(fc1_lora_impl), fc2_lora_impl(fc2_lora_impl), workspace(workspace), memcpy_event_ptr(memcpy_event_ptr) {
   }
+};
+
+struct ActivationParameters {
+  float alpha = 1.0f;
+  float beta = 0.0f;
+  int swiglu_fusion = 0;
+  float swiglu_limit = std::numeric_limits<float>::infinity();
 };
 
 namespace cutlass_kernels {
@@ -344,7 +352,10 @@ class CutlassMoeFCRunnerInterface {
                       int const num_experts, int const experts_per_token, char* workspace_ptr, void* final_output,
                       int* unpermuted_row_to_permuted_row, MOEParallelismConfig parallelism_config, bool const enable_alltoall,
                       bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale, bool min_latency_mode,
-                      MoeMinLatencyParams& min_latency_params, cudaStream_t stream) = 0;
+                      MoeMinLatencyParams& min_latency_params,
+
+                      ActivationParameters activation_params,
+                      cudaStream_t stream) = 0;
 
   // Aliases for profiling the gemms
   virtual void gemm1(void const* const input, void* const output, void* const intermediate_result,
@@ -357,7 +368,8 @@ class CutlassMoeFCRunnerInterface {
                      int const num_experts_per_node, ActivationType fc1_activation_type, float const** alpha_scale_ptr_array,
                      bool bias_is_broadcast, bool use_deepseek_fp8_block_scale, cudaStream_t stream,
                      cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode, int* num_active_experts_per,
-                     int* active_expert_global_ids) = 0;
+                     int* active_expert_global_ids,
+                     ActivationParameters activation_params = {}) = 0;
 
   virtual void gemm2(void const* const input, void* const gemm_output, void* const final_output,
                      int64_t const* const expert_first_token_offset, TmaWarpSpecializedGroupedGemmInput const tma_ws_input_template,
@@ -371,7 +383,8 @@ class CutlassMoeFCRunnerInterface {
                      int64_t const experts_per_token, float const** alpha_scale_ptr_array, bool use_lora, void* fc2_lora,
                      bool use_deepseek_fp8_block_scale, cudaStream_t stream, MOEParallelismConfig parallelism_config,
                      bool const enable_alltoall, cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-                     int* num_active_experts_per, int* active_expert_global_ids) = 0;
+                     int* num_active_experts_per, int* active_expert_global_ids,
+                     ActivationParameters activation_params = {}) = 0;
 
   virtual std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
   computeStridesTmaWarpSpecializedDispatch(int64_t const* expert_first_token_offset,
@@ -487,7 +500,10 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
               int const num_experts, int const experts_per_token, char* workspace_ptr, void* final_output,
               int* unpermuted_row_to_permuted_row, MOEParallelismConfig parallelism_config, bool const enable_alltoall,
               bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale, bool min_latency_mode,
-              MoeMinLatencyParams& min_latency_params, cudaStream_t stream) override;
+              MoeMinLatencyParams& min_latency_params,
+
+              ActivationParameters activation_params,
+              cudaStream_t stream) override;
 
   // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
   static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
@@ -506,7 +522,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                     int64_t const num_rows, int64_t const expanded_num_rows, int64_t const hidden_size, int64_t const inter_size,
                     int const num_experts_per_node, ActivationType fc1_activation_type, float const** alpha_scale_ptr_array,
                     bool bias_is_broadcast, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config,
-                    bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids);
+                    bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
+                    ActivationParameters activation_params = {});
 
   static void gemm2(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
                     DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input, void* const gemm_output,
@@ -522,7 +539,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                     int64_t const experts_per_token, float const** alpha_scale_ptr_array, bool use_lora, void* fc2_lora,
                     cudaStream_t stream, MOEParallelismConfig parallelism_config, bool const enable_alltoall,
                     cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode, int* num_active_experts_per,
-                    int* active_expert_global_ids);
+                    int* active_expert_global_ids,
+                    ActivationParameters activation_params = {});
 
   // Overrides to allow us to forward on to the internal functions with the pointers using the correct type
   void gemm1(void const* const input, void* const output, void* const intermediate_result,
@@ -535,7 +553,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
              int const num_experts_per_node, ActivationType fc1_activation_type, float const** alpha_scale_ptr_array,
              bool bias_is_broadcast, bool use_deepseek_fp8_block_scale, cudaStream_t stream,
              cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode, int* num_active_experts_per,
-             int* active_expert_global_ids) override {
+             int* active_expert_global_ids,
+             ActivationParameters activation_params = {}) override {
     auto* block_scale_gemm_runner = use_deepseek_fp8_block_scale ? getDeepSeekBlockScaleGemmRunner() : nullptr;
     return Self::gemm1(moe_gemm_runner_, block_scale_gemm_runner, static_cast<T const*>(input),
                        static_cast<T*>(output), intermediate_result, expert_first_token_offset, tma_ws_input_template,
@@ -543,7 +562,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                        num_valid_tokens_ptr, static_cast<ScaleBiasType const*>(fc1_int_scales), fc1_fp8_dequant, fc2_fp8_quant,
                        fc1_fp4_act_flat, fc2_fp4_act_flat, quant_params, num_rows, expanded_num_rows, hidden_size, inter_size,
                        num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array, bias_is_broadcast, stream, config,
-                       min_latency_mode, num_active_experts_per, active_expert_global_ids);
+                       min_latency_mode, num_active_experts_per, active_expert_global_ids, activation_params);
   }
 
   void gemm2(void const* const input, void* const gemm_output, void* const final_output,
@@ -558,7 +577,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
              int64_t const experts_per_token, float const** alpha_scale_ptr_array, bool use_lora, void* fc2_lora,
              bool use_deepseek_fp8_block_scale, cudaStream_t stream, MOEParallelismConfig parallelism_config,
              bool const enable_alltoall, cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-             int* num_active_experts_per, int* active_expert_global_ids) override {
+             int* num_active_experts_per, int* active_expert_global_ids,
+             ActivationParameters activation_params = {}) override {
     auto* block_scale_gemm_runner = use_deepseek_fp8_block_scale ? getDeepSeekBlockScaleGemmRunner() : nullptr;
     return Self::gemm2(moe_gemm_runner_, block_scale_gemm_runner, static_cast<T const*>(input), gemm_output,
                        static_cast<OutputType*>(final_output), expert_first_token_offset, tma_ws_input_template,
@@ -568,7 +588,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                        permuted_row_to_unpermuted_row, token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows,
                        hidden_size, inter_size, num_experts_per_node, experts_per_token, alpha_scale_ptr_array, use_lora, fc2_lora,
                        stream, parallelism_config, enable_alltoall, config, min_latency_mode, num_active_experts_per,
-                       active_expert_global_ids);
+                       active_expert_global_ids, activation_params);
   }
 
   virtual size_t getGemmWorkspaceSize(int num_experts_per_node) const override {
@@ -690,7 +710,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                             WeightType const* const fc1_expert_weights, ScaleBiasType const* const fc1_expert_biases,
                             float const* const fc2_fp8_quant, int64_t const num_rows, int64_t const expanded_num_rows,
                             int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
-                            ActivationType fc1_activation_type, QuantParams& quant_params, cudaStream_t stream);
+                            ActivationType fc1_activation_type, QuantParams& quant_params, cudaStream_t stream,
+                            ActivationParameters activation_params = {});
 
   static void BlockScaleFC2(DeepSeekBlockScaleGemmRunner& gemm_runner, T const* const input, void* const gemm_output,
                             OutputType* const final_output, int64_t const* const expert_first_token_offset,

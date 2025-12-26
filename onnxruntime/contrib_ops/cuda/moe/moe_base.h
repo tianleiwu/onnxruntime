@@ -15,6 +15,7 @@
 #include "contrib_ops/cpu/moe/moe_helper.h"
 #include "core/providers/cuda/cuda_common.h"
 #include "contrib_ops/cuda/llm/moe_gemm/common.h"
+#include <limits>
 
 namespace onnxruntime {
 namespace contrib {
@@ -49,6 +50,19 @@ class MoEBase {
       ORT_ENFORCE(k_ == 2, "Sparse mixer only supports k=2");
     }
 
+    // Activation parameters for parameterized SwiGLU
+    // Formula: G * sigmoid(alpha * G) * (L + beta)
+    // Default alpha=1.0f gives standard silu: x * sigmoid(x)
+    // Default beta=0.0f gives standard multiplication without offset
+    activation_alpha_ = op_kernel_info.GetAttrOrDefault<float>("activation_alpha", 1.0f);
+    activation_beta_ = op_kernel_info.GetAttrOrDefault<float>("activation_beta", 0.0f);
+
+    // SwiGLU fusion mode: 0=not fused (fc1+fc3 separate), 1=fused interleaved, 2=fused chunked
+    swiglu_fusion_ = static_cast<int>(op_kernel_info.GetAttrOrDefault<int64_t>("swiglu_fusion", 0));
+
+    // SwiGLU limit for clamping (optional, use infinity if not provided)
+    swiglu_limit_ = op_kernel_info.GetAttrOrDefault<float>("swiglu_limit", std::numeric_limits<float>::infinity());
+
     sm_ = device_prop.major * 10 + device_prop.minor;
   }
 
@@ -56,6 +70,10 @@ class MoEBase {
   bool use_sparse_mixer_;
   int64_t k_;
   onnxruntime::llm::kernels::cutlass_kernels::ActivationType activation_type_;
+  float activation_alpha_;
+  float activation_beta_;
+  int swiglu_fusion_;   // 0: not fused, 1: fused interleaved, 2: fused chunked
+  float swiglu_limit_;  // Clamp limit for SwiGLU
   int sm_;
 };
 

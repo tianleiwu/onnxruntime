@@ -201,6 +201,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
       use_deepseek_fp8_block_scale,
       min_latency_mode,
       min_latency_params,
+      {activation_alpha_, activation_beta_, swiglu_fusion_, swiglu_limit_},
       stream);
 
   return Status::OK();

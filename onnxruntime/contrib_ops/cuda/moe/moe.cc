@@ -156,6 +156,18 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
   const auto& fc1_dims = fc1_experts_weights->Shape().GetDims();
   const CudaT* fc1_input_ptr = reinterpret_cast<const CudaT*>(fc1_experts_weights->DataRaw());
 
+  // Detect fused SwiGLU weights: swiglu_fusion_ != 0 indicates FC1 contains pre-fused gate+value weights
+  // When fused, FC1 has shape [E, 2*I, H] instead of [E, I, H] and FC3 is not provided
+  bool is_fused_swiglu = (swiglu_fusion_ != 0) && (fc3_experts_weights_optional == nullptr);
+
+  // For fused SwiGLU weights, each expert block size is 2*I*H, not I*H
+  size_t fc1_per_expert_size = is_fused_swiglu ? (2 * fc1_block_size) : fc1_block_size;
+
+  // Recalculate total size for fused case
+  if (is_fused_swiglu) {
+    fc1_total_size = E * fc1_per_expert_size * sizeof(CudaT);
+  }
+
   // If input matches [E, H, I], it's KxN layout but kernel wants NxK [E, I, H]. Needs transpose.
   bool fc1_needs_transpose = (fc1_dims[1] == H && fc1_dims[2] == I);
 
@@ -186,10 +198,11 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
         CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(dest_fc3, fc3_input_ptr + e * fc1_block_size, fc1_block_size * sizeof(CudaT), cudaMemcpyDeviceToDevice, stream));
       }
     }
-  } else {  // Non-SwiGLU FC1
+  } else {  // Non-SwiGLU FC1 (may still be fused SwiGLU weights if is_fused_swiglu is true)
     if (fc1_needs_transpose) {
       for (int e = 0; e < E; ++e) {
-        LaunchTranspose2D<CudaT>(fc1_input_ptr + e * fc1_block_size, fc1_processed_ptr + e * fc1_block_size, H, I, stream);
+        // Use fc1_per_expert_size for correct offset in fused weight case
+        LaunchTranspose2D<CudaT>(fc1_input_ptr + e * fc1_per_expert_size, fc1_processed_ptr + e * fc1_per_expert_size, H, is_fused_swiglu ? 2 * I : I, stream);
       }
     } else {
       CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(fc1_processed_ptr, fc1_input_ptr, fc1_total_size, cudaMemcpyDeviceToDevice, stream));
@@ -253,6 +266,7 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
       use_deepseek_block_scale,
       min_latency_mode,
       min_latency_params,
+      {activation_alpha_, activation_beta_, swiglu_fusion_, swiglu_limit_},
       stream);
 
   return Status::OK();
