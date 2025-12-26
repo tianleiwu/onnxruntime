@@ -6,7 +6,6 @@
  * DO NOT EDIT MANUALLY.
  */
 
-#ifndef EXCLUDE_SM_80
 #include "contrib_ops/cuda/llm/moe_gemm/launchers/fused_moe_gemm_launcher_sm80.inl"
 
 namespace onnxruntime::llm::kernels::cutlass_kernels {
@@ -138,4 +137,3 @@ template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::bfloat16_t, cute:
 #endif
 
 }  // namespace onnxruntime::llm::kernels::cutlass_kernels
-#endif  // EXCLUDE_SM_80

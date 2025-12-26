@@ -21,7 +21,7 @@ namespace cuda {
       MoE, kMSDomain, 1, T, kCudaExecutionProvider, \
       (*KernelDefBuilder::Create()).MayInplace(0, 0).TypeConstraint("T", DataTypeImpl::GetTensorType<T>()), MoE<T>);
 
-// REGISTER_KERNEL_TYPED(float)
+REGISTER_KERNEL_TYPED(float)
 REGISTER_KERNEL_TYPED(MLFloat16)
 REGISTER_KERNEL_TYPED(BFloat16)
 
@@ -55,7 +55,15 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
   cudaStream_t stream = static_cast<cudaStream_t>(stream_obj->GetHandle());
 
   auto& device_prop = GetDeviceProp();
-  const int sm = device_prop.major * 10 + device_prop.minor;
+  int sm = device_prop.major * 10 + device_prop.minor;
+
+  // SM90 TMA WS kernels only support f16/bf16, not float32.
+  // Force SM80 path for float32 to use legacy kernels.
+  if constexpr (std::is_same_v<T, float>) {
+    if (sm >= 90) {
+      sm = 80;
+    }
+  }
 
   onnxruntime::llm::kernels::cutlass_kernels::CutlassMoeFCRunner<CudaT, CudaT> moe_runner(sm,
                                                                                           activation_type_,
@@ -116,28 +124,109 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
   onnxruntime::llm::kernels::LoraParams lora_params{};
   onnxruntime::llm::kernels::cutlass_kernels::MoeMinLatencyParams min_latency_params;
 
-  const CudaT* fc1_weights_ptr = reinterpret_cast<const CudaT*>(fc1_experts_weights->DataRaw());
+  // =============================================================================
+  // WEIGHT LAYOUT TRANSPOSITION (Short-term fix)
+  // =============================================================================
+  // ORT input layout:  FC1=[E, hidden_size, inter_size], FC2=[E, inter_size, hidden_size]
+  // Kernel expects:    FC1=[E, inter_size, hidden_size], FC2=[E, hidden_size, inter_size]
+  // So FC1 needs transpose from [K, N] to [N, K] per expert, and FC2 is already correct shape
+  // but stored transposed. Must transpose both.
+  //
+  // TODO(long-term): Consider updating ONNX op schema to match kernel layout, or
+  // have the kernel accept ORT layout directly to avoid runtime transposes.
+  // =============================================================================
 
-  // Fuse FC1 and FC3 if needed (SwiGLU)
-  IAllocatorUniquePtr<void> fused_fc1_buffer;
-  if (fc3_experts_weights_optional != nullptr) {
-    size_t fused_size = moe_params.num_experts * moe_params.hidden_size * moe_params.inter_size * 2 * sizeof(CudaT);
-    fused_fc1_buffer = GetScratchBuffer<void>(fused_size, stream_obj);
-    CudaT* fused_ptr = reinterpret_cast<CudaT*>(fused_fc1_buffer.get());
-    const CudaT* fc3_ptr = reinterpret_cast<const CudaT*>(fc3_experts_weights_optional->DataRaw());
+  // Calculate buffer sizes
+  size_t fc1_block_size = static_cast<size_t>(moe_params.inter_size) * static_cast<size_t>(moe_params.hidden_size);
+  size_t fc2_block_size = static_cast<size_t>(moe_params.hidden_size) * static_cast<size_t>(moe_params.inter_size);
+  int H = static_cast<int>(moe_params.hidden_size);
+  int I = static_cast<int>(moe_params.inter_size);
+  int E = static_cast<int>(moe_params.num_experts);
 
-    size_t width_bytes = moe_params.inter_size * sizeof(CudaT);
-    size_t height = moe_params.num_experts * moe_params.hidden_size;
-    size_t src_pitch = width_bytes;
-    size_t dst_pitch = 2 * width_bytes;
+  // Allocate buffers
+  size_t fc1_total_size = (fc3_experts_weights_optional != nullptr)
+                              ? E * fc1_block_size * 2 * sizeof(CudaT)  // fused
+                              : E * fc1_block_size * sizeof(CudaT);
+  size_t fc2_total_size = E * fc2_block_size * sizeof(CudaT);
 
-    // Copy FC1
-    CUDA_RETURN_IF_ERROR(cudaMemcpy2DAsync(fused_ptr, dst_pitch, fc1_weights_ptr, src_pitch, width_bytes, height, cudaMemcpyDeviceToDevice, stream));
+  auto fc1_processed_buffer = GetScratchBuffer<void>(fc1_total_size, stream_obj);
+  CudaT* fc1_processed_ptr = reinterpret_cast<CudaT*>(fc1_processed_buffer.get());
 
-    // Copy FC3
-    CUDA_RETURN_IF_ERROR(cudaMemcpy2DAsync(reinterpret_cast<uint8_t*>(fused_ptr) + width_bytes, dst_pitch, fc3_ptr, src_pitch, width_bytes, height, cudaMemcpyDeviceToDevice, stream));
+  // FC1 Handling (validating dims against H and I)
+  const auto& fc1_dims = fc1_experts_weights->Shape().GetDims();
+  const CudaT* fc1_input_ptr = reinterpret_cast<const CudaT*>(fc1_experts_weights->DataRaw());
 
-    fc1_weights_ptr = fused_ptr;
+  // If input matches [E, H, I], it's KxN layout but kernel wants NxK [E, I, H]. Needs transpose.
+  bool fc1_needs_transpose = (fc1_dims[1] == H && fc1_dims[2] == I);
+
+  // Debug: print transpose decision for float types
+  if constexpr (std::is_same_v<T, float>) {
+    printf("DEBUG [moe.cc float]: H=%d, I=%d, E=%d\\n", H, I, E);
+    printf("DEBUG [moe.cc float]: fc1_dims=[%lld, %lld, %lld]\\n",
+           (long long)fc1_dims[0], (long long)fc1_dims[1], (long long)fc1_dims[2]);
+    printf("DEBUG [moe.cc float]: fc1_needs_transpose=%d (expected: fc1_dims[1]==H && fc1_dims[2]==I)\\n",
+           fc1_needs_transpose);
+    fflush(stdout);
+  }
+
+  if (fc3_experts_weights_optional != nullptr) {  // SwiGLU
+    const CudaT* fc3_input_ptr = reinterpret_cast<const CudaT*>(fc3_experts_weights_optional->DataRaw());
+
+    for (int e = 0; e < E; ++e) {
+      CudaT* dest_fc1 = fc1_processed_ptr + 2 * e * fc1_block_size;
+      CudaT* dest_fc3 = fc1_processed_ptr + (2 * e + 1) * fc1_block_size;
+
+      if (fc1_needs_transpose) {
+        // Transpose [H, I] -> [I, H]
+        LaunchTranspose2D<CudaT>(fc1_input_ptr + e * fc1_block_size, dest_fc1, H, I, stream);
+        LaunchTranspose2D<CudaT>(fc3_input_ptr + e * fc1_block_size, dest_fc3, H, I, stream);
+      } else {
+        // Copy [I, H] directly
+        CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(dest_fc1, fc1_input_ptr + e * fc1_block_size, fc1_block_size * sizeof(CudaT), cudaMemcpyDeviceToDevice, stream));
+        CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(dest_fc3, fc3_input_ptr + e * fc1_block_size, fc1_block_size * sizeof(CudaT), cudaMemcpyDeviceToDevice, stream));
+      }
+    }
+  } else {  // Non-SwiGLU FC1
+    if (fc1_needs_transpose) {
+      for (int e = 0; e < E; ++e) {
+        LaunchTranspose2D<CudaT>(fc1_input_ptr + e * fc1_block_size, fc1_processed_ptr + e * fc1_block_size, H, I, stream);
+      }
+    } else {
+      CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(fc1_processed_ptr, fc1_input_ptr, fc1_total_size, cudaMemcpyDeviceToDevice, stream));
+    }
+  }
+
+  // FC2 Handling
+  const auto& fc2_dims = fc2_experts_weights->Shape().GetDims();
+  const CudaT* fc2_input_ptr = reinterpret_cast<const CudaT*>(fc2_experts_weights->DataRaw());
+  CudaT* fc2_processed_ptr = nullptr;
+
+  // Kernel expects FC2 as [hidden, inter] (N, K).
+  // If input is [inter, hidden] (dims matches I, H), it is KxN layout, needs transpose to NxK.
+  bool fc2_needs_transpose = (fc2_dims[1] == I && fc2_dims[2] == H);
+
+  // Debug: print FC2 transpose decision for float types
+  if constexpr (std::is_same_v<T, float>) {
+    printf("DEBUG [moe.cc float]: fc2_dims=[%lld, %lld, %lld]\\n",
+           (long long)fc2_dims[0], (long long)fc2_dims[1], (long long)fc2_dims[2]);
+    printf("DEBUG [moe.cc float]: fc2_needs_transpose=%d (expected: fc2_dims[1]==I && fc2_dims[2]==H)\\n",
+           fc2_needs_transpose);
+    printf("DEBUG [moe.cc float]: moe_params: num_rows=%lld, hidden_size=%lld, inter_size=%lld, num_experts=%lld\\n",
+           (long long)moe_params.num_rows, (long long)moe_params.hidden_size,
+           (long long)moe_params.inter_size, (long long)moe_params.num_experts);
+    fflush(stdout);
+  }
+
+  if (fc2_needs_transpose) {
+    auto fc2_buffer = GetScratchBuffer<void>(fc2_total_size, stream_obj);
+    fc2_processed_ptr = reinterpret_cast<CudaT*>(fc2_buffer.get());
+    for (int e = 0; e < E; ++e) {
+      // Transpose [I, H] -> [H, I]
+      LaunchTranspose2D<CudaT>(fc2_input_ptr + e * fc2_block_size, fc2_processed_ptr + e * fc2_block_size, I, H, stream);
+    }
+  } else {
+    // Layout matches kernel expectation [H, I]. Use directly.
+    fc2_processed_ptr = const_cast<CudaT*>(fc2_input_ptr);
   }
 
   moe_runner.runMoe(
@@ -145,10 +234,10 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
       nullptr,         // input_sf
       expert_indices,  // token_selected_experts
       expert_scales,   // token_final_scales
-      fc1_weights_ptr,
+      fc1_processed_ptr,
       fc1_experts_bias_optional == nullptr ? nullptr : reinterpret_cast<const CudaT*>(fc1_experts_bias_optional->template Data<T>()),
       activation_type_,
-      reinterpret_cast<const CudaT*>(fc2_experts_weights->DataRaw()),
+      fc2_processed_ptr,
       fc2_experts_bias_optional == nullptr ? nullptr : reinterpret_cast<const CudaT*>(fc2_experts_bias_optional->template Data<T>()),
       quant_params,
       static_cast<int>(moe_params.num_rows), static_cast<int>(moe_params.hidden_size),

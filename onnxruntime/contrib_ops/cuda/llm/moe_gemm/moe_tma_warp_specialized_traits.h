@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <type_traits>
+
 #include "cutlass/arch/mma_sm90.h"
 #include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_kernels.h"
 #include "contrib_ops/cuda/llm/cutlass_extensions/epilogue_helpers.h"
@@ -41,7 +43,7 @@ template <typename T, typename WeightType, typename EpilogueTag = cutlass_extens
           TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
 constexpr bool isValidBlackwellMOESpecialisation() {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)  // TODO Is there a better choice
-  return (cutlass::platform::is_same<T, WeightType>::value || (cutlass::platform::is_same<T, __nv_fp8_e4m3>::value && cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value)) && cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value && Fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
+  return !cutlass::platform::is_same<T, float>::value && (cutlass::platform::is_same<T, WeightType>::value || (cutlass::platform::is_same<T, __nv_fp8_e4m3>::value && cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value)) && cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value && Fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
 #else
   return false;  // CUTLASS_ARCH_MMA_SM100_SUPPORTED is set when Blackwell kernels are enabled
 #endif
@@ -52,6 +54,10 @@ template <typename T, typename WeightType, typename EpilogueTag = cutlass_extens
           TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
 constexpr bool isValidHopperMOESpecialisation() {
 #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
+  // SM90 TMA WS kernels only support f16/bf16, not float32.
+  if constexpr (std::is_same_v<std::decay_t<T>, float>) {
+    return false;
+  }
   return (cutlass::platform::is_same<T, WeightType>::value || (cutlass::platform::is_same<cutlass::uint4b_t, WeightType>::value && cutlass::platform::is_same<T, __nv_fp8_e4m3>::value))
 #ifdef ENABLE_FP4
          && !cutlass::platform::is_same<T, __nv_fp4_e2m1>::value

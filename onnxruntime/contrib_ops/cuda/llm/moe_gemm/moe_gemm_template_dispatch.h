@@ -78,6 +78,7 @@
 #include <math.h>
 #include <sstream>
 #include <type_traits>
+#include <cstdio>
 
 namespace onnxruntime::llm::kernels::cutlass_kernels {
 
@@ -168,6 +169,20 @@ struct genericMoeGemmKernelLauncher {
                                            reinterpret_cast<CutlassGemmOutputType const*>(inputs.biases), inputs.bias_is_broadcast,
                                            reinterpret_cast<CutlassGemmOutputType*>(inputs.C), inputs.total_tokens_including_expert, inputs.n,
                                            inputs.k);
+
+      // Debug: Print GEMM dimensions for float types
+      if constexpr (std::is_same_v<T, float>) {
+        printf("DEBUG [GEMM float]: num_experts=%d, N=%lld, K=%lld, num_rows=%lld\\n",
+               inputs.num_experts, (long long)inputs.n, (long long)inputs.k, (long long)inputs.num_rows);
+        printf("DEBUG [GEMM float]: A_ptr=%p, B_ptr=%p, C_ptr=%p\\n",
+               (void*)inputs.A, (void*)inputs.B, (void*)inputs.C);
+        // Sample first element of A and B (copy from device to host for inspection)
+        float a_sample = 0, b_sample = 0;
+        cudaMemcpy(&a_sample, inputs.A, sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&b_sample, inputs.B, sizeof(float), cudaMemcpyDeviceToHost);
+        printf("DEBUG [GEMM float]: A[0]=%f, B[0]=%f\\n", a_sample, b_sample);
+        fflush(stdout);
+      }
 
       GemmGrouped gemm;
 
@@ -604,7 +619,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
       }
     }
 
-    if constexpr (kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType, EpilogueTag>() && !use_w4afp8) {
+    if constexpr (!std::is_same_v<std::decay_t<T>, float> && kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType, EpilogueTag>() && !use_w4afp8) {
       // We allow both tma warp specialized and SM80 configurations to coexist because for some cases with small
       // numbers of tokens SM80 is faster. We check here to see which is selected
       if (inputs.gemm_config.sm_version >= 90) {
@@ -708,7 +723,7 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
   if (!supportsTmaWarpSpecialized()) {
     return 0;
   }
-  if constexpr (kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType>() && !use_w4afp8) {
+  if constexpr (!std::is_same_v<std::decay_t<T>, float> && kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType>() && !use_w4afp8) {
     auto configs = getTmaWarpSpecializedConfigs(sm_);
     auto fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
     if constexpr (use_wfp4afp4) {

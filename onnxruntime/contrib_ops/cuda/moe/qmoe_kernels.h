@@ -31,6 +31,16 @@ void LaunchSoftmaxTopK(
     bool normalize_scales,
     cudaStream_t stream);
 
+// Transpose a 2D matrix from [rows, cols] to [cols, rows]
+// Used to convert ORT weight layout [E, hidden_size, inter_size] to kernel layout [E, inter_size, hidden_size]
+template <typename T>
+void LaunchTranspose2D(
+    const T* input,
+    T* output,
+    int rows,
+    int cols,
+    cudaStream_t stream);
+
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime

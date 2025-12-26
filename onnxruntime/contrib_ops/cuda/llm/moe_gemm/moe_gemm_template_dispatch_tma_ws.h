@@ -58,7 +58,7 @@
 #include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_kernels.h"
 #include "contrib_ops/cuda/llm/moe_gemm/launchers/moe_gemm_tma_ws_launcher.h"
 #include "contrib_ops/cuda/llm/moe_gemm/moe_tma_warp_specialized_traits.h"
-
+#include <type_traits>
 #include "core/common/common.h"
 #include <cuda.h>
 #include <cuda_fp16.h>
@@ -72,54 +72,61 @@ template <typename Arch, typename T, typename WeightType, typename OutputType, t
           EpilogueFusion FUSION, typename TileShape, typename ClusterShape>
 void dispatchMoeGemmSelectBiasTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmInput hopper_input, int num_experts,
                                                  int multi_processor_count, cudaStream_t stream, int* occupancy, size_t* workspace_size) {
-  static_assert((Arch::kMinComputeCapability == 90 && kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType, EpilogueTag>()) || (Arch::kMinComputeCapability >= 100 && kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType, EpilogueTag>()),
-                "Invalid TMA WS configuration invoked, fallback to Sm80");
+  // Debug print
+  // printf("DEBUG: dispatchMoeGemmSelectBiasTmaWarpSpecialized called. T name: %s, Float name: %s\n", typeid(T).name(), typeid(float).name());
 
-  ORT_ENFORCE(
-      workspace_size || hopper_input.isValid(), "Hopper specialisation is missing additional input information");
+  if constexpr (std::is_same_v<std::decay_t<T>, float>) {
+    ORT_THROW("Float TMA MoE not supported");
+  } else {
+    static_assert((Arch::kMinComputeCapability == 90 && kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType, EpilogueTag>()) || (Arch::kMinComputeCapability >= 100 && kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType, EpilogueTag>()),
+                  "Invalid TMA WS configuration invoked, fallback to Sm80");
 
-  //            auto func = hopper_input.ptr_c ?
-  //            kernels::cutlass_kernels::genericMoeGemmKernelLauncherHopper<T, WeightType,
-  //                            cutlass::arch::Sm90, EpilogueTag, true>
-  //                                           :
-  //                                           kernels::cutlass_kernels::genericMoeGemmKernelLauncherHopper<T,
-  //                                           WeightType,
-  //                                               cutlass::arch::Sm90, EpilogueTag, false>;
-  // TODO Re-enable bias when CUTLASS supports it
+    ORT_ENFORCE(
+        workspace_size || hopper_input.isValid(), "Hopper specialisation is missing additional input information");
 
-  if constexpr (Arch::kMinComputeCapability < 90) {
-    ORT_THROW("Invalid architecture instantiated");
-  }
+    //            auto func = hopper_input.ptr_c ?
+    //            kernels::cutlass_kernels::genericMoeGemmKernelLauncherHopper<T, WeightType,
+    //                            cutlass::arch::Sm90, EpilogueTag, true>
+    //                                           :
+    //                                           kernels::cutlass_kernels::genericMoeGemmKernelLauncherHopper<T,
+    //                                           WeightType,
+    //                                               cutlass::arch::Sm90, EpilogueTag, false>;
+    // TODO Re-enable bias when CUTLASS supports it
+
+    if constexpr (Arch::kMinComputeCapability < 90) {
+      ORT_THROW("Invalid architecture instantiated");
+    }
 #ifndef COMPILE_HOPPER_TMA_GROUPED_GEMMS
-  else if constexpr (Arch::kMinComputeCapability >= 90 && Arch::kMinComputeCapability < 100) {
-    ORT_THROW("Please recompile with support for hopper by passing 90-real as an arch to build_wheel.py.");
-  }
+    else if constexpr (Arch::kMinComputeCapability >= 90 && Arch::kMinComputeCapability < 100) {
+      ORT_THROW("Please recompile with support for hopper by passing 90-real as an arch to build_wheel.py.");
+    }
 #endif
 #ifndef COMPILE_BLACKWELL_TMA_GROUPED_GEMMS
-  else if constexpr (Arch::kMinComputeCapability >= 100 && Arch::kMinComputeCapability < 120) {
-    ORT_THROW("Please recompile with support for blackwell by passing 100-real as an arch to build_wheel.py.");
-  }
+    else if constexpr (Arch::kMinComputeCapability >= 100 && Arch::kMinComputeCapability < 120) {
+      ORT_THROW("Please recompile with support for blackwell by passing 100-real as an arch to build_wheel.py.");
+    }
 #endif
 #ifndef COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS
-  else if constexpr (Arch::kMinComputeCapability >= 120) {
-    ORT_THROW("Please recompile with support for blackwell by passing 120-real as an arch to build_wheel.py.");
-  }
+    else if constexpr (Arch::kMinComputeCapability >= 120) {
+      ORT_THROW("Please recompile with support for blackwell by passing 120-real as an arch to build_wheel.py.");
+    }
 #endif
-  else {
-    auto getFunc = [&]() {
-      if constexpr (std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>) {
-        ORT_ENFORCE(hopper_input.fpX_block_scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
-                    "MXFPX is the only supported scaling type for WFP4AFP8");
-        return &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
-                                                                                               WeightType, OutputType, EpilogueTag, FUSION, TileShape, ClusterShape, true, false>;
-      } else {
-        ORT_ENFORCE(hopper_input.fpX_block_scaling_type != TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
-                    "MXFPX is not supported for the selected weight combination");
-        return &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
-                                                                                               WeightType, OutputType, EpilogueTag, FUSION, TileShape, ClusterShape, false, false>;
-      }
-    };
-    getFunc()(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size);
+    else {
+      auto getFunc = [&]() {
+        if constexpr (std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>) {
+          ORT_ENFORCE(hopper_input.fpX_block_scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
+                      "MXFPX is the only supported scaling type for WFP4AFP8");
+          return &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
+                                                                                                 WeightType, OutputType, EpilogueTag, FUSION, TileShape, ClusterShape, true, false>;
+        } else {
+          ORT_ENFORCE(hopper_input.fpX_block_scaling_type != TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
+                      "MXFPX is not supported for the selected weight combination");
+          return &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
+                                                                                                 WeightType, OutputType, EpilogueTag, FUSION, TileShape, ClusterShape, false, false>;
+        }
+      };
+      getFunc()(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size);
+    }
   }
 }
 
@@ -283,7 +290,7 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
     break;
 
   if (gemm_config.sm_version == 90) {
-    if constexpr (kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType, EpilogueTag, FUSION>()) {
+    if constexpr (!std::is_same_v<T, float> && kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType, EpilogueTag, FUSION>()) {
       switch (gemm_config.tile_config_sm90) {
         SHAPE_CASE(90, 128, 16, 128)
         SHAPE_CASE(90, 128, 32, 128)
