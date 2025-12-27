@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
+#if 0
 #include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_template_dispatch.h"
 
 namespace onnxruntime::llm::kernels::cutlass_kernels {
@@ -21,3 +21,4 @@ namespace onnxruntime::llm::kernels::cutlass_kernels {
 template class MoeGemmRunner<__nv_bfloat16, uint8_t, __nv_bfloat16>;
 #endif
 }  // namespace onnxruntime::llm::kernels::cutlass_kernels
+#endif

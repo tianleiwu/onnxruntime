@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#if 0  // disable QMoE for now
 #ifdef __GNUC__
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -36,12 +37,21 @@ namespace cuda {
       QMoE);
 
 REGISTER_KERNEL_TYPED(MLFloat16)
+
+#define QUICK_BUILD 1
+#if QUICK_BUILD == 0
 REGISTER_KERNEL_TYPED(BFloat16)
+#endif
 
 QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoEBase(op_kernel_info, GetDeviceProp()) {
   ORT_ENFORCE(op_kernel_info.GetAttr<int64_t>("expert_weight_bits", &expert_weight_bits_).IsOK());
+#if QUICK_BUILD
+  ORT_ENFORCE(expert_weight_bits_ == 8,
+              "expert_weight_bits must be 8, but got ", expert_weight_bits_);
+#else
   ORT_ENFORCE(expert_weight_bits_ == 8 || expert_weight_bits_ == 4,
               "expert_weight_bits must be 4 or 8, but got ", expert_weight_bits_);
+#endif
 
   this->block_size_ = op_kernel_info.GetAttrOrDefault<int64_t>("block_size", -1);
 
@@ -53,6 +63,15 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
   int32_t input_type = op_kernel_info.node().InputDefs()[0]->TypeAsProto()->tensor_type().elem_type();
 
   bool is_fp16 = input_type == ONNX_NAMESPACE::TensorProto_DataType::TensorProto_DataType_FLOAT16;
+
+#if QUICK_BUILD
+  if (is_fp16) {
+    if (expert_weight_bits_ == 8) {
+      m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, uint8_t, half>>(
+          sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
+    }
+  }
+#else
   if (is_fp16) {
     if (expert_weight_bits_ == 4) {
       m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, cutlass::uint4b_t, half>>(
@@ -70,6 +89,7 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
           sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
     }
   }
+#endif
 }
 
 Status QMoE::ComputeInternal(OpKernelContext* context) const {
@@ -210,3 +230,4 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime
+#endif

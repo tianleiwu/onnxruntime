@@ -64,6 +64,7 @@ struct GroupedGemmInput {
   bool use_fused_moe = false;
 
   cudaStream_t stream = 0;
+  ActivationParameters activation_params;
   cutlass_extensions::CutlassGemmConfig gemm_config;
 };
 

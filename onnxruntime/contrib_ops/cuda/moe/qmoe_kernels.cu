@@ -151,10 +151,3 @@ int Lora_run(LoraImpl* /*impl*/, int64_t /*numTokens*/, int64_t /*numReqs*/, voi
 }
 
 }  // namespace onnxruntime::llm::kernels
-
-// Dummy definition for getEnvEnablePDL to satisfy linker
-namespace onnxruntime::llm::common {
-bool getEnvEnablePDL() {
-  return false;
-}
-}  // namespace onnxruntime::llm::common

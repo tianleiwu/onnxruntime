@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include <limits>
 
 namespace onnxruntime::llm::kernels::cutlass_kernels {
 
@@ -27,6 +28,13 @@ enum class ActivationType {
   Geglu,
   Identity,
   InvalidType
+};
+
+struct ActivationParameters {
+  float alpha = 1.0f;
+  float beta = 0.0f;
+  int swiglu_fusion = 0;
+  float swiglu_limit = std::numeric_limits<float>::infinity();
 };
 
 }  // namespace onnxruntime::llm::kernels::cutlass_kernels

@@ -40,6 +40,15 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
   const Tensor* fc3_experts_weights_optional = context->Input<Tensor>(6);
   const Tensor* fc3_experts_bias_optional = context->Input<Tensor>(7);
 
+  using onnxruntime::llm::kernels::cutlass_kernels::ActivationType;
+  bool is_fused_swiglu = (activation_type_ == ActivationType::Swiglu) &&
+                         (swiglu_fusion_ != 0) &&
+                         (fc3_experts_weights_optional == nullptr);
+
+  printf("DEBUG MOE: activation_type=%d, swiglu_fusion=%d, fc3_exists=%d, is_fused_swiglu=%d\n",
+         static_cast<int>(activation_type_), swiglu_fusion_, (fc3_experts_weights_optional != nullptr), is_fused_swiglu);
+  fflush(stdout);
+
   MoEParameters moe_params;
   ORT_RETURN_IF_ERROR(::onnxruntime::contrib::moe_helper::CheckInputs<Tensor>(
       moe_params, input, router_probs,
@@ -47,7 +56,7 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
       fc2_experts_weights, fc2_experts_bias_optional, nullptr, nullptr,
       fc3_experts_weights_optional, fc3_experts_bias_optional, nullptr, nullptr,
       1,  //  no quantization so pack size is 1
-      activation_type_ == onnxruntime::llm::kernels::cutlass_kernels::ActivationType::Swiglu,
+      is_fused_swiglu,
       0));  // no block-wise quantization for regular MoE
 
   using CudaT = typename OrtToCudaType<T>::type;
@@ -65,8 +74,17 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
     }
   }
 
+  using onnxruntime::llm::kernels::cutlass_kernels::ActivationType;
+  ActivationType kernel_activation_type = activation_type_;
+  if (activation_type_ == ActivationType::Silu && fc3_experts_weights_optional != nullptr) {
+    // Mixtral case: SiLU activation with separate FC3.
+    // Kernel supports SwiGLU which is Linear * SiLU(Gate).
+    // We map Mixtral to SwiGLU by packing weights as [FC3, FC1] (Linear, Gate).
+    kernel_activation_type = ActivationType::Swiglu;
+  }
+
   onnxruntime::llm::kernels::cutlass_kernels::CutlassMoeFCRunner<CudaT, CudaT> moe_runner(sm,
-                                                                                          activation_type_,
+                                                                                          kernel_activation_type,
                                                                                           fc3_experts_weights_optional != nullptr,
                                                                                           normalize_routing_weights_,
                                                                                           use_sparse_mixer_);
@@ -80,7 +98,7 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
   size_t ws_size = moe_runner.getWorkspaceSize(
       static_cast<size_t>(moe_params.num_rows), static_cast<size_t>(moe_params.hidden_size),
       static_cast<size_t>(moe_params.inter_size), static_cast<size_t>(moe_params.num_experts), static_cast<size_t>(k_),
-      activation_type_, parallelism_config, use_lora, use_deepseek_block_scale, min_latency_mode, use_awq);
+      kernel_activation_type, parallelism_config, use_lora, use_deepseek_block_scale, min_latency_mode, use_awq);
 
   // Scratch buffer for workspace + expert_scales + expert_indices + permutation_map
   size_t scales_bytes = moe_params.num_rows * k_ * sizeof(float);
@@ -153,12 +171,12 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
   CudaT* fc1_processed_ptr = reinterpret_cast<CudaT*>(fc1_processed_buffer.get());
 
   // FC1 Handling (validating dims against H and I)
-  const auto& fc1_dims = fc1_experts_weights->Shape().GetDims();
+
   const CudaT* fc1_input_ptr = reinterpret_cast<const CudaT*>(fc1_experts_weights->DataRaw());
 
   // Detect fused SwiGLU weights: swiglu_fusion_ != 0 indicates FC1 contains pre-fused gate+value weights
   // When fused, FC1 has shape [E, 2*I, H] instead of [E, I, H] and FC3 is not provided
-  bool is_fused_swiglu = (swiglu_fusion_ != 0) && (fc3_experts_weights_optional == nullptr);
+  // Must also check activation_type is Swiglu to avoid false positives for other activations
 
   // For fused SwiGLU weights, each expert block size is 2*I*H, not I*H
   size_t fc1_per_expert_size = is_fused_swiglu ? (2 * fc1_block_size) : fc1_block_size;
@@ -169,24 +187,23 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
   }
 
   // If input matches [E, H, I], it's KxN layout but kernel wants NxK [E, I, H]. Needs transpose.
-  bool fc1_needs_transpose = (fc1_dims[1] == H && fc1_dims[2] == I);
+  bool fc1_needs_transpose = false;  // (fc1_dims[1] == H && fc1_dims[2] == I);
 
-  // Debug: print transpose decision for float types
-  if constexpr (std::is_same_v<T, float>) {
-    printf("DEBUG [moe.cc float]: H=%d, I=%d, E=%d\\n", H, I, E);
-    printf("DEBUG [moe.cc float]: fc1_dims=[%lld, %lld, %lld]\\n",
-           (long long)fc1_dims[0], (long long)fc1_dims[1], (long long)fc1_dims[2]);
-    printf("DEBUG [moe.cc float]: fc1_needs_transpose=%d (expected: fc1_dims[1]==H && fc1_dims[2]==I)\\n",
-           fc1_needs_transpose);
-    fflush(stdout);
-  }
-
-  if (fc3_experts_weights_optional != nullptr) {  // SwiGLU
+  if (fc3_experts_weights_optional != nullptr) {
+    // Gated activation with separate FC1 and FC3 weights (e.g., Mixtral's silu + FC3)
+    // Kernel expects weights in shape [E, 2*I, H] for gated activation GEMM.
+    // Each expert should have FC1_weights and FC3_weights horizontally stacked:
+    //   Buffer layout: [Expert0: FC1|FC3][Expert1: FC1|FC3]...
+    //   Each expert has 2*I*H elements = 2 * fc1_block_size
     const CudaT* fc3_input_ptr = reinterpret_cast<const CudaT*>(fc3_experts_weights_optional->DataRaw());
 
     for (int e = 0; e < E; ++e) {
-      CudaT* dest_fc1 = fc1_processed_ptr + 2 * e * fc1_block_size;
-      CudaT* dest_fc3 = fc1_processed_ptr + (2 * e + 1) * fc1_block_size;
+      // Horizontally stack [FC3 | FC1] within each expert's block to match SwiGLU convention
+      // Kernel computes: Linear(1st half) * SiLU(Gate(2nd half))
+      // Mixtral wants: FC3 * SiLU(FC1)
+      // So: 1st half = FC3 (Linear), 2nd half = FC1 (Gate)
+      CudaT* dest_fc1 = fc1_processed_ptr + e * 2 * fc1_block_size;                   // First half of expert e (Gate/FC1)
+      CudaT* dest_fc3 = fc1_processed_ptr + e * 2 * fc1_block_size + fc1_block_size;  // Second half of expert e (Linear/FC3)
 
       if (fc1_needs_transpose) {
         // Transpose [H, I] -> [I, H]
@@ -210,25 +227,13 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
   }
 
   // FC2 Handling
-  const auto& fc2_dims = fc2_experts_weights->Shape().GetDims();
+
   const CudaT* fc2_input_ptr = reinterpret_cast<const CudaT*>(fc2_experts_weights->DataRaw());
   CudaT* fc2_processed_ptr = nullptr;
 
   // Kernel expects FC2 as [hidden, inter] (N, K).
   // If input is [inter, hidden] (dims matches I, H), it is KxN layout, needs transpose to NxK.
-  bool fc2_needs_transpose = (fc2_dims[1] == I && fc2_dims[2] == H);
-
-  // Debug: print FC2 transpose decision for float types
-  if constexpr (std::is_same_v<T, float>) {
-    printf("DEBUG [moe.cc float]: fc2_dims=[%lld, %lld, %lld]\\n",
-           (long long)fc2_dims[0], (long long)fc2_dims[1], (long long)fc2_dims[2]);
-    printf("DEBUG [moe.cc float]: fc2_needs_transpose=%d (expected: fc2_dims[1]==I && fc2_dims[2]==H)\\n",
-           fc2_needs_transpose);
-    printf("DEBUG [moe.cc float]: moe_params: num_rows=%lld, hidden_size=%lld, inter_size=%lld, num_experts=%lld\\n",
-           (long long)moe_params.num_rows, (long long)moe_params.hidden_size,
-           (long long)moe_params.inter_size, (long long)moe_params.num_experts);
-    fflush(stdout);
-  }
+  bool fc2_needs_transpose = false;  // (fc2_dims[1] == I && fc2_dims[2] == H);
 
   if (fc2_needs_transpose) {
     auto fc2_buffer = GetScratchBuffer<void>(fc2_total_size, stream_obj);
@@ -249,7 +254,7 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
       expert_scales,   // token_final_scales
       fc1_processed_ptr,
       fc1_experts_bias_optional == nullptr ? nullptr : reinterpret_cast<const CudaT*>(fc1_experts_bias_optional->template Data<T>()),
-      activation_type_,
+      kernel_activation_type,
       fc2_processed_ptr,
       fc2_experts_bias_optional == nullptr ? nullptr : reinterpret_cast<const CudaT*>(fc2_experts_bias_optional->template Data<T>()),
       quant_params,

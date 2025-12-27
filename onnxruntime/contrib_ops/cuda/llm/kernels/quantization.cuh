@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#pragma once
 
 #include "contrib_ops/cuda/llm/common/cuda_type_utils.cuh"
 #include "contrib_ops/cuda/llm/common/cuda_runtime_utils.h"

@@ -851,7 +851,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemmBiasAct(
       runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
       break;
     case ActivationType::Swiglu:
-      runGemm<cutlass_extensions::EpilogueOpDefaultSilu>(inputs, hopper_inputs);
+      runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
       break;
     case ActivationType::Geglu:
       runGemm<cutlass_extensions::EpilogueOpDefaultFtGelu>(inputs, hopper_inputs);

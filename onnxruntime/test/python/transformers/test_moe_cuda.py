@@ -122,15 +122,18 @@ class TestMoECuda(unittest.TestCase):
         onnx_input = helper.make_tensor_value_info("input", TensorProto.FLOAT16, [num_rows, hidden_size])
         onnx_router = helper.make_tensor_value_info("router_probs", TensorProto.FLOAT16, [num_rows, num_experts])
 
-        # Prepare weights for SwiGLU
-        # CUDA kernel expects: [linear_block, gate_block] per expert
-        # i.e., fc1 has shape [E, 2*I, H] where [:, 0:I, :] = linear, [:, I:2I, :] = gate
+        # Prepare weights for SwiGLU (Interleaved: swiglu_fusion=1)
+        # CUDA kernel expects interleaved weights: Gate at even indices, Linear at odd indices
+        # fc1 has shape [E, H, I] (gate), fc3 has shape [E, H, I] (linear)
         fc1_np = model.fc1.detach().cpu().numpy().astype(np.float16)  # [E, H, I] (gate)
         fc2_np = model.fc2.detach().cpu().numpy().astype(np.float16)  # [E, I, H]
         fc3_np = model.fc3.detach().cpu().numpy().astype(np.float16)  # [E, H, I] (up/linear)
 
-        # Concatenate: [linear, gate] along inter_size dimension -> [E, H, 2*I]
-        fc1_fused_np = np.concatenate([fc3_np, fc1_np], axis=-1)  # [E, H, 2*I]
+        # Interleave weights: [Gate, Linear, Gate, Linear, ...]
+        E, H, I = fc1_np.shape
+        fc1_fused_np = np.empty((E, H, 2 * I), dtype=np.float16)
+        fc1_fused_np[:, :, 0::2] = fc1_np  # Gate
+        fc1_fused_np[:, :, 1::2] = fc3_np  # Linear
 
         # Schema expects FC1 as [E, fusion_size * inter_size, hidden_size]
         # Current fc1_fused_np is [E, H, 2*I]. Need to transpose last two dims.
@@ -149,6 +152,9 @@ class TestMoECuda(unittest.TestCase):
             domain="com.microsoft",
             k=topk,
             activation_type="swiglu",
+            activation_alpha=1.0,
+            activation_beta=0.0,
+            swiglu_fusion=1,  # Fused interleaved
             normalize_routing_weights=1,
         )
 
@@ -208,8 +214,11 @@ class TestMoECuda(unittest.TestCase):
         fc2_np = model.fc2.detach().cpu().numpy().astype(np.float16)  # [E, I, H]
         fc3_np = model.fc3.detach().cpu().numpy().astype(np.float16)  # [E, H, I] (up/linear)
 
-        # CUDA kernel expects: [linear_block, gate_block] per expert
-        fc1_fused_np = np.concatenate([fc3_np, fc1_np], axis=-1)  # [E, H, 2*I]
+        # Interleave weights: [Gate, Linear, Gate, Linear, ...]
+        E, H, I = fc1_np.shape
+        fc1_fused_np = np.empty((E, H, 2 * I), dtype=np.float16)
+        fc1_fused_np[:, :, 0::2] = fc1_np  # Gate
+        fc1_fused_np[:, :, 1::2] = fc3_np  # Linear
 
         # Transpose to match Schema (E, 2*I, H) and (E, H, I)
         fc1_tensor_np = fc1_fused_np.transpose(0, 2, 1)
@@ -225,6 +234,7 @@ class TestMoECuda(unittest.TestCase):
             domain="com.microsoft",
             k=topk,
             activation_type="swiglu",
+            swiglu_fusion=1,
             normalize_routing_weights=1,
         )
 

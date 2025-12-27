@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#if ENABLE_FP8
+
 #include "fused_gated_gemm_template.h"
 
 namespace onnxruntime::llm {
@@ -23,3 +25,5 @@ template class CutlassFusedGatedGemmRunner<__nv_fp8_e4m3>;
 }  // namespace cutlass_kernels
 }  // namespace kernels
 }  // namespace onnxruntime::llm
+
+#endif
