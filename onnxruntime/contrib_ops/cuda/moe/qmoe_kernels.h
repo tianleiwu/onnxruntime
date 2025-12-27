@@ -41,6 +41,24 @@ void LaunchTranspose2D(
     int cols,
     cudaStream_t stream);
 
+void LaunchSparseMixerTop2(
+    const float* input,
+    float* output,
+    int* indices,
+    int* source_rows,
+    int num_rows,
+    int num_experts,
+    cudaStream_t stream);
+
+void LaunchSparseMixerTop2(
+    const half* input,
+    float* output,
+    int* indices,
+    int* source_rows,
+    int num_rows,
+    int num_experts,
+    cudaStream_t stream);
+
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime

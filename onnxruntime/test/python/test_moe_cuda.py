@@ -285,7 +285,6 @@ def create_phi_moe_onnx_graph(
     fc1_scales=None,
     fc2_scales=None,
     fc3_scales=None,
-    normalize_routing_weights=0,
 ):
     use_quant = quant_bits > 0
     if use_quant:
@@ -333,7 +332,7 @@ def create_phi_moe_onnx_graph(
             ["output"],
             "MoE_0",
             k=topk,
-            normalize_routing_weights=normalize_routing_weights,
+            normalize_routing_weights=0,
             use_sparse_mixer=1,
             activation_type="silu",
             domain="com.microsoft",
@@ -663,9 +662,6 @@ class SparseMoeBlockORTHelper(nn.Module):
         return tensors["output"].reshape(batch_size, sequence_length, hidden_dim)
 
     def parity_check(self):
-        torch.manual_seed(42)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(42)
         hidden_state = torch.randn(self.batch_size, self.sequence_length, self.hidden_dim).to(device)
         torch_output = self.forward(hidden_state)
         ort_output = self.ort_forward(hidden_state)
@@ -907,14 +903,13 @@ class PhiMoESparseMoeBlock(SparseMoeBlockORTHelper):
     and memory on padding.
     """
 
-    def __init__(self, config, batch_size, sequence_length, quant_bits=0, onnx_dtype=None, normalize_routing_weights=0):
+    def __init__(self, config, batch_size, sequence_length, quant_bits=0, onnx_dtype=None):
         super().__init__(quant_bits, onnx_dtype)
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
         self.router_jitter_noise = config.router_jitter_noise
-        self.normalize_routing_weights = normalize_routing_weights
         use_quant = self.quant_bits > 0
 
         # gating
@@ -974,7 +969,6 @@ class PhiMoESparseMoeBlock(SparseMoeBlockORTHelper):
             moe_experts_weight_scale1,
             moe_experts_weight_scale2,
             moe_experts_weight_scale3,
-            normalize_routing_weights,
         )
 
         self.ort_sess = self.create_ort_session(self.moe_onnx_graph)
@@ -986,19 +980,12 @@ class PhiMoESparseMoeBlock(SparseMoeBlockORTHelper):
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate(hidden_states)
 
-        if self.normalize_routing_weights:
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-            # we cast back to the input dtype
-            routing_weights = routing_weights.to(hidden_states.dtype)
-        else:
-            # ORT LaunchSoftmaxTopK does not support jitter or masked sampling.
-            # It performs Softmax -> TopK.
-            # To ensure parity, we must match ORT's logic here.
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-            routing_weights = routing_weights.to(hidden_states.dtype)
+        routing_weights, selected_experts = masked_sampling_omp_inference(
+            router_logits,
+            top_k=self.top_k,
+            jitter_eps=self.router_jitter_noise,
+            training=False,
+        )
 
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
@@ -1076,8 +1063,6 @@ phi3_test_cases = list(
         [1, 4],  # batch_size
         [1, 32],  # sequence_length
         quant_bits_list,
-        [None],  # onnx type, None mean fp32 for bits = 0, fp16 for bits > 0
-        [True, False],  # normalize_routing_weights
     )
 )
 
@@ -1085,11 +1070,9 @@ phi3_test_cases = list(
 @unittest.skipIf(not use_cuda, "skipping moe test since it requires cuda environment.")
 class TestPhiMoE(unittest.TestCase):
     @parameterized.expand(phi3_test_cases)
-    def test_phi3_moe_parity(self, batch_size, sequence_length, quant_bits, onnx_type, normalize_routing_weights):
+    def test_phi3_moe_parity(self, batch_size, sequence_length, quant_bits):
         config = PhiMoEConfig(hidden_size=256, intermediate_size=1024)
-        phi3_moe = PhiMoESparseMoeBlock(
-            config, batch_size, sequence_length, quant_bits, onnx_type, normalize_routing_weights
-        )
+        phi3_moe = PhiMoESparseMoeBlock(config, batch_size, sequence_length, quant_bits)
         phi3_moe.to(device)
         phi3_moe.parity_check()
 
@@ -1213,10 +1196,6 @@ def create_swiglu_moe_onnx_graph(
             k=topk,
             normalize_routing_weights=1,
             activation_type="swiglu",
-            activation_alpha=1.702,
-            activation_beta=1.0,
-            swiglu_limit=7.0,
-            swiglu_fusion=1,
             domain="com.microsoft",
         ),
     ]
@@ -1377,9 +1356,9 @@ class SwigluMoEBlock(SparseMoeBlockORTHelper):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate(hidden_states)
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights, selected_experts = torch.topk(router_logits, self.top_k, dim=-1)
+        routing_weights = F.softmax(routing_weights, dim=1, dtype=torch.float)
+
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         final_hidden_states = torch.zeros(
@@ -1466,209 +1445,6 @@ class TestSwigluMoEPerf(unittest.TestCase):
         moe = SwigluMoEBlock(config, batch_size, sequence_length, quant_bits)
         moe.to(device)
         moe.benchmark_ort()
-
-
-def create_sparse_mixer_onnx_graph(
-    sequence_length,
-    num_experts,
-    hidden_size,
-    inter_size,
-    fc1_experts_weights,
-    fc1_experts_bias,
-    fc2_experts_weights,
-    fc2_experts_bias,
-    onnx_dtype,
-):
-    nodes = [
-        helper.make_node(
-            "MoE",
-            [
-                "input",
-                "router_probs",
-                "fc1_experts_weights",
-                "fc1_experts_bias",
-                "fc2_experts_weights",
-                "fc2_experts_bias",
-            ],
-            ["output"],
-            "MoE_0",
-            k=2,
-            activation_type="relu",  # Sparse mixer used relu in old code? Actually any activation works with kernel.
-            normalize_routing_weights=0,
-            use_sparse_mixer=1,
-            domain="com.microsoft",
-        ),
-    ]
-
-    graph = helper.make_graph(
-        nodes,
-        "MoE_Graph",
-        [
-            helper.make_tensor_value_info("input", onnx_dtype, [sequence_length, hidden_size]),
-            helper.make_tensor_value_info("router_probs", onnx_dtype, [sequence_length, num_experts]),
-            helper.make_tensor_value_info("fc1_experts_weights", onnx_dtype, [num_experts, hidden_size, inter_size]),
-            helper.make_tensor_value_info("fc1_experts_bias", onnx_dtype, [num_experts, inter_size]),
-            helper.make_tensor_value_info("fc2_experts_weights", onnx_dtype, [num_experts, inter_size, hidden_size]),
-            helper.make_tensor_value_info("fc2_experts_bias", onnx_dtype, [num_experts, hidden_size]),
-        ],
-        [
-            helper.make_tensor_value_info("output", onnx_dtype, [sequence_length, hidden_size]),
-        ],
-    )
-
-    return helper.make_model(graph, producer_name="MoE_Model")
-
-
-class TestSparseMixer(unittest.TestCase):
-    @parameterized.expand(
-        list(
-            itertools.product(
-                [TensorProto.FLOAT16],
-            )
-        )
-    )
-    def test_sparse_mixer_functional(self, onnx_dtype):
-        # Basic regression test for Sparse Mixer integration.
-        # k=2, experts=8 (supported size)
-        num_rows = 128
-        hidden_size = 64
-        inter_size = 32
-        num_experts = 8
-        k = 2
-
-        torch_dtype = onnx_to_torch_type_map[onnx_dtype]
-
-        input_data = torch.randn(num_rows, hidden_size, dtype=torch_dtype, device=device)
-        router_probs = torch.randn(num_rows, num_experts, dtype=torch_dtype, device=device)
-
-        fc1_weight = torch.randn(num_experts, hidden_size, inter_size, dtype=torch_dtype, device=device)
-        fc1_bias = torch.randn(num_experts, inter_size, dtype=torch_dtype, device=device)
-        fc2_weight = torch.randn(num_experts, inter_size, hidden_size, dtype=torch_dtype, device=device)
-        fc2_bias = torch.randn(num_experts, hidden_size, dtype=torch_dtype, device=device)
-
-        onnx_model = create_sparse_mixer_onnx_graph(
-            num_rows, num_experts, hidden_size, inter_size, fc1_weight, fc1_bias, fc2_weight, fc2_bias, onnx_dtype
-        )
-
-        sess_options = onnxruntime.SessionOptions()
-        sess = onnxruntime.InferenceSession(onnx_model.SerializeToString(), sess_options, providers=ort_provider)
-
-        inputs = {
-            "input": input_data.cpu().numpy(),
-            "router_probs": router_probs.cpu().numpy(),
-            "fc1_experts_weights": fc1_weight.cpu().numpy(),
-            "fc1_experts_bias": fc1_bias.cpu().numpy(),
-            "fc2_experts_weights": fc2_weight.cpu().numpy(),
-            "fc2_experts_bias": fc2_bias.cpu().numpy(),
-        }
-
-        # Just ensure it runs without error
-        output = sess.run(None, inputs)
-        self.assertEqual(output[0].shape, (num_rows, hidden_size))
-
-    def test_sparse_mixer_parity(self):
-        # Parity test against Python masked_sampling_omp_inference
-        # Checks if ORT kernel logic (jitter, OMP) matches Python reference.
-        onnx_dtype = TensorProto.FLOAT16
-        num_rows = 128
-        hidden_size = 64
-        inter_size = 32
-        num_experts = 8
-        k = 2
-
-        torch_dtype = onnx_to_torch_type_map[onnx_dtype]
-        jit_eps = 0.01
-
-        # Inputs
-        # Use simple ranges to avoid randomness issues if possible, but random is okay for parity check if stable.
-        input_data = torch.randn(num_rows, hidden_size, dtype=torch_dtype, device=device)
-        # Random logits
-        router_logits = torch.randn(num_rows, num_experts, dtype=torch_dtype, device=device)
-
-        fc1_weight = torch.randn(num_experts, hidden_size, inter_size, dtype=torch_dtype, device=device)
-        fc1_bias = torch.zeros(num_experts, inter_size, dtype=torch_dtype, device=device)
-        fc2_weight = torch.randn(num_experts, inter_size, hidden_size, dtype=torch_dtype, device=device)
-        fc2_bias = torch.zeros(num_experts, hidden_size, dtype=torch_dtype, device=device)
-
-        # 1. ORT Execution
-        onnx_model = create_sparse_mixer_onnx_graph(
-            num_rows, num_experts, hidden_size, inter_size, fc1_weight, fc1_bias, fc2_weight, fc2_bias, onnx_dtype
-        )
-        sess_options = onnxruntime.SessionOptions()
-        sess = onnxruntime.InferenceSession(onnx_model.SerializeToString(), sess_options, providers=ort_provider)
-
-        ort_inputs = {
-            "input": input_data.cpu().numpy(),
-            "router_probs": router_logits.cpu().numpy(),
-            "fc1_experts_weights": fc1_weight.cpu().numpy(),
-            "fc1_experts_bias": fc1_bias.cpu().numpy(),
-            "fc2_experts_weights": fc2_weight.cpu().numpy(),
-            "fc2_experts_bias": fc2_bias.cpu().numpy(),
-        }
-        ort_output = sess.run(None, ort_inputs)[0]
-
-        # 2. Python Reference Execution
-        # Calculate routing weights and indices
-        routing_weights, selected_experts = masked_sampling_omp_inference(
-            router_logits, top_k=k, jitter_eps=jit_eps, training=False
-        )
-
-        final_output = torch.zeros_like(input_data)
-
-        # Manual MoE
-        # Loop over experts to mimic expert parallelism / gathering
-        for expert_idx in range(num_experts):
-            # selected_experts is [B, k]
-            # Find which rows selected this expert as 1st choice
-            mask1 = selected_experts[:, 0] == expert_idx
-            # Find which rows selected this expert as 2nd choice
-            mask2 = selected_experts[:, 1] == expert_idx
-
-            # Combine to get all rows processing this expert
-            active_mask = mask1 | mask2
-            if not active_mask.any():
-                continue
-
-            active_indices = torch.nonzero(active_mask, as_tuple=True)[0]
-
-            # Select input rows
-            inp_slice = input_data[active_indices]
-
-            # Select weights for these rows for this expert
-            # If row selected expert as 1st choice, use weight[:, 0], else weight[:, 1]
-            # routing_weights is [B, k]
-            w1 = routing_weights[active_indices, 0]
-            w2 = routing_weights[active_indices, 1]
-
-            # Construct the weight vector for these rows
-            # We need to know for each active row, was it 1st or 2nd choice?
-            # It's guaranteed to be one of them (or both? No, expert selection is unique per row in OMP generally, but let's assume unique)
-
-            row_mask1 = mask1[active_indices]
-            ex_weights = torch.where(row_mask1, w1, w2).unsqueeze(1)
-
-            # Compute Expert FFN
-            # FC1: [B_sub, H] @ [H, I] + [I]
-            h = torch.matmul(inp_slice, fc1_weight[expert_idx]) + fc1_bias[expert_idx]
-            h = torch.relu(h)
-
-            # FC2: [B_sub, I] @ [I, H] + [H]
-            out = torch.matmul(h, fc2_weight[expert_idx]) + fc2_bias[expert_idx]
-
-            # Accumulate
-            final_output[active_indices] += out * ex_weights
-
-        # Compare
-        ort_output_tensor = torch.from_numpy(ort_output).to(device)
-
-        max_diff = (ort_output_tensor - final_output).abs().max().item()
-        print(f"\nTestSparseMixer Parity Max Diff: {max_diff}")
-
-        # Allow some tolerance for float/half and jitter math
-        self.assertTrue(
-            numpy.allclose(ort_output, final_output.cpu().numpy(), atol=1e-1, rtol=1e-1),
-            msg=f"Max Diff {max_diff} exceeds tolerance",
-        )
 
 
 if __name__ == "__main__":

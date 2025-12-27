@@ -64,11 +64,6 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output, GemmOutput
   bool const use_custom_swiglu = std::is_same_v<ActFn<float>, cutlass::epilogue::thread::SiLu<float>> &&
                                  (activation_params.alpha != 1.0f || activation_params.beta != 0.0f || isfinite(activation_params.swiglu_limit));
   bool const is_swiglu_interleaved = activation_params.swiglu_fusion == 1;
-  if (token == 0 && tid == 0) {
-    printf("GatedActivation: activation_type=%d use_custom_swiglu=%d is_swiglu_interleaved=%d\n", int(activation_type), int(use_custom_swiglu), int(is_swiglu_interleaved));
-    printf("GatedActivation: activation_params: alpha=%f beta=%f swiglu_limit=%f swiglu_fusion=%d\n",
-           activation_params.alpha, activation_params.beta, activation_params.swiglu_limit, activation_params.swiglu_fusion);
-  }
 
   for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
     ComputeElem gate_part;
@@ -84,9 +79,6 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output, GemmOutput
         linear_part[i] = static_cast<float>(scalar_gemm[2 * global_elem + 1]);
       }
 
-      if (token == 0 && tid == 0 && elem_index == 0) {
-        printf("GatedActivation interleaved: Token 0, Gate=%.6f, Linear=%.6f\n", (float)gate_part[0], (float)linear_part[0]);
-      }
     } else {
       gate_part = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index]);
       linear_part = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + inter_size_vec]);
@@ -111,10 +103,6 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output, GemmOutput
       gate_act = fn(gate_part) * linear_part;
     }
 
-    if (token == 0 && tid == 0 && elem_index == 0) {
-      printf("GatedActivation: Token 0, Gate=%.6f, Linear=%.6f, Act=%.6f\n", (float)gate_part[0], (float)linear_part[0], (float)gate_act[0]);
-    }
-
     output_vec[elem_index] = arrayConvert<ComputeElem, OutputElem>(gate_act);
   }
 }
@@ -123,7 +111,6 @@ template <typename ActivationOutputType, typename GemmOutputType>
 void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_result,
                        int64_t const* num_valid_tokens_ptr, int64_t inter_size, int64_t num_tokens, ActivationType activation_type,
                        cudaStream_t stream, ActivationParameters activation_params) {
-  printf("DEBUG HOST: Entering doGatedActivation. Type=%d, Tokens=%ld\n", (int)activation_type, (long)num_tokens);
   int64_t const blocks = num_tokens;
   int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
 

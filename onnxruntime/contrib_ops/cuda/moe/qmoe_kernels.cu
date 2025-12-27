@@ -139,6 +139,164 @@ template void LaunchTranspose2D<float>(const float*, float*, int, int, cudaStrea
 template void LaunchTranspose2D<half>(const half*, half*, int, int, cudaStream_t);
 template void LaunchTranspose2D<__nv_bfloat16>(const __nv_bfloat16*, __nv_bfloat16*, int, int, cudaStream_t);
 
+// ====================== Sparse Mixer Kernel ===============================
+// Ported from old/moe_kernel.cu
+
+static constexpr int WARP_SIZE = 32;
+
+template <typename T, int TPB, int NUM_EXPERTS>
+__launch_bounds__(TPB) __global__
+    void sparse_mixer_top2(const T* inputs, float* output, int* indices, int* source_rows, const float jitter_eps) {
+  static constexpr int K = 2;
+
+  using cub_kvp = cub::KeyValuePair<int, T>;
+  using KVBlockReduce = cub::BlockReduce<cub_kvp, TPB>;
+
+  __shared__ float result_kvp_value[K];
+  __shared__ typename KVBlockReduce::TempStorage kvTmpStorage;
+
+  cub_kvp thread_kvp;
+  // cub::ArgMax arg_max; // Use default ArgMax
+
+  // Manually define ArgMax functor if not available or to ensure behavior
+  struct ArgMax {
+    __device__ __forceinline__ cub_kvp operator()(const cub_kvp& a, const cub_kvp& b) const {
+      return (b.value > a.value) ? b : a;
+    }
+  } arg_max;
+
+  int num_rows = gridDim.x;
+  const int block_row = blockIdx.x;
+
+  const int thread_row_offset = blockIdx.x * NUM_EXPERTS;
+
+  float factor[K];
+  bool logits_mask[K];
+
+#pragma unroll
+  for (int k_idx = 0; k_idx < K; ++k_idx) {
+    thread_kvp.key = 0;
+    thread_kvp.value = T(-1e20f);  // Init with small value
+
+    cub_kvp inp_kvp;
+#pragma unroll
+    for (int expert = threadIdx.x; expert < NUM_EXPERTS; expert += TPB) {
+      const int idx = thread_row_offset + expert;
+      inp_kvp.key = expert;
+      inp_kvp.value = inputs[idx];
+
+      for (int prior_k = 0; prior_k < k_idx; ++prior_k) {
+        const int prior_winning_expert = indices[K * block_row + prior_k];
+
+        if (prior_winning_expert == expert) {
+          inp_kvp = thread_kvp;
+        }
+      }
+
+      thread_kvp = arg_max(inp_kvp, thread_kvp);
+    }
+
+    const cub_kvp result_kvp = KVBlockReduce(kvTmpStorage).Reduce(thread_kvp, arg_max);
+    if (threadIdx.x == 0) {
+      const int idx = K * block_row + k_idx;
+      result_kvp_value[k_idx] = (float)result_kvp.value;
+      indices[idx] = result_kvp.key;
+      source_rows[idx] = k_idx * num_rows + block_row;
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int expert = threadIdx.x; expert < NUM_EXPERTS; expert += TPB) {
+      const int idx = thread_row_offset + expert;
+      factor[k_idx] = max(abs((float)inputs[idx]), result_kvp_value[k_idx]);
+      logits_mask[k_idx] = (result_kvp_value[k_idx] - (float)inputs[idx]) > (2 * jitter_eps * factor[k_idx]);
+      if (k_idx == 1 && expert == indices[K * block_row]) {
+        logits_mask[1] = true;
+      }
+    }
+  }
+
+#pragma unroll
+  for (int k_idx = 0; k_idx < K; ++k_idx) {
+    float row_sum(0);
+
+#pragma unroll
+    for (int ii = threadIdx.x; ii < NUM_EXPERTS; ii += TPB) {
+      const int idx = thread_row_offset + ii;
+      row_sum += logits_mask[k_idx] ? 0 : exp((static_cast<float>(inputs[idx]) - result_kvp_value[k_idx]));
+    }
+
+#pragma unroll
+    for (int mask = NUM_EXPERTS / 2; mask > 0; mask /= 2) {
+      row_sum += __shfl_xor_sync(0xFFFFFFFF, row_sum, mask, NUM_EXPERTS);
+    }
+
+    const float normalizing_factor = 1.f / row_sum;
+
+    const int idx = K * block_row + k_idx;
+    if (threadIdx.x == indices[idx]) {
+      const int input_idx = thread_row_offset + threadIdx.x;
+      output[idx] = logits_mask[k_idx] ? 0
+                                       : exp((static_cast<float>(inputs[input_idx]) - result_kvp_value[k_idx])) *
+                                             normalizing_factor;
+    }
+  }
+}
+
+template <typename T>
+void LaunchSparseMixerTop2Impl(
+    const T* input,
+    float* output,
+    int* indices,
+    int* source_rows,
+    int num_rows,
+    int num_experts,
+    cudaStream_t stream) {
+  static constexpr int WARPS_PER_TB = 4;
+  static constexpr int TPB = WARP_SIZE * WARPS_PER_TB;
+  static constexpr float jitter_eps = 0.01f;
+
+  switch (num_experts) {
+    case 8: {
+      sparse_mixer_top2<T, TPB, 8><<<num_rows, TPB, 0, stream>>>(input, output, indices, source_rows, jitter_eps);
+      break;
+    }
+    case 16: {
+      sparse_mixer_top2<T, TPB, 16><<<num_rows, TPB, 0, stream>>>(input, output, indices, source_rows, jitter_eps);
+      break;
+    }
+    // Replicate logic for other sizes if needed, or fallback/throw
+    default: {
+      // Fallback to 8 or standard softmax?
+      // Old code threw error. We will throw error in moe.cc if calling this with unsupported experts.
+      // Or just launch a generic one if TPB matches?
+      // For now, only 8 and 16 supported as per request.
+    }
+  }
+}
+
+void LaunchSparseMixerTop2(
+    const float* input,
+    float* output,
+    int* indices,
+    int* source_rows,
+    int num_rows,
+    int num_experts,
+    cudaStream_t stream) {
+  LaunchSparseMixerTop2Impl<float>(input, output, indices, source_rows, num_rows, num_experts, stream);
+}
+
+void LaunchSparseMixerTop2(
+    const half* input,
+    float* output,
+    int* indices,
+    int* source_rows,
+    int num_rows,
+    int num_experts,
+    cudaStream_t stream) {
+  LaunchSparseMixerTop2Impl<half>(input, output, indices, source_rows, num_rows, num_experts, stream);
+}
+
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime

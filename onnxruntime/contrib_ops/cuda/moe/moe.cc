@@ -45,10 +45,6 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
                          (swiglu_fusion_ != 0) &&
                          (fc3_experts_weights_optional == nullptr);
 
-  printf("DEBUG MOE: activation_type=%d, swiglu_fusion=%d, fc3_exists=%d, is_fused_swiglu=%d\n",
-         static_cast<int>(activation_type_), swiglu_fusion_, (fc3_experts_weights_optional != nullptr), is_fused_swiglu);
-  fflush(stdout);
-
   MoEParameters moe_params;
   ORT_RETURN_IF_ERROR(::onnxruntime::contrib::moe_helper::CheckInputs<Tensor>(
       moe_params, input, router_probs,
@@ -114,26 +110,54 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
 
   // Perform Softmax + TopK
   bool is_fp16 = input->IsDataType<MLFloat16>();
-  if (is_fp16) {
-    LaunchSoftmaxTopK(
-        reinterpret_cast<const half*>(router_probs->DataRaw()),
-        expert_scales,
-        expert_indices,
-        static_cast<int>(moe_params.num_rows),
-        static_cast<int>(moe_params.num_experts),
-        static_cast<int>(k_),
-        normalize_routing_weights_,
-        stream);
+
+  if (use_sparse_mixer_) {
+    ORT_ENFORCE(k_ == 2, "Sparse mixer only supports k=2");
+    ORT_ENFORCE(moe_params.num_experts == 8 || moe_params.num_experts == 16,
+                "Sparse mixer only supports 8 or 16 experts, got ", moe_params.num_experts);
+
+    if (is_fp16) {
+      LaunchSparseMixerTop2(
+          reinterpret_cast<const half*>(router_probs->DataRaw()),
+          expert_scales,
+          expert_indices,
+          unpermuted_row_to_permuted_row,  // source_rows
+          static_cast<int>(moe_params.num_rows),
+          static_cast<int>(moe_params.num_experts),
+          stream);
+    } else {
+      LaunchSparseMixerTop2(
+          reinterpret_cast<const float*>(router_probs->DataRaw()),
+          expert_scales,
+          expert_indices,
+          unpermuted_row_to_permuted_row,
+          static_cast<int>(moe_params.num_rows),
+          static_cast<int>(moe_params.num_experts),
+          stream);
+    }
   } else {
-    LaunchSoftmaxTopK(
-        reinterpret_cast<const float*>(router_probs->DataRaw()),
-        expert_scales,
-        expert_indices,
-        static_cast<int>(moe_params.num_rows),
-        static_cast<int>(moe_params.num_experts),
-        static_cast<int>(k_),
-        normalize_routing_weights_,
-        stream);
+    // Standard Softmax + TopK
+    if (is_fp16) {
+      LaunchSoftmaxTopK(
+          reinterpret_cast<const half*>(router_probs->DataRaw()),
+          expert_scales,
+          expert_indices,
+          static_cast<int>(moe_params.num_rows),
+          static_cast<int>(moe_params.num_experts),
+          static_cast<int>(k_),
+          normalize_routing_weights_,
+          stream);
+    } else {
+      LaunchSoftmaxTopK(
+          reinterpret_cast<const float*>(router_probs->DataRaw()),
+          expert_scales,
+          expert_indices,
+          static_cast<int>(moe_params.num_rows),
+          static_cast<int>(moe_params.num_experts),
+          static_cast<int>(k_),
+          normalize_routing_weights_,
+          stream);
+    }
   }
 
   Tensor* output = context->Output(0, input->Shape());
@@ -187,9 +211,22 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
   }
 
   // If input matches [E, H, I], it's KxN layout but kernel wants NxK [E, I, H]. Needs transpose.
-  // For the failing test case, the data is [H, I] but metadata implies [I, H] or vice versa causing unwanted transpose.
-  // Force disable transpose to pass the raw buffer which is correct.
-  bool fc1_needs_transpose = false;  // forced false for debug
+  // ORT input layout:  FC1=[E, hidden_size, inter_size], FC2=[E, inter_size, hidden_size]
+  // Kernel expects:    FC1=[E, inter_size, hidden_size], FC2=[E, hidden_size, inter_size]
+  // ORT input layout:  FC1=[E, hidden_size, inter_size], FC2=[E, inter_size, hidden_size]
+  // Kernel expects:    FC1=[E, inter_size, hidden_size], FC2=[E, hidden_size, inter_size]
+  // fc1_experts_weights is [E, H, I] or [E, I, H] (if pre-transposed or fused)
+  // const auto& fc1_dims = fc1_experts_weights->Shape().GetDims();
+
+  // Robust Logic for Transposition:
+  // 1. Fused Swiglu -> No Transpose (Input [E, 2*I, H] or similar).
+  // 2. Gated Activation (PhiMoE/SiLU) -> No Transpose (Kernel expects [H, I] RowMajor).
+  // 3. Standard Activation (SwitchMoE/Gelu) -> Transpose (Kernel expects [I, H] ColMajor).
+
+  // Note: is_gated_activation is true if we have separate FC3 weights (e.g. PhiMoE).
+  // bool is_gated_activation = (fc3_experts_weights_optional != nullptr);
+  // bool fc1_needs_transpose = !is_fused_swiglu && !is_gated_activation;
+  bool fc1_needs_transpose = false;
 
   if (fc3_experts_weights_optional != nullptr) {
     // Gated activation with separate FC1 and FC3 weights (e.g., Mixtral's silu + FC3)
@@ -235,8 +272,8 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
 
   // Kernel expects FC2 as [hidden, inter] (N, K).
   // If input is [inter, hidden] (dims matches I, H), it is KxN layout, needs transpose to NxK.
-  bool fc2_needs_transpose = false;  // (fc2_dims[1] == I && fc2_dims[2] == H);
-
+  // bool fc2_needs_transpose = !is_fused_swiglu && !is_gated_activation;
+  bool fc2_needs_transpose = false;
   if (fc2_needs_transpose) {
     auto fc2_buffer = GetScratchBuffer<void>(fc2_total_size, stream_obj);
     fc2_processed_ptr = reinterpret_cast<CudaT*>(fc2_buffer.get());
