@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "core/common/common.h"
 #include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_kernels.h"
 #include "contrib_ops/cuda/llm/moe_gemm/common.h"
 #include "contrib_ops/cuda/llm/common/env_utils.h"
@@ -35,6 +36,7 @@ struct QuantParams;
 template <class ActivationOutputType, class GemmOutputType, template <class> class ActFn>
 __global__ void doGatedActivationKernel(ActivationOutputType* output, GemmOutputType const* gemm_result,
                                         int64_t const* num_valid_tokens_ptr, int64_t inter_size,
+                                        ActivationType activation_type,
                                         ActivationParameters activation_params = {}) {
   int64_t const tid = threadIdx.x;
   int64_t const token = blockIdx.x;
@@ -61,21 +63,29 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output, GemmOutput
   ActFn<ComputeElem> fn{};
   bool const use_custom_swiglu = std::is_same_v<ActFn<float>, cutlass::epilogue::thread::SiLu<float>> &&
                                  (activation_params.alpha != 1.0f || activation_params.beta != 0.0f || isfinite(activation_params.swiglu_limit));
-  bool const is_interleaved = activation_params.swiglu_fusion == 1;
+  bool const is_swiglu_interleaved = activation_params.swiglu_fusion == 1;
+  if (token == 0 && tid == 0) {
+    printf("GatedActivation: activation_type=%d use_custom_swiglu=%d is_swiglu_interleaved=%d\n", int(activation_type), int(use_custom_swiglu), int(is_swiglu_interleaved));
+    printf("GatedActivation: activation_params: alpha=%f beta=%f swiglu_limit=%f swiglu_fusion=%d\n",
+           activation_params.alpha, activation_params.beta, activation_params.swiglu_limit, activation_params.swiglu_fusion);
+  }
 
   for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
     ComputeElem gate_part;
     ComputeElem linear_part;
 
-    if (is_interleaved) {
+    if (is_swiglu_interleaved) {
       auto* scalar_gemm = reinterpret_cast<GemmOutputType const*>(gemm_result);
       for (int i = 0; i < ACTIVATION_ELEM_PER_THREAD; ++i) {
         int64_t global_elem = elem_index * ACTIVATION_ELEM_PER_THREAD + i;
+        if (global_elem >= inter_size) continue;
+        // Interleaved Layout [Gate, Linear, Gate, Linear] matches Python swiglu(view(..., 2))
         gate_part[i] = static_cast<float>(scalar_gemm[2 * global_elem]);
         linear_part[i] = static_cast<float>(scalar_gemm[2 * global_elem + 1]);
       }
-      if (blockIdx.x == 0 && tid == 0 && elem_index == 0) {
-        printf("DEBUG INTERLEAVED KERNEL: Token 0, Gate=%.6f, Linear=%.6f\n", (float)gate_part[0], (float)linear_part[0]);
+
+      if (token == 0 && tid == 0 && elem_index == 0) {
+        printf("GatedActivation interleaved: Token 0, Gate=%.6f, Linear=%.6f\n", (float)gate_part[0], (float)linear_part[0]);
       }
     } else {
       gate_part = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index]);
@@ -99,11 +109,12 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output, GemmOutput
       }
     } else {
       gate_act = fn(gate_part) * linear_part;
-
-      if (blockIdx.x == 0 && tid == 0 && elem_index == 0) {
-        printf("DEBUG KERNEL: Token 0, Gate=%.6f, Linear=%.6f, Act=%.6f\n", (float)gate_part[0], (float)linear_part[0], (float)gate_act[0]);
-      }
     }
+
+    if (token == 0 && tid == 0 && elem_index == 0) {
+      printf("GatedActivation: Token 0, Gate=%.6f, Linear=%.6f, Act=%.6f\n", (float)gate_part[0], (float)linear_part[0], (float)gate_act[0]);
+    }
+
     output_vec[elem_index] = arrayConvert<ComputeElem, OutputElem>(gate_act);
   }
 }
@@ -132,7 +143,7 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
     }
     return fn_list[idx];
   }();
-  fn<<<blocks, threads, 0, stream>>>(output, gemm_result, num_valid_tokens_ptr, inter_size, activation_params);
+  fn<<<blocks, threads, 0, stream>>>(output, gemm_result, num_valid_tokens_ptr, inter_size, activation_type, activation_params);
 }
 
 // ============================== Activation =================================

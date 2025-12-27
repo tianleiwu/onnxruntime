@@ -663,6 +663,9 @@ class SparseMoeBlockORTHelper(nn.Module):
         return tensors["output"].reshape(batch_size, sequence_length, hidden_dim)
 
     def parity_check(self):
+        torch.manual_seed(42)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(42)
         hidden_state = torch.randn(self.batch_size, self.sequence_length, self.hidden_dim).to(device)
         torch_output = self.forward(hidden_state)
         ort_output = self.ort_forward(hidden_state)

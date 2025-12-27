@@ -2159,7 +2159,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
   bool const is_gated_activation = isGatedActivation(fc1_activation_type);
   bool const use_ampere_activation_fusion = gemm_runner.isFusedGatedActivation(config, is_gated_activation, inter_size, hidden_size);
   size_t const fc1_out_size = ((!use_ampere_activation_fusion) && is_gated_activation) ? inter_size * 2 : inter_size;
-  printf("DEBUG HOST (v2): gemm1 use_ampere_activation_fusion=%d, is_gated_activation=%d\n", use_ampere_activation_fusion, is_gated_activation);
+  printf("DEBUG HOST (v5): gemm1 use_ampere_activation_fusion=%d, is_gated_activation=%d\n", use_ampere_activation_fusion, is_gated_activation);
 
   int64_t const* total_tokens_including_expert = expert_first_token_offset + 1;
 
@@ -2455,7 +2455,7 @@ bool CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
 
   for (int expert_idx = 0; expert_idx < num_experts_per_node; ++expert_idx) {
     int weight_index = expert_idx + start_expert;
-    for (size_t i = host_expert_first_token_offset[expert_idx]; i < host_expert_first_token_offset[expert_idx + 1];
+    for (int64_t i = host_expert_first_token_offset[expert_idx]; i < host_expert_first_token_offset[expert_idx + 1];
          ++i) {
       int source_index = host_permuted_rows[i] % num_rows;
       int32_t lora_rank = lora_params.fc1_lora_ranks[source_index];
