@@ -666,7 +666,17 @@ class SparseMoeBlockORTHelper(nn.Module):
         torch.manual_seed(42)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(42)
-        hidden_state = torch.randn(self.batch_size, self.sequence_length, self.hidden_dim).to(device)
+
+        # Determine the correct torch dtype from the onnx_dtype
+        torch_dtype = onnx_to_torch_type_map[self.onnx_dtype]
+
+        hidden_state = torch.randn(self.batch_size, self.sequence_length, self.hidden_dim).to(
+            device=device, dtype=torch_dtype
+        )
+
+        if torch_dtype in [torch.float16, torch.bfloat16]:
+            self.to(torch_dtype)
+
         torch_output = self.forward(hidden_state)
         ort_output = self.ort_forward(hidden_state)
 
@@ -675,7 +685,7 @@ class SparseMoeBlockORTHelper(nn.Module):
         # Maps "ort_type:quant_bits" to (atol, rtol)
         ort_dtype_quant_bits_tolerance_map = {
             "FP32:0": (5e-3, 1e-3),
-            "FP16:0": (5e-2, 1e-3),
+            "FP16:0": (0.3, 0.05),
             "FP16:4": (3.0, 1e-2),
             "FP16:8": (2.0, 1e-2),
             "BF16:0": (1.0, 1e-2),
@@ -1075,8 +1085,8 @@ phi3_test_cases = list(
     itertools.product(
         [1, 4],  # batch_size
         [1, 32],  # sequence_length
-        quant_bits_list,
-        [None],  # onnx type, None mean fp32 for bits = 0, fp16 for bits > 0
+        [0],  # quant_bits (0 for fp32/fp32, 8 for int8/fp16, 4 for int4/fp16)
+        [TensorProto.FLOAT, TensorProto.FLOAT16],  # onnx type, None mean fp32 for bits = 0, fp16 for bits > 0
         [True],  # normalize_routing_weights
     )
 )

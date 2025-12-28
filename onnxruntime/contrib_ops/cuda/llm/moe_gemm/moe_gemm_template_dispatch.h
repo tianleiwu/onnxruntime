@@ -172,8 +172,8 @@ struct genericMoeGemmKernelLauncher {
 
       // Debug: Print GEMM dimensions and samples for float types
       if constexpr (std::is_same_v<T, float>) {
-        printf("DEBUG [GEMM float]: num_experts=%d, N=%lld, K=%lld, num_rows=%lld\n",
-               inputs.num_experts, (long long)inputs.n, (long long)inputs.k, (long long)inputs.num_rows);
+        // printf("DEBUG [GEMM float]: num_experts=%d, N=%lld, K=%lld, num_rows=%lld\n",
+        //        inputs.num_experts, (long long)inputs.n, (long long)inputs.k, (long long)inputs.num_rows);
 
         // Copy offsets to host
         std::vector<int64_t> host_offsets(inputs.num_experts);
@@ -193,7 +193,7 @@ struct genericMoeGemmKernelLauncher {
           int64_t end_row = host_offsets[e];
           int64_t valid_rows = end_row - start_row;
 
-          printf("DEBUG [GEMM float] Expert %d: Valid Rows=%lld, Start Row=%lld\n", e, (long long)valid_rows, (long long)start_row);
+          // printf("DEBUG [GEMM float] Expert %d: Valid Rows=%lld, Start Row=%lld\n", e, (long long)valid_rows, (long long)start_row);
 
           if (valid_rows > 0) {
             // Sample Input A (Row `start_row`)
@@ -216,9 +216,9 @@ struct genericMoeGemmKernelLauncher {
             float b_sample = 0;
             cudaMemcpy(&b_sample, b_ptr, sizeof(float), cudaMemcpyDeviceToHost);
 
-            printf("DEBUG [GEMM float] Expert %d: A[%lld]=%f, B[0]=%f\n", e, (long long)(start_row * inputs.k), a_sample, b_sample);
+            // printf("DEBUG [GEMM float] Expert %d: A[%lld]=%f, B[0]=%f\n", e, (long long)(start_row * inputs.k), a_sample, b_sample);
           } else {
-            printf("DEBUG [GEMM float] Expert %d: NO VALID ROWS\n", e);
+            // printf("DEBUG [GEMM float] Expert %d: NO VALID ROWS\n", e);
           }
         }
         fflush(stdout);
@@ -258,7 +258,7 @@ struct genericMoeGemmKernelLauncher {
             const float* c_ptr = reinterpret_cast<const float*>(inputs.C) + start_row * inputs.n;
             float c_sample = 0;
             cudaMemcpy(&c_sample, c_ptr, sizeof(float), cudaMemcpyDeviceToHost);
-            printf("DEBUG [GEMM float] Expert %d: C[%lld]=%f (after GEMM)\n", e, (long long)(start_row * inputs.n), c_sample);
+            // printf("DEBUG [GEMM float] Expert %d: C[%lld]=%f (after GEMM)\n", e, (long long)(start_row * inputs.n), c_sample);
           }
         }
         fflush(stdout);
