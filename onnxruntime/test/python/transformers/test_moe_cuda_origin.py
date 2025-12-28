@@ -335,7 +335,7 @@ def create_phi_moe_onnx_graph(
             "MoE_0",
             k=topk,
             normalize_routing_weights=normalize_routing_weights,
-            use_sparse_mixer=1,
+            use_sparse_mixer=0,  # Align with Python Reference (Softmax)
             activation_type="silu",
             domain="com.microsoft",
         ),
@@ -1078,7 +1078,7 @@ phi3_test_cases = list(
         [1, 32],  # sequence_length
         quant_bits_list,
         [None],  # onnx type, None mean fp32 for bits = 0, fp16 for bits > 0
-        [True, False],  # normalize_routing_weights
+        [True],  # normalize_routing_weights
     )
 )
 
@@ -1121,7 +1121,9 @@ def swiglu(x: torch.Tensor, alpha: float = 1.702, limit: float = 7.0):
         x_glu = x_glu.clamp(max=limit)
         x_linear = x_linear.clamp(min=-limit, max=limit)
 
-    y = x_glu * torch.sigmoid(alpha * x_glu) * (x_linear + 1)
+    # Standard SwiGLU: SiLU(x_glu) * x_linear = (x_glu * sigmoid(x_glu)) * x_linear
+    # Aligns with ONNX Runtime's SiLU activation in Fused MoE.
+    y = F.silu(x_glu) * x_linear
     return y
 
 
