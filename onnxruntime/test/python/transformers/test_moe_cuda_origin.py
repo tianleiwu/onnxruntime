@@ -1105,14 +1105,23 @@ class SwigluMoeConfig:
         intermediate_size=2048,
         num_experts_per_token=2,
         num_local_experts=8,
+        swiglu_fusion=1,
+        swiglu_limit=7.0,
+        swiglu_alpha=1.702,
+        swiglu_beta=1.0,
     ):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_experts_per_token = num_experts_per_token
         self.num_local_experts = num_local_experts
+        self.swiglu_fusion = swiglu_fusion
+        self.swiglu_limit = swiglu_limit
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_beta = swiglu_beta
 
 
-def swiglu(x: torch.Tensor, alpha: float = 1.702, limit: float = 7.0):
+# GPT-OSS custom SwiGLU (input is interleaved format)
+def swiglu(x: torch.Tensor, alpha: float = 1.702, beta: float = 1.0, limit: float = 7.0):
     dim = x.shape[-1]
     x = x.view(-1, dim // 2, 2)
     x_glu, x_linear = x[..., 0], x[..., 1]
@@ -1121,9 +1130,7 @@ def swiglu(x: torch.Tensor, alpha: float = 1.702, limit: float = 7.0):
         x_glu = x_glu.clamp(max=limit)
         x_linear = x_linear.clamp(min=-limit, max=limit)
 
-    # Standard SwiGLU: SiLU(x_glu) * x_linear = (x_glu * sigmoid(x_glu)) * x_linear
-    # Aligns with ONNX Runtime's SiLU activation in Fused MoE.
-    y = F.silu(x_glu) * x_linear
+    y = x_glu * torch.sigmoid(alpha * x_glu) * (x_linear + beta)
     return y
 
 
@@ -1134,10 +1141,13 @@ class SwigluMlp(nn.Module):
         self.hidden_dim = config.hidden_size
         self.w1 = nn.Linear(self.hidden_dim, 2 * self.intermediate_size, bias=True)
         self.w2 = nn.Linear(self.intermediate_size, self.hidden_dim, bias=True)
+        self.alpha = config.swiglu_alpha
+        self.beta = config.swiglu_beta
+        self.limit = config.swiglu_limit
 
     def forward(self, x):
         x1 = self.w1(x)
-        y = swiglu(x1)
+        y = swiglu(x1, self.alpha, self.beta, self.limit)
         y = self.w2(y)
         return y
 
@@ -1420,7 +1430,16 @@ swiglu_test_cases = list(
 class TestSwigluMoE(unittest.TestCase):
     @parameterized.expand(swiglu_test_cases)
     def test_swiglu_moe_parity(self, batch_size, sequence_length, quant_bits):
-        config = SwigluMoeConfig(hidden_size=64, intermediate_size=256, num_experts_per_token=2, num_local_experts=4)
+        config = SwigluMoeConfig(
+            hidden_size=64,
+            intermediate_size=256,
+            num_experts_per_token=2,
+            num_local_experts=4,
+            swiglu_fusion=1,
+            swiglu_alpha=1.702,
+            swiglu_beta=1.0,
+            swiglu_limit=7.0,
+        )
         moe = SwigluMoEBlock(config, batch_size, sequence_length, quant_bits)
         moe.to(device)
         moe.parity_check()
