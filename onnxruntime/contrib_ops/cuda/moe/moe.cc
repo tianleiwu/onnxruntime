@@ -167,35 +167,26 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
   onnxruntime::llm::kernels::cutlass_kernels::MoeMinLatencyParams min_latency_params;
 
   // =============================================================================
-  // WEIGHT LAYOUT TRANSPOSITION (Short-term fix)
+  // WEIGHT PACKING
   // =============================================================================
-  // ORT input layout:  FC1=[E, hidden_size, inter_size], FC2=[E, inter_size, hidden_size]
-  // Kernel expects:    FC1=[E, inter_size, hidden_size], FC2=[E, hidden_size, inter_size]
-  // So FC1 needs transpose from [K, N] to [N, K] per expert, and FC2 is already correct shape
-  // but stored transposed. Must transpose both.
-  //
-  // TODO(long-term): Consider updating ONNX op schema to match kernel layout, or
-  // have the kernel accept ORT layout directly to avoid runtime transposes.
+  // Prepare buffers for CutlassMoeFCRunner.
+  // For standard MoE, we copy weights directly.
+  // For SwiGLU with separate gates (e.g. Mixtral), we interleave FC1 and FC3 weights.
   // =============================================================================
 
   // Calculate buffer sizes
   size_t fc1_block_size = static_cast<size_t>(moe_params.inter_size) * static_cast<size_t>(moe_params.hidden_size);
-  size_t fc2_block_size = static_cast<size_t>(moe_params.hidden_size) * static_cast<size_t>(moe_params.inter_size);
-  int H = static_cast<int>(moe_params.hidden_size);
-  int I = static_cast<int>(moe_params.inter_size);
   int E = static_cast<int>(moe_params.num_experts);
 
   // Allocate buffers
   size_t fc1_total_size = (fc3_experts_weights_optional != nullptr)
                               ? E * fc1_block_size * 2 * sizeof(CudaT)  // fused
                               : E * fc1_block_size * sizeof(CudaT);
-  size_t fc2_total_size = E * fc2_block_size * sizeof(CudaT);
 
   auto fc1_processed_buffer = GetScratchBuffer<void>(fc1_total_size, stream_obj);
   CudaT* fc1_processed_ptr = reinterpret_cast<CudaT*>(fc1_processed_buffer.get());
 
-  // FC1 Handling (validating dims against H and I)
-
+  // FC1 Handling
   const CudaT* fc1_input_ptr = reinterpret_cast<const CudaT*>(fc1_experts_weights->DataRaw());
 
   // Detect fused SwiGLU weights: swiglu_fusion_ != 0 indicates FC1 contains pre-fused gate+value weights
@@ -209,24 +200,6 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
   if (is_fused_swiglu) {
     fc1_total_size = E * fc1_per_expert_size * sizeof(CudaT);
   }
-
-  // If input matches [E, H, I], it's KxN layout but kernel wants NxK [E, I, H]. Needs transpose.
-  // ORT input layout:  FC1=[E, hidden_size, inter_size], FC2=[E, inter_size, hidden_size]
-  // Kernel expects:    FC1=[E, inter_size, hidden_size], FC2=[E, hidden_size, inter_size]
-  // ORT input layout:  FC1=[E, hidden_size, inter_size], FC2=[E, inter_size, hidden_size]
-  // Kernel expects:    FC1=[E, inter_size, hidden_size], FC2=[E, hidden_size, inter_size]
-  // fc1_experts_weights is [E, H, I] or [E, I, H] (if pre-transposed or fused)
-  // const auto& fc1_dims = fc1_experts_weights->Shape().GetDims();
-
-  // Robust Logic for Transposition:
-  // 1. Fused Swiglu -> No Transpose (Input [E, 2*I, H] or similar).
-  // 2. Gated Activation (PhiMoE/SiLU) -> No Transpose (Kernel expects [H, I] RowMajor).
-  // 3. Standard Activation (SwitchMoE/Gelu) -> Transpose (Kernel expects [I, H] ColMajor).
-
-  // Note: is_gated_activation is true if we have separate FC3 weights (e.g. PhiMoE).
-  // bool is_gated_activation = (fc3_experts_weights_optional != nullptr);
-  // bool fc1_needs_transpose = !is_fused_swiglu && !is_gated_activation;
-  bool fc1_needs_transpose = false;
 
   if (fc3_experts_weights_optional != nullptr) {
     // Gated activation with separate FC1 and FC3 weights (e.g., Mixtral's silu + FC3)
@@ -244,47 +217,18 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
       CudaT* dest_fc1 = fc1_processed_ptr + e * 2 * fc1_block_size;                   // First half of expert e (Gate/FC1)
       CudaT* dest_fc3 = fc1_processed_ptr + e * 2 * fc1_block_size + fc1_block_size;  // Second half of expert e (Linear/FC3)
 
-      if (fc1_needs_transpose) {
-        // Transpose [H, I] -> [I, H]
-        LaunchTranspose2D<CudaT>(fc1_input_ptr + e * fc1_block_size, dest_fc1, H, I, stream);
-        LaunchTranspose2D<CudaT>(fc3_input_ptr + e * fc1_block_size, dest_fc3, H, I, stream);
-      } else {
-        // Copy [I, H] directly
-        CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(dest_fc1, fc1_input_ptr + e * fc1_block_size, fc1_block_size * sizeof(CudaT), cudaMemcpyDeviceToDevice, stream));
-        CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(dest_fc3, fc3_input_ptr + e * fc1_block_size, fc1_block_size * sizeof(CudaT), cudaMemcpyDeviceToDevice, stream));
-      }
+      // Copy [I, H] directly
+      CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(dest_fc1, fc1_input_ptr + e * fc1_block_size, fc1_block_size * sizeof(CudaT), cudaMemcpyDeviceToDevice, stream));
+      CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(dest_fc3, fc3_input_ptr + e * fc1_block_size, fc1_block_size * sizeof(CudaT), cudaMemcpyDeviceToDevice, stream));
     }
   } else {  // Non-SwiGLU FC1 (may still be fused SwiGLU weights if is_fused_swiglu is true)
-    if (fc1_needs_transpose) {
-      for (int e = 0; e < E; ++e) {
-        // Use fc1_per_expert_size for correct offset in fused weight case
-        LaunchTranspose2D<CudaT>(fc1_input_ptr + e * fc1_per_expert_size, fc1_processed_ptr + e * fc1_per_expert_size, H, is_fused_swiglu ? 2 * I : I, stream);
-      }
-    } else {
-      CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(fc1_processed_ptr, fc1_input_ptr, fc1_total_size, cudaMemcpyDeviceToDevice, stream));
-    }
+    CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(fc1_processed_ptr, fc1_input_ptr, fc1_total_size, cudaMemcpyDeviceToDevice, stream));
   }
 
   // FC2 Handling
-
   const CudaT* fc2_input_ptr = reinterpret_cast<const CudaT*>(fc2_experts_weights->DataRaw());
-  CudaT* fc2_processed_ptr = nullptr;
-
-  // Kernel expects FC2 as [hidden, inter] (N, K).
-  // If input is [inter, hidden] (dims matches I, H), it is KxN layout, needs transpose to NxK.
-  // bool fc2_needs_transpose = !is_fused_swiglu && !is_gated_activation;
-  bool fc2_needs_transpose = false;
-  if (fc2_needs_transpose) {
-    auto fc2_buffer = GetScratchBuffer<void>(fc2_total_size, stream_obj);
-    fc2_processed_ptr = reinterpret_cast<CudaT*>(fc2_buffer.get());
-    for (int e = 0; e < E; ++e) {
-      // Transpose [I, H] -> [H, I]
-      LaunchTranspose2D<CudaT>(fc2_input_ptr + e * fc2_block_size, fc2_processed_ptr + e * fc2_block_size, I, H, stream);
-    }
-  } else {
-    // Layout matches kernel expectation [H, I]. Use directly.
-    fc2_processed_ptr = const_cast<CudaT*>(fc2_input_ptr);
-  }
+  // Layout matches kernel expectation [H, I]. Use directly.
+  const CudaT* fc2_processed_ptr = fc2_input_ptr;
 
   moe_runner.runMoe(
       reinterpret_cast<const CudaT*>(input->template Data<T>()),

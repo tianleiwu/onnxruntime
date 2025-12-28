@@ -106,39 +106,6 @@ void LaunchSoftmaxTopK(
   SoftmaxTopKKernel<half><<<grid, block, 0, stream>>>(logits, topk_scales, topk_indices, num_rows, num_experts, k, normalize_scales);
 }
 
-// Transpose kernel: converts [rows, cols] to [cols, rows]
-// For MoE: transposes weights from ORT layout [hidden_size, inter_size]
-// to kernel layout [inter_size, hidden_size]
-template <typename T>
-__global__ void Transpose2DKernel(const T* input, T* output, int rows, int cols) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = rows * cols;
-  if (idx >= total) return;
-
-  int r = idx / cols;  // row in input
-  int c = idx % cols;  // col in input
-  // output[c, r] = input[r, c]
-  output[c * rows + r] = input[r * cols + c];
-}
-
-template <typename T>
-void LaunchTranspose2D(
-    const T* input,
-    T* output,
-    int rows,
-    int cols,
-    cudaStream_t stream) {
-  int total = rows * cols;
-  int block = 256;
-  int grid = (total + block - 1) / block;
-  Transpose2DKernel<T><<<grid, block, 0, stream>>>(input, output, rows, cols);
-}
-
-// Explicit template instantiations
-template void LaunchTranspose2D<float>(const float*, float*, int, int, cudaStream_t);
-template void LaunchTranspose2D<half>(const half*, half*, int, int, cudaStream_t);
-template void LaunchTranspose2D<__nv_bfloat16>(const __nv_bfloat16*, __nv_bfloat16*, int, int, cudaStream_t);
-
 // ====================== Sparse Mixer Kernel ===============================
 // Ported from old/moe_kernel.cu
 
