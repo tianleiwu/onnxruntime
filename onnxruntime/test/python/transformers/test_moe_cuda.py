@@ -1473,7 +1473,7 @@ perf_test_cases = list(
 @unittest.skipIf(pipeline_mode or not use_cuda, "skipping performance test in CI pipeline.")
 class TestSwigluMoEPerf(unittest.TestCase):
     @parameterized.expand(perf_test_cases)
-    def test_swiglu_moe_parity(self, batch_size, sequence_length, quant_bits):
+    def test_swiglu_moe_performance(self, batch_size, sequence_length, quant_bits):
         hidden_size = 2880
         intermediate_size = 2880
         num_experts_per_token = 8
@@ -1594,6 +1594,7 @@ class TestSparseMixer(unittest.TestCase):
         output = sess.run(None, inputs)
         self.assertEqual(output[0].shape, (num_rows, hidden_size))
 
+    @unittest.skipIf(not use_cuda, "Sparse Mixer testing requires CUDAExecutionProvider")
     def test_sparse_mixer_parity(self):
         # Parity test against Python masked_sampling_omp_inference
         # Checks if ORT kernel logic (jitter, OMP) matches Python reference.
