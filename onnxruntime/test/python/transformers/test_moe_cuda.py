@@ -64,8 +64,8 @@ def quant_dequant(weights, is_4_bit_quantization: bool = True):
         # Quantize on CPU
         # quantize_matmul_4bits returns: (q_weight, scale, zero_point)
         # weights: [out, in] -> transpose to [in, out] for quantization
-        weights_T = weights.T.contiguous()
-        rows, cols = weights_T.shape
+        weights_t = weights.T.contiguous()
+        rows, cols = weights_t.shape
         block_size = 128
 
         # We need to manually call the quantization function exposed in pybind
@@ -76,42 +76,42 @@ def quant_dequant(weights, is_4_bit_quantization: bool = True):
         # m.def("quantize_matmul_4bits", &QuantizeMatMulNBitsBlockwise<float, 4>);
 
         # Create output buffers
-        # shape: [ N, block_per_K, block_blob_size ]
-        # N = cols, K = rows
-        K, N = rows, cols
-        block_per_K = (K + block_size - 1) // block_size
+        # shape: [ n, block_per_k, block_blob_size ]
+        # n = cols, k = rows
+        k, n = rows, cols
+        block_per_k = (k + block_size - 1) // block_size
         blob_size = block_size // 2  # 4 bits
 
-        q_weight = numpy.zeros((N, block_per_K, blob_size), dtype=numpy.uint8)
-        scale = numpy.zeros((N, block_per_K), dtype=numpy.float32)  # Use float32 for scale
-        zero_point = numpy.zeros((N, (block_per_K + 1) // 2), dtype=numpy.uint8)
+        q_weight = numpy.zeros((n, block_per_k, blob_size), dtype=numpy.uint8)
+        scale = numpy.zeros((n, block_per_k), dtype=numpy.float32)  # Use float32 for scale
+        zero_point = numpy.zeros((n, (block_per_k + 1) // 2), dtype=numpy.uint8)
 
-        # weights_T is float32 or float16. The pybind expects float or MLFloat16.
+        # weights_t is float32 or float16. The pybind expects float or MLFloat16.
         # If weights are float32, use float version.
         is_symmetric = True
 
         if weights.dtype == torch.float32:
             _quantize.quantize_matmul_4bits(
-                q_weight, weights_T.detach().cpu().numpy(), scale, zero_point, block_size, N, K, is_symmetric
+                q_weight, weights_t.detach().cpu().numpy(), scale, zero_point, block_size, n, k, is_symmetric
             )
         elif weights.dtype == torch.float16:
             # We might need to handle float16 manually or convert to float32
             _quantize.quantize_matmul_4bits(
-                q_weight, weights_T.detach().cpu().numpy(), scale, zero_point, block_size, N, K, is_symmetric
+                q_weight, weights_t.detach().cpu().numpy(), scale, zero_point, block_size, n, k, is_symmetric
             )
 
         # The output of quantize_matmul_4bits is blockwise.
-        # We need to reshape it to [N, K // 2].
-        # q_weight is [N, K/block_size, block_size/2]
-        # reshape to [N, K/2]
-        q_weight_reshaped = q_weight.reshape(N, -1)
+        # We need to reshape it to [n, k // 2].
+        # q_weight is [n, k/block_size, block_size/2]
+        # reshape to [n, k/2]
+        q_weight_reshaped = q_weight.reshape(n, -1)
 
         # Pack weights for CUDA mixed-gemm kernel (FpA_IntB format), and qMoE kernel uses the same format.
-        processed_q_weight = _quantize.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, N, K, 4)
+        processed_q_weight = _quantize.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, n, k, 4)
 
         # So we need to DEQUANTIZE back to get `result`.
-        # scale is [N, block_per_K]
-        # q_weight is [N, block_per_K, blob_size]
+        # scale is [n, block_per_k]
+        # q_weight is [n, block_per_k, blob_size]
 
         # Let's do simple dequantization in torch for the reference
         scale_torch = torch.from_numpy(scale).to(weights.device)
@@ -123,13 +123,13 @@ def quant_dequant(weights, is_4_bit_quantization: bool = True):
         # high 4 bits
         q_high = (q_weight_torch >> 4) & 0x0F
 
-        # q_weight was [N, blocks, block/2]
-        # we want [N, blocks, block]
+        # q_weight was [n, blocks, block/2]
+        # we want [n, blocks, block]
         # Interleave low and high?
         # MlasQuantizeBlockwise packs 2 elements into uint8.
         # e0 is low 4 bits, e1 is high 4 bits.
 
-        q_unpacked = torch.stack((q_low, q_high), dim=-1).view(N, block_per_K, block_size)
+        q_unpacked = torch.stack((q_low, q_high), dim=-1).view(n, block_per_k, block_size)
 
         # symmetric quantization: value = (q - 8) * scale
         # 8 is zero point for 4-bit symmetric?
@@ -142,21 +142,21 @@ def quant_dequant(weights, is_4_bit_quantization: bool = True):
         # Usually mapped to [1, 15] with zero point 8.
 
         q_unpacked = q_unpacked.to(weights.dtype)
-        scale_torch = scale_torch.unsqueeze(-1)  # [N, blocks, 1]
+        scale_torch = scale_torch.unsqueeze(-1)  # [n, blocks, 1]
 
         # (q - 8) * scale
         dequantized = (q_unpacked - 8.0) * scale_torch
 
-        # reshape to [N, K] to match nn.Linear.weight shape [out_features, in_features]
-        result = dequantized.view(N, K)
+        # reshape to [n, k] to match nn.Linear.weight shape [out_features, in_features]
+        result = dequantized.view(n, k)
 
-        # pack_weights_for_cuda_mixed_gemm returns flat [K * N // 2].
-        # ONNX expects [hidden_size, inter_size // 2] = [K, N // 2].
-        # The function transposes, so output is in [K, N // 2] row-major order.
-        processed_q_weight_torch = torch.from_numpy(processed_q_weight).reshape(K, N // 2)
+        # pack_weights_for_cuda_mixed_gemm returns flat [k * n // 2].
+        # ONNX expects [hidden_size, inter_size // 2] = [k, n // 2].
+        # The function transposes, so output is in [k, n // 2] row-major order.
+        processed_q_weight_torch = torch.from_numpy(processed_q_weight).reshape(k, n // 2)
 
-        # Scale: flatten to [N] for per-channel quantization compatibility.
-        # The graph expects [inter_size] = [N].
+        # Scale: flatten to [n] for per-channel quantization compatibility.
+        # The graph expects [inter_size] = [n].
         scale_flat = scale.mean(axis=1)  # Average across blocks for per-channel approx
         scale_flat_torch = torch.from_numpy(scale_flat).to(weights.device)
 
@@ -164,31 +164,31 @@ def quant_dequant(weights, is_4_bit_quantization: bool = True):
 
     else:
         # 8-bit quantization
-        weights_T = weights.T.contiguous()
-        rows, cols = weights_T.shape
+        weights_t = weights.T.contiguous()
+        rows, cols = weights_t.shape
         block_size = 128
-        K, N = rows, cols
-        block_per_K = (K + block_size - 1) // block_size
+        k, n = rows, cols
+        block_per_k = (k + block_size - 1) // block_size
 
         # 8-bit: 1 byte per element
-        q_weight = numpy.zeros((N, block_per_K, block_size), dtype=numpy.uint8)
-        scale = numpy.zeros((N, block_per_K), dtype=numpy.float32)
-        zero_point = numpy.zeros((N, block_per_K), dtype=numpy.uint8)  # Or dummy?
+        q_weight = numpy.zeros((n, block_per_k, block_size), dtype=numpy.uint8)
+        scale = numpy.zeros((n, block_per_k), dtype=numpy.float32)
+        zero_point = numpy.zeros((n, block_per_k), dtype=numpy.uint8)  # Or dummy?
 
         is_symmetric = True
 
         if weights.dtype == torch.float32:
             _quantize.quantize_matmul_8bits(
-                q_weight, weights_T.detach().cpu().numpy(), scale, zero_point, block_size, N, K, is_symmetric
+                q_weight, weights_t.detach().cpu().numpy(), scale, zero_point, block_size, n, k, is_symmetric
             )
         else:
             _quantize.quantize_matmul_8bits(
-                q_weight, weights_T.detach().cpu().numpy(), scale, zero_point, block_size, N, K, is_symmetric
+                q_weight, weights_t.detach().cpu().numpy(), scale, zero_point, block_size, n, k, is_symmetric
             )
 
-        q_weight_reshaped = q_weight.reshape(N, -1)
+        q_weight_reshaped = q_weight.reshape(n, -1)
         # Pack weights for CUDA mixed-gemm kernel (FpA_IntB format)
-        processed_q_weight = _quantize.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, N, K, 8)
+        processed_q_weight = _quantize.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, n, k, 8)
 
         # Dequantize for reference
         # (q - 128) * scale if using 128 offset? or (q) * scale if symmetric around 0?
@@ -209,14 +209,14 @@ def quant_dequant(weights, is_4_bit_quantization: bool = True):
 
         scale_torch = scale_torch.unsqueeze(-1)
         dequantized = q_signed.to(weights.dtype) * scale_torch
-        # reshape to [N, K] to match nn.Linear.weight shape [out_features, in_features]
-        result = dequantized.view(N, K)
+        # reshape to [n, k] to match nn.Linear.weight shape [out_features, in_features]
+        result = dequantized.view(n, k)
 
-        # pack_weights_moe returns flat [K * N].
-        # ONNX expects [hidden_size, inter_size] = [K, N].
-        processed_q_weight_torch = torch.from_numpy(processed_q_weight).reshape(K, N)
+        # pack_weights_moe returns flat [k * n].
+        # ONNX expects [hidden_size, inter_size] = [k, n].
+        processed_q_weight_torch = torch.from_numpy(processed_q_weight).reshape(k, n)
 
-        # Scale: flatten to [N] for per-channel quantization compatibility.
+        # Scale: flatten to [n] for per-channel quantization compatibility.
         scale_flat = scale.mean(axis=1)  # Average across blocks for per-channel approx
         scale_flat_torch = torch.from_numpy(scale_flat).to(weights.device)
 
@@ -313,42 +313,42 @@ def quant_dequant(weights, is_4_bit_quantization: bool = True):
     from onnxruntime.capi import _pybind_state as _quantize
 
     if is_4_bit_quantization:
-        weights_T = weights.T.contiguous()
-        rows, cols = weights_T.shape
-        K, N = rows, cols
-        block_size = K  # Per-channel
+        weights_t = weights.T.contiguous()
+        rows, cols = weights_t.shape
+        k, n = rows, cols
+        block_size = k  # Per-channel
 
-        block_per_K = (K + block_size - 1) // block_size  # Should be 1
+        block_per_k = (k + block_size - 1) // block_size  # Should be 1
         blob_size = block_size // 2
 
-        q_weight = numpy.zeros((N, block_per_K, blob_size), dtype=numpy.uint8)
-        scale = numpy.zeros((N, block_per_K), dtype=numpy.float32)
-        zero_point = numpy.zeros((N, (block_per_K + 1) // 2), dtype=numpy.uint8)
+        q_weight = numpy.zeros((n, block_per_k, blob_size), dtype=numpy.uint8)
+        scale = numpy.zeros((n, block_per_k), dtype=numpy.float32)
+        zero_point = numpy.zeros((n, (block_per_k + 1) // 2), dtype=numpy.uint8)
 
         is_symmetric = True
 
         if weights.dtype == torch.float32:
             _quantize.quantize_matmul_4bits(
-                q_weight, weights_T.cpu().numpy(), scale, zero_point, block_size, N, K, is_symmetric
+                q_weight, weights_t.cpu().numpy(), scale, zero_point, block_size, n, k, is_symmetric
             )
         elif weights.dtype == torch.float16:
             _quantize.quantize_matmul_4bits(
-                q_weight, weights_T.cpu().numpy(), scale, zero_point, block_size, N, K, is_symmetric
+                q_weight, weights_t.cpu().numpy(), scale, zero_point, block_size, n, k, is_symmetric
             )
 
         # Reshape for packing
-        q_weight_reshaped = q_weight.reshape(N, -1)
+        q_weight_reshaped = q_weight.reshape(n, -1)
 
         # Pack
         # We invoke our new function
-        processed_q_weight = _quantize.pack_weights_moe(q_weight_reshaped, N, K, 4, block_size)
+        processed_q_weight = _quantize.pack_weights_moe(q_weight_reshaped, n, k, 4, block_size)
 
         # Dequantize for reference
-        # scale: [N, 1]
+        # scale: [n, 1]
         scale_torch = torch.from_numpy(scale).to(device=weights.device, dtype=weights.dtype)
 
         # We need raw q_weights for dequantization value recovery
-        q_weight_torch = torch.from_numpy(q_weight_reshaped).to(device=weights.device)  # [N, K/2]
+        q_weight_torch = torch.from_numpy(q_weight_reshaped).to(device=weights.device)  # [n, k/2]
 
         # unpack 4 bits manually for reference
         # Little endian packing in generic logic?
@@ -357,7 +357,7 @@ def quant_dequant(weights, is_4_bit_quantization: bool = True):
         # So low 4 bits is first element, high 4 bits is second.
 
         # unpack
-        # We need to expand [N, K/2] to [N, K]
+        # We need to expand [n, k/2] to [n, k]
         # But we need to use the original `q_weight` buffer before packing?
         # Yes, `q_weight` from `quantize_matmul_4bits` matches `q` values.
 
@@ -366,7 +366,7 @@ def quant_dequant(weights, is_4_bit_quantization: bool = True):
 
         # Interleave
         # flat view
-        q_flat = torch.stack((q_low, q_high), dim=-1).view(N, K)
+        q_flat = torch.stack((q_low, q_high), dim=-1).view(n, k)
 
         # symmetric 4-bit range [0, 15], zero point 8.
         # value = (q - 8) * scale

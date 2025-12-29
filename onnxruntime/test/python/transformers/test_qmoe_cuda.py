@@ -109,11 +109,11 @@ def preprocess_weights_for_mixed_gemm(
     if len(tensor.shape) == 2:
         tensor = tensor.unsqueeze(0)
 
-    # Input tensor shape is [Experts, N, K_packed]. K_packed is K/2 for 4-bit, K for 8-bit.
+    # Input tensor shape is [Experts, n, k_packed]. k_packed is k/2 for 4-bit, k for 8-bit.
     num_experts = tensor.shape[0]
-    N = tensor.shape[1]
-    K_packed = tensor.shape[2]
-    K = K_packed * 2 if quant_bits == 4 else K_packed
+    n = tensor.shape[1]
+    k_packed = tensor.shape[2]
+    k = k_packed * 2 if quant_bits == 4 else k_packed
 
     packed_list = []
 
@@ -122,11 +122,11 @@ def preprocess_weights_for_mixed_gemm(
     if pybind and hasattr(pybind, "pack_weights_for_cuda_mixed_gemm") and torch.cuda.is_available():
         for i in range(num_experts):
             weight = tensor[i].cpu().numpy()
-            packed = pybind.pack_weights_for_cuda_mixed_gemm(weight, N, K, quant_bits)
+            packed = pybind.pack_weights_for_cuda_mixed_gemm(weight, n, k, quant_bits)
             # pack_weights_for_cuda_mixed_gemm returns int8 array of shape [packed_size]
-            # We need to reshape it to (K, N/2) for 4-bit, (K, N) for 8-bit.
-            output_rows = K
-            output_cols = N // 2 if quant_bits == 4 else N
+            # We need to reshape it to (k, n/2) for 4-bit, (k, n) for 8-bit.
+            output_rows = k
+            output_cols = n // 2 if quant_bits == 4 else n
             packed_tensor = torch.from_numpy(packed).to(tensor.device)
             packed_tensor = packed_tensor.view(torch.uint8).view(output_rows, output_cols)
             packed_list.append(packed_tensor)
@@ -139,9 +139,6 @@ def preprocess_weights_for_mixed_gemm(
         )
 
 
-
-
-
 def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = True, asymmetric: bool = False):
     from onnxruntime.capi import _pybind_state as _quantize
 
@@ -149,27 +146,27 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
     # print(f"DEBUG: quant_dequant input shape={weights.shape}, 4bit={is_4_bit_quantization}, asym={asymmetric}")
 
     if is_4_bit_quantization:
-        weights_T = weights.T.contiguous()
-        rows, cols = weights_T.shape
-        K, N = rows, cols
-        block_per_K = (K + block_size - 1) // block_size
+        weights_t = weights.T.contiguous()
+        rows, cols = weights_t.shape
+        k, n = rows, cols
+        block_per_k = (k + block_size - 1) // block_size
         blob_size = block_size // 2
 
-        q_weight = numpy.zeros((N, block_per_K, blob_size), dtype=numpy.uint8)
-        scale = numpy.zeros((N, block_per_K), dtype=numpy.float32)
-        zero_point = numpy.zeros((N, (block_per_K + 1) // 2), dtype=numpy.uint8)
+        q_weight = numpy.zeros((n, block_per_k, blob_size), dtype=numpy.uint8)
+        scale = numpy.zeros((n, block_per_k), dtype=numpy.float32)
+        zero_point = numpy.zeros((n, (block_per_k + 1) // 2), dtype=numpy.uint8)
 
         is_symmetric = not asymmetric
 
         # Use existing binding which determines implementation based on type
         # Assuming weights are float16 or float32. Binding supports both (via overload or check).
         # We need to pass numpy array.
-        weights_np = weights_T.detach().cpu().numpy()
+        weights_np = weights_t.detach().cpu().numpy()
 
-        _quantize.quantize_matmul_4bits(q_weight, weights_np, scale, zero_point, block_size, N, K, is_symmetric)
+        _quantize.quantize_matmul_4bits(q_weight, weights_np, scale, zero_point, block_size, n, k, is_symmetric)
 
-        q_weight_reshaped = q_weight.reshape(N, -1)
-        processed_q_weight = _quantize.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, N, K, 4)
+        q_weight_reshaped = q_weight.reshape(n, -1)
+        processed_q_weight = _quantize.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, n, k, 4)
 
         # Dequantize for reference
         scale_torch = torch.from_numpy(scale).to(weights.device).unsqueeze(-1)
@@ -179,7 +176,7 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
             # Unpack: low, high
             q_low = q_weight_torch & 0x0F
             q_high = (q_weight_torch >> 4) & 0x0F
-            q_unpacked = torch.stack((q_low, q_high), dim=-1).view(N, block_per_K, block_size)
+            q_unpacked = torch.stack((q_low, q_high), dim=-1).view(n, block_per_k, block_size)
             q_unpacked = q_unpacked.to(weights.dtype)
             dequantized = (q_unpacked - 8.0) * scale_torch
         else:
@@ -187,7 +184,7 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
             # Unpack weights same way
             q_low = q_weight_torch & 0x0F
             q_high = (q_weight_torch >> 4) & 0x0F
-            q_unpacked = torch.stack((q_low, q_high), dim=-1).view(N, block_per_K, block_size)
+            q_unpacked = torch.stack((q_low, q_high), dim=-1).view(n, block_per_k, block_size)
             q_unpacked = q_unpacked.to(weights.dtype)
 
             # Unpack ZP
@@ -195,8 +192,8 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
             zp_low = zp_torch & 0x0F
             zp_high = (zp_torch >> 4) & 0x0F
             zp_unpacked = torch.stack((zp_low, zp_high), dim=-1).flatten(1, 2)
-            zp_unpacked = zp_unpacked[:, :block_per_K].contiguous()
-            zp_unpacked = zp_unpacked.view(N, block_per_K, 1)
+            zp_unpacked = zp_unpacked[:, :block_per_k].contiguous()
+            zp_unpacked = zp_unpacked.view(n, block_per_k, 1)
             zp_unpacked = zp_unpacked.to(weights.dtype)
 
             dequantized = (q_unpacked - zp_unpacked) * scale_torch
@@ -207,30 +204,30 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
         zero_points_storage = torch.from_numpy(zero_point).to(weights.device) if asymmetric else None
 
         processed_q_weight_torch = (
-            torch.from_numpy(processed_q_weight).reshape(K, N // 2).to(weights.device).view(torch.uint8)
+            torch.from_numpy(processed_q_weight).reshape(k, n // 2).to(weights.device).view(torch.uint8)
         )
-        result = dequantized.view(N, K)
+        result = dequantized.view(n, k)
 
         return scale_torch_out.T, processed_q_weight_torch, result, zero_points_storage
 
     else:
         # 8-bit
-        weights_T = weights.T.contiguous()
-        rows, cols = weights_T.shape
-        K, N = rows, cols
-        block_per_K = (K + block_size - 1) // block_size
+        weights_t = weights.T.contiguous()
+        rows, cols = weights_t.shape
+        k, n = rows, cols
+        block_per_k = (k + block_size - 1) // block_size
 
-        q_weight = numpy.zeros((N, block_per_K, block_size), dtype=numpy.uint8)
-        scale = numpy.zeros((N, block_per_K), dtype=numpy.float32)
-        zero_point = numpy.zeros((N, block_per_K), dtype=numpy.uint8)
+        q_weight = numpy.zeros((n, block_per_k, block_size), dtype=numpy.uint8)
+        scale = numpy.zeros((n, block_per_k), dtype=numpy.float32)
+        zero_point = numpy.zeros((n, block_per_k), dtype=numpy.uint8)
 
         is_symmetric = not asymmetric
-        weights_np = weights_T.detach().cpu().numpy()
+        weights_np = weights_t.detach().cpu().numpy()
 
-        _quantize.quantize_matmul_8bits(q_weight, weights_np, scale, zero_point, block_size, N, K, is_symmetric)
+        _quantize.quantize_matmul_8bits(q_weight, weights_np, scale, zero_point, block_size, n, k, is_symmetric)
 
-        q_weight_reshaped = q_weight.reshape(N, -1)
-        processed_q_weight = _quantize.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, N, K, 8)
+        q_weight_reshaped = q_weight.reshape(n, -1)
+        processed_q_weight = _quantize.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, n, k, 8)
 
         scale_torch = torch.from_numpy(scale).to(weights.device).unsqueeze(-1)
         q_weight_torch = torch.from_numpy(q_weight).to(weights.device).to(weights.dtype)
@@ -248,10 +245,10 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
         scale_torch_out = torch.from_numpy(scale).to(weights.device).to(torch.float16)
 
         processed_q_weight_torch = (
-            torch.from_numpy(processed_q_weight).reshape(N, K).to(weights.device).view(torch.uint8)
+            torch.from_numpy(processed_q_weight).reshape(n, k).to(weights.device).view(torch.uint8)
         )  # 8bit is N, K?
 
-        result = dequantized.view(N, K)
+        result = dequantized.view(n, k)
 
         zero_points_storage = torch.from_numpy(zero_point).to(weights.device) if asymmetric else None
 
@@ -931,7 +928,7 @@ class SparseMoeBlockORTHelper(nn.Module):
     def parity_check(self):
         model_updated = self.recreate_onnx_model()
         if not model_updated:
-            assert False, "Model update failed"
+            raise AssertionError("Model update failed")
 
         dtype = torch.float16 if self.onnx_dtype == TensorProto.FLOAT16 else torch.float32
         hidden_state = torch.randn(self.batch_size, self.sequence_length, self.hidden_dim).to(device).to(dtype)
@@ -939,7 +936,7 @@ class SparseMoeBlockORTHelper(nn.Module):
         ort_output = self.ort_forward(hidden_state)
 
         if ort_output is None:
-            assert False, "ORT output is None"
+            raise AssertionError("ORT output is None")
 
         torch_has_nan = torch.isnan(torch_output).any()
         ort_has_nan = torch.isnan(ort_output).any()
@@ -1101,8 +1098,10 @@ class SwigluMoEBlock(SparseMoeBlockORTHelper):
                         expert.w1.weight, self.block_size, is_4_bit, asymmetric=self.use_asymmetric_quant
                     )
                     if expert == 0:
-                        print("Debug: scale1.shape={}, pre_qweight1.shape={}, w1_qdq.shape={}, zp1.shape={}".format(scale1.shape, pre_qweight1.shape, w1_qdq.shape, zp1.shape))
-                        print("Debug: scale1={}, pre_qweight1={}, w1_qdq={}, zp1={}".format(scale1, pre_qweight1, w1_qdq, zp1))
+                        print(
+                            f"Debug: scale1.shape={scale1.shape}, pre_qweight1.shape={pre_qweight1.shape}, w1_qdq.shape={w1_qdq.shape}, zp1.shape={zp1.shape}"
+                        )
+                        print(f"Debug: scale1={scale1}, pre_qweight1={pre_qweight1}, w1_qdq={w1_qdq}, zp1={zp1}")
                     scale2, pre_qweight2, w2_qdq, zp2 = quant_dequant_blockwise(
                         expert.w2.weight, self.block_size, is_4_bit, asymmetric=self.use_asymmetric_quant
                     )
