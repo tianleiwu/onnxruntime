@@ -44,13 +44,8 @@ REGISTER_KERNEL_TYPED(BFloat16)
 
 QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoEBase(op_kernel_info, GetDeviceProp()) {
   ORT_ENFORCE(op_kernel_info.GetAttr<int64_t>("expert_weight_bits", &expert_weight_bits_).IsOK());
-#if QUICK_BUILD
-  ORT_ENFORCE(expert_weight_bits_ == 8,
-              "expert_weight_bits must be 8, but got ", expert_weight_bits_);
-#else
   ORT_ENFORCE(expert_weight_bits_ == 8 || expert_weight_bits_ == 4,
               "expert_weight_bits must be 4 or 8, but got ", expert_weight_bits_);
-#endif
 
   this->block_size_ = op_kernel_info.GetAttrOrDefault<int64_t>("block_size", -1);
 
@@ -65,7 +60,10 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
 
 #if QUICK_BUILD
   if (is_fp16) {
-    if (expert_weight_bits_ == 8) {
+    if (expert_weight_bits_ == 4) {
+      m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, cutlass::uint4b_t, half>>(
+          sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
+    } else {  // expert_weight_bits_ == 8
       m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, uint8_t, half>>(
           sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
     }
@@ -135,12 +133,14 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   // expert_indices: num_rows * k * sizeof(int)
   size_t scales_bytes = moe_params.num_rows * k_ * sizeof(float);
   size_t indices_bytes = moe_params.num_rows * k_ * sizeof(int);
-  size_t total_scratch_bytes = workspace_size + scales_bytes + indices_bytes;
+  size_t permutation_bytes = moe_params.num_rows * k_ * sizeof(int);
+  size_t total_scratch_bytes = workspace_size + scales_bytes + indices_bytes + permutation_bytes;
 
   auto work_space = GetScratchBuffer<void>(total_scratch_bytes, context->GetComputeStream());
   char* workspace_ptr = reinterpret_cast<char*>(work_space.get());
   float* expert_scales = reinterpret_cast<float*>(workspace_ptr + workspace_size);
   int* expert_indices = reinterpret_cast<int*>(workspace_ptr + workspace_size + scales_bytes);
+  int* unpermuted_row_to_permuted_row = reinterpret_cast<int*>(workspace_ptr + workspace_size + scales_bytes + indices_bytes);
 
   cudaStream_t stream = static_cast<cudaStream_t>(context->GetComputeStream()->GetHandle());
 
@@ -212,7 +212,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
       k_,
       workspace_ptr,
       output->MutableDataRaw(),
-      nullptr,
+      unpermuted_row_to_permuted_row,
       parallelism_config,
       false,  // enable_alltoall
       use_lora,
