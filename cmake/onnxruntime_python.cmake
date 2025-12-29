@@ -222,7 +222,6 @@ target_link_libraries(onnxruntime_pybind11_state PRIVATE
 )
 
 if (onnxruntime_USE_CUDA)
-  target_link_libraries(onnxruntime_pybind11_state PRIVATE CUDA::cudart)
   target_sources(onnxruntime_pybind11_state PRIVATE
     "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/llm/fpA_intB_gemm_adaptor.cu"
     "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/llm/fpA_intB_gemm_preprocessors_impl.cu"
