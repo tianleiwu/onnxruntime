@@ -188,7 +188,7 @@ size_t dispatchNVFP4xNVFP4GemmCTAShapeSm120(T* D, void const* A, void const* B, 
                                             tkc::CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes, cudaStream_t stream,
                                             int* occupancy = nullptr) {
   ORT_LLM_LOG_ENTRY();
-  ORT_LLM_LOG_DEBUG(onnxruntime::MakeString("gemmConfig.tile_config_sm120: ", gemmConfig.tile_config_sm120));
+  ORT_LLM_LOG_DEBUG(onnxruntime::MakeString("gemmConfig: ", gemmConfig.toString()));
 
   switch (gemmConfig.tile_config_sm120) {
     case tkc::CutlassTileConfigSM120::CtaShape128x128x256B:

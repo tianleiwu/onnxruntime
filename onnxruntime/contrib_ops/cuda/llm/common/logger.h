@@ -11,7 +11,7 @@
 #define PRETTY_FUNCTION __PRETTY_FUNCTION__
 #endif
 
-#define ORT_LLM_VERBOSE 0  // Set to 1 for verbose, 2 for max verbosity
+#define ORT_LLM_VERBOSE 1  // Set to 1 for verbose, 2 for max verbosity
 
 #if ORT_LLM_VERBOSE
 #include <iostream>

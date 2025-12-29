@@ -268,6 +268,8 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
                                                       size_t* workspace_size) {
   using namespace cute;
 
+  ORT_LLM_LOG_TRACE(onnxruntime::MakeString("At ", __PRETTY_FUNCTION__, "gemm_config=", gemm_config.toString()));
+
 #define SHAPE_CASE(SMVERSION, M, N, K)                                                                                                      \
   case cutlass_extensions::CutlassTileConfigSM##SMVERSION::CtaShape##M##x##N##x##K##B: {                                                    \
     constexpr int KtileBytes = (K * 8) / cutlass::sizeof_bits<typename kernels::cutlass_kernels::CudaToCutlassTypeAdapter<T>::type>::value; \
@@ -329,7 +331,6 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
       ORT_THROW("Unsupported SM100 configuration requested");
     }
   } else if (gemm_config.sm_version == 120 || gemm_config.sm_version == 121) {
-    ORT_LLM_LOG_TRACE(onnxruntime::MakeString("At ", __PRETTY_FUNCTION__, "SM120 config=", gemm_config.tile_config_sm120));
     if constexpr (kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType, EpilogueTag, FUSION>()) {
       switch (gemm_config.tile_config_sm120) {
         SHAPE_CASE(120, 128, 128, 64)

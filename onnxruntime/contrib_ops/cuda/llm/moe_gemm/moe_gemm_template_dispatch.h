@@ -39,7 +39,7 @@
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
-
+#include "contrib_ops/cuda/llm/common/logger.h"
 #include "contrib_ops/cuda/llm/cutlass_extensions/gemm/threadblock/dq_mma_pipelined.h"
 
 #include "cutlass/tensor_ref.h"
@@ -80,6 +80,8 @@
 #include <type_traits>
 #include <cstdio>
 
+#define ORT_DEBUG_MOE 0
+
 namespace onnxruntime::llm::kernels::cutlass_kernels {
 
 // ============================= Variable batched Gemm things ===========================
@@ -87,6 +89,7 @@ template <typename T, typename WeightType, typename GemmOutputType, typename arc
           typename EpilogueTag, typename ThreadblockShape, typename WarpShape, int Stages>
 struct genericMoeGemmKernelLauncher {
   static void call(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs, int sm_count_) {
+    ORT_LLM_LOG_ENTRY();
 #if defined(ENABLE_FP8)
     static_assert(cutlass::platform::is_same<T, __nv_bfloat16>::value || cutlass::platform::is_same<T, half>::value || cutlass::platform::is_same<T, __nv_fp8_e4m3>::value || cutlass::platform::is_same<T, __nv_fp8_e5m2>::value || cutlass::platform::is_same<T, float>::value,
                   "Specialized for fp8, bfloat16, half, float");
@@ -169,7 +172,7 @@ struct genericMoeGemmKernelLauncher {
                                            reinterpret_cast<CutlassGemmOutputType const*>(inputs.biases), inputs.bias_is_broadcast,
                                            reinterpret_cast<CutlassGemmOutputType*>(inputs.C), inputs.total_tokens_including_expert, inputs.n,
                                            inputs.k);
-
+#if ORT_DEBUG_MOE
       // Debug: Print GEMM dimensions and samples for float types
       if constexpr (std::is_same_v<T, float>) {
         // printf("DEBUG [GEMM float]: num_experts=%d, N=%lld, K=%lld, num_rows=%lld\n",
@@ -223,6 +226,7 @@ struct genericMoeGemmKernelLauncher {
         }
         fflush(stdout);
       }
+#endif
 
       GemmGrouped gemm;
 
@@ -237,7 +241,7 @@ struct genericMoeGemmKernelLauncher {
       auto run_status = gemm.run(inputs.stream);
       ORT_ENFORCE(run_status == cutlass::Status::kSuccess,
                   "Failed to run cutlass grouped gemm. Error: " + std::string(cutlassGetStatusString(run_status)));
-
+#if ORT_DEBUG_MOE
       // Debug: Sample output after GEMM for float types
       if constexpr (std::is_same_v<T, float>) {
         cudaStreamSynchronize(inputs.stream);
@@ -263,7 +267,7 @@ struct genericMoeGemmKernelLauncher {
         }
         fflush(stdout);
       }
-
+#endif
     } else if constexpr (sizeof(ElementType) == 2 && sizeof(CutlassWeightType) == 2 && (std::is_same_v<EpilogueTag, cutlass_extensions::EpilogueOpDefaultSilu> || std::is_same_v<EpilogueTag, cutlass_extensions::EpilogueOpDefaultFtGelu>))  // use fused moe gemm
                                                                                                                                                                                                                                               // kernel.. (only support
                                                                                                                                                                                                                                               // fp16 or bf16)
@@ -290,6 +294,7 @@ struct genericMoeGemmKernelLauncher<__nv_bfloat16, __nv_fp8_e4m3, GemmOutputType
 template <typename T, typename WeightType, typename GemmOutputType, typename Arch, typename EpilogueTag,
           typename ThreadblockShape, typename WarpShape, int Stages>
 static void dispatch(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs, int sm_count_) {
+  ORT_LLM_LOG_ENTRY();
   static_assert(Arch::kMinComputeCapability < 90, "Use TMA specialized functions for arch SM90+");
 #if defined(ENABLE_FP8)
   constexpr bool isFp8 = std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>;
@@ -325,6 +330,7 @@ template <typename T, typename WeightType, typename GemmOutputType, typename arc
           typename ThreadblockShape, typename WarpShape,
           typename std::enable_if<(std::is_same<T, __nv_fp8_e4m3>::value || std::is_same<T, __nv_fp8_e5m2>::value) && !std::is_same<T, WeightType>::value>::type* = nullptr>
 void dispatchGemmConfig(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs, int sm_count_) {
+  ORT_LLM_LOG_ENTRY();
   switch (inputs.gemm_config.stages) {
     case 2:
       dispatch<T, WeightType, GemmOutputType, arch, EpilogueTag, ThreadblockShape, WarpShape, 3>(inputs, sm_count_);
@@ -345,6 +351,7 @@ template <typename T, typename WeightType, typename GemmOutputType, typename arc
           typename ThreadblockShape, typename WarpShape,
           typename std::enable_if<((!std::is_same<T, __nv_fp8_e4m3>::value) && (!std::is_same<T, __nv_fp8_e5m2>::value)) || std::is_same<T, WeightType>::value>::type* = nullptr>
 void dispatchGemmConfig(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs, int sm_count_) {
+  ORT_LLM_LOG_ENTRY();
   switch (inputs.gemm_config.stages) {
     case 2:
       dispatch<T, WeightType, GemmOutputType, arch, EpilogueTag, ThreadblockShape, WarpShape, 2>(inputs, sm_count_);
@@ -370,6 +377,7 @@ template <typename T, typename WeightType, typename GemmOutputType, typename arc
 #endif
                                   && std::is_same<T, WeightType>::value>::type* = nullptr>
 void dispatchMoeGemmToCutlass(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs, int sm_count_) {
+  ORT_LLM_LOG_ENTRY();
   switch (inputs.gemm_config.tile_config_sm80) {
     case cutlass_extensions::CutlassTileConfig::CtaShape16x128x64_WarpShape16x32x64:
       ORT_ENFORCE(arch::kMinComputeCapability >= 75, "Invalid config on Volta");
@@ -415,6 +423,7 @@ void dispatchMoeGemmToCutlass(GroupedGemmInput<T, WeightType, GemmOutputType, Ge
 template <typename T, typename WeightType, typename GemmOutputType, typename arch, typename EpilogueTag,
           typename std::enable_if<!std::is_same<T, float>::value && !std::is_same<T, WeightType>::value>::type* = nullptr>
 void dispatchMoeGemmToCutlass(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs, int sm_count_) {
+  ORT_LLM_LOG_ENTRY();
   constexpr int tile_shape_k = 128 * 8 / cutlass::sizeof_bits<T>::value;
   switch (inputs.gemm_config.tile_config_sm80) {
     case cutlass_extensions::CutlassTileConfig::CtaShape16x128x64_WarpShape16x32x64:
@@ -466,6 +475,7 @@ void dispatchMoeGemmToCutlass(GroupedGemmInput<T, WeightType, GemmOutputType, Ge
 template <typename T, typename WeightType, typename GemmOutputType, typename arch, typename EpilogueTag,
           typename std::enable_if<(std::is_same<T, __nv_fp8_e4m3>::value || std::is_same<T, __nv_fp8_e5m2>::value) && std::is_same<T, WeightType>::value>::type* = nullptr>
 void dispatchMoeGemmToCutlass(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs, int sm_count_) {
+  ORT_LLM_LOG_ENTRY();
   switch (inputs.gemm_config.tile_config_sm80) {
     case cutlass_extensions::CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128:
       dispatchGemmConfig<T, WeightType, GemmOutputType, arch, EpilogueTag, cutlass::gemm::GemmShape<16, 256, 128>,
@@ -512,6 +522,7 @@ void dispatchMoeGemmToCutlass(GroupedGemmInput<T, WeightType, GemmOutputType, Ge
 template <typename T, typename WeightType, typename GemmOutputType, typename arch, typename EpilogueTag,
           typename std::enable_if<std::is_same<T, float>::value>::type* = nullptr>
 void dispatchMoeGemmToCutlass(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs, int sm_count_) {
+  ORT_LLM_LOG_ENTRY();
   switch (inputs.gemm_config.tile_config_sm80) {
     case cutlass_extensions::CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8:
       dispatchGemmConfig<T, WeightType, GemmOutputType, arch, EpilogueTag, cutlass::gemm::GemmShape<128, 128, 8>,
@@ -532,12 +543,14 @@ void dispatchMoeGemmToCutlass(GroupedGemmInput<T, WeightType, GemmOutputType, Ge
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 std::vector<cutlass_extensions::CutlassGemmConfig>
 MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs() const {
+  ORT_LLM_LOG_ENTRY();
   return getConfigs(sm_);
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs(
     int sm) {
+  ORT_LLM_LOG_ENTRY();
   std::vector<cutlass_extensions::CutlassGemmConfig> candidate_configs = getTmaWarpSpecializedConfigs(sm);
   std::vector<cutlass_extensions::CutlassGemmConfig> ampere_configs = getAmpereConfigs(sm);
   std::copy(ampere_configs.begin(), ampere_configs.end(), std::back_inserter(candidate_configs));
@@ -547,6 +560,7 @@ std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<T, WeightType, 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 std::vector<cutlass_extensions::CutlassGemmConfig>
 MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getAmpereConfigs(int sm) {
+  ORT_LLM_LOG_ENTRY();
   using onnxruntime::llm::cutlass_extensions::CutlassGemmConfig;
   static constexpr auto weight_only_flag = std::is_same<T, WeightType>::value ? CutlassGemmConfig::NONE : CutlassGemmConfig::WEIGHT_ONLY;
   static constexpr auto simt_only_flag = std::is_same<T, float>::value ? CutlassGemmConfig::SIMT_ONLY : CutlassGemmConfig::NONE;
@@ -569,6 +583,7 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getAmpereConfigs(int sm
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 std::vector<cutlass_extensions::CutlassGemmConfig>
 MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedConfigs(int sm) {
+  ORT_LLM_LOG_ENTRY();
   using onnxruntime::llm::cutlass_extensions::CutlassGemmConfig;
   static constexpr auto weight_only_flag = std::is_same<T, WeightType>::value ? CutlassGemmConfig::NONE : CutlassGemmConfig::WEIGHT_ONLY;
   static constexpr auto simt_only_flag = std::is_same<T, float>::value ? CutlassGemmConfig::SIMT_ONLY : CutlassGemmConfig::NONE;
@@ -608,6 +623,7 @@ bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::isTmaWarpSpecializ
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsTmaWarpSpecialized() const {
+  ORT_LLM_LOG_ENTRY();
   return (sm_ == 90 && kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType>()) ||
          (sm_ >= 100 && sm_ < 120 && kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType>()) ||
          ((sm_ == 120 || sm_ == 121) && kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>());
@@ -646,6 +662,7 @@ template <typename T, typename WeightType, typename OutputType, typename ScaleBi
 template <typename EpilogueTag>
 void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
     GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs, TmaWarpSpecializedGroupedGemmInput hopper_inputs) {
+  ORT_LLM_LOG_ENTRY();
   static_assert(std::is_same_v<ScaleBiasType, OutputType>,
                 "Separate Scale/Bias type is not supported. This is assumed to be the gemm output type");
 
@@ -836,7 +853,10 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::runGemm(
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemmBiasAct(
-    GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs, TmaWarpSpecializedGroupedGemmInput hopper_inputs) {
+    GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType>
+        inputs,
+    TmaWarpSpecializedGroupedGemmInput hopper_inputs) {
+  ORT_LLM_LOG_ENTRY();
   switch (inputs.activation_type) {
     case ActivationType::Relu:
       runGemm<cutlass_extensions::EpilogueOpDefaultReLU>(inputs, hopper_inputs);
@@ -867,7 +887,10 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemmBiasAct(
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemm(
-    GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs, TmaWarpSpecializedGroupedGemmInput hopper_inputs) {
+    GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType>
+        inputs,
+    TmaWarpSpecializedGroupedGemmInput hopper_inputs) {
+  ORT_LLM_LOG_ENTRY();
   runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
 }
 

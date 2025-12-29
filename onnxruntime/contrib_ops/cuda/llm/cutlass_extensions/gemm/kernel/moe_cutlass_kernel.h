@@ -332,21 +332,25 @@ struct MoeFCGemm {
       }
 
       if (args.weight_scales == nullptr) {
+        printf("Debug ErrorNotSupported: weight_scales is NULL\n");
         return Status::kErrorNotSupported;
       }
 
       if constexpr (hasZero(Mma::QuantOp)) {
         if (args.weight_zeros == nullptr) {
+          printf("Debug ErrorNotSupported: weight_zeros is NULL yet Mma::QuantOp has zero\n");
           return Status::kErrorNotSupported;
         }
       } else {
         if (args.weight_zeros != nullptr) {
+          printf("Debug ErrorNotSupported: weight_zeros is NULL\n");
           return Status::kErrorNotSupported;
         }
       }
 
       if constexpr (isFinegrained(Mma::QuantOp)) {
-        if (args.group_size != 128 && args.group_size != args.gemm_k) {
+        if (args.group_size % 32 != 0 && args.group_size != args.gemm_k) {
+          printf("Debug ErrorNotSupported: group_size=%d is not supported (must be multiple of 32). gemm_k=%d\n", int(args.group_size), int(args.gemm_k));
           return Status::kErrorNotSupported;
         }
       }
