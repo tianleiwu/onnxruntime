@@ -371,6 +371,7 @@ QMoECPU<T>::QMoECPU(const OpKernelInfo& op_kernel_info)
 
 template <typename T>
 Status QMoECPU<T>::Compute(OpKernelContext* context) const {
+  printf("QMoE Compute running on CPU\n");
   const auto* input = context->Input<Tensor>(0);
   const auto* router_probs = context->Input<Tensor>(1);
   const auto* fc1_experts_weights = context->Input<Tensor>(2);

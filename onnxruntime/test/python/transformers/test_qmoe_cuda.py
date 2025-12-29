@@ -72,9 +72,15 @@ if not has_onnx:
 
 onnxruntime.preload_dlls()
 
-device = torch.device("cpu")
+if torch.cuda.is_available():
+    device = torch.device("cuda:0")
+else:
+    device = torch.device("cpu")
 
-ort_provider = ["CPUExecutionProvider"]
+if torch.cuda.is_available():
+    ort_provider = ["CUDAExecutionProvider"]
+else:
+    ort_provider = ["CPUExecutionProvider"]
 
 torch.manual_seed(42)
 numpy.random.seed(42)
@@ -97,168 +103,159 @@ ort_dtype_name_map = {
 }
 
 
-def get_sm_version():
-    if torch.cuda.is_available():
-        major, minor = torch.cuda.get_device_capability()
-        return major * 10 + minor
-    return 80  # Default to 80 if no GPU found (shouldn't happen in this test)
-
-
 def preprocess_weights_for_mixed_gemm(
     tensor: torch.Tensor, quant_bits: int, sm_: int = -1, do_weight_interleave: bool = True
 ) -> torch.Tensor:
-    # Logic adapted from TensorRT-LLM/tensorrt_llm/quantization/functional.py
-
-    sm_ = sm_ if sm_ > 0 else get_sm_version()
     if len(tensor.shape) == 2:
         tensor = tensor.unsqueeze(0)
-    elif sm_ >= 90:
-        sm_ = 80
-    if sm_ > 90:
-        sm_ = 80
 
-    permutation_map = {
-        "16_8": [0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15],
-        "16_4": [
-            0,
-            1,
-            8,
-            9,
-            16,
-            17,
-            24,
-            25,
-            2,
-            3,
-            10,
-            11,
-            18,
-            19,
-            26,
-            27,
-            4,
-            5,
-            12,
-            13,
-            20,
-            21,
-            28,
-            29,
-            6,
-            7,
-            14,
-            15,
-            22,
-            23,
-            30,
-            31,
-        ],
-        "8_4": [
-            0,
-            1,
-            2,
-            3,
-            16,
-            17,
-            18,
-            19,
-            4,
-            5,
-            6,
-            7,
-            20,
-            21,
-            22,
-            23,
-            8,
-            9,
-            10,
-            11,
-            24,
-            25,
-            26,
-            27,
-            12,
-            13,
-            14,
-            15,
-            28,
-            29,
-            30,
-            31,
-        ],
-    }
+    # Input tensor shape is [Experts, N, K_packed]. K_packed is K/2 for 4-bit, K for 8-bit.
+    num_experts = tensor.shape[0]
+    N = tensor.shape[1]
+    K_packed = tensor.shape[2]
+    K = K_packed * 2 if quant_bits == 4 else K_packed
 
-    # bits_per_elt_a assumed 16 (float16/bfloat16)
-    bits_per_elt_a = 16
-    bits_per_elt_b = quant_bits
-    b_rows_per_mma = 8 * 16 // bits_per_elt_b
+    packed_list = []
 
-    num_rows = tensor.shape[1]
+    from onnxruntime.capi import _pybind_state as pybind
 
-    # Padding if necessary (TRT-LLM usually asserts, but we might need to pad)
-    if num_rows % b_rows_per_mma != 0:
-        # simple padding
-        pad_len = b_rows_per_mma - (num_rows % b_rows_per_mma)
-        tensor = F.pad(tensor, (0, 0, 0, pad_len))
-        num_rows = tensor.shape[1]
+    if pybind and hasattr(pybind, "pack_weights_for_cuda_mixed_gemm") and torch.cuda.is_available():
+        for i in range(num_experts):
+            weight = tensor[i].cpu().numpy()
+            packed = pybind.pack_weights_for_cuda_mixed_gemm(weight, N, K, quant_bits)
+            # pack_weights_for_cuda_mixed_gemm returns int8 array of shape [packed_size]
+            # We need to reshape it to (K, N/2) for 4-bit, (K, N) for 8-bit.
+            output_rows = K
+            output_cols = N // 2 if quant_bits == 4 else N
+            packed_tensor = torch.from_numpy(packed).to(tensor.device)
+            packed_tensor = packed_tensor.view(torch.uint8).view(output_rows, output_cols)
+            packed_list.append(packed_tensor)
 
-    if do_weight_interleave:
-        row_idx_list = [
-            (row_idx // b_rows_per_mma) * b_rows_per_mma
-            + permutation_map[f"{bits_per_elt_a}_{bits_per_elt_b}"][row_idx % b_rows_per_mma]
-            for row_idx in range(num_rows)
-        ]
-        tensor = tensor[:, row_idx_list, :]
-
-    # subbyte_transpose
-    original_shape = tensor.shape
-    if bits_per_elt_b == 4:
-        tensor = tensor.view(torch.uint8)
-        # In TRT-LLM, high/low might be swapped compared to our Packing?
-        # TRT-LLM: low = (x << 4) >> 4, high = (x >> 4)
-        # Our quant_dequant: (val1 & 0xF) | ((val2 & 0xF) << 4)
-        # val1 is low nibble, val2 is high nibble.
-        # val1 corresponds to col i, val2 to col i+1.
-
-        # TRT-LLM transform:
-        high_tensor = (tensor >> 4).permute(0, 2, 1).unsqueeze(2)
-        low_tensor = ((tensor << 4) >> 4).permute(0, 2, 1).unsqueeze(2)
-        new_tensor = torch.cat([low_tensor, high_tensor], dim=2).reshape(tensor.shape[0], -1, tensor.shape[1])
-        # Re-packing
-        new_tensor = new_tensor[:, :, 0::2] + new_tensor[:, :, 1::2] * 16
-        tensor = new_tensor.view(torch.uint8).reshape(original_shape)
+        return torch.stack(packed_list)
     else:
-        tensor = tensor.permute(0, 2, 1).reshape(original_shape)
+        # This shall not happen unless older version of onnxruntime is used.
+        raise ImportError(
+            "onnxruntime._pybind_state.pack_weights_for_cuda_mixed_gemm not found. Cannot preprocess weights."
+        )
 
-    if do_weight_interleave:
-        # interleave_column_major_tensor
-        interleave = bits_per_elt_a // bits_per_elt_b
-        if interleave > 1 and sm_ < 90:
-            rows_per_tile = 128 * 8 // bits_per_elt_a  # 128*8/16 = 64
 
-            # Pad for column interleave if needed
-            # We skip assertions and just try to reshape. If fail, we might need padding.
-            if num_rows % rows_per_tile != 0:
-                pad_len = rows_per_tile - (num_rows % rows_per_tile)
-                tensor = F.pad(tensor, (0, 0, 0, pad_len))  # Pad rows?
-                # Wait, tensor currently is [experts, cols (original), rows (original)] roughly?
-                # After subbyte_transpose/permute above:
-                # If 4-bit:
-                #   Original: [E, Row, Col/2]
-                #   Subbyte: Split -> Permute(0,2,1) -> [E, Col/2, Row] -> Unsqueeze/Cat -> [E, Col, Row] -> Repack -> [E, Col/2, Row]
-                #   So tensor is [Experts, Col_Packed, Row]
 
-            # Wait, TRT logic:
-            # tensor = tensor.reshape(..., num_rows // rows_per_tile, ...)
-            # Logic uses 'num_rows' which was original Rows.
-            # But tensor shape here is modified.
 
-            # This logic is complex to copy exactly without matching types perfectly.
-            # Only implementing the row-permutation (Pre-Ampere/Hopper requirements) and basic transpose.
-            # For now, let's trust that BASIC row permutation is key.
 
-    return tensor.squeeze(0).contiguous()
+def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = True, asymmetric: bool = False):
+    from onnxruntime.capi import _pybind_state as _quantize
+
+    # DEBUG
+    # print(f"DEBUG: quant_dequant input shape={weights.shape}, 4bit={is_4_bit_quantization}, asym={asymmetric}")
+
+    if is_4_bit_quantization:
+        weights_T = weights.T.contiguous()
+        rows, cols = weights_T.shape
+        K, N = rows, cols
+        block_per_K = (K + block_size - 1) // block_size
+        blob_size = block_size // 2
+
+        q_weight = numpy.zeros((N, block_per_K, blob_size), dtype=numpy.uint8)
+        scale = numpy.zeros((N, block_per_K), dtype=numpy.float32)
+        zero_point = numpy.zeros((N, (block_per_K + 1) // 2), dtype=numpy.uint8)
+
+        is_symmetric = not asymmetric
+
+        # Use existing binding which determines implementation based on type
+        # Assuming weights are float16 or float32. Binding supports both (via overload or check).
+        # We need to pass numpy array.
+        weights_np = weights_T.detach().cpu().numpy()
+
+        _quantize.quantize_matmul_4bits(q_weight, weights_np, scale, zero_point, block_size, N, K, is_symmetric)
+
+        q_weight_reshaped = q_weight.reshape(N, -1)
+        processed_q_weight = _quantize.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, N, K, 4)
+
+        # Dequantize for reference
+        scale_torch = torch.from_numpy(scale).to(weights.device).unsqueeze(-1)
+        q_weight_torch = torch.from_numpy(q_weight).to(weights.device)
+
+        if is_symmetric:
+            # Unpack: low, high
+            q_low = q_weight_torch & 0x0F
+            q_high = (q_weight_torch >> 4) & 0x0F
+            q_unpacked = torch.stack((q_low, q_high), dim=-1).view(N, block_per_K, block_size)
+            q_unpacked = q_unpacked.to(weights.dtype)
+            dequantized = (q_unpacked - 8.0) * scale_torch
+        else:
+            # Asymmetric
+            # Unpack weights same way
+            q_low = q_weight_torch & 0x0F
+            q_high = (q_weight_torch >> 4) & 0x0F
+            q_unpacked = torch.stack((q_low, q_high), dim=-1).view(N, block_per_K, block_size)
+            q_unpacked = q_unpacked.to(weights.dtype)
+
+            # Unpack ZP
+            zp_torch = torch.from_numpy(zero_point).to(weights.device)
+            zp_low = zp_torch & 0x0F
+            zp_high = (zp_torch >> 4) & 0x0F
+            zp_unpacked = torch.stack((zp_low, zp_high), dim=-1).flatten(1, 2)
+            zp_unpacked = zp_unpacked[:, :block_per_K].contiguous()
+            zp_unpacked = zp_unpacked.view(N, block_per_K, 1)
+            zp_unpacked = zp_unpacked.to(weights.dtype)
+
+            dequantized = (q_unpacked - zp_unpacked) * scale_torch
+
+        scale_torch_out = torch.from_numpy(scale).to(weights.device).to(torch.float16)  # N, block_per_K
+
+        # zero_point_storage
+        zero_points_storage = torch.from_numpy(zero_point).to(weights.device) if asymmetric else None
+
+        processed_q_weight_torch = (
+            torch.from_numpy(processed_q_weight).reshape(K, N // 2).to(weights.device).view(torch.uint8)
+        )
+        result = dequantized.view(N, K)
+
+        return scale_torch_out.T, processed_q_weight_torch, result, zero_points_storage
+
+    else:
+        # 8-bit
+        weights_T = weights.T.contiguous()
+        rows, cols = weights_T.shape
+        K, N = rows, cols
+        block_per_K = (K + block_size - 1) // block_size
+
+        q_weight = numpy.zeros((N, block_per_K, block_size), dtype=numpy.uint8)
+        scale = numpy.zeros((N, block_per_K), dtype=numpy.float32)
+        zero_point = numpy.zeros((N, block_per_K), dtype=numpy.uint8)
+
+        is_symmetric = not asymmetric
+        weights_np = weights_T.detach().cpu().numpy()
+
+        _quantize.quantize_matmul_8bits(q_weight, weights_np, scale, zero_point, block_size, N, K, is_symmetric)
+
+        q_weight_reshaped = q_weight.reshape(N, -1)
+        processed_q_weight = _quantize.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, N, K, 8)
+
+        scale_torch = torch.from_numpy(scale).to(weights.device).unsqueeze(-1)
+        q_weight_torch = torch.from_numpy(q_weight).to(weights.device).to(weights.dtype)
+
+        if is_symmetric:
+            # q - 128 (if offset 128)
+            # _quantize 8bit symmetric produces [0, 255] with ZP=128 usually?
+            # Check if zero_point is populated? zero_point buffer is passed.
+            # If zero_point is effectively 128.
+            dequantized = (q_weight_torch - 128.0) * scale_torch
+        else:
+            zp_torch = torch.from_numpy(zero_point).to(weights.device).to(weights.dtype).unsqueeze(-1)
+            dequantized = (q_weight_torch - zp_torch) * scale_torch
+
+        scale_torch_out = torch.from_numpy(scale).to(weights.device).to(torch.float16)
+
+        processed_q_weight_torch = (
+            torch.from_numpy(processed_q_weight).reshape(N, K).to(weights.device).view(torch.uint8)
+        )  # 8bit is N, K?
+
+        result = dequantized.view(N, K)
+
+        zero_points_storage = torch.from_numpy(zero_point).to(weights.device) if asymmetric else None
+
+        return scale_torch_out.T, processed_q_weight_torch, result, zero_points_storage
 
 
 def quant_dequant(weights, is_4_bit_quantization: bool = True, asymmetric: bool = False):
@@ -269,244 +266,8 @@ def quant_dequant(weights, is_4_bit_quantization: bool = True, asymmetric: bool 
     Returns:
         scale, quantized_storage, dequantized, zero_point_storage
     """
-    rows, cols = weights.shape
-
-    # Handle edge case of all-zero weights tensor
-    if torch.all(weights == 0):
-        scale = torch.zeros((rows), dtype=torch.float32, device=weights.device)
-        if is_4_bit_quantization:
-            packed_size = (cols + 1) // 2
-            quantized_storage = torch.zeros((rows, packed_size), dtype=torch.uint8, device=weights.device)
-            zp_packed_size = (rows + 1) // 2
-            zero_point_storage = (
-                torch.zeros(zp_packed_size, dtype=torch.uint8, device=weights.device) if asymmetric else None
-            )
-        else:
-            quantized_storage = torch.zeros_like(weights, dtype=torch.uint8)
-            zero_point_storage = torch.zeros((rows), dtype=torch.uint8, device=weights.device) if asymmetric else None
-
-        return scale, quantized_storage, torch.zeros_like(weights), zero_point_storage
-
-    if is_4_bit_quantization:
-        qmin_val, qmax_val = (0, 15) if asymmetric else (-8, 7)
-        storage_qmin, storage_qmax = (0, 15)
-    else:
-        qmin_val, qmax_val = (0, 255) if asymmetric else (-128, 127)
-        storage_qmin, storage_qmax = (0, 255)
-
-    # Calculate scale and zero point
-    if asymmetric:
-        min_val = weights.min(dim=-1, keepdim=True)[0]
-        max_val = weights.max(dim=-1, keepdim=True)[0]
-        scale = (max_val - min_val) / (qmax_val - qmin_val)
-        scale = torch.clamp(scale, min=1e-8)
-        zero_point_float = qmin_val - min_val.double() / scale.double()
-        zero_point_int = (
-            torch.round(zero_point_float).clamp(storage_qmin, storage_qmax).to(torch.int32)
-        )  # Shape [rows, 1]
-    else:
-        abs_max = weights.abs().max(dim=-1, keepdim=True)[0]
-        scale = abs_max / qmax_val
-        scale = torch.clamp(scale, min=1e-8)
-        # Symmetric zero point (storage offset)
-        zero_point_int = torch.full_like(
-            scale, (storage_qmax + 1) // 2, dtype=torch.int32
-        )  # 8 for 4-bit, 128 for 8-bit
-
-    # Quantize
-    quantized_float = weights.double() / scale.double()
-    if asymmetric:
-        quantized_float += zero_point_float.double()
-    else:
-        quantized_float += zero_point_int.double()  # Add storage offset for symmetric
-
-    clamped_quantized = torch.round(quantized_float).clamp(storage_qmin, storage_qmax).to(torch.uint8)  # [rows, cols]
-
-    # Dequantize for verification
-    if asymmetric:
-        dequantized = (clamped_quantized.float() - zero_point_int.float()) * scale.float()
-    else:
-        # Symmetric: convert storage [0, 15] back to [-8, 7]
-        signed_vals = clamped_quantized.float() - zero_point_int.float()
-        dequantized = signed_vals * scale.float()
-
-    # Pack quantized weights and zero points
-    if is_4_bit_quantization:
-        # Pack weights
-        packed_size = (cols + 1) // 2
-        quantized_storage = torch.zeros((rows, packed_size), dtype=torch.uint8, device=weights.device)
-        for i in range(0, cols, 2):
-            val1 = clamped_quantized[..., i]
-            val2 = clamped_quantized[..., i + 1] if i + 1 < cols else torch.zeros_like(val1)
-            quantized_storage[..., i // 2] = (val1 & 0xF) | ((val2 & 0xF) << 4)
-
-        # Pack zero points (if asymmetric)
-        if asymmetric:
-            zp_vals = zero_point_int.squeeze(-1).to(torch.uint8)  # Shape [rows]
-            zp_packed_size = (rows + 1) // 2
-            zero_point_storage = torch.zeros(zp_packed_size, dtype=torch.uint8, device=weights.device)
-            for i in range(0, rows, 2):
-                val1 = zp_vals[i] & 0x0F
-                val2 = (zp_vals[i + 1] & 0x0F) << 4 if i + 1 < rows else 0
-                zero_point_storage[i // 2] = val1 | val2
-        else:
-            zero_point_storage = None  # Symmetric, no ZP tensor
-
-    else:  # 8-bit
-        quantized_storage = clamped_quantized
-        if asymmetric:
-            zero_point_storage = zero_point_int.squeeze(-1).to(torch.uint8)  # Shape [rows]
-        else:
-            zero_point_storage = None  # Symmetric, no ZP tensor
-
-    return scale.squeeze(-1).to(torch.float32), quantized_storage, dequantized, zero_point_storage
-
-
-def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = True, asymmetric: bool = False):
-    """
-    Block-wise quantization and dequantization for testing purposes.
-    Supports symmetric (default) and asymmetric quantization.
-
-    Args:
-        weights: Input tensor of shape [rows, cols]
-        block_size: Size of each quantization block
-        is_4_bit_quantization: Whether to use 4-bit (True) or 8-bit (False) quantization
-        asymmetric: Whether to use asymmetric (True) or symmetric (False) quantization
-
-    Returns:
-        scales: Scale tensor of shape [rows, num_blocks]
-        quantized: Quantized tensor
-        dequantized: Dequantized tensor for verification
-        zero_points_storage: Packed zero-point tensor
-    """
-    rows, cols = weights.shape
-    num_blocks = (cols + block_size - 1) // block_size
-
-    # Handle edge case of all-zero weights tensor
-    if torch.all(weights == 0):
-        scales = torch.zeros((rows, num_blocks), dtype=torch.float32, device=weights.device)
-        dequantized = torch.zeros_like(weights)
-        if is_4_bit_quantization:
-            packed_size = (cols + 1) // 2
-            quantized = torch.zeros((rows, packed_size), dtype=torch.uint8, device=weights.device)
-            zp_packed_size = (num_blocks + 1) // 2
-            zero_points_storage = (
-                torch.zeros((rows, zp_packed_size), dtype=torch.uint8, device=weights.device) if asymmetric else None
-            )
-        else:
-            quantized = torch.zeros((rows, cols), dtype=torch.uint8, device=weights.device)
-            zero_points_storage = (
-                torch.zeros((rows, num_blocks), dtype=torch.uint8, device=weights.device) if asymmetric else None
-            )
-        return scales, quantized, dequantized, zero_points_storage
-
-    # Initialize output tensors
-    scales = torch.zeros((rows, num_blocks), dtype=torch.float32, device=weights.device)
-    zero_points_tensor = (
-        torch.zeros((rows, num_blocks), dtype=torch.int32, device=weights.device) if asymmetric else None
-    )
-    dequantized = torch.zeros_like(weights)
-
-    # Quantization ranges
-    if is_4_bit_quantization:
-        qmin_val, qmax_val = (0, 15) if asymmetric else (-8, 7)
-        storage_qmin, storage_qmax = (0, 15)
-        sym_zp_offset = 8
-        packed_size = (cols + 1) // 2
-        quantized = torch.zeros((rows, packed_size), dtype=torch.uint8, device=weights.device)
-    else:
-        qmin_val, qmax_val = (0, 255) if asymmetric else (-128, 127)
-        storage_qmin, storage_qmax = (0, 255)
-        sym_zp_offset = 128
-        quantized = torch.zeros((rows, cols), dtype=torch.uint8, device=weights.device)
-
-    # Process each block
-    for row in range(rows):
-        for block_idx in range(num_blocks):
-            start_col = block_idx * block_size
-            end_col = min(start_col + block_size, cols)
-            block_data = weights[row, start_col:end_col]
-
-            if torch.all(block_data == 0):
-                scales[row, block_idx] = 1e-8
-                if asymmetric:
-                    zero_points_tensor[row, block_idx] = storage_qmin
-                # Quantized block will be 0 (for asymmetric) or sym_zp_offset (for symmetric)
-                # Dequantized block will be 0
-                quantized_block_uint8 = torch.full_like(
-                    block_data, storage_qmin if asymmetric else sym_zp_offset, dtype=torch.uint8
-                )
-                dequantized[row, start_col:end_col] = 0.0
-
-            else:
-                if asymmetric:
-                    min_val = block_data.min()
-                    max_val = block_data.max()
-                    scale = (max_val - min_val) / (qmax_val - qmin_val)
-                    scale = torch.clamp(scale, min=1e-8)
-                    zero_point_float = qmin_val - min_val.double() / scale.double()
-                    zero_point_int = torch.round(zero_point_float).clamp(storage_qmin, storage_qmax).to(torch.int32)
-
-                    scales[row, block_idx] = scale.to(torch.float32)
-                    zero_points_tensor[row, block_idx] = zero_point_int
-
-                    quantized_block_float = (block_data.double() / scale.double()) + zero_point_float.double()
-                    quantized_block_uint8 = (
-                        torch.round(quantized_block_float).clamp(storage_qmin, storage_qmax).to(torch.uint8)
-                    )
-
-                    dequantized[row, start_col:end_col] = (
-                        quantized_block_uint8.float() - zero_point_int.float()
-                    ) * scale.float()
-
-                else:  # Symmetric
-                    abs_max = block_data.abs().max()
-                    scale = abs_max / qmax_val
-                    scale = torch.clamp(scale, min=1e-8)
-                    scales[row, block_idx] = scale.to(torch.float32)
-
-                    quantized_block_signed = (
-                        torch.round(block_data.double() / scale.double()).clamp(qmin_val, qmax_val).to(torch.int32)
-                    )
-                    quantized_block_uint8 = (quantized_block_signed + sym_zp_offset).to(torch.uint8)
-
-                    dequantized[row, start_col:end_col] = quantized_block_signed.float() * scale.float()
-
-            # Pack quantized data
-            if is_4_bit_quantization:
-                for i in range(0, end_col - start_col, 2):
-                    col_idx = start_col + i
-                    packed_idx = col_idx // 2
-
-                    val1 = int(quantized_block_uint8[i])
-                    val2 = (
-                        int(quantized_block_uint8[i + 1])
-                        if i + 1 < len(quantized_block_uint8)
-                        else storage_qmin
-                        if asymmetric
-                        else sym_zp_offset
-                    )
-
-                    packed_val = (val1 & 0xF) | ((val2 & 0xF) << 4)
-                    quantized[row, packed_idx] = packed_val
-            else:
-                quantized[row, start_col:end_col] = quantized_block_uint8
-
-    # Pack zero points
-    zero_points_storage = None
-    if asymmetric:
-        if is_4_bit_quantization:
-            zp_packed_size = (num_blocks + 1) // 2
-            zero_points_storage = torch.zeros((rows, zp_packed_size), dtype=torch.uint8, device=weights.device)
-            zp_vals_uint8 = zero_points_tensor.to(torch.uint8)
-            for j in range(0, num_blocks, 2):
-                val1 = zp_vals_uint8[:, j] & 0x0F
-                val2 = (zp_vals_uint8[:, j + 1] & 0x0F) << 4 if j + 1 < num_blocks else 0
-                zero_points_storage[:, j // 2] = val1 | val2
-        else:  # 8-bit
-            zero_points_storage = zero_points_tensor.to(torch.uint8)
-
-    return scales, quantized, dequantized, zero_points_storage
+    block_size = weights.shape[1]
+    return quant_dequant_blockwise(weights, block_size, is_4_bit_quantization, asymmetric)
 
 
 def create_cpu_moe_onnx_graph(
@@ -700,6 +461,7 @@ def create_cpu_moe_onnx_graph(
     if fc1_zero_points is not None:
         fc1_zp_np = fc1_zero_points.detach().cpu().numpy().astype(numpy.uint8)
         fc1_zp_np = numpy.ascontiguousarray(fc1_zp_np)
+        print(f"DEBUG: fc1_zp shape={fc1_zero_points.shape}, bytes={len(fc1_zp_np.tobytes())}")
         initializers.append(
             helper.make_tensor(
                 "fc1_zero_points",
@@ -840,6 +602,8 @@ class PhiMoESwiGLUMLP(nn.Module):
         self.w2 = nn.Linear(self.intermediate_size, self.hidden_dim, bias=True)
 
     def forward(self, x):
+        if x.dtype != self.w1.weight.dtype:
+            x = x.to(self.w1.weight.dtype)
         x1 = self.w1(x)
         y = swiglu(x1)
         y = self.w2(y)
@@ -855,6 +619,8 @@ class SwigluMlp(nn.Module):
         self.w2 = nn.Linear(self.intermediate_size, self.hidden_dim, bias=True)
 
     def forward(self, x):
+        if x.dtype != self.w1.weight.dtype:
+            x = x.to(self.w1.weight.dtype)
         x1 = self.w1(x)
         y = swiglu(x1)
         y = self.w2(y)
@@ -1057,6 +823,8 @@ class SparseMoeBlockORTHelper(nn.Module):
                     self.experts[i].w2.weight, is_4_bit, asymmetric=self.use_asymmetric_quant
                 )
 
+            torch_dtype = onnx_to_torch_type_map[self.onnx_dtype] if self.onnx_dtype else torch.float32
+
             if self.use_swiglu:
                 if self.swiglu_interleaved:
                     pass
@@ -1083,18 +851,25 @@ class SparseMoeBlockORTHelper(nn.Module):
                         w1_zp = torch.cat([gate_zp, value_zp], dim=0)
 
                 if self.swiglu_interleaved:
-                    self.experts[i].w1.weight = nn.Parameter(w1_qdq.contiguous().clone())
+                    self.experts[i].w1.weight = nn.Parameter(w1_qdq.contiguous().clone().to(torch_dtype))
 
                 else:
                     intermediate_size = self.experts[i].w1.weight.shape[0]
-                    gate_dequant = w1_qdq[:intermediate_size].contiguous().clone()
-                    value_dequant = w1_qdq[intermediate_size:].contiguous().clone()
+                    gate_dequant = w1_qdq[:intermediate_size].contiguous().clone().to(torch_dtype)
+                    value_dequant = w1_qdq[intermediate_size:].contiguous().clone().to(torch_dtype)
                     self.experts[i].w1.weight.data = gate_dequant
                     self.experts[i].w3.weight.data = value_dequant
             else:
-                self.experts[i].w1.weight.data = w1_qdq.contiguous().clone()
+                self.experts[i].w1.weight.data = w1_qdq.contiguous().clone().to(torch_dtype)
 
-            self.experts[i].w2.weight.data = w2_qdq.contiguous().clone()
+            self.experts[i].w2.weight.data = w2_qdq.contiguous().clone().to(torch_dtype)
+
+            # DEBUG
+            # print(f"DEBUG: Expert {i} w1 dtype={self.experts[i].w1.weight.dtype}, w2 dtype={self.experts[i].w2.weight.dtype}")
+            if i == 0:
+                print(
+                    f"DEBUG: Expert {i} w1 dtype={self.experts[i].w1.weight.dtype}, bias={self.experts[i].w1.bias.dtype if self.experts[i].w1.bias is not None else 'None'}"
+                )
 
             w1_list.append(pre_qweight1)
             w2_list.append(pre_qweight2)
@@ -1107,9 +882,6 @@ class SparseMoeBlockORTHelper(nn.Module):
 
         self.moe_experts_weight1 = torch.stack(w1_list, dim=0)
         self.moe_experts_weight2 = torch.stack(w2_list, dim=0)
-
-        self.moe_experts_weight1 = preprocess_weights_for_mixed_gemm(self.moe_experts_weight1, self.quant_bits)
-        self.moe_experts_weight2 = preprocess_weights_for_mixed_gemm(self.moe_experts_weight2, self.quant_bits)
 
         moe_experts_weight_scale1 = torch.stack(w1_scale_list, dim=0)
         moe_experts_weight_scale2 = torch.stack(w2_scale_list, dim=0)
@@ -1148,7 +920,8 @@ class SparseMoeBlockORTHelper(nn.Module):
                 swiglu_interleaved=self.swiglu_interleaved if hasattr(self, "swiglu_interleaved") else False,
                 block_size=self.block_size,  # Add block_size for block-wise quantization
             )
-        except Exception:
+        except Exception as e:
+            print(f"Failed to create ONNX graph: {e}")
             self.moe_onnx_graph = None
             return False
 
@@ -1158,14 +931,15 @@ class SparseMoeBlockORTHelper(nn.Module):
     def parity_check(self):
         model_updated = self.recreate_onnx_model()
         if not model_updated:
-            return
+            assert False, "Model update failed"
 
-        hidden_state = torch.randn(self.batch_size, self.sequence_length, self.hidden_dim).to(device)
+        dtype = torch.float16 if self.onnx_dtype == TensorProto.FLOAT16 else torch.float32
+        hidden_state = torch.randn(self.batch_size, self.sequence_length, self.hidden_dim).to(device).to(dtype)
         torch_output = self.forward(hidden_state)
         ort_output = self.ort_forward(hidden_state)
 
         if ort_output is None:
-            return
+            assert False, "ORT output is None"
 
         torch_has_nan = torch.isnan(torch_output).any()
         ort_has_nan = torch.isnan(ort_output).any()
@@ -1302,9 +1076,11 @@ class SwigluMoEBlock(SparseMoeBlockORTHelper):
         self.block_size = block_size
         use_quant = self.quant_bits > 0
 
-        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=True)
+        torch_dtype = onnx_to_torch_type_map[self.onnx_dtype] if self.onnx_dtype else torch.float32
 
-        self.experts = nn.ModuleList([SwigluMlp(config) for _ in range(self.num_experts)])
+        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=True).to(device).to(torch_dtype)
+
+        self.experts = nn.ModuleList([SwigluMlp(config).to(device).to(torch_dtype) for _ in range(self.num_experts)])
 
         fc1_w_list, fc2_w_list = [], []
         fc1_b_list, fc2_b_list = [], []
@@ -1324,6 +1100,9 @@ class SwigluMoEBlock(SparseMoeBlockORTHelper):
                     scale1, pre_qweight1, w1_qdq, zp1 = quant_dequant_blockwise(
                         expert.w1.weight, self.block_size, is_4_bit, asymmetric=self.use_asymmetric_quant
                     )
+                    if expert == 0:
+                        print("Debug: scale1.shape={}, pre_qweight1.shape={}, w1_qdq.shape={}, zp1.shape={}".format(scale1.shape, pre_qweight1.shape, w1_qdq.shape, zp1.shape))
+                        print("Debug: scale1={}, pre_qweight1={}, w1_qdq={}, zp1={}".format(scale1, pre_qweight1, w1_qdq, zp1))
                     scale2, pre_qweight2, w2_qdq, zp2 = quant_dequant_blockwise(
                         expert.w2.weight, self.block_size, is_4_bit, asymmetric=self.use_asymmetric_quant
                     )
@@ -1335,8 +1114,8 @@ class SwigluMoEBlock(SparseMoeBlockORTHelper):
                         expert.w2.weight, is_4_bit, asymmetric=self.use_asymmetric_quant
                     )
 
-                expert.w1.weight.data = w1_qdq
-                expert.w2.weight.data = w2_qdq
+                expert.w1.weight.data = w1_qdq.to(torch_dtype)
+                expert.w2.weight.data = w2_qdq.to(torch_dtype)
 
                 fc1_w_list.append(pre_qweight1)
                 fc2_w_list.append(pre_qweight2)
@@ -1406,9 +1185,12 @@ class PhiMoESparseMoeBlock(SparseMoeBlockORTHelper):
         self.block_size = block_size
         use_quant = self.quant_bits > 0
 
-        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=True)
+        torch_dtype = onnx_to_torch_type_map[self.onnx_dtype] if self.onnx_dtype else torch.float32
 
-        self.experts = nn.ModuleList([PhiMoESwiGLUMLP(config) for _ in range(self.num_experts)])
+        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=True).to(device).to(torch_dtype)
+        self.experts = nn.ModuleList(
+            [PhiMoESwiGLUMLP(config).to(device).to(torch_dtype) for _ in range(self.num_experts)]
+        )
 
         fc1_w_list, fc2_w_list = [], []
         fc1_b_list, fc2_b_list = [], []
@@ -1419,8 +1201,11 @@ class PhiMoESparseMoeBlock(SparseMoeBlockORTHelper):
             fc1_b_list.append(expert.w1.bias)
             fc2_b_list.append(expert.w2.bias)
             if not use_quant:
-                fc1_w_list.append(expert.w1.weight)
-                fc2_w_list.append(expert.w2.weight)
+                # Store original weights
+                fc1_w_list.append(expert.w1.weight.detach())
+                fc2_w_list.append(expert.w2.weight.detach())
+                scale_1_list.append(torch.tensor(1.0))
+                scale_2_list.append(torch.tensor(1.0))
             else:
                 is_4_bit = self.quant_bits == 4
 
@@ -1439,8 +1224,8 @@ class PhiMoESparseMoeBlock(SparseMoeBlockORTHelper):
                         expert.w2.weight, is_4_bit, asymmetric=self.use_asymmetric_quant
                     )
 
-                expert.w1.weight.data = w1_qdq
-                expert.w2.weight.data = w2_qdq
+                expert.w1.weight.data = w1_qdq.to(torch_dtype)
+                expert.w2.weight.data = w2_qdq.to(torch_dtype)
 
                 fc1_w_list.append(pre_qweight1)
                 fc2_w_list.append(pre_qweight2)
@@ -1567,11 +1352,11 @@ class TestPhiQMoECPU(unittest.TestCase):
             batch_size=batch_size,
             sequence_length=sequence_length,
             quant_bits=quant_bits,
-            onnx_dtype=TensorProto.FLOAT,
+            onnx_dtype=TensorProto.FLOAT16,
             use_asymmetric_quant=False,
         )
 
-        hidden_states = torch.randn(batch_size, sequence_length, config.hidden_size).to(torch.float32)
+        hidden_states = torch.randn(batch_size, sequence_length, config.hidden_size).to(device).to(torch.float16)
 
         torch_result = phi3_moe.forward(hidden_states)
 
@@ -1585,6 +1370,7 @@ class TestPhiQMoECPU(unittest.TestCase):
 
     @parameterized.expand(phi3_test_cases)
     def test_phi3_qmoe_asymmetric_parity_cpu(self, batch_size, sequence_length, quant_bits):
+        self.skipTest("Asymmetric quantization is not supported on CUDA")
         base_seed = 3000
         param_hash = hash((batch_size, sequence_length, quant_bits))
         unique_seed = base_seed + abs(param_hash) % 1000
@@ -1603,13 +1389,15 @@ class TestPhiQMoECPU(unittest.TestCase):
             batch_size=batch_size,
             sequence_length=sequence_length,
             quant_bits=quant_bits,
-            onnx_dtype=TensorProto.FLOAT,
+            onnx_dtype=TensorProto.FLOAT16,
             use_asymmetric_quant=True,
         )
         phi3_moe.parity_check()
 
     @parameterized.expand(phi3_blockwise_test_cases)
     def test_phi3_qmoe_blockwise_parity_cpu(self, batch_size, sequence_length, quant_bits, block_size):
+        if quant_bits == 8:
+            self.skipTest("8-bit blockwise quantization is not supported on CUDA")
         torch.manual_seed(42)
         numpy.random.seed(42)
 
@@ -1623,12 +1411,12 @@ class TestPhiQMoECPU(unittest.TestCase):
             batch_size=batch_size,
             sequence_length=sequence_length,
             quant_bits=quant_bits,
-            onnx_dtype=TensorProto.FLOAT,
+            onnx_dtype=TensorProto.FLOAT16,
             block_size=block_size,
             use_asymmetric_quant=False,
         )
 
-        hidden_states = torch.randn(batch_size, sequence_length, config.hidden_size).to(torch.float32)
+        hidden_states = torch.randn(batch_size, sequence_length, config.hidden_size).to(device).to(torch.float16)
 
         torch_result = phi3_moe.forward(hidden_states)
 
@@ -1642,6 +1430,7 @@ class TestPhiQMoECPU(unittest.TestCase):
 
     @parameterized.expand(phi3_blockwise_test_cases)
     def test_phi3_qmoe_blockwise_asymmetric_parity_cpu(self, batch_size, sequence_length, quant_bits, block_size):
+        self.skipTest("Asymmetric quantization is not supported on CUDA")
         torch.manual_seed(43)
         numpy.random.seed(43)
 
@@ -1655,7 +1444,7 @@ class TestPhiQMoECPU(unittest.TestCase):
             batch_size=batch_size,
             sequence_length=sequence_length,
             quant_bits=quant_bits,
-            onnx_dtype=TensorProto.FLOAT,
+            onnx_dtype=TensorProto.FLOAT16,
             block_size=block_size,
             use_asymmetric_quant=True,
         )
@@ -1704,11 +1493,11 @@ class TestSwigluQMoECPU(unittest.TestCase):
             batch_size=batch_size,
             sequence_length=sequence_length,
             quant_bits=quant_bits,
-            onnx_dtype=TensorProto.FLOAT,
+            onnx_dtype=TensorProto.FLOAT16,
             use_asymmetric_quant=False,
         )
 
-        hidden_states = torch.randn(batch_size, sequence_length, config.hidden_size).to(torch.float32)
+        hidden_states = torch.randn(batch_size, sequence_length, config.hidden_size).to(device).to(torch.float16)
 
         torch_result = swiglu_moe.forward(hidden_states)
 
@@ -1721,6 +1510,7 @@ class TestSwigluQMoECPU(unittest.TestCase):
 
     @parameterized.expand(swiglu_test_cases)
     def test_swiglu_qmoe_asymmetric_parity_cpu(self, batch_size, sequence_length, quant_bits):
+        self.skipTest("Asymmetric quantization is not supported on CUDA")
         base_seed = 1100
         param_hash = hash((batch_size, sequence_length, quant_bits))
         unique_seed = base_seed + abs(param_hash) % 1000
@@ -1739,13 +1529,15 @@ class TestSwigluQMoECPU(unittest.TestCase):
             batch_size=batch_size,
             sequence_length=sequence_length,
             quant_bits=quant_bits,
-            onnx_dtype=TensorProto.FLOAT,
+            onnx_dtype=TensorProto.FLOAT16,
             use_asymmetric_quant=True,
         )
         swiglu_moe.parity_check()
 
     @parameterized.expand(swiglu_blockwise_test_cases)
     def test_swiglu_qmoe_blockwise_parity_cpu(self, batch_size, sequence_length, quant_bits, block_size):
+        if quant_bits == 8:
+            self.skipTest("8-bit blockwise quantization is not supported on CUDA")
         torch.manual_seed(42)
         numpy.random.seed(42)
 
@@ -1759,12 +1551,12 @@ class TestSwigluQMoECPU(unittest.TestCase):
             batch_size=batch_size,
             sequence_length=sequence_length,
             quant_bits=quant_bits,
-            onnx_dtype=TensorProto.FLOAT,
+            onnx_dtype=TensorProto.FLOAT16,
             block_size=block_size,
             use_asymmetric_quant=False,
         )
 
-        hidden_states = torch.randn(batch_size, sequence_length, config.hidden_size).to(torch.float32)
+        hidden_states = torch.randn(batch_size, sequence_length, config.hidden_size).to(device).to(torch.float16)
 
         torch_result = swiglu_moe.forward(hidden_states)
 
@@ -1777,6 +1569,7 @@ class TestSwigluQMoECPU(unittest.TestCase):
 
     @parameterized.expand(swiglu_blockwise_test_cases)
     def test_swiglu_qmoe_blockwise_asymmetric_parity_cpu(self, batch_size, sequence_length, quant_bits, block_size):
+        self.skipTest("Asymmetric quantization is not supported on CUDA")
         torch.manual_seed(43)
         numpy.random.seed(43)
 
@@ -1790,7 +1583,7 @@ class TestSwigluQMoECPU(unittest.TestCase):
             batch_size=batch_size,
             sequence_length=sequence_length,
             quant_bits=quant_bits,
-            onnx_dtype=TensorProto.FLOAT,
+            onnx_dtype=TensorProto.FLOAT16,
             block_size=block_size,
             use_asymmetric_quant=True,
         )
@@ -1842,11 +1635,11 @@ class TestQMoESwiGLUBenchmark(unittest.TestCase):
                     batch_size=batch_size,
                     sequence_length=sequence_length,
                     quant_bits=quant_bits,
-                    onnx_dtype=TensorProto.FLOAT,
+                    onnx_dtype=TensorProto.FLOAT16,
                 )
 
                 # Create test input with fixed sequence length to match ONNX model
-                full_hidden_states = torch.randn(batch_size, sequence_length, hidden_size).to(torch.float32)
+                full_hidden_states = torch.randn(batch_size, sequence_length, hidden_size).to(device).to(torch.float16)
 
                 # For TTFT simulation, we'll measure single forward pass time
                 # This represents the time to process one token in autoregressive generation

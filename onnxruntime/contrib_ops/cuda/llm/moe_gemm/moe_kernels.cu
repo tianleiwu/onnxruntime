@@ -2878,8 +2878,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>:
     layout_info2.alpha_scale_ptr_array = nullptr;
   }
 
-  layout_info1.int4_groupwise_params.enabled = use_w4afp8;
-  layout_info2.int4_groupwise_params.enabled = use_w4afp8;
+  layout_info1.int4_groupwise_params.enabled = use_w4afp8 || quant_params.groupwise.group_size > 0;
+  layout_info2.int4_groupwise_params.enabled = use_w4afp8 || quant_params.groupwise.group_size > 0;
 
   layout_info1.fpX_block_scaling_type = getScalingType();
   layout_info2.fpX_block_scaling_type = getScalingType();
