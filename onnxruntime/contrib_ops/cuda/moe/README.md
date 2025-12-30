@@ -176,3 +176,55 @@ While weight packing is architecture-aware, many architectures share the same la
 **Summary**:
 *   **Group A (Universal)**: SM75, SM80, SM86, SM89, SM120. Weights packed on any of these can be used on any other in this group.
 *   **Group B (Hopper)**: SM90. Weights packed for SM90 are unique to SM90.
+
+## 7. SwiGLU Details
+
+The operator supports **SwiGLU** activation with support for interleaved inputs, which is critical for performance in certain model architectures (e.g., GPT-OSS).
+
+### 7.1 Formula
+The SwiGLU activation is computed as:
+```
+SwiGLU(x) = Gate * Sigmoid(alpha * Gate) * (Value + beta)
+```
+Where the input `x` contains both `Gate` and `Value` components.
+
+### 7.2 Data Interleaving
+The MoE operator handles two main data layouts for SwiGLU, controlled by the `swiglu_fusion` attribute (or inferred):
+
+1.  **Interleaved (`swiglu_fusion=1`)**:
+    *   **ONNX Input**: The input tensor is expected to contain [Gate, Value] pairs interleaved.
+    *   **Memory Layout**: `[Gate_0, Value_0, Gate_1, Value_1, ..., Gate_N, Value_N]`
+    *   **Cutlass Requirements**: The kernel iterates through the output buffer and reads adjacent elements.
+        *   `Gate` = input[2 * i]
+        *   `Value` = input[2 * i + 1]
+    *   **Code Reference**: `onnxruntime/contrib_ops/cuda/llm/moe_gemm/moe_gemm_activation_kernels.cuh` -> `doGatedActivationKernel` (checks `is_swiglu_interleaved`).
+
+2.  **Separate Blocks (`swiglu_fusion=0/2`)**:
+    *   **Memory Layout**: All Gates followed by all Values. `[Gate_0 ... Gate_N | Value_0 ... Value_N]`.
+    *   The kernel calculates pointers to the second half of the buffer for the Value component.
+
+**Weight Conversion**:
+When exporting a model to ONNX with SwiGLU, the weights for the Gate and Value projections (typically FC1 and Gate_Proj) are often merged. To use **Interleaved** mode, these weights must be interleaved at the output channel dimension during the export/packing phase so that the GEMM output naturally results in `[G, V, G, V...]`.
+
+## 8. Summary of Kernel Changes from TensorRT-LLM
+
+The Cutlass kernels in this implementation are derived from TensorRT-LLM but have been significantly enhanced to support broader ONNX Runtime requirements and fix specific issues.
+
+### Key Modifications:
+
+1.  **Pre-Packed Bias Optimization**:
+    *   Implemented `PrePack` logic to pre-calculate `Bias = -ZeroPoint * Scale` offline (or at initialization).
+    *   This allows the kernel to treat quantization offsets as a simple additive bias, converting mixed-precision math into efficient FP16 accumulation.
+    *   *Commit*: "prepack update", "fp16 zp fake uint8 walkaround"
+
+2.  **SwiGLU Interleaving**:
+    *   Enhanced activation kernels to support **Interleaved** SwiGLU (as described in Section 7), allowing direct compatibility with weights packed for interleaved output.
+    *   *Commit*: "fix swiglu test", "swiglu parameters"
+
+3.  **Sparse Mixer Support**:
+    *   Added support for Sparse Mixer architectures (controlled by `use_sparse_mixer`).
+    *   *Commit*: "add sparse mixer"
+
+## 9. Test Status
+As of the latest validation:
+*   **All tests in `test_moe_cuda.py` pass**, verifying correctness for FP16, Int8, and 4-bit configurations, including SwiGLU and standard activations.
