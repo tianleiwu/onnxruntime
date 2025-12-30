@@ -262,7 +262,8 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
         q_weight_reshaped = q_weight.reshape(n, -1)
         processed_q_weight = _quantize.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, n, k, 8)
 
-        scale_torch = torch.from_numpy(scale).to(weights.device).unsqueeze(-1)
+        # Use abs() for reference dequant to match Cutlass kernel's positive scales
+        scale_torch = torch.from_numpy(scale).to(weights.device).unsqueeze(-1).abs()
         q_weight_torch = torch.from_numpy(q_weight).to(weights.device).to(weights.dtype)
 
         if is_symmetric:
@@ -273,7 +274,8 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
             zp_torch = torch.from_numpy(zero_point).to(weights.device).to(weights.dtype).unsqueeze(-1)
             dequantized = (q_weight_torch - zp_torch) * scale_torch
 
-        scale_torch_out = torch.from_numpy(scale).to(weights.device).to(torch.float16)
+        # Scales must be positive for Cutlass kernel (absolute values)
+        scale_torch_out = torch.from_numpy(scale).to(weights.device).to(torch.float16).abs()
 
         processed_q_weight_torch = (
             torch.from_numpy(processed_q_weight).reshape(k, n).to(weights.device).view(torch.uint8)
@@ -281,11 +283,18 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
 
         result = dequantized.view(n, k)
 
-        zero_points_storage = torch.from_numpy(zero_point).to(weights.device) if asymmetric else None
+        if not asymmetric and not is_4_bit_quantization:
+            # 8-bit Symmetric: weights are uint8, biased by 128.
+            # Cutlass expects explicit Zero Point = 128 to perform (q - 128) * scale.
+            # If we pass None, it defaults to 0, resulting in (q - 0) * scale which is wrong.
+            zero_point[:] = 128
+            zero_points_storage = torch.from_numpy(zero_point).to(weights.device)
+        else:
+            zero_points_storage = torch.from_numpy(zero_point).to(weights.device) if asymmetric else None
 
-        # Return scale in [block_per_k, N] layout to match 4-bit path
-        # After stacking: [E, B, N]. Operator will transpose to [E, B, N] for kernel.
-        return scale_torch_out.T, processed_q_weight_torch, result, zero_points_storage
+        # Return scale in [N, block_per_k] layout matching operator spec [E, N, B] after stacking
+        # Operator will transpose from [E, N, B] to [E, B, N] for kernel
+        return scale_torch_out, processed_q_weight_torch, result, zero_points_storage
 
 
 def quant_dequant(weights, is_4_bit_quantization: bool = True, asymmetric: bool = False):
@@ -926,6 +935,14 @@ class SparseMoeBlockORTHelper(nn.Module):
                 moe_experts_weight_scale1 = moe_experts_weight_scale1.squeeze(-1)
             if moe_experts_weight_scale2.dim() == 3:
                 moe_experts_weight_scale2 = moe_experts_weight_scale2.squeeze(-1)
+
+        # DEBUG: Print scale tensor info before ONNX graph creation
+        print(
+            f"DEBUG Python: moe_experts_weight_scale1 shape={moe_experts_weight_scale1.shape}, "
+            f"min={moe_experts_weight_scale1.min():.6f}, max={moe_experts_weight_scale1.max():.6f}"
+        )
+        if self.block_size > 0:
+            print(f"DEBUG Python: block_size={self.block_size}, expected scale layout: [E, N, B]")
 
         try:
             self.moe_onnx_graph = create_cpu_moe_onnx_graph(

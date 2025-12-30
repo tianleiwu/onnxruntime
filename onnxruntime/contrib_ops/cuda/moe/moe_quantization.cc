@@ -90,7 +90,8 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
 }
 
 Status QMoE::ComputeInternal(OpKernelContext* context) const {
-  printf("DEBUG: QMoE ComputeInternal running on CUDA\n");
+  std::cout << "DEBUG QMoE: ComputeInternal called, block_size_=" << block_size_
+            << ", expert_weight_bits_=" << expert_weight_bits_ << std::endl;
   const Tensor* input = context->Input<Tensor>(0);
   const Tensor* router_probs = context->Input<Tensor>(1);
   const Tensor* fc1_experts_weights = context->Input<Tensor>(2);
@@ -208,28 +209,14 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
       size_t total_elements_packed = E * (N + N3) * B;
       packed_holder = GetScratchBuffer<void>(total_elements_packed * element_size, context->GetComputeStream());
 
-      // TODO: Implement actual packing kernel if separate fc3 scales/zp are provided.
-      // Current usage implies interleaved scales might be in fc1_scales or tests don't assume separate inputs.
-      // For now, we fallback to t1 if packing is requested but not implemented (or throw).
-      // Given the parity tests pass without this, we defer implementation.
       return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED, "Packing of separate FC3 scales/zp not yet implemented");
     }
-
-    // TRANSPOSE: [E, Rows, B] -> [E, B, Rows]
-    // The QuantParams struct expects [E, B, Rows] (group-wise) or [E, Rows] (column-wise).
-    // If block_size > 0, we have B > 1.
-    // If B=1, transpose is effectively [E, N, 1] -> [E, 1, N], which is physically same layout,
-    // but we run it for consistency or could skip.
-    // Cutlass GroupWise params: pointers are expected to be (Expert, Block, Channel) ?
-    // Actually, checked moe_kernels.cu: load_q_scale handles stride.
-    // However, the parity fix implies the layout correction was needed.
 
     // Rows to transpose per expert = N. Cols = B.
     size_t total_elements = E * N * B;
     trans_holder = GetScratchBuffer<void>(total_elements * element_size, context->GetComputeStream());
-
+    // Restore transpose: [E, N, B] -> [E, B, N]
     onnxruntime::llm::kernels::LaunchBatchedTranspose(stream, source_ptr, trans_holder.get(), E, N, B, static_cast<int>(element_size));
-
     out_ptr = trans_holder.get();
     return Status::OK();
   };
