@@ -56,6 +56,39 @@ ort_dtype_name_map = {
 }
 
 
+def print_diff_statistics(diff_tensor: torch.Tensor, prefix: str = ""):
+    """
+    Print percentile statistics (75%, 95%, 99%) for a difference tensor.
+    This helps assess parity quality beyond just max difference.
+
+    Args:
+        diff_tensor: Tensor containing absolute differences between expected and actual outputs.
+        prefix: Optional prefix string for the output message.
+    """
+    diff_flat = diff_tensor.flatten().float()
+    if diff_flat.numel() == 0:
+        print(f"{prefix}Diff statistics: empty tensor")
+        return
+
+    # Compute percentiles
+    sorted_diff, _ = torch.sort(diff_flat)
+    n = sorted_diff.numel()
+
+    p75_idx = min(int(n * 0.75), n - 1)
+    p95_idx = min(int(n * 0.95), n - 1)
+    p99_idx = min(int(n * 0.99), n - 1)
+
+    p75 = sorted_diff[p75_idx].item()
+    p95 = sorted_diff[p95_idx].item()
+    p99 = sorted_diff[p99_idx].item()
+    max_val = sorted_diff[-1].item()
+    mean_val = diff_flat.mean().item()
+
+    print(
+        f"{prefix}Diff stats - mean: {mean_val:.6f}, p75: {p75:.6f}, p95: {p95:.6f}, p99: {p99:.6f}, max: {max_val:.6f}"
+    )
+
+
 def quant_dequant(weights, is_4_bit_quantization: bool = True):
     # We use the pybind directly for testing to match what we added in onnxruntime_pybind_quant.cc
     from onnxruntime.capi import _pybind_state as _quantize
@@ -611,43 +644,68 @@ def create_phi_moe_onnx_graph(
     normalize_routing_weights=0,
 ):
     use_quant = quant_bits > 0
+    use_fused_swiglu = fc3_experts_weights is None  # Fused SwiGLU: FC1 contains both gate and value
     if use_quant:
-        assert fc1_experts_weights.dtype == torch.int8
-        assert fc2_experts_weights.dtype == torch.int8
-        assert fc3_experts_weights.dtype == torch.int8
+        assert fc1_experts_weights.dtype == torch.uint8
+        assert fc2_experts_weights.dtype == torch.uint8
+        if not use_fused_swiglu:
+            assert fc3_experts_weights.dtype == torch.uint8
+            assert fc3_scales is not None
+            assert fc3_scales.dtype == torch.float16
         assert fc1_scales is not None
         assert fc2_scales is not None
-        assert fc3_scales is not None
         assert fc1_scales.dtype == torch.float16
         assert fc2_scales.dtype == torch.float16
-        assert fc3_scales.dtype == torch.float16
 
     op_name = "QMoE" if use_quant else "MoE"
-    inputs = (
-        [
-            "input",
-            "router_probs",
-            "fc1_experts_weights",
-            "fc1_scales",
-            "",
-            "fc2_experts_weights",
-            "fc2_scales",
-            "",
-            "fc3_experts_weights",
-            "fc3_scales",
-            "",
-        ]
-        if use_quant
-        else [
-            "input",
-            "router_probs",
-            "fc1_experts_weights",
-            "",
-            "fc2_experts_weights",
-            "",
-            "fc3_experts_weights",
-        ]
-    )
+    if use_fused_swiglu:
+        # Fused SwiGLU: FC1 contains both gate and value, no separate FC3
+        inputs = (
+            [
+                "input",
+                "router_probs",
+                "fc1_experts_weights",
+                "fc1_scales",
+                "",
+                "fc2_experts_weights",
+                "fc2_scales",
+                "",
+            ]
+            if use_quant
+            else [
+                "input",
+                "router_probs",
+                "fc1_experts_weights",
+                "",
+                "fc2_experts_weights",
+            ]
+        )
+    else:
+        inputs = (
+            [
+                "input",
+                "router_probs",
+                "fc1_experts_weights",
+                "fc1_scales",
+                "",
+                "fc2_experts_weights",
+                "fc2_scales",
+                "",
+                "fc3_experts_weights",
+                "fc3_scales",
+                "",
+            ]
+            if use_quant
+            else [
+                "input",
+                "router_probs",
+                "fc1_experts_weights",
+                "",
+                "fc2_experts_weights",
+                "",
+                "fc3_experts_weights",
+            ]
+        )
 
     nodes = [
         helper.make_node(
@@ -658,7 +716,8 @@ def create_phi_moe_onnx_graph(
             k=topk,
             normalize_routing_weights=normalize_routing_weights,
             use_sparse_mixer=0,  # Align with Python Reference (Softmax)
-            activation_type="silu",
+            activation_type="silu" if not use_fused_swiglu else "swiglu",
+            swiglu_fusion=2 if use_fused_swiglu else 0,  # 2 = fused, not interleaved
             domain="com.microsoft",
         ),
     ]
@@ -666,10 +725,9 @@ def create_phi_moe_onnx_graph(
     if use_quant:
         nodes[0].attribute.extend([helper.make_attribute("expert_weight_bits", quant_bits)])
 
-    components = 2 if quant_bits == 4 else 1
-    fc1_shape = [num_experts, hidden_size, inter_size // components]
-    fc2_shape = [num_experts, inter_size, hidden_size // components]
-    fc3_shape = [num_experts, hidden_size, inter_size // components]
+    # Use actual tensor shapes instead of hardcoding
+    fc1_shape = list(fc1_experts_weights.shape)
+    fc2_shape = list(fc2_experts_weights.shape)
 
     torch_dtype = onnx_to_torch_type_map[onnx_dtype]
 
@@ -691,19 +749,24 @@ def create_phi_moe_onnx_graph(
             fc2_experts_weights.flatten().detach().cpu().numpy().astype(weight_numpy_type).tolist(),
             raw=False,
         ),
-        helper.make_tensor(
-            "fc3_experts_weights",
-            weight_onnx_type,
-            fc3_shape,
-            fc3_experts_weights.flatten().detach().cpu().numpy().astype(weight_numpy_type).tolist(),
-            raw=False,
-        ),
     ]
 
+    # Add FC3 only if not fused
+    if not use_fused_swiglu and fc3_experts_weights is not None:
+        fc3_shape = list(fc3_experts_weights.shape)
+        initializers.append(
+            helper.make_tensor(
+                "fc3_experts_weights",
+                weight_onnx_type,
+                fc3_shape,
+                fc3_experts_weights.flatten().detach().cpu().numpy().astype(weight_numpy_type).tolist(),
+                raw=False,
+            )
+        )
+
     if use_quant:
-        fc1_scale_shape = [num_experts, inter_size]
-        fc2_scale_shape = [num_experts, hidden_size]
-        fc3_scale_shape = [num_experts, inter_size]
+        fc1_scale_shape = list(fc1_scales.shape)
+        fc2_scale_shape = list(fc2_scales.shape)
         initializers.extend(
             [
                 helper.make_tensor(
@@ -720,15 +783,20 @@ def create_phi_moe_onnx_graph(
                     fc2_scales.to(torch_dtype).flatten().tolist(),
                     raw=False,
                 ),
+            ]
+        )
+        # Add FC3 scales only if not fused
+        if not use_fused_swiglu and fc3_scales is not None:
+            fc3_scale_shape = list(fc3_scales.shape)
+            initializers.append(
                 helper.make_tensor(
                     "fc3_scales",
                     onnx_dtype,
                     fc3_scale_shape,
                     fc3_scales.to(torch_dtype).flatten().tolist(),
                     raw=False,
-                ),
-            ]
-        )
+                )
+            )
 
     graph_inputs = [
         helper.make_tensor_value_info("input", onnx_dtype, [sequence_length, hidden_size]),
@@ -1018,11 +1086,14 @@ class SparseMoeBlockORTHelper(nn.Module):
 
         atol, rtol = ort_dtype_quant_bits_tolerance_map[f"{dtype_str}:{self.quant_bits}"]
         if ort_output is not None:
+            diff = (torch_output.cpu() - ort_output.cpu()).abs()
             print(
                 f"name: {self.__class__.__name__}, quant_bits: {self.quant_bits}, dtype: {dtype_str},"
                 f" batch: {self.batch_size}, seq_len: {self.sequence_length},"
-                f" max_diff: {(torch_output.cpu() - ort_output.cpu()).abs().max()}"
+                f" max_diff: {diff.max()}"
             )
+            # Print percentile statistics for better parity assessment
+            print_diff_statistics(diff, prefix=f"  [{self.__class__.__name__}] ")
             torch.testing.assert_close(
                 ort_output.cpu().to(torch.float32), torch_output.cpu().to(torch.float32), rtol=rtol, atol=atol
             )
@@ -1291,6 +1362,20 @@ class PhiMoESparseMoeBlock(SparseMoeBlockORTHelper):
         moe_experts_weight_scale2 = torch.stack(w2_scale_list, dim=0) if use_quant else None
         moe_experts_weight_scale3 = torch.stack(w3_scale_list, dim=0) if use_quant else None
 
+        # Combine FC1 (gate) and FC3 (value) for fused SwiGLU to avoid separate FC3 input
+        # This triggers swiglu_fusion=2 mode (fused, not interleaved) - concat along N dimension
+        if use_quant:
+            # Weights: [E, K, N/pack] -> [E, K, 2*N/pack] - concat along dim=2 (N axis)
+            self.moe_experts_weight1 = torch.cat([self.moe_experts_weight1, self.moe_experts_weight3], dim=2)
+            self.moe_experts_weight3 = None
+            # Scales: [E, N] -> [E, 2*N] - concat along dim=1
+            moe_experts_weight_scale1 = torch.cat([moe_experts_weight_scale1, moe_experts_weight_scale3], dim=1)
+            moe_experts_weight_scale3 = None
+        else:
+            # Float weights: [E, N, K] -> [E, 2*N, K] - concat along dim=1
+            self.moe_experts_weight1 = torch.cat([self.moe_experts_weight1, self.moe_experts_weight3], dim=1)
+            self.moe_experts_weight3 = None
+
         self.batch_size = batch_size
         self.sequence_length = sequence_length
         self.moe_onnx_graph = create_phi_moe_onnx_graph(
@@ -1300,13 +1385,13 @@ class PhiMoESparseMoeBlock(SparseMoeBlockORTHelper):
             self.ffn_dim,
             self.moe_experts_weight1,
             self.moe_experts_weight2,
-            self.moe_experts_weight3,
+            self.moe_experts_weight3,  # Now None, triggering fused SwiGLU path
             self.top_k,
             self.onnx_dtype,
             self.quant_bits,
             moe_experts_weight_scale1,
             moe_experts_weight_scale2,
-            moe_experts_weight_scale3,
+            moe_experts_weight_scale3,  # Now None
             normalize_routing_weights,
         )
 

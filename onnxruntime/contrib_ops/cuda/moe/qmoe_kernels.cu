@@ -275,4 +275,37 @@ int Lora_run(LoraImpl* /*impl*/, int64_t /*numTokens*/, int64_t /*numReqs*/, voi
   return 0;
 }
 
+template <typename T>
+__global__ void BatchedTransposeKernel(const T* __restrict__ input, T* __restrict__ output, int batch, int rows, int cols) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t matrix_size = static_cast<int64_t>(rows) * cols;
+  int64_t total_size = static_cast<int64_t>(batch) * matrix_size;
+
+  if (idx < total_size) {
+    int64_t b = idx / matrix_size;
+    int64_t rem = idx % matrix_size;
+    int r = rem / cols;
+    int c = rem % cols;
+
+    int64_t out_idx = b * matrix_size + static_cast<int64_t>(c) * rows + r;
+    output[out_idx] = input[idx];
+  }
+}
+
+void LaunchBatchedTranspose(cudaStream_t stream, const void* input, void* output, int batch, int rows, int cols, int element_size) {
+  int64_t total_elements = static_cast<int64_t>(batch) * rows * cols;
+  int threads = 256;
+  int blocks = (total_elements + threads - 1) / threads;
+
+  printf("DEBUG Kernel: LaunchBatchedTranspose element_size=%d, total=%ld\n", element_size, total_elements);
+
+  if (element_size == 1) {
+    BatchedTransposeKernel<uint8_t><<<blocks, threads, 0, stream>>>(static_cast<const uint8_t*>(input), static_cast<uint8_t*>(output), batch, rows, cols);
+  } else if (element_size == 2) {
+    BatchedTransposeKernel<uint16_t><<<blocks, threads, 0, stream>>>(static_cast<const uint16_t*>(input), static_cast<uint16_t*>(output), batch, rows, cols);
+  } else if (element_size == 4) {
+    BatchedTransposeKernel<uint32_t><<<blocks, threads, 0, stream>>>(static_cast<const uint32_t*>(input), static_cast<uint32_t*>(output), batch, rows, cols);
+  }
+}
+
 }  // namespace onnxruntime::llm::kernels

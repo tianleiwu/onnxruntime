@@ -162,7 +162,8 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
 
   Tensor* output = context->Output(0, input->Shape());
 
-  onnxruntime::llm::kernels::cutlass_kernels::QuantParams quant_params{};  // Default constructor
+  onnxruntime::llm::kernels::cutlass_kernels::QuantParams quant_params{};
+
   onnxruntime::llm::kernels::LoraParams lora_params{};
   onnxruntime::llm::kernels::cutlass_kernels::MoeMinLatencyParams min_latency_params;
 

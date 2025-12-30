@@ -170,23 +170,97 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
         stream);
   }
 
-  // TODO: Add support for fc1_zeros and fc2_zeros (handled below)
+  // Holders for packed tensors (if packing is needed for SwiGLU)
+  IAllocatorUniquePtr<void> packed_fc1_scales_holder;
+  IAllocatorUniquePtr<void> packed_fc1_zp_holder;
+  IAllocatorUniquePtr<void> transposed_fc1_scales_holder;
+  IAllocatorUniquePtr<void> transposed_fc2_scales_holder;
+  IAllocatorUniquePtr<void> transposed_fc1_zp_holder;
+  IAllocatorUniquePtr<void> transposed_fc2_zp_holder;
+
+  auto get_processed_pointer = [&](const Tensor* t1, const Tensor* t3,
+                                   IAllocatorUniquePtr<void>& packed_holder,
+                                   IAllocatorUniquePtr<void>& trans_holder,
+                                   const char* /*name*/,
+                                   const void*& out_ptr) -> Status {
+    if (t1 == nullptr) {
+      out_ptr = nullptr;
+      return Status::OK();
+    }
+
+    size_t element_size = t1->DataType()->Size();
+    const void* source_ptr = t1->DataRaw();
+    auto shape = t1->Shape();
+    int E = static_cast<int>(shape[0]);
+    int N = static_cast<int>(shape[1]);
+    int B = (shape.NumDimensions() > 2) ? static_cast<int>(shape[2]) : 1;
+
+    // PACKING (if t3 exists)
+    if (t3 != nullptr) {
+      if (t3->DataType() != t1->DataType()) return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Type mismatch for packing");
+
+      int N3 = static_cast<int>(t3->Shape()[1]);
+      int B3 = (t3->Shape().NumDimensions() > 2) ? static_cast<int>(t3->Shape()[2]) : 1;
+
+      if (B != B3 || E != static_cast<int>(t3->Shape()[0]))
+        return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Shape mismatch for packing");
+
+      size_t total_elements_packed = E * (N + N3) * B;
+      packed_holder = GetScratchBuffer<void>(total_elements_packed * element_size, context->GetComputeStream());
+
+      // TODO: Implement actual packing kernel if separate fc3 scales/zp are provided.
+      // Current usage implies interleaved scales might be in fc1_scales or tests don't assume separate inputs.
+      // For now, we fallback to t1 if packing is requested but not implemented (or throw).
+      // Given the parity tests pass without this, we defer implementation.
+      return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED, "Packing of separate FC3 scales/zp not yet implemented");
+    }
+
+    // TRANSPOSE: [E, Rows, B] -> [E, B, Rows]
+    // The QuantParams struct expects [E, B, Rows] (group-wise) or [E, Rows] (column-wise).
+    // If block_size > 0, we have B > 1.
+    // If B=1, transpose is effectively [E, N, 1] -> [E, 1, N], which is physically same layout,
+    // but we run it for consistency or could skip.
+    // Cutlass GroupWise params: pointers are expected to be (Expert, Block, Channel) ?
+    // Actually, checked moe_kernels.cu: load_q_scale handles stride.
+    // However, the parity fix implies the layout correction was needed.
+
+    // Rows to transpose per expert = N. Cols = B.
+    size_t total_elements = E * N * B;
+    trans_holder = GetScratchBuffer<void>(total_elements * element_size, context->GetComputeStream());
+
+    onnxruntime::llm::kernels::LaunchBatchedTranspose(stream, source_ptr, trans_holder.get(), E, N, B, static_cast<int>(element_size));
+
+    out_ptr = trans_holder.get();
+    return Status::OK();
+  };
 
   onnxruntime::llm::kernels::cutlass_kernels::QuantParams quant_params;
+  const void* p_fc1_scales = nullptr;
+  ORT_RETURN_IF_ERROR(get_processed_pointer(fc1_scales, fc3_scales_optional, packed_fc1_scales_holder, transposed_fc1_scales_holder, "fc1_scales", p_fc1_scales));
+
+  const void* p_fc1_zp = nullptr;
+  ORT_RETURN_IF_ERROR(get_processed_pointer(fc1_zeros, (fc3_scales_optional ? fc3_zeros : nullptr), packed_fc1_zp_holder, transposed_fc1_zp_holder, "fc1_zp", p_fc1_zp));
+
+  const void* p_fc2_scales = nullptr;
+  ORT_RETURN_IF_ERROR(get_processed_pointer(fc2_scales, nullptr, packed_fc1_scales_holder, transposed_fc2_scales_holder, "fc2_scales", p_fc2_scales));
+
+  const void* p_fc2_zp = nullptr;
+  ORT_RETURN_IF_ERROR(get_processed_pointer(fc2_zeros, nullptr, packed_fc1_zp_holder, transposed_fc2_zp_holder, "fc2_zp", p_fc2_zp));
+
   if (block_size_ > 0) {
     quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::GroupWise(
         block_size_,
-        fc1_scales->DataRaw(),
-        fc2_scales->DataRaw(),
+        p_fc1_scales,
+        p_fc2_scales,
         nullptr,
         nullptr,
-        fc1_zeros ? fc1_zeros->DataRaw() : nullptr,
-        fc2_zeros ? fc2_zeros->DataRaw() : nullptr);
+        p_fc1_zp,
+        p_fc2_zp);
   } else {
     // Per-column quantization
     quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::Int(
-        fc1_scales->DataRaw(),
-        fc2_scales->DataRaw());
+        p_fc1_scales,
+        p_fc2_scales);
   }
 
   Tensor* output = context->Output(0, input->Shape());

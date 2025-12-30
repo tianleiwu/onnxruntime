@@ -52,3 +52,7 @@ void LaunchSparseMixerTop2(
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime
+
+namespace onnxruntime::llm::kernels {
+void LaunchBatchedTranspose(cudaStream_t stream, const void* input, void* output, int batch, int rows, int cols, int element_size);
+}

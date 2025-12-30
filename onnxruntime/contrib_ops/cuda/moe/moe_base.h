@@ -63,6 +63,8 @@ class MoEBase {
     // SwiGLU limit for clamping (optional, use infinity if not provided)
     swiglu_limit_ = op_kernel_info.GetAttrOrDefault<float>("swiglu_limit", std::numeric_limits<float>::infinity());
 
+    block_size_ = op_kernel_info.GetAttrOrDefault<int64_t>("block_size", 0);
+
     sm_ = device_prop.major * 10 + device_prop.minor;
   }
 
@@ -74,6 +76,7 @@ class MoEBase {
   float activation_beta_;
   int swiglu_fusion_;   // 0: not fused, 1: fused interleaved, 2: fused chunked
   float swiglu_limit_;  // Clamp limit for SwiGLU
+  int64_t block_size_;
   int sm_;
 };
 
