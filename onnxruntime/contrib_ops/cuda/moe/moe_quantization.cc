@@ -93,17 +93,17 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   const Tensor* input = context->Input<Tensor>(0);
   const Tensor* router_probs = context->Input<Tensor>(1);
   const Tensor* fc1_experts_weights = context->Input<Tensor>(2);
-  const Tensor* fc1_scales = context->Input<Tensor>(3);
+  const Tensor* fc1_scales = packed_fc1_scales_ ? nullptr : context->Input<Tensor>(3);
   const Tensor* fc1_experts_bias_optional = context->Input<Tensor>(4);
   const Tensor* fc2_experts_weights = context->Input<Tensor>(5);
-  const Tensor* fc2_scales = context->Input<Tensor>(6);
+  const Tensor* fc2_scales = packed_fc2_scales_ ? nullptr : context->Input<Tensor>(6);
   const Tensor* fc2_experts_bias_optional = context->Input<Tensor>(7);
   const Tensor* fc3_experts_weights_optional = context->Input<Tensor>(8);
   const Tensor* fc3_scales_optional = context->Input<Tensor>(9);
   const Tensor* fc3_experts_bias_optional = context->Input<Tensor>(10);
 
-  const Tensor* fc1_zeros = context->Input<Tensor>(11);
-  const Tensor* fc2_zeros = context->Input<Tensor>(12);
+  const Tensor* fc1_zeros = packed_fc1_bias_ ? nullptr : context->Input<Tensor>(11);
+  const Tensor* fc2_zeros = packed_fc2_bias_ ? nullptr : context->Input<Tensor>(12);
   const Tensor* fc3_zeros = context->Input<Tensor>(13);
   (void)fc3_zeros;  // Cast to void to avoid unused warning
 
@@ -186,54 +186,116 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   // Use pre-packed buffers if available, otherwise use input tensors (and potentially compute bias on the fly)
   IAllocatorUniquePtr<void> transient_fc1_bias;
   IAllocatorUniquePtr<void> transient_fc2_bias;
+  IAllocatorUniquePtr<void> transient_fc1_scales;
+  IAllocatorUniquePtr<void> transient_fc2_scales;
 
   auto prepare_scale_zp = [&](const Tensor* scales, const Tensor* zeros,
                               const IAllocatorUniquePtr<void>& packed_scale, const IAllocatorUniquePtr<void>& packed_bias,
-                              IAllocatorUniquePtr<void>& transient_bias,
+                              IAllocatorUniquePtr<void>& transient_scale, IAllocatorUniquePtr<void>& transient_bias,
                               const void*& eff_scale, const void*& eff_zp) {
     if (packed_scale) {
       eff_scale = packed_scale.get();
     } else if (scales) {
-      eff_scale = scales->DataRaw();
+      // Transpose scales on the fly: [E, N, B] -> [E, B, N]
+      auto& shape = scales->Shape();
+      if (shape.NumDimensions() == 3 && block_size_ > 0) {
+        int E = static_cast<int>(shape[0]);
+        int N = static_cast<int>(shape[1]);
+        int B = static_cast<int>(shape[2]);
+        size_t bytes = scales->SizeInBytes();
+        transient_scale = GetScratchBuffer<void>(bytes, context->GetComputeStream());
+        eff_scale = transient_scale.get();
+
+        bool is_fp16 = scales->IsDataType<MLFloat16>();
+        if (is_fp16) {
+          LaunchQMoETranspose2D(static_cast<const half*>(scales->DataRaw()), static_cast<half*>(transient_scale.get()), E, N, B, stream);
+        } else {
+          LaunchQMoETranspose2D(static_cast<const float*>(scales->DataRaw()), static_cast<float*>(transient_scale.get()), E, N, B, stream);
+        }
+      } else {
+        eff_scale = scales->DataRaw();
+      }
     }
 
     if (packed_bias) {
       eff_zp = packed_bias.get();
     } else if (zeros) {
       // Compute bias on the fly: bias = -zp * scale
-      // We need 'eff_scale' to be available.
+      // Zeros [E, N, B] -> Transpose [E, B, N] -> Compute Bias
       if (eff_scale && block_size_ > 0) {
-        size_t num_elements = zeros->Shape().Size();
-        size_t bytes = num_elements * (expert_weight_bits_ == 4 ? sizeof(half) : sizeof(half));  // Assuming bias is half/float matching scale
-        // Determine type size based on scale type
-        bool is_fp16 = scales->IsDataType<MLFloat16>();
-        bytes = num_elements * (is_fp16 ? 2 : 4);
+        auto& shape = zeros->Shape();
+        if (shape.NumDimensions() == 3) {
+          int E = static_cast<int>(shape[0]);
+          int N = static_cast<int>(shape[1]);
+          int B = static_cast<int>(shape[2]);
+          size_t num_elements = shape.Size();
+          bool is_fp16 = scales->IsDataType<MLFloat16>();
+          size_t bytes = num_elements * (is_fp16 ? 2 : 4);
 
-        transient_bias = GetScratchBuffer<void>(bytes, context->GetComputeStream());
-        // transient_bias =IAllocator::MakeUniquePtr<void>(context->GetComputeStream()->GetAllocator(), bytes, true);
-        eff_zp = transient_bias.get();
+          transient_bias = GetScratchBuffer<void>(bytes, context->GetComputeStream());
+          eff_zp = transient_bias.get();
 
-        if (is_fp16) {
-          LaunchQMoEPrePackZP(
-              static_cast<const uint8_t*>(zeros->DataRaw()),
-              static_cast<const half*>(eff_scale),
-              static_cast<half*>(transient_bias.get()),
-              static_cast<int>(num_elements),
-              stream);
+          // 1. Transpose ZPs to temp buffer (reusing bias buffer? No, type mismatch uint8 vs half)
+          // We need temp uint8 buffer.
+          auto temp_zp = GetScratchBuffer<void>(num_elements * sizeof(uint8_t), context->GetComputeStream());
+          LaunchQMoETranspose2D(static_cast<const uint8_t*>(zeros->DataRaw()), static_cast<uint8_t*>(temp_zp.get()), E, N, B, stream);
+
+          // 2. Compute Bias using Transposed ZP and Transposed Scale (eff_scale)
+          if (is_fp16) {
+            LaunchQMoEPrePackZP(
+                static_cast<const uint8_t*>(temp_zp.get()),
+                static_cast<const half*>(eff_scale),
+                static_cast<half*>(transient_bias.get()),
+                static_cast<int>(num_elements),
+                stream);
+          } else {
+            LaunchQMoEPrePackZP(
+                static_cast<const uint8_t*>(temp_zp.get()),
+                static_cast<const float*>(eff_scale),
+                static_cast<float*>(transient_bias.get()),
+                static_cast<int>(num_elements),
+                stream);
+          }
         } else {
-          LaunchQMoEPrePackZP(
-              static_cast<const uint8_t*>(zeros->DataRaw()),
-              static_cast<const float*>(eff_scale),
-              static_cast<float*>(transient_bias.get()),
-              static_cast<int>(num_elements),
-              stream);
+          // Fallback for rank != 3 (e.g. per-column) -> Linear computation
+          size_t num_elements = shape.Size();
+          bool is_fp16 = scales->IsDataType<MLFloat16>();
+          size_t bytes = num_elements * (is_fp16 ? 2 : 4);
+          transient_bias = GetScratchBuffer<void>(bytes, context->GetComputeStream());
+          eff_zp = transient_bias.get();
+          if (is_fp16) {
+            LaunchQMoEPrePackZP(static_cast<const uint8_t*>(zeros->DataRaw()), static_cast<const half*>(eff_scale), static_cast<half*>(transient_bias.get()), static_cast<int>(num_elements), stream);
+          } else {
+            LaunchQMoEPrePackZP(static_cast<const uint8_t*>(zeros->DataRaw()), static_cast<const float*>(eff_scale), static_cast<float*>(transient_bias.get()), static_cast<int>(num_elements), stream);
+          }
         }
       }
     }
   };
 
-  prepare_scale_zp(fc1_scales, fc1_zeros, packed_fc1_scales_, packed_fc1_bias_, transient_fc1_bias, p_fc1_scales, p_fc1_zp);
-  prepare_scale_zp(fc2_scales, fc2_zeros, packed_fc2_scales_, packed_fc2_bias_, transient_fc2_bias, p_fc2_scales, p_fc2_zp);
+  prepare_scale_zp(fc1_scales, fc1_zeros, packed_fc1_scales_, packed_fc1_bias_, transient_fc1_scales, transient_fc1_bias, p_fc1_scales, p_fc1_zp);
+  prepare_scale_zp(fc2_scales, fc2_zeros, packed_fc2_scales_, packed_fc2_bias_, transient_fc2_scales, transient_fc2_bias, p_fc2_scales, p_fc2_zp);
+
+  // DEBUG PRINTS (Preserved and fixed)
+  if (true) {  // block_size_ > 0 checks (ALWAYS RUN DEBUG)
+    // printf("QMoE Debug: block_size=%ld, expert_bits=%ld\n", block_size_, expert_weight_bits_);
+    // printf("QMoE Debug: FC1 Scales=%p, ZP=%p (PackedScales=%p, PackedBias=%p)\n", p_fc1_scales, p_fc1_zp, packed_fc1_scales_.get(), packed_fc1_bias_.get());
+    if (p_fc1_zp == nullptr && fc1_zeros != nullptr) {
+      printf("QMoE ERROR: FC1 ZP is NULL despite input zeros present! Fallback failed?\n");
+    } else if (p_fc1_zp != nullptr) {
+      // Dump first element of Bias
+      float bias_val = 0.0f;
+      // Use outer is_fp16 from input type check to avoid dereferencing possibly null fc1_scales
+      if (is_fp16) {
+        onnxruntime::MLFloat16 half_val;
+        cudaMemcpy(&half_val, p_fc1_zp, 2, cudaMemcpyDeviceToHost);
+        printf("QMoE DEBUG: FC1 ZP[0] (Half) = %f (Raw: %x)\n", half_val.ToFloat(), half_val.val);
+      } else {
+        cudaMemcpy(&bias_val, p_fc1_zp, sizeof(float), cudaMemcpyDeviceToHost);  // Try float copy
+        printf("QMoE DEBUG: FC1 ZP[0] (Float) = %f\n", bias_val);
+      }
+    }
+  }
 
   onnxruntime::llm::kernels::cutlass_kernels::QuantParams quant_params;
   if (block_size_ > 0) {
@@ -298,7 +360,22 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
   auto capture_scale = [&](IAllocatorUniquePtr<void>& packed_buf) {
     size_t bytes = tensor.SizeInBytes();
     packed_buf = IAllocator::MakeUniquePtr<void>(alloc, bytes, true);
-    cudaMemcpyAsync(packed_buf.get(), tensor.DataRaw(), bytes, cudaMemcpyDefault, stream);
+
+    // Transpose [E, N, B] -> [E, B, N]
+    const auto& shape = tensor.Shape();
+    if (shape.NumDimensions() == 3) {
+      int E = static_cast<int>(shape[0]);
+      int N = static_cast<int>(shape[1]);
+      int B = static_cast<int>(shape[2]);
+      bool is_fp16 = (tensor.GetElementType() == TensorProto_DataType_FLOAT16);
+      if (is_fp16) {
+        LaunchQMoETranspose2D(static_cast<const half*>(tensor.DataRaw()), static_cast<half*>(packed_buf.get()), E, N, B, stream);
+      } else {
+        LaunchQMoETranspose2D(static_cast<const float*>(tensor.DataRaw()), static_cast<float*>(packed_buf.get()), E, N, B, stream);
+      }
+    } else {
+      cudaMemcpyAsync(packed_buf.get(), tensor.DataRaw(), bytes, cudaMemcpyDefault, stream);
+    }
     cudaStreamSynchronize(stream);
     is_packed = true;
   };
@@ -319,11 +396,30 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
       p_zeros = temp_zeros_gpu.get();
     }
 
-    if (is_fp16) {
-      LaunchQMoEPrePackZP(static_cast<const uint8_t*>(p_zeros), static_cast<const half*>(packed_scale.get()), static_cast<half*>(packed_bias.get()), num_elements, stream);
+    // Transpose ZP [E, N, B] -> [E, B, N] into a temp buffer
+    const auto& shape = tensor.Shape();
+    if (shape.NumDimensions() == 3) {
+      int E = static_cast<int>(shape[0]);
+      int N = static_cast<int>(shape[1]);
+      int B = static_cast<int>(shape[2]);
+      auto temp_zp_transposed = IAllocator::MakeUniquePtr<void>(alloc, num_elements * sizeof(uint8_t), true);
+
+      LaunchQMoETranspose2D(static_cast<const uint8_t*>(p_zeros), static_cast<uint8_t*>(temp_zp_transposed.get()), E, N, B, stream);
+
+      // Compute bias using Transposed ZP and Transposed Scale (packed_scale)
+      if (is_fp16) {
+        LaunchQMoEPrePackZP(static_cast<const uint8_t*>(temp_zp_transposed.get()), static_cast<const half*>(packed_scale.get()), static_cast<half*>(packed_bias.get()), num_elements, stream);
+      } else {
+        LaunchQMoEPrePackZP(static_cast<const uint8_t*>(temp_zp_transposed.get()), static_cast<const float*>(packed_scale.get()), static_cast<float*>(packed_bias.get()), num_elements, stream);
+      }
     } else {
-      LaunchQMoEPrePackZP(static_cast<const uint8_t*>(p_zeros), static_cast<const float*>(packed_scale.get()), static_cast<float*>(packed_bias.get()), num_elements, stream);
+      if (is_fp16) {
+        LaunchQMoEPrePackZP(static_cast<const uint8_t*>(p_zeros), static_cast<const half*>(packed_scale.get()), static_cast<half*>(packed_bias.get()), num_elements, stream);
+      } else {
+        LaunchQMoEPrePackZP(static_cast<const uint8_t*>(p_zeros), static_cast<const float*>(packed_scale.get()), static_cast<float*>(packed_bias.get()), num_elements, stream);
+      }
     }
+
     cudaStreamSynchronize(stream);
     is_packed = true;
   };

@@ -1,10 +1,4 @@
 # --------------------------------------------------------------------------
-# Copyright 2020 The HuggingFace Inc. team
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
-# --------------------------------------------------------------------------
 # Copyright (c) Microsoft Corporation.  All rights reserved.
 # Licensed under the MIT License.  See License.txt in the project root for
 # license information.
@@ -19,7 +13,7 @@
 # This follows the _symmetric_quantize_last_axis_of_batched_matrix pattern.
 # Tolerance values account for numerical differences between implementations.
 #
-# Routing Logic: CPU implementation uses top-k selection first, then softmax
+# Routing Logic:top-k selection first, then softmax
 # normalization on the selected experts. This provides proper weight distribution
 # while maintaining computational efficiency.
 # --------------------------------------------------------------------------
@@ -288,10 +282,10 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
             # Cutlass expects explicit Zero Point = 128 to perform (q - 128) * scale.
             # ZP must be FP16 (match Scale type).
             zero_point[:] = 128
-            zero_points_storage = torch.from_numpy(zero_point).to(weights.device).to(torch.float16)
+            zero_points_storage = torch.from_numpy(zero_point).to(weights.device).to(torch.uint8)
         else:
             zero_points_storage = (
-                torch.from_numpy(zero_point).to(weights.device).to(torch.float16) if asymmetric else None
+                torch.from_numpy(zero_point).to(weights.device).to(torch.uint8) if asymmetric else None
             )
 
         # Return scale in [N, block_per_k] layout matching operator spec [E, N, B] after stacking
@@ -311,7 +305,7 @@ def quant_dequant(weights, is_4_bit_quantization: bool = True, asymmetric: bool 
     return quant_dequant_blockwise(weights, block_size, is_4_bit_quantization, asymmetric)
 
 
-def create_cpu_moe_onnx_graph(
+def create_moe_onnx_graph(
     hidden_size,
     sequence_length,
     num_experts,
@@ -631,7 +625,7 @@ class PhiMoEBlockSparseTop2MLP(MoEBlockSparseTop2MLP):
 
 class PhiMoESwiGLUMLP(nn.Module):
     """
-    Phi3 MoE expert converted to 2-weight SwiGLU structure for CPU compatibility.
+    Phi3 MoE expert converted to 2-weight SwiGLU structure.
     This converts the traditional 3-weight Phi3 structure to SwiGLU format.
     """
 
@@ -946,7 +940,7 @@ class SparseMoeBlockORTHelper(nn.Module):
             print(f"DEBUG Python: block_size={self.block_size}, expected scale layout: [E, N, B]")
 
         try:
-            self.moe_onnx_graph = create_cpu_moe_onnx_graph(
+            self.moe_onnx_graph = create_moe_onnx_graph(
                 hidden_size=self.hidden_dim,
                 sequence_length=self.batch_size * self.sequence_length,
                 num_experts=self.num_experts,
@@ -1306,7 +1300,7 @@ class PhiMoESparseMoeBlock(SparseMoeBlockORTHelper):
         self.batch_size = batch_size
         self.sequence_length = sequence_length
 
-        self.moe_onnx_graph = create_cpu_moe_onnx_graph(
+        self.moe_onnx_graph = create_moe_onnx_graph(
             hidden_size=self.hidden_dim,
             sequence_length=self.batch_size * self.sequence_length,
             num_experts=self.num_experts,
@@ -1338,7 +1332,7 @@ class PhiMoESparseMoeBlock(SparseMoeBlockORTHelper):
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate(hidden_states)
 
-        # Match CPU implementation: select top-k experts by logits, then softmax over those logits
+        # select top-k experts by logits, then softmax over those logits
         routing_weights_vals, selected_experts = torch.topk(router_logits, self.top_k, dim=-1)
         routing_weights = F.softmax(routing_weights_vals, dim=1, dtype=torch.float)
         routing_weights = routing_weights.to(hidden_states.dtype)
@@ -1382,9 +1376,9 @@ phi3_blockwise_test_cases = [
 ]
 
 
-class TestPhiQMoECPU(unittest.TestCase):
+class TestPhiQMoE(unittest.TestCase):
     @parameterized.expand(phi3_test_cases)
-    def test_phi3_qmoe_parity_cpu(self, batch_size, sequence_length, quant_bits):
+    def test_phi3_qmoe_parity(self, batch_size, sequence_length, quant_bits):
         # Create unique seed based on test parameters to ensure different inputs for each test
         base_seed = 2000  # Different base seed from other tests
         param_hash = hash((batch_size, sequence_length, quant_bits))
@@ -1422,7 +1416,7 @@ class TestPhiQMoECPU(unittest.TestCase):
         phi3_moe.parity_check()
 
     @parameterized.expand(phi3_test_cases)
-    def test_phi3_qmoe_asymmetric_parity_cpu(self, batch_size, sequence_length, quant_bits):
+    def test_phi3_qmoe_asymmetric_parity(self, batch_size, sequence_length, quant_bits):
         base_seed = 3000
         param_hash = hash((batch_size, sequence_length, quant_bits))
         unique_seed = base_seed + abs(param_hash) % 1000
@@ -1447,7 +1441,7 @@ class TestPhiQMoECPU(unittest.TestCase):
         phi3_moe.parity_check()
 
     @parameterized.expand(phi3_blockwise_test_cases)
-    def test_phi3_qmoe_blockwise_parity_cpu(self, batch_size, sequence_length, quant_bits, block_size):
+    def test_phi3_qmoe_blockwise_parity(self, batch_size, sequence_length, quant_bits, block_size):
         if quant_bits == 8:
             self.skipTest("8-bit blockwise quantization is not supported on CUDA")
         torch.manual_seed(42)
@@ -1481,7 +1475,7 @@ class TestPhiQMoECPU(unittest.TestCase):
         phi3_moe.parity_check()
 
     @parameterized.expand(phi3_blockwise_test_cases)
-    def test_phi3_qmoe_blockwise_asymmetric_parity_cpu(self, batch_size, sequence_length, quant_bits, block_size):
+    def test_phi3_qmoe_blockwise_asymmetric_parity(self, batch_size, sequence_length, quant_bits, block_size):
         torch.manual_seed(43)
         numpy.random.seed(43)
 
@@ -1519,9 +1513,9 @@ swiglu_blockwise_test_cases = [
 ]
 
 
-class TestSwigluQMoECPU(unittest.TestCase):
+class TestSwigluQMoE(unittest.TestCase):
     @parameterized.expand(swiglu_test_cases)
-    def test_swiglu_qmoe_parity_cpu(self, batch_size, sequence_length, quant_bits):
+    def test_swiglu_qmoe_parity(self, batch_size, sequence_length, quant_bits):
         # Create unique seed based on test parameters to ensure different inputs for each test
         base_seed = 1000  # Different base seed from regular MoE tests
         param_hash = hash((batch_size, sequence_length, quant_bits))
@@ -1558,7 +1552,7 @@ class TestSwigluQMoECPU(unittest.TestCase):
         swiglu_moe.parity_check()
 
     @parameterized.expand(swiglu_test_cases)
-    def test_swiglu_qmoe_asymmetric_parity_cpu(self, batch_size, sequence_length, quant_bits):
+    def test_swiglu_qmoe_asymmetric_parity(self, batch_size, sequence_length, quant_bits):
         base_seed = 1100
         param_hash = hash((batch_size, sequence_length, quant_bits))
         unique_seed = base_seed + abs(param_hash) % 1000
@@ -1583,7 +1577,7 @@ class TestSwigluQMoECPU(unittest.TestCase):
         swiglu_moe.parity_check()
 
     @parameterized.expand(swiglu_blockwise_test_cases)
-    def test_swiglu_qmoe_blockwise_parity_cpu(self, batch_size, sequence_length, quant_bits, block_size):
+    def test_swiglu_qmoe_blockwise_parity(self, batch_size, sequence_length, quant_bits, block_size):
         # if quant_bits == 8:
         #     self.skipTest("8-bit blockwise quantization is not supported on CUDA")
         torch.manual_seed(42)
@@ -1616,7 +1610,7 @@ class TestSwigluQMoECPU(unittest.TestCase):
         swiglu_moe.parity_check()
 
     @parameterized.expand(swiglu_blockwise_test_cases)
-    def test_swiglu_qmoe_blockwise_asymmetric_parity_cpu(self, batch_size, sequence_length, quant_bits, block_size):
+    def test_swiglu_qmoe_blockwise_asymmetric_parity(self, batch_size, sequence_length, quant_bits, block_size):
         torch.manual_seed(43)
         numpy.random.seed(43)
 
@@ -1637,7 +1631,7 @@ class TestSwigluQMoECPU(unittest.TestCase):
         swiglu_moe.parity_check()
 
 
-@unittest.skipIf(True, "Skipping QMoE CPU benchmark tests")
+@unittest.skipIf(True, "Skipping QMoE benchmark tests")
 class TestQMoESwiGLUBenchmark(unittest.TestCase):
     """Benchmark tests for QMoE SwiGLU performance measurement."""
 

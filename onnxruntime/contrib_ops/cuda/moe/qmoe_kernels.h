@@ -63,6 +63,30 @@ void LaunchQMoEPrePackZP(
     int num_elements,
     cudaStream_t stream);
 
+void LaunchQMoETranspose2D(
+    const float* input,
+    float* output,
+    int batch_size,
+    int rows,
+    int cols,
+    cudaStream_t stream);
+
+void LaunchQMoETranspose2D(
+    const half* input,
+    half* output,
+    int batch_size,
+    int rows,
+    int cols,
+    cudaStream_t stream);
+
+void LaunchQMoETranspose2D(
+    const uint8_t* input,
+    uint8_t* output,
+    int batch_size,
+    int rows,
+    int cols,
+    cudaStream_t stream);
+
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime

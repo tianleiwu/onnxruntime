@@ -298,6 +298,55 @@ void LaunchSparseMixerTop2(
   LaunchSparseMixerTop2Impl<half>(input, output, indices, source_rows, num_rows, num_experts, stream);
 }
 
+template <typename T>
+__global__ void QMoETranspose2DKernel(const T* input, T* output, int num_elements_per_batch, int rows, int cols) {
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y * blockDim.y + threadIdx.y;
+  int batch = blockIdx.z;
+
+  if (col < cols && row < rows) {
+    int in_idx = batch * num_elements_per_batch + row * cols + col;
+    int out_idx = batch * num_elements_per_batch + col * rows + row;
+    output[out_idx] = input[in_idx];
+  }
+}
+
+void LaunchQMoETranspose2D(
+    const float* input,
+    float* output,
+    int batch_size,
+    int rows,
+    int cols,
+    cudaStream_t stream) {
+  dim3 block(32, 32);
+  dim3 grid((cols + block.x - 1) / block.x, (rows + block.y - 1) / block.y, batch_size);
+  QMoETranspose2DKernel<float><<<grid, block, 0, stream>>>(input, output, rows * cols, rows, cols);
+}
+
+void LaunchQMoETranspose2D(
+    const half* input,
+    half* output,
+    int batch_size,
+    int rows,
+    int cols,
+    cudaStream_t stream) {
+  dim3 block(32, 32);
+  dim3 grid((cols + block.x - 1) / block.x, (rows + block.y - 1) / block.y, batch_size);
+  QMoETranspose2DKernel<half><<<grid, block, 0, stream>>>(input, output, rows * cols, rows, cols);
+}
+
+void LaunchQMoETranspose2D(
+    const uint8_t* input,
+    uint8_t* output,
+    int batch_size,
+    int rows,
+    int cols,
+    cudaStream_t stream) {
+  dim3 block(32, 32);
+  dim3 grid((cols + block.x - 1) / block.x, (rows + block.y - 1) / block.y, batch_size);
+  QMoETranspose2DKernel<uint8_t><<<grid, block, 0, stream>>>(input, output, rows * cols, rows, cols);
+}
+
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime
