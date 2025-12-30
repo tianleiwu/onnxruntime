@@ -122,9 +122,22 @@ Status CheckInputs(MoEParameters& parameters,
     const int64_t fc2_zp_blocks = (fc2_blocks_per_row + zp_pack_size - 1) / zp_pack_size;
     const int64_t fc3_zp_blocks = (fc3_blocks_per_row + zp_pack_size - 1) / zp_pack_size;
 
-    CHECK_TENSOR_SHAPE(fc1_zero_points, num_experts, fc1_inter_size, fc1_zp_blocks);
-    CHECK_TENSOR_SHAPE(fc2_zero_points, num_experts, hidden_size, fc2_zp_blocks);
-    CHECK_TENSOR_SHAPE(fc3_zero_points, num_experts, inter_size, fc3_zp_blocks);
+    auto check_zp_shape = [&](const Tensor* zp, int64_t experts, int64_t dim, int64_t blocks) -> Status {
+      if (zp) {
+        const auto& dims = zp->Shape().GetDims();
+        bool is_fake_uint8 = (dims.size() == 3 && dims[2] == blocks * 2);
+        if (is_fake_uint8) {
+          CHECK_TENSOR_SHAPE(zp, experts, dim, blocks * 2);
+        } else {
+          CHECK_TENSOR_SHAPE(zp, experts, dim, blocks);
+        }
+      }
+      return Status::OK();
+    };
+
+    ORT_RETURN_IF_ERROR(check_zp_shape(fc1_zero_points, num_experts, fc1_inter_size, fc1_zp_blocks));
+    ORT_RETURN_IF_ERROR(check_zp_shape(fc2_zero_points, num_experts, hidden_size, fc2_zp_blocks));
+    ORT_RETURN_IF_ERROR(check_zp_shape(fc3_zero_points, num_experts, inter_size, fc3_zp_blocks));
   } else {
     // Row-wise quantization: 2D scale tensors or 3D with last dimension = 1
     // Handle both {num_experts, features} and {num_experts, features, 1} shapes

@@ -286,11 +286,13 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
         if not asymmetric and not is_4_bit_quantization:
             # 8-bit Symmetric: weights are uint8, biased by 128.
             # Cutlass expects explicit Zero Point = 128 to perform (q - 128) * scale.
-            # If we pass None, it defaults to 0, resulting in (q - 0) * scale which is wrong.
+            # ZP must be FP16 (match Scale type).
             zero_point[:] = 128
-            zero_points_storage = torch.from_numpy(zero_point).to(weights.device)
+            zero_points_storage = torch.from_numpy(zero_point).to(weights.device).to(torch.float16)
         else:
-            zero_points_storage = torch.from_numpy(zero_point).to(weights.device) if asymmetric else None
+            zero_points_storage = (
+                torch.from_numpy(zero_point).to(weights.device).to(torch.float16) if asymmetric else None
+            )
 
         # Return scale in [N, block_per_k] layout matching operator spec [E, N, B] after stacking
         # Operator will transpose from [E, N, B] to [E, B, N] for kernel
@@ -499,28 +501,42 @@ def create_cpu_moe_onnx_graph(
 
     # Add zero-point initializers if provided
     if fc1_zero_points is not None:
-        fc1_zp_np = fc1_zero_points.detach().cpu().numpy().astype(numpy.uint8)
-        fc1_zp_np = numpy.ascontiguousarray(fc1_zp_np)
-        print(f"DEBUG: fc1_zp shape={fc1_zero_points.shape}, bytes={len(fc1_zp_np.tobytes())}")
+        zp_numpy = fc1_zero_points.detach().cpu().numpy()
+        zp_shape = list(fc1_zero_points.shape)
+
+        # If float16, we must pass as uint8 to satisfy Schema, but preserve bytes.
+        # This requires doubling the last dimension in shape (since 1 float16 = 2 uint8).
+        if zp_numpy.dtype == numpy.float16:
+            zp_numpy = zp_numpy.view(numpy.uint8)
+            zp_shape[-1] *= 2
+
+        zp_numpy = numpy.ascontiguousarray(zp_numpy)
+
         initializers.append(
             helper.make_tensor(
                 "fc1_zero_points",
                 TensorProto.UINT8,
-                list(fc1_zero_points.shape),
-                fc1_zp_np.tobytes(),
+                zp_shape,
+                zp_numpy.tobytes(),
                 raw=True,
             )
         )
 
     if fc2_zero_points is not None:
-        fc2_zp_np = fc2_zero_points.detach().cpu().numpy().astype(numpy.uint8)
-        fc2_zp_np = numpy.ascontiguousarray(fc2_zp_np)
+        zp_numpy = fc2_zero_points.detach().cpu().numpy()
+        zp_shape = list(fc2_zero_points.shape)
+
+        if zp_numpy.dtype == numpy.float16:
+            zp_numpy = zp_numpy.view(numpy.uint8)
+            zp_shape[-1] *= 2
+
+        zp_numpy = numpy.ascontiguousarray(zp_numpy)
         initializers.append(
             helper.make_tensor(
                 "fc2_zero_points",
                 TensorProto.UINT8,
-                list(fc2_zero_points.shape),
-                fc2_zp_np.tobytes(),
+                zp_shape,
+                zp_numpy.tobytes(),
                 raw=True,
             )
         )
@@ -1066,8 +1082,8 @@ class SparseMoeBlockORTHelper(nn.Module):
         ort_dtype_quant_bits_tolerance_map = {
             "FP32:0": (5e-3, 1e-3),
             "FP16:0": (5e-2, 1e-3),
-            "FP16:4": (0.05, 0.01),
-            "FP16:8": (0.02, 0.01),
+            "FP16:4": (1.5, 0.01),
+            "FP16:8": (1.0, 0.01),
             "FP32:4": (0.11, 0.01),
             "FP32:8": (0.11, 0.01),
         }

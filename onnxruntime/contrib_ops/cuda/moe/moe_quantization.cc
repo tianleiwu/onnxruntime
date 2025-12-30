@@ -90,8 +90,6 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
 }
 
 Status QMoE::ComputeInternal(OpKernelContext* context) const {
-  std::cout << "DEBUG QMoE: ComputeInternal called, block_size_=" << block_size_
-            << ", expert_weight_bits_=" << expert_weight_bits_ << std::endl;
   const Tensor* input = context->Input<Tensor>(0);
   const Tensor* router_probs = context->Input<Tensor>(1);
   const Tensor* fc1_experts_weights = context->Input<Tensor>(2);
@@ -179,60 +177,17 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   IAllocatorUniquePtr<void> transposed_fc1_zp_holder;
   IAllocatorUniquePtr<void> transposed_fc2_zp_holder;
 
-  auto get_processed_pointer = [&](const Tensor* t1, const Tensor* t3,
-                                   IAllocatorUniquePtr<void>& packed_holder,
-                                   IAllocatorUniquePtr<void>& trans_holder,
-                                   const char* /*name*/,
-                                   const void*& out_ptr) -> Status {
-    if (t1 == nullptr) {
-      out_ptr = nullptr;
-      return Status::OK();
-    }
-
-    size_t element_size = t1->DataType()->Size();
-    const void* source_ptr = t1->DataRaw();
-    auto shape = t1->Shape();
-    int E = static_cast<int>(shape[0]);
-    int N = static_cast<int>(shape[1]);
-    int B = (shape.NumDimensions() > 2) ? static_cast<int>(shape[2]) : 1;
-
-    // PACKING (if t3 exists)
-    if (t3 != nullptr) {
-      if (t3->DataType() != t1->DataType()) return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Type mismatch for packing");
-
-      int N3 = static_cast<int>(t3->Shape()[1]);
-      int B3 = (t3->Shape().NumDimensions() > 2) ? static_cast<int>(t3->Shape()[2]) : 1;
-
-      if (B != B3 || E != static_cast<int>(t3->Shape()[0]))
-        return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Shape mismatch for packing");
-
-      size_t total_elements_packed = E * (N + N3) * B;
-      packed_holder = GetScratchBuffer<void>(total_elements_packed * element_size, context->GetComputeStream());
-
-      return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED, "Packing of separate FC3 scales/zp not yet implemented");
-    }
-
-    // Rows to transpose per expert = N. Cols = B.
-    size_t total_elements = E * N * B;
-    trans_holder = GetScratchBuffer<void>(total_elements * element_size, context->GetComputeStream());
-    // Restore transpose: [E, N, B] -> [E, B, N]
-    onnxruntime::llm::kernels::LaunchBatchedTranspose(stream, source_ptr, trans_holder.get(), E, N, B, static_cast<int>(element_size));
-    out_ptr = trans_holder.get();
-    return Status::OK();
-  };
+  // We specify direct pointers because Cutlass FineGrainedScaleZeroIterator expects [N, B] layout
+  // (contiguous N) which matches the input layout [E, N, B] for each expert.
+  // We do NOT transpose scales/ZPs.
 
   onnxruntime::llm::kernels::cutlass_kernels::QuantParams quant_params;
-  const void* p_fc1_scales = nullptr;
-  ORT_RETURN_IF_ERROR(get_processed_pointer(fc1_scales, fc3_scales_optional, packed_fc1_scales_holder, transposed_fc1_scales_holder, "fc1_scales", p_fc1_scales));
 
-  const void* p_fc1_zp = nullptr;
-  ORT_RETURN_IF_ERROR(get_processed_pointer(fc1_zeros, (fc3_scales_optional ? fc3_zeros : nullptr), packed_fc1_zp_holder, transposed_fc1_zp_holder, "fc1_zp", p_fc1_zp));
+  const void* p_fc1_scales = (fc1_scales != nullptr) ? fc1_scales->DataRaw() : nullptr;
+  const void* p_fc1_zp = (fc1_zeros != nullptr) ? fc1_zeros->DataRaw() : nullptr;
 
-  const void* p_fc2_scales = nullptr;
-  ORT_RETURN_IF_ERROR(get_processed_pointer(fc2_scales, nullptr, packed_fc1_scales_holder, transposed_fc2_scales_holder, "fc2_scales", p_fc2_scales));
-
-  const void* p_fc2_zp = nullptr;
-  ORT_RETURN_IF_ERROR(get_processed_pointer(fc2_zeros, nullptr, packed_fc1_zp_holder, transposed_fc2_zp_holder, "fc2_zp", p_fc2_zp));
+  const void* p_fc2_scales = (fc2_scales != nullptr) ? fc2_scales->DataRaw() : nullptr;
+  const void* p_fc2_zp = (fc2_zeros != nullptr) ? fc2_zeros->DataRaw() : nullptr;
 
   if (block_size_ > 0) {
     quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::GroupWise(
@@ -244,31 +199,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
         p_fc1_zp,
         p_fc2_zp);
 
-    // DEBUG: Dump first expert's scale values for verification
-    if (fc1_scales != nullptr) {
-      auto shape = fc1_scales->Shape();
-      int E = static_cast<int>(shape[0]);
-      int N = static_cast<int>(shape[1]);
-      int B = (shape.NumDimensions() > 2) ? static_cast<int>(shape[2]) : 1;
-      size_t num_elements = E * N * B;
-      size_t dump_count = std::min(num_elements, size_t(16));
 
-      std::vector<float> scale_cpu(dump_count);
-      // Copy from GPU (transposed buffer) to CPU for inspection
-      cudaMemcpy(scale_cpu.data(), p_fc1_scales, dump_count * sizeof(float) / 2, cudaMemcpyDeviceToHost);
-
-      std::cout << "DEBUG QMoE: block_size=" << block_size_
-                << ", fc1_scales shape=[" << E << ", " << N << ", " << B << "]"
-                << " (transposed to [E, B, N])" << std::endl;
-      std::cout << "DEBUG QMoE: First " << dump_count << " scale values (as fp16 bits): ";
-      for (size_t i = 0; i < dump_count / 2; ++i) {
-        // Convert raw bytes to half and then to float for display
-        uint16_t* raw = reinterpret_cast<uint16_t*>(scale_cpu.data());
-        float val = __half2float(*reinterpret_cast<__half*>(&raw[i]));
-        std::cout << val << " ";
-      }
-      std::cout << std::endl;
-    }
   } else {
     // Per-column quantization
     quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::Int(
