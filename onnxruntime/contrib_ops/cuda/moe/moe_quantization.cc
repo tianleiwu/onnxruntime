@@ -177,18 +177,65 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   IAllocatorUniquePtr<void> transposed_fc1_zp_holder;
   IAllocatorUniquePtr<void> transposed_fc2_zp_holder;
 
-  // We specify direct pointers because Cutlass FineGrainedScaleZeroIterator expects [N, B] layout
-  // (contiguous N) which matches the input layout [E, N, B] for each expert.
-  // We do NOT transpose scales/ZPs.
+  // Determine effective pointers for scales and zero points
+  const void* p_fc1_scales = nullptr;
+  const void* p_fc1_zp = nullptr;
+  const void* p_fc2_scales = nullptr;
+  const void* p_fc2_zp = nullptr;
+
+  // Use pre-packed buffers if available, otherwise use input tensors (and potentially compute bias on the fly)
+  IAllocatorUniquePtr<void> transient_fc1_bias;
+  IAllocatorUniquePtr<void> transient_fc2_bias;
+
+  auto prepare_scale_zp = [&](const Tensor* scales, const Tensor* zeros,
+                              const IAllocatorUniquePtr<void>& packed_scale, const IAllocatorUniquePtr<void>& packed_bias,
+                              IAllocatorUniquePtr<void>& transient_bias,
+                              const void*& eff_scale, const void*& eff_zp) {
+    if (packed_scale) {
+      eff_scale = packed_scale.get();
+    } else if (scales) {
+      eff_scale = scales->DataRaw();
+    }
+
+    if (packed_bias) {
+      eff_zp = packed_bias.get();
+    } else if (zeros) {
+      // Compute bias on the fly: bias = -zp * scale
+      // We need 'eff_scale' to be available.
+      if (eff_scale && block_size_ > 0) {
+        size_t num_elements = zeros->Shape().Size();
+        size_t bytes = num_elements * (expert_weight_bits_ == 4 ? sizeof(half) : sizeof(half));  // Assuming bias is half/float matching scale
+        // Determine type size based on scale type
+        bool is_fp16 = scales->IsDataType<MLFloat16>();
+        bytes = num_elements * (is_fp16 ? 2 : 4);
+
+        transient_bias = GetScratchBuffer<void>(bytes, context->GetComputeStream());
+        // transient_bias =IAllocator::MakeUniquePtr<void>(context->GetComputeStream()->GetAllocator(), bytes, true);
+        eff_zp = transient_bias.get();
+
+        if (is_fp16) {
+          LaunchQMoEPrePackZP(
+              static_cast<const uint8_t*>(zeros->DataRaw()),
+              static_cast<const half*>(eff_scale),
+              static_cast<half*>(transient_bias.get()),
+              static_cast<int>(num_elements),
+              stream);
+        } else {
+          LaunchQMoEPrePackZP(
+              static_cast<const uint8_t*>(zeros->DataRaw()),
+              static_cast<const float*>(eff_scale),
+              static_cast<float*>(transient_bias.get()),
+              static_cast<int>(num_elements),
+              stream);
+        }
+      }
+    }
+  };
+
+  prepare_scale_zp(fc1_scales, fc1_zeros, packed_fc1_scales_, packed_fc1_bias_, transient_fc1_bias, p_fc1_scales, p_fc1_zp);
+  prepare_scale_zp(fc2_scales, fc2_zeros, packed_fc2_scales_, packed_fc2_bias_, transient_fc2_bias, p_fc2_scales, p_fc2_zp);
 
   onnxruntime::llm::kernels::cutlass_kernels::QuantParams quant_params;
-
-  const void* p_fc1_scales = (fc1_scales != nullptr) ? fc1_scales->DataRaw() : nullptr;
-  const void* p_fc1_zp = (fc1_zeros != nullptr) ? fc1_zeros->DataRaw() : nullptr;
-
-  const void* p_fc2_scales = (fc2_scales != nullptr) ? fc2_scales->DataRaw() : nullptr;
-  const void* p_fc2_zp = (fc2_zeros != nullptr) ? fc2_zeros->DataRaw() : nullptr;
-
   if (block_size_ > 0) {
     quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::GroupWise(
         block_size_,
@@ -198,8 +245,6 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
         nullptr,
         p_fc1_zp,
         p_fc2_zp);
-
-
   } else {
     // Per-column quantization
     quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::Int(
@@ -240,6 +285,62 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
       min_latency_params,
       {activation_alpha_, activation_beta_, swiglu_fusion_, swiglu_limit_},
       stream);
+
+  return Status::OK();
+}
+
+Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
+                     bool& is_packed, PrePackedWeights* prepacked_weights) {
+  is_packed = false;
+
+  cudaStream_t stream = 0;  // Use default stream for PrePack operations
+
+  auto capture_scale = [&](IAllocatorUniquePtr<void>& packed_buf) {
+    size_t bytes = tensor.SizeInBytes();
+    packed_buf = IAllocator::MakeUniquePtr<void>(alloc, bytes, true);
+    cudaMemcpyAsync(packed_buf.get(), tensor.DataRaw(), bytes, cudaMemcpyDefault, stream);
+    cudaStreamSynchronize(stream);
+    is_packed = true;
+  };
+
+  auto compute_bias = [&](const IAllocatorUniquePtr<void>& packed_scale, IAllocatorUniquePtr<void>& packed_bias) {
+    if (!packed_scale) return;  // Cannot compute bias without scales
+    size_t num_elements = tensor.Shape().Size();
+    auto type = Info().node().InputDefs()[0]->TypeAsProto()->tensor_type().elem_type();
+    bool is_fp16 = (type == TensorProto_DataType_FLOAT16);
+    size_t bytes = num_elements * (is_fp16 ? 2 : 4);
+    packed_bias = IAllocator::MakeUniquePtr<void>(alloc, bytes, true);
+
+    const void* p_zeros = tensor.DataRaw();
+    IAllocatorUniquePtr<void> temp_zeros_gpu;
+    if (tensor.Location().device.Type() == OrtDevice::CPU) {
+      temp_zeros_gpu = IAllocator::MakeUniquePtr<void>(alloc, tensor.SizeInBytes(), true);
+      cudaMemcpyAsync(temp_zeros_gpu.get(), p_zeros, tensor.SizeInBytes(), cudaMemcpyDefault, stream);
+      p_zeros = temp_zeros_gpu.get();
+    }
+
+    if (is_fp16) {
+      LaunchQMoEPrePackZP(static_cast<const uint8_t*>(p_zeros), static_cast<const half*>(packed_scale.get()), static_cast<half*>(packed_bias.get()), num_elements, stream);
+    } else {
+      LaunchQMoEPrePackZP(static_cast<const uint8_t*>(p_zeros), static_cast<const float*>(packed_scale.get()), static_cast<float*>(packed_bias.get()), num_elements, stream);
+    }
+    cudaStreamSynchronize(stream);
+    is_packed = true;
+  };
+
+  if (input_idx == 3) {  // fc1_scales
+    capture_scale(packed_fc1_scales_);
+  } else if (input_idx == 6) {  // fc2_scales
+    capture_scale(packed_fc2_scales_);
+  } else if (input_idx == 9 && has_fc3_) {  // fc3_scales
+    capture_scale(packed_fc3_scales_);
+  } else if (input_idx == 11) {  // fc1_zeros
+    compute_bias(packed_fc1_scales_, packed_fc1_bias_);
+  } else if (input_idx == 12) {  // fc2_zeros
+    compute_bias(packed_fc2_scales_, packed_fc2_bias_);
+  }
+  // fc3_zeros (13) not handled for now as it's optional and rarely used?
+  // Code structure allows adding it easily.
 
   return Status::OK();
 }

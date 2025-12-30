@@ -106,6 +106,40 @@ void LaunchSoftmaxTopK(
   SoftmaxTopKKernel<half><<<grid, block, 0, stream>>>(logits, topk_scales, topk_indices, num_rows, num_experts, k, normalize_scales);
 }
 
+template <typename T>
+__global__ void QMoEPrePackZPKernel(const uint8_t* zp, const T* scales, T* out, int num_elements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < num_elements) {
+    float s = static_cast<float>(scales[idx]);
+    float z = static_cast<float>(zp[idx]);
+    // Compute bias = -1.0 * zp * scale
+    // This allows q * scale + bias = (q - zp) * scale
+    out[idx] = static_cast<T>(-z * s);
+  }
+}
+
+void LaunchQMoEPrePackZP(
+    const uint8_t* zp,
+    const float* scales,
+    float* output,
+    int num_elements,
+    cudaStream_t stream) {
+  int block = 256;
+  int grid = (num_elements + block - 1) / block;
+  QMoEPrePackZPKernel<float><<<grid, block, 0, stream>>>(zp, scales, output, num_elements);
+}
+
+void LaunchQMoEPrePackZP(
+    const uint8_t* zp,
+    const half* scales,
+    half* output,
+    int num_elements,
+    cudaStream_t stream) {
+  int block = 256;
+  int grid = (num_elements + block - 1) / block;
+  QMoEPrePackZPKernel<half><<<grid, block, 0, stream>>>(zp, scales, output, num_elements);
+}
+
 // ====================== Sparse Mixer Kernel ===============================
 // Ported from old/moe_kernel.cu
 

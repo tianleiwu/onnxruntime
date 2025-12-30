@@ -49,6 +49,20 @@ void LaunchSparseMixerTop2(
     int num_experts,
     cudaStream_t stream);
 
+void LaunchQMoEPrePackZP(
+    const uint8_t* zp,
+    const float* scales,
+    float* output,
+    int num_elements,
+    cudaStream_t stream);
+
+void LaunchQMoEPrePackZP(
+    const uint8_t* zp,
+    const half* scales,
+    half* output,
+    int num_elements,
+    cudaStream_t stream);
+
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime

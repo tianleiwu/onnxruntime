@@ -18,6 +18,8 @@ class QMoE final : public CudaKernel, public MoEBase {
  public:
   explicit QMoE(const OpKernelInfo& op_kernel_info);
   Status ComputeInternal(OpKernelContext* ctx) const override;
+  Status PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
+                 bool& is_packed, PrePackedWeights* prepacked_weights) override;
 
  private:
   int64_t expert_weight_bits_;
@@ -25,6 +27,18 @@ class QMoE final : public CudaKernel, public MoEBase {
   bool has_fc3_;
 
   std::unique_ptr<onnxruntime::llm::kernels::cutlass_kernels::CutlassMoeFCRunnerInterface> m_moe_runner;
+
+  // Pre-packed buffers
+  // Note: For QMoE, we need both Scales (for dequant) and Bias (derived from ZP/Scale) during inference.
+  // PrePack logic:
+  // - Copies scales to GPU buffer (if in CPU) or just keeps them. For simplicity, we allocate and copy.
+  // - Computes Bias from ZP and Scale using PrePack kernel.
+  IAllocatorUniquePtr<void> packed_fc1_scales_;
+  IAllocatorUniquePtr<void> packed_fc1_bias_;
+  IAllocatorUniquePtr<void> packed_fc2_scales_;
+  IAllocatorUniquePtr<void> packed_fc2_bias_;
+  IAllocatorUniquePtr<void> packed_fc3_scales_;
+  IAllocatorUniquePtr<void> packed_fc3_bias_;
 };
 
 }  // namespace cuda

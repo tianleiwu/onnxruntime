@@ -501,42 +501,27 @@ def create_cpu_moe_onnx_graph(
 
     # Add zero-point initializers if provided
     if fc1_zero_points is not None:
-        zp_numpy = fc1_zero_points.detach().cpu().numpy()
-        zp_shape = list(fc1_zero_points.shape)
-
-        # If float16, we must pass as uint8 to satisfy Schema, but preserve bytes.
-        # This requires doubling the last dimension in shape (since 1 float16 = 2 uint8).
-        if zp_numpy.dtype == numpy.float16:
-            zp_numpy = zp_numpy.view(numpy.uint8)
-            zp_shape[-1] *= 2
-
-        zp_numpy = numpy.ascontiguousarray(zp_numpy)
-
+        fc1_zp_np = fc1_zero_points.detach().cpu().numpy().astype(numpy.uint8)
+        fc1_zp_np = numpy.ascontiguousarray(fc1_zp_np)
         initializers.append(
             helper.make_tensor(
                 "fc1_zero_points",
                 TensorProto.UINT8,
-                zp_shape,
-                zp_numpy.tobytes(),
+                list(fc1_zero_points.shape),
+                fc1_zp_np.tobytes(),
                 raw=True,
             )
         )
 
     if fc2_zero_points is not None:
-        zp_numpy = fc2_zero_points.detach().cpu().numpy()
-        zp_shape = list(fc2_zero_points.shape)
-
-        if zp_numpy.dtype == numpy.float16:
-            zp_numpy = zp_numpy.view(numpy.uint8)
-            zp_shape[-1] *= 2
-
-        zp_numpy = numpy.ascontiguousarray(zp_numpy)
+        fc2_zp_np = fc2_zero_points.detach().cpu().numpy().astype(numpy.uint8)
+        fc2_zp_np = numpy.ascontiguousarray(fc2_zp_np)
         initializers.append(
             helper.make_tensor(
                 "fc2_zero_points",
                 TensorProto.UINT8,
-                zp_shape,
-                zp_numpy.tobytes(),
+                list(fc2_zero_points.shape),
+                fc2_zp_np.tobytes(),
                 raw=True,
             )
         )
