@@ -11,7 +11,11 @@ The implementation relies on strict memory layouts for weights and quantization 
 For Group-wise Quantized MoE (e.g., 4-bit or 8-bit), the weights are **not** standard linear layers. They must be pre-packed to match the specific interleaving requirements of the Cutlass Mixed Input GEMM kernel.
 
 *   **Logical Shape**: `[NumExperts, HiddenSize, InterSize]` (Note: ONNX uses `[E, In, Out]` convention for MoE, but PyTorch Linear is `[Out, In]`. Effectively `[E, K, N]`).
-*   **Physical Layout**: The weights are packed into `uint8` tensors (even for 4-bit, where two 4-bit elements are packed into one byte).
+    *   *Clarification*: This shape corresponds to the `MatMulNBits` standard (`[Experts, N, K_Blocks] `) *before* architecture-specific packing.
+*   **Physical Layout (Storage)**: Opaque Blob.
+    *   The actual stored data is **no longer** in the logical shape. It is a packed, transposed, and interleaved blob formatted specifically for the Cutlass kernel.
+    *   **Packing**: The `pack_weights_for_cuda_mixed_gemm` function transforms the logical `[E, N, K]` weights into this architecture-dependent blob.
+    *   *Note*: Do not attempt to interpret the raw bytes of this tensor as a standard array; it must be treated as a blob passed directly to the kernel.
 *   **Packing Tool**: The weights are packed using `pack_weights_for_cuda_mixed_gemm` (exposed via `onnxruntime.quantization.matmul_4bits`). This function rearranges the elements into the column-major interleaved format expected by the Cutlass kernel.
 *   **Input Index**:
     *   `fc1_experts_weights`: Input 2
@@ -25,6 +29,8 @@ Scaling factors for dequantization.
     *   Example: For `Hidden=4096`, `Block=64`, `Scale` dim is `4096/64 = 64`.
     *   `fc1_scales` (Hidden -> Inter): `[NumExperts, InterSize, HiddenSize // BlockSize]`.
     *   `fc2_scales` (Inter -> Hidden): `[NumExperts, HiddenSize, InterSize // BlockSize]`.
+    *   *Reference*: This layout corresponds to the ONNX interface `[NumExperts, Output, Input_Blocks]`.
+    *   *Note*: The underlying Cutlass kernel (and TensorRT-LLM specifications) describes a transposed order `[Groups, N]`. The ONNX Runtime implementation adapts this to ensure the correct kernel execution.
 *   **Type**: `float16` (MLFloat16).
 *   **Input Index**: 3, 6, 9.
 
@@ -122,6 +128,8 @@ The primary test scripts are located in `onnxruntime/test/python/transformers/`.
 *   **Workspace**: The operator requires a workspace for intermediate results (sorting indices, permuted rows).
 *   **Pre-allocated Buffers**: `PrePack` allocates GPU memory for Scales and Biases. These persist for the lifetime of the session, reducing overhead per inference step.
 
+> **Note**: The general quantization format and kernel expectations align with TensorRT-LLM specifications.
+
 ## 6. Weight Packing Details (`pack_weights_for_cuda_mixed_gemm`)
 
 The `pack_weights_for_cuda_mixed_gemm` function is a critical offline preprocessing step required to format weights for Cutlass Mixed Input GEMM kernels. The source code is distributed across:
@@ -161,6 +169,16 @@ The packing process applies specific interleaving patterns to align data with Cu
 
 *Note*: `RowsPerTile` refers to the K-dimension tile size. `ColumnsInterleaved` indicates how many N-dimension columns are interleaved together.
 
+#### Visualizing `ColumnMajorTileInterleave<Rows, Cols>`
+To answer the specific layout question: **Yes, the tile is effectively stored in Column-Major format.**
+
+For `<64, 2>` (Interleaving 2 columns for every 64 rows):
+1.  The logical block is `64 Rows x 2 Columns`.
+2.  **Storage Order**:
+    *   Store all 64 elements of **Column 0**.
+    *   Followed immediately by all 64 elements of **Column 1**.
+3.  **Global Structure**: The entire matrix is composed of these `(64x2)` tiles stacked vertically (down K) and then horizontally (across N). Memory is a linear sequence of these tiles.
+
 ### 6.3 Cross-Architecture Compatibility
 While weight packing is architecture-aware, many architectures share the same layout format. The following table summarizes compatibility:
 
@@ -188,20 +206,37 @@ SwiGLU(x) = Gate * Sigmoid(alpha * Gate) * (Value + beta)
 ```
 Where the input `x` contains both `Gate` and `Value` components.
 
-### 7.2 Data Interleaving
-The MoE operator handles two main data layouts for SwiGLU, controlled by the `swiglu_fusion` attribute (or inferred):
+### 7.2 MoE (Float16/BFloat16) Runtime Fusion
+For the standard **MoE** operator (non-quantized), the `Compute` method includes logic to automatically fuse split weight tensors at runtime.
 
-1.  **Interleaved (`swiglu_fusion=1`)**:
-    *   **ONNX Input**: The input tensor is expected to contain [Gate, Value] pairs interleaved.
-    *   **Memory Layout**: `[Gate_0, Value_0, Gate_1, Value_1, ..., Gate_N, Value_N]`
-    *   **Cutlass Requirements**: The kernel iterates through the output buffer and reads adjacent elements.
-        *   `Gate` = input[2 * i]
-        *   `Value` = input[2 * i + 1]
-    *   **Code Reference**: `onnxruntime/contrib_ops/cuda/llm/moe_gemm/moe_gemm_activation_kernels.cuh` -> `doGatedActivationKernel` (checks `is_swiglu_interleaved`).
+*   **Trigger**: If the optional `fc3_experts_weights` input is provided.
+*   **Behavior**:
+    *   The operator allocates a temporary buffer.
+    *   It manually concatenates `fc1` (Gate) and `fc3` (Value) for each expert.
+    *   **Resulting Layout**: `[Expert0: FC1|FC3, Expert1: FC1|FC3, ...]`.
+    *   This fused buffer is then passed to the kernel, simulating `swiglu_fusion=2` (Block Fusion).
+*   **Activation Check**: This path is taken implicitly when `fc3` is present, typically used with Gated activations like `SiLU` (Mixtral) or `SwiGLU`.
 
-2.  **Separate Blocks (`swiglu_fusion=0/2`)**:
-    *   **Memory Layout**: All Gates followed by all Values. `[Gate_0 ... Gate_N | Value_0 ... Value_N]`.
-    *   The kernel calculates pointers to the second half of the buffer for the Value component.
+> **Note**: This runtime packing is specific to **standard MoE**. The **QMoE** operator does **not** perform runtime fusion; correct packing must be done offline (see Section 6).
+
+### 7.3 Fusion Modes (`swiglu_fusion`)
+The operator handles three distinct modes for SwiGLU, controlled by the `swiglu_fusion` attribute:
+
+1.  **No Fusion (`swiglu_fusion=0`)**:
+    *   **Inputs**: 3 distinct weight tensors (`fc1`, `fc2`, `fc3`).
+    *   **Logic**: `fc1` (Gate) and `fc3` (Value) are provided separately. The kernel handles the computation and activation conceptually as if they were separate comparisons.
+
+2.  **Interleaved Fusion (`swiglu_fusion=1`)**:
+    *   **Inputs**: 2 distinct weight tensors (`fc1`, `fc2`).
+        *   `fc1` contains *both* Gate and Value weights fused.
+    *   **Memory Layout**: `[Gate_0, Value_0, Gate_1, Value_1, ..., Gate_N, Value_N]`.
+    *   **Cutlass Requirements**: The kernel expects adjacent elements in the GEMM output to correspond to Gate and Value.
+    *   **Usage**: Recommended for optimal performance on newer architectures as it aligns with interleaved GEMM optimizations.
+
+3.  **Block Fusion (`swiglu_fusion=2`)**:
+    *   **Inputs**: 2 distinct weight tensors (`fc1`, `fc2`).
+    *   **Memory Layout**: `[Gate_0 ... Gate_N | Value_0 ... Value_N]` (Concatenated).
+    *   **Logic**: The kernel processes the first half as Gate and the second half as Value.
 
 **Weight Conversion**:
 When exporting a model to ONNX with SwiGLU, the weights for the Gate and Value projections (typically FC1 and Gate_Proj) are often merged. To use **Interleaved** mode, these weights must be interleaved at the output channel dimension during the export/packing phase so that the GEMM output naturally results in `[G, V, G, V...]`.
