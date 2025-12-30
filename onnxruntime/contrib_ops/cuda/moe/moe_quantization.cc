@@ -256,6 +256,32 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
         nullptr,
         p_fc1_zp,
         p_fc2_zp);
+
+    // DEBUG: Dump first expert's scale values for verification
+    if (fc1_scales != nullptr) {
+      auto shape = fc1_scales->Shape();
+      int E = static_cast<int>(shape[0]);
+      int N = static_cast<int>(shape[1]);
+      int B = (shape.NumDimensions() > 2) ? static_cast<int>(shape[2]) : 1;
+      size_t num_elements = E * N * B;
+      size_t dump_count = std::min(num_elements, size_t(16));
+
+      std::vector<float> scale_cpu(dump_count);
+      // Copy from GPU (transposed buffer) to CPU for inspection
+      cudaMemcpy(scale_cpu.data(), p_fc1_scales, dump_count * sizeof(float) / 2, cudaMemcpyDeviceToHost);
+
+      std::cout << "DEBUG QMoE: block_size=" << block_size_
+                << ", fc1_scales shape=[" << E << ", " << N << ", " << B << "]"
+                << " (transposed to [E, B, N])" << std::endl;
+      std::cout << "DEBUG QMoE: First " << dump_count << " scale values (as fp16 bits): ";
+      for (size_t i = 0; i < dump_count / 2; ++i) {
+        // Convert raw bytes to half and then to float for display
+        uint16_t* raw = reinterpret_cast<uint16_t*>(scale_cpu.data());
+        float val = __half2float(*reinterpret_cast<__half*>(&raw[i]));
+        std::cout << val << " ";
+      }
+      std::cout << std::endl;
+    }
   } else {
     // Per-column quantization
     quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::Int(

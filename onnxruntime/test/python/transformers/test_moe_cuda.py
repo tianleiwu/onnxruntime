@@ -186,7 +186,7 @@ def quant_dequant(weights, is_4_bit_quantization: bool = True):
         # pack_weights_for_cuda_mixed_gemm returns flat [k * n // 2].
         # ONNX expects [hidden_size, inter_size // 2] = [k, n // 2].
         # The function transposes, so output is in [k, n // 2] row-major order.
-        processed_q_weight_torch = torch.from_numpy(processed_q_weight).reshape(k, n // 2)
+        processed_q_weight_torch = torch.from_numpy(processed_q_weight).reshape(k, n // 2).view(torch.uint8)
 
         # Scale: flatten to [n] for per-channel quantization compatibility.
         # The graph expects [inter_size] = [n].
@@ -247,7 +247,7 @@ def quant_dequant(weights, is_4_bit_quantization: bool = True):
 
         # pack_weights_moe returns flat [k * n].
         # ONNX expects [hidden_size, inter_size] = [k, n].
-        processed_q_weight_torch = torch.from_numpy(processed_q_weight).reshape(k, n)
+        processed_q_weight_torch = torch.from_numpy(processed_q_weight).reshape(k, n).view(torch.uint8)
 
         # Scale: flatten to [n] for per-channel quantization compatibility.
         scale_flat = scale.mean(axis=1)  # Average across blocks for per-channel approx
@@ -1364,6 +1364,7 @@ class PhiMoESparseMoeBlock(SparseMoeBlockORTHelper):
 
         # Combine FC1 (gate) and FC3 (value) for fused SwiGLU to avoid separate FC3 input
         # This triggers swiglu_fusion=2 mode (fused, not interleaved) - concat along N dimension
+        # Only apply for quantized weights to avoid separate FC3 scales issue
         if use_quant:
             # Weights: [E, K, N/pack] -> [E, K, 2*N/pack] - concat along dim=2 (N axis)
             self.moe_experts_weight1 = torch.cat([self.moe_experts_weight1, self.moe_experts_weight3], dim=2)
@@ -1371,10 +1372,7 @@ class PhiMoESparseMoeBlock(SparseMoeBlockORTHelper):
             # Scales: [E, N] -> [E, 2*N] - concat along dim=1
             moe_experts_weight_scale1 = torch.cat([moe_experts_weight_scale1, moe_experts_weight_scale3], dim=1)
             moe_experts_weight_scale3 = None
-        else:
-            # Float weights: [E, N, K] -> [E, 2*N, K] - concat along dim=1
-            self.moe_experts_weight1 = torch.cat([self.moe_experts_weight1, self.moe_experts_weight3], dim=1)
-            self.moe_experts_weight3 = None
+        # For non-quant, keep fc1/fc2/fc3 separate
 
         self.batch_size = batch_size
         self.sequence_length = sequence_length

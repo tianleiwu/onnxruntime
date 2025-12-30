@@ -266,10 +266,8 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
         q_weight_torch = torch.from_numpy(q_weight).to(weights.device).to(weights.dtype)
 
         if is_symmetric:
-            # q - 128 (if offset 128)
-            # _quantize 8bit symmetric produces [0, 255] with ZP=128 usually?
-            # Check if zero_point is populated? zero_point buffer is passed.
-            # If zero_point is effectively 128.
+            # Kernel does: (biased_uint8 - 128) * scale for symmetric 8-bit
+            # quantize_matmul_8bits produces biased uint8 values in [0, 255] centered at 128
             dequantized = (q_weight_torch - 128.0) * scale_torch
         else:
             zp_torch = torch.from_numpy(zero_point).to(weights.device).to(weights.dtype).unsqueeze(-1)
@@ -285,8 +283,9 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
 
         zero_points_storage = torch.from_numpy(zero_point).to(weights.device) if asymmetric else None
 
-        # Return scale in [N, block_per_k] layout to match operator spec [E, N, B]
-        return scale_torch_out, processed_q_weight_torch, result, zero_points_storage
+        # Return scale in [block_per_k, N] layout to match 4-bit path
+        # After stacking: [E, B, N]. Operator will transpose to [E, B, N] for kernel.
+        return scale_torch_out.T, processed_q_weight_torch, result, zero_points_storage
 
 
 def quant_dequant(weights, is_4_bit_quantization: bool = True, asymmetric: bool = False):
