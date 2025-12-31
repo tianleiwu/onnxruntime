@@ -50,18 +50,21 @@ The `QMoE` operator implements a `PrePack` method (`moe_quantization.cc`) to opt
 *   **Runtime Action**: None. The `QMoE::PrePack` implementation currently **skips** weights. It assumes that weights provided to the ONNX model have *already* been packed using the offline `pack_weights_for_cuda_mixed_gemm` tool.
 
 ### 2.2 Scale & Zero-Point Processing
-To maximize performance and compatibility with Cutlass kernels that expect a "Scale + Bias" dequantization formula (`q * scale + bias`), the `PrePack` step performs the following:
+To maximize performance and compatibility with Cutlass kernels, the `PrePack` step adapts the data based on the quantization type:
 
-1.  **Capture Scales**: Copies `fc_scales` from CPU to GPU (or just retains them if already on GPU).
-2.  **Compute Bias**: The Cutlass kernel expects an additive bias, but ONNX provides integer Zero Points (`zp`). The PrePack step pre-calculates this bias:
-    ```cpp
-    Bias = -ZeroPoint * Scale
-    ```
-    *   This conversion happens via a CUDA kernel `LaunchQMoEPrePackZP`.
-    *   The resulting `Bias` is stored in a `float16` buffer.
-    *   This allows the kernel to perform `q * scale + bias` which is mathematically equivalent to `(q - zp) * scale`.
+1.  **Capture Scales**: Copies `fc_scales` from CPU to GPU.
+2.  **Zero-Point / Bias Conversion**:
+    *   **8-bit Weights**: Weights are shifted by -128 (uint8 -> int8). We compute a bias to compensate:
+        ```cpp
+        Bias = (128 - ZeroPoint) * Scale
+        ```
+        *   This effectively treats the calculation as `(W_stored + 128 - ZP) * Scale`.
+    *   **4-bit Weights**: Zero Points are unpacked from nibbles (2 per byte) and stored as **Unscaled** floating-point values (just the integer ZP cast to float/half).
+        *   The Cutlass 4-bit kernel (`FINEGRAINED_SCALE_AND_ZEROS`) natively handles `(W - ZP) * Scale` without requiring a pre-computed bias.
+    *   **Symmetric**: Bias is 0.
 
-The stored `Bias` buffer allows the operator to effectively ignore the original `uint8` Zero-Point tensor during the time-critical `Compute` phase.
+    *   This conversion happens via generic kernels (`LaunchQMoEPrePackOffsetBias`, `QMoEPrePackPacked4BitZPKernel`).
+    *   The resulting buffer (`packed_bias`) is stored in `float16/float`, matching the Scale type.
 
 ## 3. Cutlass Kernel Expectations
 
@@ -76,10 +79,12 @@ MoeGemmRunner<half, uint8_t, half>  // InputType, WeightType, OutputType
 ### 3.2 Layout Requirements
 *   **Weights**: Column-Major Interleaved (Packed).
 *   **Scales & Bias**: Row-Major `[Output, Input/Block]`. (Note: Since we process one expert at a time or grouped experts, the `NumExperts` dimension is the batch).
-*   **Bias Type Constraint**:
+*   **Bias/ZP Type Constraint**:
     *   For Symmetric Quantization (`Bias=0`), the kernel works seamlessly.
-    *   For Asymmetric Quantization, the kernel expects `ElementZero` (the bias type) to match `ElementScale` (`half`).
-    *   *Note*: There is a known issue where `DefaultGemmGrouped` may infer `ElementZero` type from `ElementB` (Weights, `uint8`) instead of `ElementScale`, which can cause asymmetric parity issues if not explicitly specialized.
+    *   For Asymmetric Quantization, the kernel expects `ElementZero` (the bias/ZP buffer type) to match `ElementScale` (`half` or `float`).
+        *   **4-bit**: Stores Unscaled ZP values.
+        *   **8-bit**: Stores Pre-calculated Bias.
+    *   *Note*: `DefaultGemmGrouped` may infer `ElementZero` from `ElementB` (Weights, `uint8`). This implementation ensures `ElementZero` matches `ElementScale` (Floating Point) to support asymmetric quantization correctly.
 
 ## 4. Testing Infrastructure
 
@@ -247,10 +252,11 @@ The Cutlass kernels in this implementation are derived from TensorRT-LLM but hav
 
 ### Key Modifications:
 
-1.  **Pre-Packed Bias Optimization**:
-    *   Implemented `PrePack` logic to pre-calculate `Bias = -ZeroPoint * Scale` offline (or at initialization).
-    *   This allows the kernel to treat quantization offsets as a simple additive bias, converting mixed-precision math into efficient FP16 accumulation.
-    *   *Commit*: "prepack update", "fp16 zp fake uint8 walkaround"
+1.  **Pre-Packed ZP/Bias Optimization**:
+    *   Implemented `PrePack` logic to pre-process Zero Points offline (or at initialization).
+    *   **8-bit**: Pre-calculates `Bias = (128 - ZP) * Scale` to handle the weight shift efficiently.
+    *   **4-bit**: Unpacks and stores unscaled ZPs to match Cutlass kernel requirements.
+    *   *Commit*: "prepack update", "fix 8-bit/4-bit asymmetric parity"
 
 2.  **SwiGLU Interleaving**:
     *   Enhanced activation kernels to support **Interleaved** SwiGLU (as described in Section 7), allowing direct compatibility with weights packed for interleaved output.

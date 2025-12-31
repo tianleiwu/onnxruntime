@@ -107,14 +107,15 @@ void LaunchSoftmaxTopK(
 }
 
 template <typename T>
-__global__ void QMoEPrePackZPKernel(const uint8_t* zp, const T* scales, T* out, int num_elements) {
+__global__ void QMoEPrePackZPKernel(const uint8_t* zp, const T* scales, T* out, int num_elements, float offset) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < num_elements) {
     float s = static_cast<float>(scales[idx]);
     float z = static_cast<float>(zp[idx]);
-    // Compute bias = -1.0 * zp * scale
-    // This allows q * scale + bias = (q - zp) * scale
-    out[idx] = static_cast<T>(-z * s);
+    // Compute bias = (offset - zp) * scale
+    // If offset = 0, bias = -zp * scale
+    // If offset = 128 (e.g. for uint8 -> int8 shift), bias = (128 - zp) * scale
+    out[idx] = static_cast<T>((offset - z) * s);
   }
 }
 
@@ -126,7 +127,7 @@ void LaunchQMoEPrePackZP(
     cudaStream_t stream) {
   int block = 256;
   int grid = (num_elements + block - 1) / block;
-  QMoEPrePackZPKernel<float><<<grid, block, 0, stream>>>(zp, scales, output, num_elements);
+  QMoEPrePackZPKernel<float><<<grid, block, 0, stream>>>(zp, scales, output, num_elements, 0.0f);
 }
 
 void LaunchQMoEPrePackZP(
@@ -137,7 +138,97 @@ void LaunchQMoEPrePackZP(
     cudaStream_t stream) {
   int block = 256;
   int grid = (num_elements + block - 1) / block;
-  QMoEPrePackZPKernel<half><<<grid, block, 0, stream>>>(zp, scales, output, num_elements);
+  QMoEPrePackZPKernel<half><<<grid, block, 0, stream>>>(zp, scales, output, num_elements, 0.0f);
+}
+
+template <typename T>
+__global__ void QMoEPrePackPacked4BitZPKernel(const uint8_t* packed_zp, const T* scales, T* out, int num_elements, int N) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < num_elements) {
+    float s = static_cast<float>(scales[idx]);
+
+    // 4-bit unpacking with stride N
+    // row = idx / N; col = idx % N;
+    // byte_row = row >> 1; nibble = row & 1;
+    // byte_idx = byte_row * N + col;
+
+    int row = idx / N;
+    int col = idx % N;
+    int byte_idx = (row >> 1) * N + col;
+
+    uint8_t packed_byte = packed_zp[byte_idx];
+    uint8_t val = (packed_byte >> ((row & 1) << 2)) & 0x0F;
+    float z = static_cast<float>(val);
+
+    // Bias calculation: Store ZP directly (Unscaled) for Cutlass GroupWise?
+    // z is 0..15.
+    out[idx] = static_cast<T>(z);
+  }
+}
+
+void LaunchQMoEPrePackPacked4BitZPKernel(
+    const uint8_t* packed_zp,
+    const float* scales,
+    float* output,
+    int num_elements,
+    int N,
+    cudaStream_t stream) {
+  int block = 256;
+  int grid = (num_elements + block - 1) / block;
+  QMoEPrePackPacked4BitZPKernel<float><<<grid, block, 0, stream>>>(packed_zp, scales, output, num_elements, N);
+}
+
+void LaunchQMoEPrePackPacked4BitZPKernel(
+    const uint8_t* packed_zp,
+    const half* scales,
+    half* output,
+    int num_elements,
+    int N,
+    cudaStream_t stream) {
+  int block = 256;
+  int grid = (num_elements + block - 1) / block;
+  QMoEPrePackPacked4BitZPKernel<half><<<grid, block, 0, stream>>>(packed_zp, scales, output, num_elements, N);
+}
+
+void LaunchQMoEPrePackOffsetBias(
+    const uint8_t* zp,
+    const float* scales,
+    float* output,
+    int num_elements,
+    float offset,
+    cudaStream_t stream) {
+  int block = 256;
+  int grid = (num_elements + block - 1) / block;
+  QMoEPrePackZPKernel<float><<<grid, block, 0, stream>>>(zp, scales, output, num_elements, offset);
+}
+
+void LaunchQMoEPrePackOffsetBias(
+    const uint8_t* zp,
+    const half* scales,
+    half* output,
+    int num_elements,
+    float offset,
+    cudaStream_t stream) {
+  int block = 256;
+  int grid = (num_elements + block - 1) / block;
+  QMoEPrePackZPKernel<half><<<grid, block, 0, stream>>>(zp, scales, output, num_elements, offset);
+}
+
+__global__ void QMoEShiftWeightsKernel(const uint8_t* input, uint8_t* output, int num_elements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < num_elements) {
+    output[idx] = input[idx] ^ 0x80;
+  }
+}
+
+void LaunchQMoEShiftWeights(
+    const uint8_t* input,
+    uint8_t* output,
+    int num_elements,
+    cudaStream_t stream) {
+  int block = 256;
+  int grid = (num_elements + block - 1) / block;
+  QMoEShiftWeightsKernel<<<grid, block, 0, stream>>>(input, output, num_elements);
 }
 
 // ====================== Sparse Mixer Kernel ===============================

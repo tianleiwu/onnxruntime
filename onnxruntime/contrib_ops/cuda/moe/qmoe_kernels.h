@@ -63,6 +63,44 @@ void LaunchQMoEPrePackZP(
     int num_elements,
     cudaStream_t stream);
 
+void LaunchQMoEPrePackPacked4BitZPKernel(
+    const uint8_t* packed_zp,
+    const float* scales,
+    float* output,
+    int num_elements,
+    int N,
+    cudaStream_t stream);
+
+void LaunchQMoEPrePackPacked4BitZPKernel(
+    const uint8_t* packed_zp,
+    const half* scales,
+    half* output,
+    int num_elements,
+    int N,
+    cudaStream_t stream);
+
+void LaunchQMoEPrePackOffsetBias(
+    const uint8_t* zp,
+    const float* scales,
+    float* output,
+    int num_elements,
+    float offset,
+    cudaStream_t stream);
+
+void LaunchQMoEPrePackOffsetBias(
+    const uint8_t* zp,
+    const half* scales,
+    half* output,
+    int num_elements,
+    float offset,
+    cudaStream_t stream);
+
+void LaunchQMoEShiftWeights(
+    const uint8_t* input,
+    uint8_t* output,
+    int num_elements,
+    cudaStream_t stream);
+
 void LaunchQMoETranspose2D(
     const float* input,
     float* output,
