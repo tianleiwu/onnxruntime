@@ -60,6 +60,7 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
   int32_t input_type = op_kernel_info.node().InputDefs()[0]->TypeAsProto()->tensor_type().elem_type();
 
   bool is_fp16 = input_type == ONNX_NAMESPACE::TensorProto_DataType::TensorProto_DataType_FLOAT16;
+  is_fp16_ = is_fp16;
 
 #if QUICK_BUILD
   if (is_fp16) {
@@ -202,31 +203,55 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
     if (packed_bias) {
       eff_zp = packed_bias.get();
     } else if (zeros) {
-      // Compute bias on the fly: bias = -zp * scale
-      // We need 'eff_scale' to be available.
-      if (eff_scale && block_size_ > 0) {
-        size_t num_elements = zeros->Shape().Size();
-        // Determine type size based on scale type
-        bool is_fp16 = scales->IsDataType<MLFloat16>();
-        size_t bytes = num_elements * (is_fp16 ? 2 : 4);
+      if (expert_weight_bits_ == 4) {
+        // Compute bias on the fly: bias = -zp * scale
+        // We need 'eff_scale' to be available.
+        if (eff_scale && block_size_ > 0) {
+          size_t num_elements = zeros->Shape().Size();
+          // Determine type size based on scale type
+          bool is_fp16 = scales->IsDataType<MLFloat16>();
+          size_t bytes = num_elements * (is_fp16 ? 2 : 4);
 
-        transient_bias = GetScratchBuffer<void>(bytes, context->GetComputeStream());
-        eff_zp = transient_bias.get();
+          transient_bias = GetScratchBuffer<void>(bytes, context->GetComputeStream());
+          eff_zp = transient_bias.get();
 
-        if (is_fp16) {
-          LaunchQMoEPrePackZP(
-              static_cast<const uint8_t*>(zeros->DataRaw()),
-              static_cast<const half*>(eff_scale),
-              static_cast<half*>(transient_bias.get()),
-              static_cast<int>(num_elements),
-              stream);
+          if (is_fp16) {
+            LaunchQMoEPrePackZP(
+                static_cast<const uint8_t*>(zeros->DataRaw()),
+                static_cast<const half*>(eff_scale),
+                static_cast<half*>(transient_bias.get()),
+                static_cast<int>(num_elements),
+                stream);
+          } else {
+            LaunchQMoEPrePackZP(
+                static_cast<const uint8_t*>(zeros->DataRaw()),
+                static_cast<const float*>(eff_scale),
+                static_cast<float*>(transient_bias.get()),
+                static_cast<int>(num_elements),
+                stream);
+          }
+        }
+      } else {
+        // For 8-bit, ZP is used as is (or transposed).
+        // Since we are not packing, we use the raw pointer unless transpose is needed.
+        // Transpose on the fly is tricky without allocation. BUT, ComputeInternal is usually called
+        // with pre-packed weights/scales if coming from unit tests or offline tools.
+        // If not pre-packed (e.g. dynamic graph), we might need to transpose if 3D.
+        // For now, assuming standard path or 1D ZP for 2D weights.
+        // If 3D, we must transpose.
+        auto shape = zeros->Shape();
+        if (shape.NumDimensions() == 3 && shape[2] > 1) {
+          // Need temporary buffer for transpose
+          size_t bytes = zeros->SizeInBytes();
+          transient_bias = GetScratchBuffer<void>(bytes, context->GetComputeStream());
+          eff_zp = transient_bias.get();
+
+          size_t rows = shape[1];   // N
+          size_t cols = shape[2];   // Blocks
+          size_t batch = shape[0];  // Experts
+          LaunchQMoETranspose2D(static_cast<const uint8_t*>(zeros->DataRaw()), static_cast<uint8_t*>(transient_bias.get()), batch, rows, cols, stream);
         } else {
-          LaunchQMoEPrePackZP(
-              static_cast<const uint8_t*>(zeros->DataRaw()),
-              static_cast<const float*>(eff_scale),
-              static_cast<float*>(transient_bias.get()),
-              static_cast<int>(num_elements),
-              stream);
+          eff_zp = zeros->DataRaw();
         }
       }
     }
@@ -358,41 +383,67 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
   };
 
   auto compute_bias = [&](const IAllocatorUniquePtr<void>& packed_scale, IAllocatorUniquePtr<void>& packed_bias) {
-    if (!packed_scale) return;  // Cannot compute bias without scales
+    // If not computing bias (e.g. 8-bit ZP), we might not need scales at all, but we check anyway.
+    if ((expert_weight_bits_ == 4) && !packed_scale) return;
+
     size_t num_elements = tensor.Shape().Size();
-
     auto shape = tensor.Shape();
-    auto type = Info().node().InputDefs()[0]->TypeAsProto()->tensor_type().elem_type();
-    bool is_fp16 = (type == TensorProto_DataType_FLOAT16);
-    size_t bytes = num_elements * (is_fp16 ? 2 : 4);
-    packed_bias = IAllocator::MakeUniquePtr<void>(alloc, bytes, true);
 
-    const void* p_src_zp = tensor.DataRaw();
-    IAllocatorUniquePtr<void> temp_zp_gpu;
-    if (tensor.Location().device.Type() == OrtDevice::CPU) {
-      temp_zp_gpu = IAllocator::MakeUniquePtr<void>(alloc, tensor.SizeInBytes(), true);
-      cudaMemcpyAsync(temp_zp_gpu.get(), p_src_zp, tensor.SizeInBytes(), cudaMemcpyDefault, stream);
-      p_src_zp = temp_zp_gpu.get();
-    }
+    if (expert_weight_bits_ == 8) {
+      // For 8-bit: packed_bias holds the ZP (uint8), possibly transposed.
+      size_t bytes = num_elements * sizeof(uint8_t);
+      packed_bias = IAllocator::MakeUniquePtr<void>(alloc, bytes, true);
 
-    const void* p_zp_for_calc = p_src_zp;
-    IAllocatorUniquePtr<void> temp_zp_transposed;
+      const void* p_src_zp = tensor.DataRaw();
+      IAllocatorUniquePtr<void> temp_zp_gpu;
+      if (tensor.Location().device.Type() == OrtDevice::CPU) {
+        temp_zp_gpu = IAllocator::MakeUniquePtr<void>(alloc, tensor.SizeInBytes(), true);
+        cudaMemcpyAsync(temp_zp_gpu.get(), p_src_zp, tensor.SizeInBytes(), cudaMemcpyDefault, stream);
+        p_src_zp = temp_zp_gpu.get();
+      }
 
-    if (shape.NumDimensions() == 3 && shape[2] > 1) {
-      size_t rows = shape[1];   // N
-      size_t cols = shape[2];   // Blocks
-      size_t batch = shape[0];  // Experts
-
-      // Transpose ZP to match Scale layout [Experts, Blocks, N]
-      temp_zp_transposed = IAllocator::MakeUniquePtr<void>(alloc, tensor.SizeInBytes(), true);
-      LaunchQMoETranspose2D(static_cast<const uint8_t*>(p_src_zp), static_cast<uint8_t*>(temp_zp_transposed.get()), batch, rows, cols, stream);
-      p_zp_for_calc = temp_zp_transposed.get();
-    }
-
-    if (is_fp16) {
-      LaunchQMoEPrePackZP(static_cast<const uint8_t*>(p_zp_for_calc), static_cast<const half*>(packed_scale.get()), static_cast<half*>(packed_bias.get()), num_elements, stream);
+      if (shape.NumDimensions() == 3 && shape[2] > 1) {
+        size_t rows = shape[1];   // N
+        size_t cols = shape[2];   // Blocks
+        size_t batch = shape[0];  // Experts
+        LaunchQMoETranspose2D(static_cast<const uint8_t*>(p_src_zp), static_cast<uint8_t*>(packed_bias.get()), batch, rows, cols, stream);
+      } else {
+        cudaMemcpyAsync(packed_bias.get(), p_src_zp, bytes, cudaMemcpyDefault, stream);
+      }
     } else {
-      LaunchQMoEPrePackZP(static_cast<const uint8_t*>(p_zp_for_calc), static_cast<const float*>(packed_scale.get()), static_cast<float*>(packed_bias.get()), num_elements, stream);
+      // For 4-bit: packed_bias holds floating point bias = -ZP * Scale
+      auto type = Info().node().InputDefs()[0]->TypeAsProto()->tensor_type().elem_type();
+      bool is_fp16 = (type == TensorProto_DataType_FLOAT16);
+      size_t bytes = num_elements * (is_fp16 ? 2 : 4);
+      packed_bias = IAllocator::MakeUniquePtr<void>(alloc, bytes, true);
+
+      const void* p_src_zp = tensor.DataRaw();
+      IAllocatorUniquePtr<void> temp_zp_gpu;
+      if (tensor.Location().device.Type() == OrtDevice::CPU) {
+        temp_zp_gpu = IAllocator::MakeUniquePtr<void>(alloc, tensor.SizeInBytes(), true);
+        cudaMemcpyAsync(temp_zp_gpu.get(), p_src_zp, tensor.SizeInBytes(), cudaMemcpyDefault, stream);
+        p_src_zp = temp_zp_gpu.get();
+      }
+
+      const void* p_zp_for_calc = p_src_zp;
+      IAllocatorUniquePtr<void> temp_zp_transposed;
+
+      if (shape.NumDimensions() == 3 && shape[2] > 1) {
+        size_t rows = shape[1];   // N
+        size_t cols = shape[2];   // Blocks
+        size_t batch = shape[0];  // Experts
+
+        // Transpose ZP to match Scale layout [Experts, Blocks, N]
+        temp_zp_transposed = IAllocator::MakeUniquePtr<void>(alloc, tensor.SizeInBytes(), true);
+        LaunchQMoETranspose2D(static_cast<const uint8_t*>(p_src_zp), static_cast<uint8_t*>(temp_zp_transposed.get()), batch, rows, cols, stream);
+        p_zp_for_calc = temp_zp_transposed.get();
+      }
+
+      if (is_fp16) {
+        LaunchQMoEPrePackZP(static_cast<const uint8_t*>(p_zp_for_calc), static_cast<const half*>(packed_scale.get()), static_cast<half*>(packed_bias.get()), num_elements, stream);
+      } else {
+        LaunchQMoEPrePackZP(static_cast<const uint8_t*>(p_zp_for_calc), static_cast<const float*>(packed_scale.get()), static_cast<float*>(packed_bias.get()), num_elements, stream);
+      }
     }
     cudaStreamSynchronize(stream);
     is_packed = true;
@@ -403,14 +454,11 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
 #if DUMP_TENSOR_LEVEL >= 1
   auto dump_tensor = [&](const char* name, const IAllocatorUniquePtr<void>& packed_scales, const Tensor& scales) {
     auto shape = scales.Shape();
-    if (shape.NumDimensions() == 3 && shape[2] > 1) {
+    if (shape.NumDimensions() == 3 && is_fp16_) {
       size_t rows = shape[1];   // N
       size_t cols = shape[2];   // Blocks
       size_t batch = shape[0];  // Experts
-      auto type = scales.DataType();
-      if (type == DataTypeImpl::GetType<MLFloat16>()) {
-        DUMP_TENSOR(name, static_cast<const half*>(packed_scales.get()), int(batch), int(cols), int(rows));
-      }
+      DUMP_TENSOR(name, static_cast<const half*>(packed_scales.get()), int(batch), int(cols), int(rows));
     }
   };
 #define DUMP_PACK_TENSOR(name, packed_scales, scales) dump_tensor(name, packed_scales, scales)
@@ -431,13 +479,13 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
     TransposeAndPack(packed_fc3_scales_);
     DUMP_PACK_TENSOR("packed_fc3_scales", packed_fc3_scales_, tensor);
   } else if (input_idx == 11) {  // fc1_zeros
-    DUMP_TENSOR("fc1_zeros", tensor);
+    // DUMP_TENSOR("fc1_zeros", tensor);
     compute_bias(packed_fc1_scales_, packed_fc1_bias_);
-    DUMP_PACK_TENSOR("packed_fc1_bias", packed_fc1_bias_, tensor);
+    // DUMP_PACK_TENSOR("packed_fc1_bias", packed_fc1_bias_, tensor);
   } else if (input_idx == 12) {  // fc2_zeros
-    DUMP_TENSOR("fc2_zeros", tensor);
+    // DUMP_TENSOR("fc2_zeros", tensor);
     compute_bias(packed_fc2_scales_, packed_fc2_bias_);
-    DUMP_PACK_TENSOR("packed_fc2_bias", packed_fc2_bias_, tensor);
+    // DUMP_PACK_TENSOR("packed_fc2_bias", packed_fc2_bias_, tensor);
   }
   // TODO: fc3_zeros (13) not handled for now as it's optional and rarely used?
   // Code structure allows adding it easily.

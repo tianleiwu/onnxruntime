@@ -288,6 +288,8 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
                 torch.from_numpy(zero_point).to(weights.device).to(torch.uint8) if asymmetric else None
             )
 
+
+
         # Return scale in [N, block_per_k] layout matching operator spec [E, N, B] after stacking
         # Operator will transpose from [E, N, B] to [E, B, N] for kernel
         return scale_torch_out, processed_q_weight_torch, result, zero_points_storage
@@ -931,13 +933,7 @@ class SparseMoeBlockORTHelper(nn.Module):
             if moe_experts_weight_scale2.dim() == 3:
                 moe_experts_weight_scale2 = moe_experts_weight_scale2.squeeze(-1)
 
-        # DEBUG: Print scale tensor info before ONNX graph creation
-        print(
-            f"DEBUG Python: moe_experts_weight_scale1 shape={moe_experts_weight_scale1.shape}, "
-            f"min={moe_experts_weight_scale1.min():.6f}, max={moe_experts_weight_scale1.max():.6f}"
-        )
-        if self.block_size > 0:
-            print(f"DEBUG Python: block_size={self.block_size}, expected scale layout: [E, N, B]")
+
 
         try:
             self.moe_onnx_graph = create_moe_onnx_graph(
@@ -1186,9 +1182,10 @@ class SwigluMoEBlock(SparseMoeBlockORTHelper):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate(hidden_states)
+        print("[Torch] router_logits", router_logits.shape)
         routing_weights, selected_experts = torch.topk(router_logits, self.top_k, dim=-1)
         routing_weights = F.softmax(routing_weights, dim=1, dtype=torch.float)
-
+        print("[Torch] routing_weights", routing_weights)
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         final_hidden_states = torch.zeros(
@@ -1196,11 +1193,11 @@ class SwigluMoEBlock(SparseMoeBlockORTHelper):
         )
 
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        print("[Torch] expert_mask", expert_mask.shape)
 
         for expert_idx in range(self.num_experts):
             expert_layer = self.experts[expert_idx]
             idx, top_x = torch.where(expert_mask[expert_idx])
-
             if top_x.shape[0] == 0:
                 continue
 

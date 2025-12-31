@@ -25,6 +25,7 @@ class QMoE final : public CudaKernel, public MoEBase {
   int64_t expert_weight_bits_;
   int64_t block_size_;
   bool has_fc3_;
+  bool is_fp16_;
 
   std::unique_ptr<onnxruntime::llm::kernels::cutlass_kernels::CutlassMoeFCRunnerInterface> m_moe_runner;
 
