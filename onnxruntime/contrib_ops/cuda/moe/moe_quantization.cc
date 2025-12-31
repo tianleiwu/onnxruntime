@@ -314,10 +314,43 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
 
   cudaStream_t stream = 0;  // Use default stream for PrePack operations
 
-  auto capture_scale = [&](IAllocatorUniquePtr<void>& packed_buf) {
+  // Scale/Bias layout is [Experts, Blocks, N] in cutlass kernel
+  // But passed from Python as [Experts, N, Blocks] for block-wise (3D)
+  // For per-column (2D), it is [Experts, N], which is effectively [Experts, 1, N] (compatible with [Experts, Blocks, N] where Blocks=1)
+  // So we only transpose if 3D.
+
+  auto TransposeAndPack = [&](IAllocatorUniquePtr<void>& packed_buf) {
+    auto shape = tensor.Shape();
     size_t bytes = tensor.SizeInBytes();
     packed_buf = IAllocator::MakeUniquePtr<void>(alloc, bytes, true);
-    cudaMemcpyAsync(packed_buf.get(), tensor.DataRaw(), bytes, cudaMemcpyDefault, stream);
+
+    const void* p_src = tensor.DataRaw();
+    IAllocatorUniquePtr<void> temp_src_gpu;
+    if (tensor.Location().device.Type() == OrtDevice::CPU) {
+      temp_src_gpu = IAllocator::MakeUniquePtr<void>(alloc, bytes, true);
+      cudaMemcpyAsync(temp_src_gpu.get(), p_src, bytes, cudaMemcpyDefault, stream);
+      p_src = temp_src_gpu.get();
+    }
+
+    if (shape.NumDimensions() == 3 && shape[2] > 1) {
+      size_t rows = shape[1];   // N
+      size_t cols = shape[2];   // Blocks
+      size_t batch = shape[0];  // Experts
+      auto type = tensor.DataType();
+
+      if (type == DataTypeImpl::GetType<MLFloat16>()) {
+        LaunchQMoETranspose2D(static_cast<const half*>(p_src), static_cast<half*>(packed_buf.get()), batch, rows, cols, stream);
+      } else if (type == DataTypeImpl::GetType<float>()) {
+        LaunchQMoETranspose2D(static_cast<const float*>(p_src), static_cast<float*>(packed_buf.get()), batch, rows, cols, stream);
+      } else if (type == DataTypeImpl::GetType<uint8_t>()) {
+        LaunchQMoETranspose2D(static_cast<const uint8_t*>(p_src), static_cast<uint8_t*>(packed_buf.get()), batch, rows, cols, stream);
+      } else {
+        ORT_THROW("Unsupported data type for scale transposition");
+      }
+    } else {
+      // 2D case or others: Direct Copy
+      cudaMemcpyAsync(packed_buf.get(), p_src, bytes, cudaMemcpyDefault, stream);
+    }
     cudaStreamSynchronize(stream);
     is_packed = true;
   };
@@ -325,34 +358,50 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
   auto compute_bias = [&](const IAllocatorUniquePtr<void>& packed_scale, IAllocatorUniquePtr<void>& packed_bias) {
     if (!packed_scale) return;  // Cannot compute bias without scales
     size_t num_elements = tensor.Shape().Size();
+
+    auto shape = tensor.Shape();
     auto type = Info().node().InputDefs()[0]->TypeAsProto()->tensor_type().elem_type();
     bool is_fp16 = (type == TensorProto_DataType_FLOAT16);
     size_t bytes = num_elements * (is_fp16 ? 2 : 4);
     packed_bias = IAllocator::MakeUniquePtr<void>(alloc, bytes, true);
 
-    const void* p_zeros = tensor.DataRaw();
-    IAllocatorUniquePtr<void> temp_zeros_gpu;
+    const void* p_src_zp = tensor.DataRaw();
+    IAllocatorUniquePtr<void> temp_zp_gpu;
     if (tensor.Location().device.Type() == OrtDevice::CPU) {
-      temp_zeros_gpu = IAllocator::MakeUniquePtr<void>(alloc, tensor.SizeInBytes(), true);
-      cudaMemcpyAsync(temp_zeros_gpu.get(), p_zeros, tensor.SizeInBytes(), cudaMemcpyDefault, stream);
-      p_zeros = temp_zeros_gpu.get();
+      temp_zp_gpu = IAllocator::MakeUniquePtr<void>(alloc, tensor.SizeInBytes(), true);
+      cudaMemcpyAsync(temp_zp_gpu.get(), p_src_zp, tensor.SizeInBytes(), cudaMemcpyDefault, stream);
+      p_src_zp = temp_zp_gpu.get();
+    }
+
+    const void* p_zp_for_calc = p_src_zp;
+    IAllocatorUniquePtr<void> temp_zp_transposed;
+
+    if (shape.NumDimensions() == 3 && shape[2] > 1) {
+      size_t rows = shape[1];   // N
+      size_t cols = shape[2];   // Blocks
+      size_t batch = shape[0];  // Experts
+
+      // Transpose ZP to match Scale layout [Experts, Blocks, N]
+      temp_zp_transposed = IAllocator::MakeUniquePtr<void>(alloc, tensor.SizeInBytes(), true);
+      LaunchQMoETranspose2D(static_cast<const uint8_t*>(p_src_zp), static_cast<uint8_t*>(temp_zp_transposed.get()), batch, rows, cols, stream);
+      p_zp_for_calc = temp_zp_transposed.get();
     }
 
     if (is_fp16) {
-      LaunchQMoEPrePackZP(static_cast<const uint8_t*>(p_zeros), static_cast<const half*>(packed_scale.get()), static_cast<half*>(packed_bias.get()), num_elements, stream);
+      LaunchQMoEPrePackZP(static_cast<const uint8_t*>(p_zp_for_calc), static_cast<const half*>(packed_scale.get()), static_cast<half*>(packed_bias.get()), num_elements, stream);
     } else {
-      LaunchQMoEPrePackZP(static_cast<const uint8_t*>(p_zeros), static_cast<const float*>(packed_scale.get()), static_cast<float*>(packed_bias.get()), num_elements, stream);
+      LaunchQMoEPrePackZP(static_cast<const uint8_t*>(p_zp_for_calc), static_cast<const float*>(packed_scale.get()), static_cast<float*>(packed_bias.get()), num_elements, stream);
     }
     cudaStreamSynchronize(stream);
     is_packed = true;
   };
 
   if (input_idx == 3) {  // fc1_scales
-    capture_scale(packed_fc1_scales_);
+    TransposeAndPack(packed_fc1_scales_);
   } else if (input_idx == 6) {  // fc2_scales
-    capture_scale(packed_fc2_scales_);
+    TransposeAndPack(packed_fc2_scales_);
   } else if (input_idx == 9 && has_fc3_) {  // fc3_scales
-    capture_scale(packed_fc3_scales_);
+    TransposeAndPack(packed_fc3_scales_);
   } else if (input_idx == 11) {  // fc1_zeros
     compute_bias(packed_fc1_scales_, packed_fc1_bias_);
   } else if (input_idx == 12) {  // fc2_zeros
