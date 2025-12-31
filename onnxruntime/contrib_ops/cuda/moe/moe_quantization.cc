@@ -13,6 +13,9 @@
 #include "core/common/safeint.h"
 #include "contrib_ops/cuda/moe/qmoe_kernels.h"
 
+#include "contrib_ops/cuda/utils/dump_cuda_tensor.h"
+#include "contrib_ops/cpu/utils/debug_macros.h"
+
 using namespace onnxruntime::cuda;
 using namespace ::onnxruntime::common;
 using namespace ONNX_NAMESPACE;
@@ -105,7 +108,6 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   const Tensor* fc1_zeros = packed_fc1_bias_ ? nullptr : context->Input<Tensor>(11);
   const Tensor* fc2_zeros = packed_fc2_bias_ ? nullptr : context->Input<Tensor>(12);
   const Tensor* fc3_zeros = context->Input<Tensor>(13);
-  (void)fc3_zeros;  // Cast to void to avoid unused warning
 
   int64_t pack_size = expert_weight_bits_ == 4 ? 2 : 1;
   bool is_fused_swiglu = activation_type_ == onnxruntime::llm::kernels::cutlass_kernels::ActivationType::Swiglu;
@@ -337,7 +339,6 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
       size_t cols = shape[2];   // Blocks
       size_t batch = shape[0];  // Experts
       auto type = tensor.DataType();
-
       if (type == DataTypeImpl::GetType<MLFloat16>()) {
         LaunchQMoETranspose2D(static_cast<const half*>(p_src), static_cast<half*>(packed_buf.get()), batch, rows, cols, stream);
       } else if (type == DataTypeImpl::GetType<float>()) {
@@ -351,6 +352,7 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
       // 2D case or others: Direct Copy
       cudaMemcpyAsync(packed_buf.get(), p_src, bytes, cudaMemcpyDefault, stream);
     }
+
     cudaStreamSynchronize(stream);
     is_packed = true;
   };
@@ -396,18 +398,48 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
     is_packed = true;
   };
 
+  DUMP_TENSOR_INIT();
+
+#if DUMP_TENSOR_LEVEL >= 1
+  auto dump_tensor = [&](const char* name, const IAllocatorUniquePtr<void>& packed_scales, const Tensor& scales) {
+    auto shape = scales.Shape();
+    if (shape.NumDimensions() == 3 && shape[2] > 1) {
+      size_t rows = shape[1];   // N
+      size_t cols = shape[2];   // Blocks
+      size_t batch = shape[0];  // Experts
+      auto type = scales.DataType();
+      if (type == DataTypeImpl::GetType<MLFloat16>()) {
+        DUMP_TENSOR(name, static_cast<const half*>(packed_scales.get()), int(batch), int(cols), int(rows));
+      }
+    }
+  };
+#define DUMP_PACK_TENSOR(name, packed_scales, scales) dump_tensor(name, packed_scales, scales)
+#else
+#define DUMP_PACK_TENSOR(name, packed_scales, scales)
+#endif
+
   if (input_idx == 3) {  // fc1_scales
+    DUMP_TENSOR("fc1_scales", tensor);
     TransposeAndPack(packed_fc1_scales_);
+    DUMP_PACK_TENSOR("packed_fc1_scales", packed_fc1_scales_, tensor);
   } else if (input_idx == 6) {  // fc2_scales
+    DUMP_TENSOR("fc2_scales", tensor);
     TransposeAndPack(packed_fc2_scales_);
+    DUMP_PACK_TENSOR("packed_fc2_scales", packed_fc2_scales_, tensor);
   } else if (input_idx == 9 && has_fc3_) {  // fc3_scales
+    DUMP_TENSOR("fc3_scales", tensor);
     TransposeAndPack(packed_fc3_scales_);
+    DUMP_PACK_TENSOR("packed_fc3_scales", packed_fc3_scales_, tensor);
   } else if (input_idx == 11) {  // fc1_zeros
+    DUMP_TENSOR("fc1_zeros", tensor);
     compute_bias(packed_fc1_scales_, packed_fc1_bias_);
+    DUMP_PACK_TENSOR("packed_fc1_bias", packed_fc1_bias_, tensor);
   } else if (input_idx == 12) {  // fc2_zeros
+    DUMP_TENSOR("fc2_zeros", tensor);
     compute_bias(packed_fc2_scales_, packed_fc2_bias_);
+    DUMP_PACK_TENSOR("packed_fc2_bias", packed_fc2_bias_, tensor);
   }
-  // fc3_zeros (13) not handled for now as it's optional and rarely used?
+  // TODO: fc3_zeros (13) not handled for now as it's optional and rarely used?
   // Code structure allows adding it easily.
 
   return Status::OK();

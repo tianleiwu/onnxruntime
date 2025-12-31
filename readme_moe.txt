@@ -236,23 +236,21 @@ It is recommended to use run.sh to build and install wheel:
 Or the following to clean moe related build artifacts and then build and install wheel:
 ./run.sh --build --install --clean_moe
 
-If you need clean all build artifacts and then build and install wheel:
-rm -rf build
-./run.sh --build --install
+If you need clean all build artifacts (rm -rf build) and then build and install wheel:
+./run.sh --clean --build --install
+
+If you want to enable debug node inputs and outputs (You may add --clean if previous build has no --dump option):
+./run.sh --build --install --dump
 
 # How to test
+run test_moe_cuda.py:
 ./run.sh --test_moe
+
+run test_qmoe_cuda.py:
 ./run.sh --test_qmoe
-The above commands will run test_moe_cuda.py and test_qmoe_cuda.py
 
-# How to debug:
-If you want to see node inputs and outputs in stdout during executing onnx graph:
+If you need to run a specific test case, you can use the following command:
+./run.sh --test_qmoe_case TestSwigluQMoE.test_swiglu_qmoe_blockwise_parity_3
 
-You can set a flag in build script (modify run.sh): --cmake_extra_defines onnxruntime_DEBUG_NODE_INPUTS_OUTPUTS=1
-
-Then set the following environment variables before running python test:
-export ORT_DEBUG_NODE_IO_DUMP_INPUT_DATA=1
-export ORT_DEBUG_NODE_IO_DUMP_OUTPUT_DATA=1
-export ORT_DEBUG_NODE_IO_SNIPPET_THRESHOLD=0
-export ORT_DEBUG_NODE_IO_SNIPPET_EDGE_ITEMS=3
-export ORT_DEBUG_NODE_IO_DUMP_STATISTICS_DATA=1
+If you want to enable debug node inputs and outputs (Current build need to be built with --dump option):
+./run.sh --test_qmoe_case TestSwigluQMoE.test_swiglu_qmoe_blockwise_parity_3 --dump

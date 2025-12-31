@@ -6,10 +6,12 @@
 #   --build           Run build.sh
 #   --clean           Clean build directory (rm -rf build)
 #   --install         Install the built wheel
+#   --dump            Enable dump node inputs/outputs
 # Options for MoE or QMoE:
 #   --clean_moe       Clean moe build artifacts
 #   --test_moe        Run test_moe_cuda.py
 #   --test_qmoe       Run test_qmoe_cuda.py
+#   --test_qmoe_case  Run specific test case in test_qmoe_cuda.py (e.g. TestSwigluQMoE.test_swiglu_qmoe_blockwise_parity_3)
 # Options for Flash Attention only (Not Used for MoE or QMoE):
 #   --quick           Configure quick build/test (flash attention hdim128 only and exclude bf16, sets onnxruntime_QUICK_BUILD=ON)
 #   --quick_build     A combination of --quick and --build
@@ -34,8 +36,11 @@ USE_QUICK_BUILD=false
 RUN_INSTALL=false
 RUN_TEST_MOE=false
 RUN_TEST_QMOE=false
+RUN_TEST_QMOE_CASE=false
+TEST_QMOE_CASE=""
 RUN_BENCHMARK=false
 RUN_PROFILE=false
+ENABLE_DUMP="OFF"
 
 while [[ "$#" -gt 0 ]]; do
     case $1 in
@@ -77,6 +82,12 @@ while [[ "$#" -gt 0 ]]; do
             RUN_TEST_QMOE=true
             echo "==== 🚫 Test QMoE run enabled ===="
             ;;
+        --test_qmoe_case)
+            RUN_TEST_QMOE_CASE=true
+            TEST_QMOE_CASE="$2"
+            echo "==== 🚫 Test QMoE case run enabled: $TEST_QMOE_CASE ===="
+            shift
+            ;;
         --benchmark)
             RUN_BENCHMARK=true
             echo "==== 📊 Benchmark run enabled ===="
@@ -84,6 +95,10 @@ while [[ "$#" -gt 0 ]]; do
         --profile)
             RUN_PROFILE=true
             echo "==== 📊 Profiling enabled ===="
+            ;;
+        --dump)
+            ENABLE_DUMP="ON"
+            echo "==== 📊 Enable dump ===="
             ;;
         *)
             echo "Unknown option: $1"
@@ -114,7 +129,8 @@ if [ "$RUN_BUILD" = true ]; then
             --cmake_generator Ninja \
             --enable_cuda_nhwc_ops \
             --use_binskim_compliant_compile_flags \
-            --cmake_extra_defines onnxruntime_DEBUG_NODE_INPUTS_OUTPUTS=0 \
+            --cmake_extra_defines onnxruntime_DEBUG_NODE_INPUTS_OUTPUTS=$ENABLE_DUMP \
+            --cmake_extra_defines onnxruntime_DUMP_TENSOR=$ENABLE_DUMP \
             --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES="90" \
             --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF \
             --cmake_extra_defines onnxruntime_USE_FPA_INTB_GEMM=OFF \
@@ -138,6 +154,15 @@ if [ "$RUN_INSTALL" = true ]; then
     pip install build/cuda/Release/dist/onnxruntime_gpu-1.24.0-cp312-cp312-linux_x86_64.whl --force-reinstall
 fi
 
+if [ "$ENABLE_DUMP" = "ON" ]; then
+    export ORT_DEBUG_NODE_IO_DUMP_SHAPE_DATA=1
+    export ORT_DEBUG_NODE_IO_DUMP_INPUT_DATA=1
+    export ORT_DEBUG_NODE_IO_DUMP_OUTPUT_DATA=1
+    export ORT_DEBUG_NODE_IO_SNIPPET_THRESHOLD=200
+    export ORT_DEBUG_NODE_IO_SNIPPET_EDGE_ITEMS=3
+    export ORT_DEBUG_NODE_IO_DUMP_STATISTICS_DATA=0
+fi
+
 # Test/Benchmark/profile scripts are in the following directory
 cd onnxruntime/test/python/transformers
 
@@ -159,6 +184,16 @@ if [ "$RUN_TEST_QMOE" = true ]; then
         exit $test_exit_code
     fi
     echo "==== ✅ test_qmoe_cuda.py passed! ===="
+fi
+
+if [ "$RUN_TEST_QMOE_CASE" = true ]; then
+    python test_qmoe_cuda.py -k "$TEST_QMOE_CASE"
+    test_exit_code=$?
+    if [ $test_exit_code -ne 0 ]; then
+        echo "==== ❌ test_qmoe_cuda.py -k $TEST_QMOE_CASE failed with exit code $test_exit_code! Exiting. ===="
+        exit $test_exit_code
+    fi
+    echo "==== ✅ test_qmoe_cuda.py -k $TEST_QMOE_CASE passed! ===="
 fi
 
 if [ "$RUN_BENCHMARK" = true ]; then

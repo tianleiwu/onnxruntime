@@ -131,7 +131,7 @@ def print_diff_statistics(diff_tensor: torch.Tensor, prefix: str = ""):
 
 
 def preprocess_weights_for_mixed_gemm(
-    tensor: torch.Tensor, quant_bits: int, sm_: int = -1, do_weight_interleave: bool = True
+    tensor: torch.Tensor, quant_bits: int, sm: int = -1, do_weight_interleave: bool = True
 ) -> torch.Tensor:
     if len(tensor.shape) == 2:
         tensor = tensor.unsqueeze(0)
@@ -149,7 +149,7 @@ def preprocess_weights_for_mixed_gemm(
     if pybind and hasattr(pybind, "pack_weights_for_cuda_mixed_gemm") and torch.cuda.is_available():
         for i in range(num_experts):
             weight = tensor[i].cpu().numpy()
-            packed = pybind.pack_weights_for_cuda_mixed_gemm(weight, n, k, quant_bits)
+            packed = pybind.pack_weights_for_cuda_mixed_gemm(weight, n, k, quant_bits, sm)
             # pack_weights_for_cuda_mixed_gemm returns int8 array of shape [packed_size]
             # We need to reshape it to (k, n/2) for 4-bit, (k, n) for 8-bit.
             output_rows = k
@@ -254,7 +254,7 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
         _quantize.quantize_matmul_8bits(q_weight, weights_np, scale, zero_point, block_size, n, k, is_symmetric)
 
         q_weight_reshaped = q_weight.reshape(n, -1)
-        processed_q_weight = _quantize.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, n, k, 8)
+        processed_q_weight = _quantize.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, n, k, 8, 80)
 
         # Use abs() for reference dequant to match Cutlass kernel's positive scales
         scale_torch = torch.from_numpy(scale).to(weights.device).unsqueeze(-1).abs()

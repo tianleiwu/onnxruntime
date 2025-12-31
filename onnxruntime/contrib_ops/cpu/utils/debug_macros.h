@@ -1,12 +1,8 @@
 #pragma once
 #include "core/common/make_string.h"
 
-// #define DEBUG_GENERATION 1  // uncomment it for debugging generation (like beam search etc)
-
-#ifdef DEBUG_GENERATION
-#define DUMP_TENSOR_LEVEL 2
-#else
-#define DUMP_TENSOR_LEVEL 0  // change it to 1 or 2 if want to enable dumping for code not in generation.
+#if !defined(DUMP_TENSOR_LEVEL)
+#define DUMP_TENSOR_LEVEL 0
 #endif
 
 #define DUMP_CPU_TENSOR_LEVEL DUMP_TENSOR_LEVEL

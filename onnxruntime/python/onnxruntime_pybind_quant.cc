@@ -165,7 +165,8 @@ py::array_t<int8_t> PackWeightsForMixedGemm(
     py::array_t<uint8_t> q_weights,
     int32_t N,
     int32_t K,
-    int32_t bits) {
+    int32_t bits,
+    int32_t force_arch = -1) {
   py::buffer_info q_weights_buf = q_weights.request();
 
   size_t n = static_cast<size_t>(N);
@@ -209,12 +210,14 @@ py::array_t<int8_t> PackWeightsForMixedGemm(
   using ::onnxruntime::llm::kernels::weight_only::QuantType;
   QuantType quant_type = bits == 4 ? QuantType::W4_A16 : QuantType::W8_A16;
 
-  int sm = 0;
-  int device_id = 0;
-  cudaGetDevice(&device_id);
-  cudaDeviceProp device_prop;
-  cudaGetDeviceProperties(&device_prop, device_id);
-  sm = device_prop.major * 10 + device_prop.minor;
+  int sm = force_arch;
+  if (sm < 0) {
+    int device_id = 0;
+    cudaGetDevice(&device_id);
+    cudaDeviceProp device_prop;
+    cudaGetDeviceProperties(&device_prop, device_id);
+    sm = device_prop.major * 10 + device_prop.minor;
+  }
 
   auto permutation_map_buffer = make_cuda_ptr(32 * sizeof(int32_t));
 
@@ -248,7 +251,8 @@ void CreateQuantPybindModule(py::module& m) {
   m.def("quantize_qdq_matmul_4bits", &QuantizeQDQMatMul4BitsBlockwise<MLFloat16>);
 #ifdef USE_CUDA
   m.def("pack_weights_for_cuda_mixed_gemm", &cuda::PackWeightsForMixedGemm,
-        "Pack quantized weights for CUDA mixed-precision GEMM (FpA_IntB format)");
+        "Pack quantized weights for CUDA mixed-precision GEMM (FpA_IntB format)",
+        py::arg("q_weights"), py::arg("N"), py::arg("K"), py::arg("bits"), py::arg("force_arch") = -1);
 #endif
 }
 
