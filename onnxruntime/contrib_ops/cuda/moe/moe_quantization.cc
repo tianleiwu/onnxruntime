@@ -123,7 +123,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   constexpr bool use_lora = false;
   constexpr bool use_deepseek_fp8_block_scale = false;
   constexpr bool min_latency_mode = false;
-  bool use_awq = (fc1_zeros != nullptr);
+  bool use_awq = (fc1_zeros != nullptr) || (packed_fc1_bias_ != nullptr);
   onnxruntime::llm::kernels::cutlass_kernels::MOEParallelismConfig parallelism_config{};
 
   size_t workspace_size = m_moe_runner->getWorkspaceSize(
@@ -261,25 +261,10 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   prepare_scale_zp(fc2_scales, fc2_zeros, packed_fc2_scales_, packed_fc2_bias_, transient_fc2_bias, p_fc2_scales, p_fc2_zp);
 
   // DEBUG PRINTS (Preserved and fixed)
-  if (true) {  // block_size_ > 0 checks (ALWAYS RUN DEBUG)
-    // printf("QMoE Debug: block_size=%ld, expert_bits=%ld\n", block_size_, expert_weight_bits_);
-    // printf("QMoE Debug: FC1 Scales=%p, ZP=%p (PackedScales=%p, PackedBias=%p)\n", p_fc1_scales, p_fc1_zp, packed_fc1_scales_.get(), packed_fc1_bias_.get());
-    if (p_fc1_zp == nullptr && fc1_zeros != nullptr) {
-      printf("QMoE ERROR: FC1 ZP is NULL despite input zeros present! Fallback failed?\n");
-    } else if (p_fc1_zp != nullptr) {
-      // Dump first element of Bias
-      float bias_val = 0.0f;
-      // Use outer is_fp16 from input type check to avoid dereferencing possibly null fc1_scales
-      if (is_fp16) {
-        onnxruntime::MLFloat16 half_val;
-        cudaMemcpy(&half_val, p_fc1_zp, 2, cudaMemcpyDeviceToHost);
-        printf("QMoE DEBUG: FC1 ZP[0] (Half) = %f (Raw: %x)\n", half_val.ToFloat(), half_val.val);
-      } else {
-        cudaMemcpy(&bias_val, p_fc1_zp, sizeof(float), cudaMemcpyDeviceToHost);  // Try float copy
-        printf("QMoE DEBUG: FC1 ZP[0] (Float) = %f\n", bias_val);
-      }
-    }
-  }
+  // if (block_size_ > 0) {
+  //   printf("QMoE Debug: block_size=%ld, expert_bits=%ld\n", block_size_, expert_weight_bits_);
+  //   printf("QMoE Debug: FC1 Scales=%p, ZP=%p (PackedScales=%p, PackedBias=%p)\n", p_fc1_scales, p_fc1_zp, packed_fc1_scales_.get(), packed_fc1_bias_.get());
+  // }
 
   onnxruntime::llm::kernels::cutlass_kernels::QuantParams quant_params;
   if (block_size_ > 0) {

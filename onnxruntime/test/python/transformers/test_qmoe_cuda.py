@@ -288,8 +288,6 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
                 torch.from_numpy(zero_point).to(weights.device).to(torch.uint8) if asymmetric else None
             )
 
-
-
         # Return scale in [N, block_per_k] layout matching operator spec [E, N, B] after stacking
         # Operator will transpose from [E, N, B] to [E, B, N] for kernel
         return scale_torch_out, processed_q_weight_torch, result, zero_points_storage
@@ -932,8 +930,6 @@ class SparseMoeBlockORTHelper(nn.Module):
                 moe_experts_weight_scale1 = moe_experts_weight_scale1.squeeze(-1)
             if moe_experts_weight_scale2.dim() == 3:
                 moe_experts_weight_scale2 = moe_experts_weight_scale2.squeeze(-1)
-
-
 
         try:
             self.moe_onnx_graph = create_moe_onnx_graph(
