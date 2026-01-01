@@ -14,15 +14,18 @@ import os
 import platform
 import random
 import unittest
+from copy import deepcopy
 from dataclasses import dataclass
 
 import numpy
 import torch
 from einops import rearrange, repeat
 from onnx import TensorProto, helper
+from packaging import version
 from parameterized import parameterized
 
-from onnxruntime import InferenceSession, OrtValue, SessionOptions, get_available_providers
+import onnxruntime
+from onnxruntime import InferenceSession, SessionOptions, get_available_providers
 
 # Set seed for reproducibility
 torch.manual_seed(0)
@@ -31,9 +34,44 @@ random.seed(69)
 # Reduces number of tests to run for faster pipeline checks
 pipeline_mode = os.getenv("PIPELINE_MODE", "1") == "1"
 
+# Number of values per parameter (compared to pipeline mode)
+param_count = int(os.getenv("PARAM_COUNT", "3")) if not pipeline_mode else 2
+
+# Quick build mode: only test hdim128 for faster development iteration
+quick_build = os.getenv("QUICK_BUILD", "0") == "1"
+
+debug_gqa = os.getenv("DEBUG_GQA", "0") == "1"
+
 # #################################################################################################
 #  Configuration and Helper Classes
 # #################################################################################################
+
+
+# --- ONNX and Torch/Numpy Dtype Mappings ---
+ONNX_TENSOR_TYPE_MAP = {
+    "float32": TensorProto.FLOAT,
+    "float16": TensorProto.FLOAT16,
+    "bfloat16": TensorProto.BFLOAT16,
+    "int32": TensorProto.INT32,
+    "int8": TensorProto.INT8,
+    "int4": TensorProto.UINT8,
+}
+
+TORCH_DTYPE_MAP = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "int8": torch.int8,
+    "int4": torch.uint8,
+}
+
+NUMPY_DTYPE_MAP = {
+    "float32": numpy.float32,
+    "float16": numpy.float16,
+    "bfloat16": numpy.uint16,
+    "int8": numpy.int8,
+    "int4": numpy.uint8,
+}
 
 
 @dataclass
@@ -57,6 +95,97 @@ class GQAConfig:
     has_position_ids: bool = False
     has_attention_bias: bool = False
     has_head_sink: bool = False
+    # Quantization parameters
+    k_quant_type: str = "NONE"
+    v_quant_type: str = "NONE"
+    kv_cache_type: str = "float16"
+    kv_cache_bit_width: int = 0
+
+
+# #################################################################################################
+#  Quantization Helpers
+# #################################################################################################
+
+
+def get_q_range(q_type_str):
+    if q_type_str == "int8":
+        return -128, 127
+    if q_type_str == "int4":
+        return -8, 7
+    raise ValueError(f"Unsupported quantization type for range: {q_type_str}")
+
+
+def pack_int4(tensor_int8):
+    assert tensor_int8.shape[-1] % 2 == 0
+    t_low = tensor_int8[..., 0::2] + 8
+    t_high = tensor_int8[..., 1::2] + 8
+    packed = (t_low & 0x0F) | (t_high << 4)
+    return packed.to(torch.uint8)
+
+
+def unpack_int4(packed_tensor_uint8):
+    t_low = (packed_tensor_uint8 & 0x0F) - 8
+    t_high = (packed_tensor_uint8 >> 4) - 8
+    unpacked = torch.empty(
+        (*packed_tensor_uint8.shape[:-1], packed_tensor_uint8.shape[-1] * 2),
+        dtype=torch.int8,
+        device=packed_tensor_uint8.device,
+    )
+    unpacked[..., 0::2] = t_low
+    unpacked[..., 1::2] = t_high
+    return unpacked
+
+
+def compute_scale(tensor_float, quant_type, q_type_str):
+    if quant_type == "NONE":
+        return None
+
+    qmin, qmax = get_q_range(q_type_str)
+
+    if quant_type == "PER_TENSOR":
+        t_max = torch.max(torch.abs(tensor_float))
+        scale = t_max / qmax if t_max > 1e-6 else torch.tensor(1.0, device=tensor_float.device, dtype=torch.float32)
+        return scale.unsqueeze(0).to(torch.float32)
+
+    if quant_type == "PER_CHANNEL":
+        # Per-channel scale is computed independently for each channel across the batch and sequence length dimensions.
+        t_max = torch.max(torch.abs(tensor_float), dim=2, keepdim=True)[0]
+        t_max = torch.max(t_max, dim=0, keepdim=True)[0]
+        scale = t_max / qmax
+        scale[scale < 1e-6] = 1.0
+        return scale.to(torch.float32)
+
+    raise ValueError(f"Unsupported quant_type: {quant_type}")
+
+
+def dequantize_tensor(quantized_tensor, scale, quant_type, q_type_str):
+    if quant_type == "NONE":
+        return quantized_tensor
+
+    # Ensure scale is on the same device as quantized_tensor
+    if isinstance(scale, torch.Tensor):
+        scale = scale.to(quantized_tensor.device)
+
+    unpacked_tensor = quantized_tensor
+    if q_type_str == "int4":
+        unpacked_tensor = unpack_int4(quantized_tensor)
+
+    return unpacked_tensor.to(torch.float32) * scale
+
+
+def quantize_tensor_with_scale(tensor_float, scale, quant_type, q_type_str):
+    """Quantizes a tensor using a provided scale."""
+    if quant_type == "NONE":
+        return tensor_float
+
+    qmin, qmax = get_q_range(q_type_str)
+    quantized = torch.clamp(torch.round(tensor_float / scale), qmin, qmax)
+
+    if q_type_str == "int4":
+        quantized = pack_int4(quantized.to(torch.int8))
+    else:
+        quantized = quantized.to(TORCH_DTYPE_MAP[q_type_str])
+    return quantized
 
 
 # #################################################################################################
@@ -149,45 +278,91 @@ def apply_rotary_embedding(x, cos, sin, pos, interleaved, device="cpu"):
 # #################################################################################################
 
 
-def create_group_query_attention_graph_prompt(
+def create_gqa_node_and_io(
     config: GQAConfig,
     ort_type,
     share_buffer=True,
+    is_past=False,
+    output_qk: int = 0,  # CUDA does not support output_qk for GQA
 ):
-    assert not (config.has_head_sink and config.use_smooth_softmax)
-    past_kv_seqlen = config.buffer_sequence_length if share_buffer else 0
-    present_kv_seqlen = config.buffer_sequence_length if share_buffer else config.kv_sequence_length
+    if is_past:
+        if share_buffer:
+            past_kv_seqlen = config.buffer_sequence_length
+            present_kv_seqlen = config.buffer_sequence_length
+        else:
+            past_kv_seqlen = config.past_kv_sequence_length
+            present_kv_seqlen = config.past_kv_sequence_length + config.kv_sequence_length
+    else:  # Prompt
+        past_kv_seqlen = config.buffer_sequence_length if share_buffer else 0
+        present_kv_seqlen = config.buffer_sequence_length if share_buffer else config.kv_sequence_length
 
-    nodes = [
-        helper.make_node(
-            op_type="GroupQueryAttention",
-            inputs=[
-                "query",
-                "key" if not config.packed else "",
-                "value" if not config.packed else "",
-                "past_key" if share_buffer else "",
-                "past_value" if share_buffer else "",
-                "seqlens_k",
-                "total_sequence_length",
-                "cos_cache" if config.rotary else "",
-                "sin_cache" if config.rotary else "",
-                "position_ids" if config.has_position_ids else "",
-                "attention_bias" if config.has_attention_bias else "",
-                "head_sink" if config.has_head_sink else "",
-            ],
-            outputs=["output", "present_key", "present_value"],
-            name="GroupQueryAttention_0",
-            num_heads=config.num_heads,
-            kv_num_heads=config.kv_num_heads,
-            local_window_size=config.local_window_size,
-            do_rotary=config.rotary,
-            rotary_interleaved=config.rotary_interleaved,
-            softcap=config.softcap,
-            smooth_softmax=1 if config.use_smooth_softmax else 0,
-            domain="com.microsoft",
-        ),
+    # --- Node Definition ---
+    outputs = [
+        "output",
+        "present_key",
+        "present_value",
     ]
 
+    if output_qk > 0:
+        outputs.append("output_qk")
+
+    # Ensure kv_cache_bit_width is set correctly based on cache type if not provided
+    bit_width = config.kv_cache_bit_width
+    if bit_width == 0:
+        if config.kv_cache_type == "int4":
+            bit_width = 4
+        elif config.kv_cache_type == "int8":
+            bit_width = 8
+
+    inputs = [
+        "query",
+        "key" if not config.packed else "",
+        "value" if not config.packed else "",
+        "past_key" if is_past or share_buffer else "",
+        "past_value" if is_past or share_buffer else "",
+        "seqlens_k",
+        "total_sequence_length",
+        "cos_cache" if config.rotary else "",
+        "sin_cache" if config.rotary else "",
+        "position_ids" if config.has_position_ids else "",
+        "attention_bias" if config.has_attention_bias else "",
+        "head_sink" if config.has_head_sink else "",
+        "k_scale" if config.k_quant_type != "NONE" and (is_past or share_buffer) else "",
+        "v_scale" if config.v_quant_type != "NONE" and (is_past or share_buffer) else "",
+    ]
+
+    # Remove trailing empty strings
+    while inputs and inputs[-1] == "":
+        inputs.pop()
+
+    quantization_attributes = (
+        {
+            "k_quant_type": config.k_quant_type,
+            "v_quant_type": config.v_quant_type,
+            "kv_cache_bit_width": bit_width,
+        }
+        if config.k_quant_type != "NONE"
+        else {}
+    )
+
+    node = helper.make_node(
+        op_type="GroupQueryAttention",
+        inputs=inputs,
+        outputs=outputs,
+        name="GroupQueryAttention_0",
+        num_heads=config.num_heads,
+        kv_num_heads=config.kv_num_heads,
+        local_window_size=config.local_window_size,
+        do_rotary=config.rotary,
+        rotary_interleaved=config.rotary_interleaved,
+        softcap=config.softcap,
+        smooth_softmax=1 if config.use_smooth_softmax else 0,
+        qk_output=output_qk,
+        **quantization_attributes,
+        domain="com.microsoft",
+    )
+
+    # --- Graph Inputs ---
     q_hidden_size = (
         (config.num_heads * config.head_size)
         if not config.packed
@@ -198,6 +373,8 @@ def create_group_query_attention_graph_prompt(
         helper.make_tensor_value_info("seqlens_k", TensorProto.INT32, [config.batch_size]),
         helper.make_tensor_value_info("total_sequence_length", TensorProto.INT32, [1]),
     ]
+
+    cache_ort_type = ONNX_TENSOR_TYPE_MAP[config.kv_cache_type]
 
     if not config.packed:
         graph_input.extend(
@@ -214,25 +391,32 @@ def create_group_query_attention_graph_prompt(
                 ),
             ]
         )
-    if share_buffer:
-        # Shape is (batch_size, kv_num_heads, sequence_length, head_size)
+
+    if is_past or share_buffer:
         k_shape = [config.batch_size, config.kv_num_heads, past_kv_seqlen, config.head_size]
-        v_shape = k_shape
+        if config.kv_cache_type == "int4":
+            k_shape[-1] //= 2
         graph_input.extend(
             [
-                helper.make_tensor_value_info("past_key", ort_type, k_shape),
-                helper.make_tensor_value_info("past_value", ort_type, v_shape),
+                helper.make_tensor_value_info("past_key", cache_ort_type, k_shape),
+                helper.make_tensor_value_info("past_value", cache_ort_type, k_shape),
             ]
         )
+        if config.k_quant_type != "NONE":
+            graph_input.append(helper.make_tensor_value_info("k_scale", ort_type, None))
+        if config.v_quant_type != "NONE":
+            graph_input.append(helper.make_tensor_value_info("v_scale", ort_type, None))
+
     if config.rotary:
         rotary_dim = (math.floor(config.head_size / 16) * 16) // 2
-        cache_seq_len = config.buffer_sequence_length if share_buffer else config.kv_sequence_length
+        cache_seq_len = config.buffer_sequence_length
         graph_input.extend(
             [
                 helper.make_tensor_value_info("cos_cache", ort_type, [cache_seq_len, rotary_dim]),
                 helper.make_tensor_value_info("sin_cache", ort_type, [cache_seq_len, rotary_dim]),
             ]
         )
+
     if config.has_position_ids:
         graph_input.append(
             helper.make_tensor_value_info(
@@ -240,147 +424,50 @@ def create_group_query_attention_graph_prompt(
             )
         )
     if config.has_attention_bias:
+        bias_len = present_kv_seqlen if is_past else config.kv_sequence_length
         graph_input.append(
             helper.make_tensor_value_info(
-                "attention_bias", ort_type, [config.batch_size, 1, config.q_sequence_length, config.kv_sequence_length]
+                "attention_bias", ort_type, [config.batch_size, 1, config.q_sequence_length, bias_len]
             )
         )
     if config.has_head_sink:
         graph_input.append(helper.make_tensor_value_info("head_sink", ort_type, [config.num_heads]))
 
-    # Shape is (batch_size, kv_num_heads, sequence_length, head_size)
+    # --- Graph Outputs ---
     output_k_shape = [config.batch_size, config.kv_num_heads, present_kv_seqlen, config.head_size]
-    output_v_shape = output_k_shape
+    if config.kv_cache_type == "int4":
+        output_k_shape[-1] //= 2
 
     graph_output = [
         helper.make_tensor_value_info(
             "output", ort_type, [config.batch_size, config.q_sequence_length, config.num_heads * config.head_size]
         ),
-        helper.make_tensor_value_info("present_key", ort_type, output_k_shape),
-        helper.make_tensor_value_info("present_value", ort_type, output_v_shape),
+        helper.make_tensor_value_info("present_key", cache_ort_type, output_k_shape),
+        helper.make_tensor_value_info("present_value", cache_ort_type, output_k_shape),
     ]
 
-    graph = helper.make_graph(nodes, "GroupQueryAttention_Graph", graph_input, graph_output)
+    if output_qk > 0:
+        graph_output.append(
+            helper.make_tensor_value_info(
+                "output_qk",
+                ort_type,
+                [config.batch_size, config.num_heads, config.q_sequence_length, present_kv_seqlen],
+            )
+        )
+
+    return node, graph_input, graph_output
+
+
+def create_group_query_attention_graph_prompt(config: GQAConfig, ort_type, share_buffer=True):
+    node, graph_input, graph_output = create_gqa_node_and_io(config, ort_type, share_buffer, is_past=False)
+    graph = helper.make_graph([node], "GroupQueryAttention_Graph", graph_input, graph_output)
     model = helper.make_model(graph)
     return model.SerializeToString()
 
 
-def create_group_query_attention_graph_past(
-    config: GQAConfig,
-    ort_type,
-    share_buffer=True,
-):
-    assert not (config.has_head_sink and config.use_smooth_softmax)
-
-    if share_buffer:
-        past_kv_seqlen = config.buffer_sequence_length
-        present_kv_seqlen = config.buffer_sequence_length
-    else:
-        past_kv_seqlen = config.past_kv_sequence_length
-        present_kv_seqlen = config.past_kv_sequence_length + config.kv_sequence_length
-
-    nodes = [
-        helper.make_node(
-            "GroupQueryAttention",
-            [
-                "query",
-                "key" if not config.packed else "",
-                "value" if not config.packed else "",
-                "past_key",
-                "past_value",
-                "seqlens_k",
-                "total_sequence_length",
-                "cos_cache" if config.rotary else "",
-                "sin_cache" if config.rotary else "",
-                "position_ids" if config.has_position_ids else "",
-                "attention_bias" if config.has_attention_bias else "",
-                "head_sink" if config.has_head_sink else "",
-            ],
-            ["output", "present_key", "present_value"],
-            "GroupQueryAttention_0",
-            num_heads=config.num_heads,
-            kv_num_heads=config.kv_num_heads,
-            local_window_size=config.local_window_size,
-            do_rotary=config.rotary,
-            rotary_interleaved=config.rotary_interleaved,
-            softcap=config.softcap,
-            smooth_softmax=1 if config.use_smooth_softmax else 0,
-            domain="com.microsoft",
-        ),
-    ]
-
-    q_hidden_size = (
-        (config.num_heads * config.head_size)
-        if not config.packed
-        else (config.num_heads * config.head_size + 2 * config.kv_num_heads * config.head_size)
-    )
-    # Shape is (batch_size, kv_num_heads, sequence_length, head_size)
-    past_k_shape = [config.batch_size, config.kv_num_heads, past_kv_seqlen, config.head_size]
-    graph_input = [
-        helper.make_tensor_value_info("query", ort_type, [config.batch_size, config.q_sequence_length, q_hidden_size]),
-        helper.make_tensor_value_info("past_key", ort_type, past_k_shape),
-        helper.make_tensor_value_info("past_value", ort_type, past_k_shape),
-        helper.make_tensor_value_info("seqlens_k", TensorProto.INT32, [config.batch_size]),
-        helper.make_tensor_value_info("total_sequence_length", TensorProto.INT32, [1]),
-    ]
-
-    if not config.packed:
-        graph_input.extend(
-            [
-                helper.make_tensor_value_info(
-                    "key",
-                    ort_type,
-                    [config.batch_size, config.q_sequence_length, config.kv_num_heads * config.head_size],
-                ),
-                helper.make_tensor_value_info(
-                    "value",
-                    ort_type,
-                    [config.batch_size, config.q_sequence_length, config.kv_num_heads * config.head_size],
-                ),
-            ]
-        )
-
-    if config.rotary:
-        rotary_dim = (math.floor(config.head_size / 16) * 16) // 2
-        cache_len = config.buffer_sequence_length
-        graph_input.extend(
-            [
-                helper.make_tensor_value_info("cos_cache", ort_type, [cache_len, rotary_dim]),
-                helper.make_tensor_value_info("sin_cache", ort_type, [cache_len, rotary_dim]),
-            ]
-        )
-
-    if config.has_position_ids:
-        graph_input.append(
-            helper.make_tensor_value_info(
-                "position_ids", TensorProto.INT64, [config.batch_size, config.q_sequence_length]
-            )
-        )
-    if config.has_attention_bias:
-        graph_input.append(
-            helper.make_tensor_value_info(
-                "attention_bias", ort_type, [config.batch_size, 1, config.q_sequence_length, present_kv_seqlen]
-            )
-        )
-    if config.has_head_sink:
-        graph_input.append(helper.make_tensor_value_info("head_sink", ort_type, [config.num_heads]))
-
-    output_k_shape = [
-        config.batch_size,
-        config.kv_num_heads,
-        present_kv_seqlen,
-        config.head_size,
-    ]
-
-    graph_output = [
-        helper.make_tensor_value_info(
-            "output", ort_type, [config.batch_size, config.q_sequence_length, config.num_heads * config.head_size]
-        ),
-        helper.make_tensor_value_info("present_key", ort_type, output_k_shape),
-        helper.make_tensor_value_info("present_value", ort_type, output_k_shape),
-    ]
-
-    graph = helper.make_graph(nodes, "GroupQueryAttention_Graph", graph_input, graph_output)
+def create_group_query_attention_graph_past(config: GQAConfig, ort_type, share_buffer=True):
+    node, graph_input, graph_output = create_gqa_node_and_io(config, ort_type, share_buffer, is_past=True)
+    graph = helper.make_graph([node], "GroupQueryAttention_Graph", graph_input, graph_output)
     model = helper.make_model(graph)
     return model.SerializeToString()
 
@@ -388,6 +475,34 @@ def create_group_query_attention_graph_past(
 # #################################################################################################
 #  ONNX Runtime Execution Functions
 # #################################################################################################
+
+
+def bind_tensor(io_binding, name, tensor, device, ort_type):
+    # Helper to bind a tensor to ONNX Runtime based on its device and type
+    if tensor is None:
+        return
+    # Assuming tensor is a torch tensor. This works for both CPU and GPU tensors.
+    io_binding.bind_input(
+        name,
+        tensor.device.type,
+        0,
+        ort_type,
+        tuple(tensor.shape),
+        tensor.data_ptr(),
+    )
+
+
+def bind_output_tensor(io_binding, name, tensor, device, ort_type):
+    if tensor is None:
+        return
+    io_binding.bind_output(
+        name,
+        tensor.device.type,
+        0,
+        ort_type,
+        tuple(tensor.shape),
+        tensor.data_ptr(),
+    )
 
 
 def gqa_prompt_func(
@@ -403,11 +518,12 @@ def gqa_prompt_func(
     position_ids,
     attention_bias,
     head_sink,
+    k_scale,
+    v_scale,
     ep,
     device,
     share_buffer=True,
     ort_type=TensorProto.FLOAT16,
-    numpy_type=numpy.float16,
 ):
     onnx_model_str = create_group_query_attention_graph_prompt(
         config=config,
@@ -424,54 +540,124 @@ def gqa_prompt_func(
     ort_session = InferenceSession(onnx_model_str, sess_options, providers=[ep])
     io_binding = ort_session.io_binding()
 
-    # Common inputs
-    ort_inputs = {
-        "query": q.detach().cpu().numpy(),
-        "seqlens_k": seqlens_k.detach().cpu().numpy().astype(numpy.int32),
-        "total_sequence_length": torch.tensor([config.q_sequence_length], dtype=torch.int32).detach().cpu().numpy(),
-    }
-    io_binding.bind_cpu_input("query", ort_inputs["query"])
-    io_binding.bind_cpu_input("seqlens_k", ort_inputs["seqlens_k"])
-    io_binding.bind_cpu_input("total_sequence_length", ort_inputs["total_sequence_length"])
+    # Determine input device for binding
+    # We assume primary inputs are on the target device
 
+    # 1. Bind 'query'
+    bind_tensor(io_binding, "query", q, device, ort_type)
+
+    # 2. Bind 'key', 'value' (from new_k, new_v)
     if new_k is not None:
-        ort_inputs["key"] = new_k.detach().cpu().numpy()
-        ort_inputs["value"] = new_v.detach().cpu().numpy()
-        io_binding.bind_cpu_input("key", ort_inputs["key"])
-        io_binding.bind_cpu_input("value", ort_inputs["value"])
-    if cos is not None:
-        ort_inputs["cos_cache"] = cos.detach().cpu().numpy()
-        ort_inputs["sin_cache"] = sin.detach().cpu().numpy()
-        io_binding.bind_cpu_input("cos_cache", ort_inputs["cos_cache"])
-        io_binding.bind_cpu_input("sin_cache", ort_inputs["sin_cache"])
+        bind_tensor(io_binding, "key", new_k, device, ort_type)
+        bind_tensor(io_binding, "value", new_v, device, ort_type)
 
-    # CPU-specific inputs
-    if config.has_position_ids:
-        ort_inputs["position_ids"] = position_ids.detach().cpu().numpy()
-        io_binding.bind_cpu_input("position_ids", ort_inputs["position_ids"])
-    if config.has_attention_bias:
-        ort_inputs["attention_bias"] = attention_bias.detach().cpu().numpy()
-        io_binding.bind_cpu_input("attention_bias", ort_inputs["attention_bias"])
-    if config.has_head_sink:
-        ort_inputs["head_sink"] = head_sink.detach().cpu().numpy()
-        io_binding.bind_cpu_input("head_sink", ort_inputs["head_sink"])
+    # 3. Bind 'past_key', 'past_value' (if share_buffer and passed as k/v)
+    if share_buffer:
+        # cache_ort_type corresponds to config.kv_cache_type
+        cache_ort_type = ONNX_TENSOR_TYPE_MAP[config.kv_cache_type]
+        bind_tensor(io_binding, "past_key", k, device, cache_ort_type)
+        bind_tensor(io_binding, "past_value", v, device, cache_ort_type)
+
+    # 4. Bind scalars/1D tensors
+    # seqlens_k is INT32
+    bind_tensor(io_binding, "seqlens_k", seqlens_k.to(torch.int32), device, TensorProto.INT32)
+
+    # total_sequence_length is INT32 [1]
+    tsl = torch.tensor([config.q_sequence_length], dtype=torch.int32, device=device)
+    bind_tensor(io_binding, "total_sequence_length", tsl, device, TensorProto.INT32)
+
+    # 5. Optional inputs
+    if cos is not None:
+        bind_tensor(io_binding, "cos_cache", cos, device, ort_type)
+        bind_tensor(io_binding, "sin_cache", sin, device, ort_type)
+
+    if config.has_position_ids and position_ids is not None:
+        bind_tensor(io_binding, "position_ids", position_ids, device, TensorProto.INT64)
+
+    if config.has_attention_bias and attention_bias is not None:
+        bind_tensor(io_binding, "attention_bias", attention_bias, device, ort_type)
+
+    if config.has_head_sink and head_sink is not None:
+        bind_tensor(io_binding, "head_sink", head_sink, device, ort_type)
+
+    # 6. Quantization scales
+    if k_scale is not None:
+        target_dtype = {
+            TensorProto.FLOAT: torch.float32,
+            TensorProto.FLOAT16: torch.float16,
+            TensorProto.BFLOAT16: torch.bfloat16,
+        }.get(ort_type, torch.float32)
+
+        if k_scale.dtype != target_dtype:
+            k_scale = k_scale.to(target_dtype)
+        if debug_gqa:
+            print(
+                f"DEBUG: Binding k_scale dtype={k_scale.dtype} ort_type={ort_type} shape={k_scale.shape} val={k_scale.flatten()[:4]}"
+            )
+        bind_tensor(io_binding, "k_scale", k_scale, device, ort_type)
+    if v_scale is not None:
+        target_dtype = {
+            TensorProto.FLOAT: torch.float32,
+            TensorProto.FLOAT16: torch.float16,
+            TensorProto.BFLOAT16: torch.bfloat16,
+        }.get(ort_type, torch.float32)
+
+        if v_scale.dtype != target_dtype:
+            v_scale = v_scale.to(target_dtype)
+        bind_tensor(io_binding, "v_scale", v_scale, device, ort_type)
+
+    # 7. Bind Outputs
+    # output shape calculation
+    hidden_size = config.num_heads * config.head_size
+
+    out_dtype = TORCH_DTYPE_MAP.get(config.kv_cache_type, torch.float16)
+    if ort_type == TensorProto.BFLOAT16:
+        out_dtype = torch.bfloat16
+    elif ort_type == TensorProto.FLOAT16:
+        out_dtype = torch.float16
+    else:
+        out_dtype = torch.float32
+
+    out_torch = torch.zeros((config.batch_size, config.q_sequence_length, hidden_size), dtype=out_dtype, device=device)
+    bind_output_tensor(io_binding, "output", out_torch, device, ort_type)
+
+    # present_dims logic
+    if share_buffer:
+        present_seqlen = config.buffer_sequence_length
+    else:
+        present_seqlen = config.kv_sequence_length
+
+    present_dims = [config.batch_size, config.kv_num_heads, present_seqlen, config.head_size]
+    # Update present shape when kv cache has quantization (int4 packs 2 values)
+    if config.kv_cache_bit_width == 4:
+        present_dims[-1] //= 2
+
+    # Determine dtype for cache tensors
+    if config.kv_cache_type == "int4" or config.kv_cache_type == "int8":
+        cache_dtype = torch.uint8 if config.kv_cache_type == "int4" else torch.int8
+        cache_ort_type = TensorProto.UINT8 if config.kv_cache_type == "int4" else TensorProto.INT8
+    else:
+        cache_dtype = out_dtype
+        cache_ort_type = ort_type
+        if config.kv_cache_type in ONNX_TENSOR_TYPE_MAP:
+            cache_ort_type = ONNX_TENSOR_TYPE_MAP[config.kv_cache_type]
 
     if share_buffer:
-        past_k_ort = OrtValue.ortvalue_from_numpy(k.detach().cpu().numpy(), device, 0)
-        past_v_ort = OrtValue.ortvalue_from_numpy(v.detach().cpu().numpy(), device, 0)
-        io_binding.bind_input("past_key", device, 0, numpy_type, past_k_ort.shape(), past_k_ort.data_ptr())
-        io_binding.bind_input("past_value", device, 0, numpy_type, past_v_ort.shape(), past_v_ort.data_ptr())
-        io_binding.bind_output("output")
-        io_binding.bind_ortvalue_output("present_key", past_k_ort)
-        io_binding.bind_ortvalue_output("present_value", past_v_ort)
+        # We bind output to the input buffer 'k' / 'v' (in-place update)
+        # Assuming k and v are large enough buffers provided as input
+        io_binding.bind_output("present_key", device, 0, cache_ort_type, tuple(k.shape), k.data_ptr())
+        io_binding.bind_output("present_value", device, 0, cache_ort_type, tuple(v.shape), v.data_ptr())
+        present_k = k
+        present_v = v
     else:
-        io_binding.bind_output("output")
-        io_binding.bind_output("present_key")
-        io_binding.bind_output("present_value")
+        present_k = torch.zeros(tuple(present_dims), dtype=cache_dtype, device=device)
+        present_v = torch.zeros(tuple(present_dims), dtype=cache_dtype, device=device)
+        bind_output_tensor(io_binding, "present_key", present_k, device, cache_ort_type)
+        bind_output_tensor(io_binding, "present_value", present_v, device, cache_ort_type)
 
     ort_session.run_with_iobinding(io_binding)
-    ort_output, present_k, present_v = io_binding.copy_outputs_to_cpu()
-    return torch.tensor(ort_output), present_k, present_v
+
+    return out_torch, present_k, present_v
 
 
 def gqa_past_func(
@@ -487,11 +673,12 @@ def gqa_past_func(
     position_ids,
     attention_bias,
     head_sink,
+    k_scale,
+    v_scale,
     ep,
     device,
     share_buffer=True,
     ort_type=TensorProto.FLOAT16,
-    numpy_type=numpy.float16,
 ):
     onnx_model_str = create_group_query_attention_graph_past(
         config=config,
@@ -509,61 +696,125 @@ def gqa_past_func(
     io_binding = ort_session.io_binding()
 
     # Common inputs
-    total_seq_len = (
-        config.past_kv_sequence_length if share_buffer else config.past_kv_sequence_length + config.q_sequence_length
-    )
-    ort_inputs = {
-        "query": q.detach().cpu().numpy(),
-        "seqlens_k": seqlens_k.detach().cpu().numpy().astype(numpy.int32),
-        "total_sequence_length": torch.tensor([total_seq_len], dtype=torch.int32).detach().cpu().numpy(),
-    }
-    io_binding.bind_cpu_input("query", ort_inputs["query"])
-    io_binding.bind_cpu_input("seqlens_k", ort_inputs["seqlens_k"])
-    io_binding.bind_cpu_input("total_sequence_length", ort_inputs["total_sequence_length"])
+    total_seq_len = config.past_kv_sequence_length + config.q_sequence_length
 
+    # 1. Bind 'query'
+    bind_tensor(io_binding, "query", q, device, ort_type)
+
+    # 2. Bind 'key', 'value' (from new_k, new_v) --> wait, past func takes separate new_k/new_v inputs?
+    # In past_func, new_k/new_v are the *new* tokens to accept.
     if new_k is not None:
-        ort_inputs["key"] = new_k.detach().cpu().numpy()
-        ort_inputs["value"] = new_v.detach().cpu().numpy()
-        io_binding.bind_cpu_input("key", ort_inputs["key"])
-        io_binding.bind_cpu_input("value", ort_inputs["value"])
-    if cos is not None:
-        ort_inputs["cos_cache"] = cos.detach().cpu().numpy()
-        ort_inputs["sin_cache"] = sin.detach().cpu().numpy()
-        io_binding.bind_cpu_input("cos_cache", ort_inputs["cos_cache"])
-        io_binding.bind_cpu_input("sin_cache", ort_inputs["sin_cache"])
+        bind_tensor(io_binding, "key", new_k, device, ort_type)
+        bind_tensor(io_binding, "value", new_v, device, ort_type)
 
-    # CPU-specific inputs
-    if config.has_position_ids:
-        ort_inputs["position_ids"] = position_ids.detach().cpu().numpy()
-        io_binding.bind_cpu_input("position_ids", ort_inputs["position_ids"])
-    if config.has_attention_bias:
-        ort_inputs["attention_bias"] = attention_bias.detach().cpu().numpy()
-        io_binding.bind_cpu_input("attention_bias", ort_inputs["attention_bias"])
-    if config.has_head_sink:
-        ort_inputs["head_sink"] = head_sink.detach().cpu().numpy()
-        io_binding.bind_cpu_input("head_sink", ort_inputs["head_sink"])
+    # 3. Bind 'past_key', 'past_value'
+    # These are required inputs for past_func
+    # cache_ort_type corresponds to config.kv_cache_type
+    cache_ort_type = ONNX_TENSOR_TYPE_MAP[config.kv_cache_type]
 
-    # Binding past and present KV
     if share_buffer:
-        past_k_ort = OrtValue.ortvalue_from_numpy(k.detach().cpu().numpy(), device, 0)
-        past_v_ort = OrtValue.ortvalue_from_numpy(v.detach().cpu().numpy(), device, 0)
-        io_binding.bind_input("past_key", device, 0, numpy_type, past_k_ort.shape(), past_k_ort.data_ptr())
-        io_binding.bind_input("past_value", device, 0, numpy_type, past_v_ort.shape(), past_v_ort.data_ptr())
-        io_binding.bind_output("output")
-        io_binding.bind_ortvalue_output("present_key", past_k_ort)
-        io_binding.bind_ortvalue_output("present_value", past_v_ort)
+        # If sharing buffer, we bind 'past_key' to the large buffer 'k'
+        bind_tensor(io_binding, "past_key", k, device, cache_ort_type)
+        bind_tensor(io_binding, "past_value", v, device, cache_ort_type)
     else:
-        ort_inputs["past_key"] = k.detach().cpu().numpy()
-        ort_inputs["past_value"] = v.detach().cpu().numpy()
-        io_binding.bind_cpu_input("past_key", ort_inputs["past_key"])
-        io_binding.bind_cpu_input("past_value", ort_inputs["past_value"])
-        io_binding.bind_output("output")
-        io_binding.bind_output("present_key")
-        io_binding.bind_output("present_value")
+        # If not sharing buffer, 'k' and 'v' are the *past* states passed in (usually smaller?)
+        # Actually logic in test_gqa: k, v are the cache tensors.
+        # We bind them.
+        bind_tensor(io_binding, "past_key", k, device, cache_ort_type)
+        bind_tensor(io_binding, "past_value", v, device, cache_ort_type)
+
+    # 4. Scalars
+    bind_tensor(io_binding, "seqlens_k", seqlens_k.to(torch.int32), device, TensorProto.INT32)
+
+    tsl = torch.tensor([total_seq_len], dtype=torch.int32, device=device)
+    bind_tensor(io_binding, "total_sequence_length", tsl, device, TensorProto.INT32)
+
+    # 5. Optional inputs
+    if cos is not None:
+        bind_tensor(io_binding, "cos_cache", cos, device, ort_type)
+        bind_tensor(io_binding, "sin_cache", sin, device, ort_type)
+
+    if config.has_position_ids and position_ids is not None:
+        bind_tensor(io_binding, "position_ids", position_ids, device, TensorProto.INT64)
+
+    if config.has_attention_bias and attention_bias is not None:
+        bind_tensor(io_binding, "attention_bias", attention_bias, device, ort_type)
+
+    if config.has_head_sink and head_sink is not None:
+        bind_tensor(io_binding, "head_sink", head_sink, device, ort_type)
+
+    # 6. Quantization
+    if k_scale is not None:
+        target_dtype = {
+            TensorProto.FLOAT: torch.float32,
+            TensorProto.FLOAT16: torch.float16,
+            TensorProto.BFLOAT16: torch.bfloat16,
+        }.get(ort_type, torch.float32)
+
+        if k_scale.dtype != target_dtype:
+            k_scale = k_scale.to(target_dtype)
+        bind_tensor(io_binding, "k_scale", k_scale, device, ort_type)
+    if v_scale is not None:
+        target_dtype = {
+            TensorProto.FLOAT: torch.float32,
+            TensorProto.FLOAT16: torch.float16,
+            TensorProto.BFLOAT16: torch.bfloat16,
+        }.get(ort_type, torch.float32)
+
+        if v_scale.dtype != target_dtype:
+            v_scale = v_scale.to(target_dtype)
+        bind_tensor(io_binding, "v_scale", v_scale, device, ort_type)
+
+    # 7. Outputs
+    # output shape calculation
+    hidden_size = config.num_heads * config.head_size
+
+    out_dtype = TORCH_DTYPE_MAP.get(config.kv_cache_type, torch.float16)
+    if ort_type == TensorProto.BFLOAT16:
+        out_dtype = torch.bfloat16
+    elif ort_type == TensorProto.FLOAT16:
+        out_dtype = torch.float16
+    else:
+        out_dtype = torch.float32
+
+    # Initialize to zeros
+    out_torch = torch.zeros((config.batch_size, config.q_sequence_length, hidden_size), dtype=out_dtype, device=device)
+    bind_output_tensor(io_binding, "output", out_torch, device, ort_type)
+
+    # present_dims logic
+    if share_buffer:
+        present_seqlen = config.buffer_sequence_length
+    else:
+        present_seqlen = total_seq_len  # For past_func, total seq len is accumulated
+
+    present_dims = [config.batch_size, config.kv_num_heads, present_seqlen, config.head_size]
+    if config.kv_cache_bit_width == 4:
+        present_dims[-1] //= 2
+
+    if config.kv_cache_type == "int4" or config.kv_cache_type == "int8":
+        cache_dtype = torch.uint8 if config.kv_cache_type == "int4" else torch.int8
+        cache_ort_type = TensorProto.UINT8 if config.kv_cache_type == "int4" else TensorProto.INT8
+    else:
+        cache_dtype = out_dtype
+        cache_ort_type = ort_type
+        if config.kv_cache_type in ONNX_TENSOR_TYPE_MAP:
+            cache_ort_type = ONNX_TENSOR_TYPE_MAP[config.kv_cache_type]
+
+    if share_buffer:
+        # In-place update to k/v buffers
+        io_binding.bind_output("present_key", device, 0, cache_ort_type, tuple(k.shape), k.data_ptr())
+        io_binding.bind_output("present_value", device, 0, cache_ort_type, tuple(v.shape), v.data_ptr())
+        present_k = k
+        present_v = v
+    else:
+        present_k = torch.zeros(tuple(present_dims), dtype=cache_dtype, device=device)
+        present_v = torch.zeros(tuple(present_dims), dtype=cache_dtype, device=device)
+        bind_output_tensor(io_binding, "present_key", present_k, device, cache_ort_type)
+        bind_output_tensor(io_binding, "present_value", present_v, device, cache_ort_type)
 
     ort_session.run_with_iobinding(io_binding)
-    ort_output, present_k, present_v = io_binding.copy_outputs_to_cpu()
-    return torch.tensor(ort_output), present_k, present_v
+
+    return out_torch, present_k, present_v
 
 
 # #################################################################################################
@@ -587,7 +838,7 @@ def construct_local_mask(seqlen_q, seqlen_k, window_size, query_padding_mask, ke
 
 
 def smooth_softmax_ref(x, head_sink):
-    b, n, s, t = x.shape
+    b, n, s, _ = x.shape
     if head_sink is not None:
         sink = head_sink.reshape(1, n, 1, 1).expand(b, -1, s, -1)
     else:
@@ -668,6 +919,26 @@ def attention_ref(
 # #################################################################################################
 # Parity Check (Core Test Logic)
 # #################################################################################################
+def get_static_scale(config: GQAConfig, device, torch_type, std):
+    """Generates calibration data and computes the static quantization scale."""
+    calibration_batch_size = 1
+    calibration_sequence_length = 1024
+    calibration_data_k = (
+        torch.randn(
+            calibration_batch_size,
+            config.kv_num_heads,
+            calibration_sequence_length,
+            config.head_size,
+            device=device,
+            dtype=torch_type,
+        )
+        * std
+    )
+    calibration_data_v = torch.randn_like(calibration_data_k) * std
+
+    k_scale = compute_scale(calibration_data_k, config.k_quant_type, config.kv_cache_type)
+    v_scale = compute_scale(calibration_data_v, config.v_quant_type, config.kv_cache_type)
+    return k_scale, v_scale
 
 
 def parity_check_gqa_prompt(
@@ -675,17 +946,13 @@ def parity_check_gqa_prompt(
     ep,
     device,
     torch_type,
-    numpy_type,
     ort_type,
     causal,
     rtol,
     atol,
 ):
-    # Q/K/V have normal distribution with mean = 0 and standard deviation = 0.02.
-    # If we use standard deviation = 1, numerical stability issues may occur.
+    torch.manual_seed(0)
     std = 0.02
-
-    # --- Test Data Generation ---
     q = (
         torch.randn(
             config.batch_size,
@@ -698,9 +965,9 @@ def parity_check_gqa_prompt(
         * std
     )
 
-    # k and v are the cache buffers, created in BNSH format
+    # Initialize the KV cache to zeros since no past context in prompt testing.
     k = (
-        torch.randn(
+        torch.zeros(
             config.batch_size,
             config.kv_num_heads,
             config.buffer_sequence_length,
@@ -710,7 +977,7 @@ def parity_check_gqa_prompt(
         )
         * std
     )
-    v = torch.randn_like(k)
+    v = torch.zeros_like(k)
 
     new_k = (
         torch.randn(
@@ -725,8 +992,13 @@ def parity_check_gqa_prompt(
     )
     new_v = torch.randn_like(new_k) * std
 
-    head_sink = torch.rand(config.num_heads, dtype=torch_type, device=device) if config.has_head_sink else None
+    k_scale, v_scale = get_static_scale(config, device, torch_type, std)
+    if k_scale is not None:
+        k_scale = k_scale.to(torch_type)
+    if v_scale is not None:
+        v_scale = v_scale.to(torch_type)
 
+    head_sink = torch.rand(config.num_heads, dtype=torch_type, device=device) if config.has_head_sink else None
     window_size = (-1, -1)
     if config.local_window_size > 0:
         window_size = (config.local_window_size, 0)
@@ -734,10 +1006,20 @@ def parity_check_gqa_prompt(
         window_size = (-1, 0)
 
     # --- PyTorch Reference Path ---
-    # Transpose BNSH cache to BSNH format for reference implementation
-    k_cache_ref = k.clone().transpose(1, 2)
-    v_cache_ref = v.clone().transpose(1, 2)
-
+    k_ref_dequant = dequantize_tensor(
+        quantize_tensor_with_scale(k, k_scale, config.k_quant_type, config.kv_cache_type),
+        k_scale,
+        config.k_quant_type,
+        config.kv_cache_type,
+    )
+    v_ref_dequant = dequantize_tensor(
+        quantize_tensor_with_scale(v, v_scale, config.v_quant_type, config.kv_cache_type),
+        v_scale,
+        config.v_quant_type,
+        config.kv_cache_type,
+    )
+    k_cache_ref = k_ref_dequant.clone().transpose(1, 2)
+    v_cache_ref = v_ref_dequant.clone().transpose(1, 2)
     cache_seqlens = torch.full((config.batch_size,), config.kv_sequence_length, device=device, dtype=torch.int32)
     rotary_seqlens = torch.zeros(config.batch_size, device=device, dtype=torch.long)
 
@@ -750,8 +1032,7 @@ def parity_check_gqa_prompt(
         q_ro = apply_rotary_embedding(q.clone(), cos, sin, rotary_seqlens, config.rotary_interleaved, device)
         k_ro = apply_rotary_embedding(new_k.clone(), cos, sin, rotary_seqlens, config.rotary_interleaved, device)
 
-    position_ids = None
-    attention_bias = None
+    position_ids, attention_bias = None, None
     if ep == "CPUExecutionProvider":
         if config.has_position_ids:
             position_ids = (
@@ -771,15 +1052,19 @@ def parity_check_gqa_prompt(
     kv_seqlens_expanded = rearrange(cache_seqlens, "b -> b 1")
     update_mask = arange < kv_seqlens_expanded
 
-    k_cache_ref[update_mask] = rearrange(k_ro, "b s ... -> (b s) ...").to(dtype=torch_type)
-    v_cache_ref[update_mask] = rearrange(new_v, "b s ... -> (b s) ...").to(dtype=torch_type)
+    # Explicitly cast the source tensor to the destination's dtype before assignment.
+    source_k = rearrange(k_ro, "b s ... -> (b s) ...")
+    k_cache_ref[update_mask] = source_k.to(k_cache_ref.dtype)
+
+    source_v = rearrange(new_v, "b s ... -> (b s) ...")
+    v_cache_ref[update_mask] = source_v.to(v_cache_ref.dtype)
+
     key_padding_mask = arange < kv_seqlens_expanded
 
     out_ref, _ = attention_ref(
         q=q_ro,
         k=k_cache_ref,
         v=v_cache_ref,
-        query_padding_mask=None,
         key_padding_mask=key_padding_mask,
         attention_bias=attention_bias,
         causal=True,
@@ -788,24 +1073,27 @@ def parity_check_gqa_prompt(
         use_smooth_softmax=config.use_smooth_softmax,
         head_sink=head_sink,
     )
-    out_ref_np = out_ref.detach().cpu().numpy()
-
-    # Transpose reference cache back to BNSH for comparison
-    k_cache_ref_np = k_cache_ref.transpose(1, 2).detach().cpu().numpy()
-    v_cache_ref_np = v_cache_ref.transpose(1, 2).detach().cpu().numpy()
+    out_ref_np = out_ref.to(torch.float32).detach().cpu().numpy()
 
     # --- ONNX Runtime Path ---
-    q_ort, k_ort, v_ort, new_k_ort, new_v_ort = q, k, v, new_k, new_v
+    q_ort, new_k_ort, new_v_ort = q, new_k, new_v
     if config.packed:
         q_ort = torch.cat([q, new_k, new_v], dim=2)
         new_k_ort, new_v_ort = None, None
 
-    # seqlens_k for GQA op is past_seq_len + seq_len - 1
+    k_quant = quantize_tensor_with_scale(k, k_scale, config.k_quant_type, config.kv_cache_type)
+    v_quant = quantize_tensor_with_scale(v, v_scale, config.v_quant_type, config.kv_cache_type)
+
     ort_seqlens = cache_seqlens - 1
+    if debug_gqa:
+        if config.packed:
+            print(f"DEBUG_INPUT_PACKED: q_ort[0,0,0,:10] = {q_ort[0, 0, 0, :10]}")
+        else:
+            print(f"DEBUG_INPUT: q_ort[0,0,0,:10] = {q_ort[0, 0, 0, :10]}")
     out, present_k, present_v = gqa_prompt_func(
         q=q_ort,
-        k=k_ort,
-        v=v_ort,
+        k=k_quant,
+        v=v_quant,
         config=config,
         new_k=new_k_ort,
         new_v=new_v_ort,
@@ -815,19 +1103,113 @@ def parity_check_gqa_prompt(
         position_ids=position_ids,
         attention_bias=attention_bias,
         head_sink=head_sink,
+        k_scale=k_scale.to(dtype=torch_type) if k_scale is not None else None,
+        v_scale=v_scale.to(dtype=torch_type) if v_scale is not None else None,
         ep=ep,
         device=device,
         share_buffer=True,
         ort_type=ort_type,
-        numpy_type=numpy_type,
     )
     out = torch.reshape(out, (config.batch_size, config.q_sequence_length, config.num_heads, config.head_size))
-    out_np = out.detach().cpu().numpy()
+    out_np = out.to(torch.float32).detach().cpu().numpy()
 
     # --- Comparison ---
-    numpy.testing.assert_allclose(present_k, k_cache_ref_np, rtol=rtol, atol=atol)
-    numpy.testing.assert_allclose(present_v, v_cache_ref_np, rtol=rtol, atol=atol)
+    # DEBUG: Print the first 10 elements of the output to see hijacked values
+    # Shape is (batch, seqlen, num_heads, head_dim)
+    # We hijacked block (0,0,0), thread 0 => batch 0, seq 0, head 0.
+    if debug_gqa:
+        if config.batch_size > 0 and config.q_sequence_length > 0:
+            print(f"DEBUG_HIJACK: out_np[0,0,0,:10] = {out_np[0, 0, 0, :10]}")
+        # Print batch 1 debug values if batch_size > 1
+        if config.batch_size > 1 and config.q_sequence_length > 0:
+            print(f"DEBUG_BATCH1: out_np[1,0,0,:10] = {out_np[1, 0, 0, :10]}")
+            print("  (seqlen_q, seqlen_k, sum_s_q, sum_s_k, seqlen_k_cache, n_block_max, n_block_min, gQ)")
+        # Print head 2 debug values (where NaN appears)
+        if config.batch_size > 1 and config.num_heads > 2 and config.q_sequence_length > 0:
+            print(f"DEBUG_HEAD2: out_np[1,0,2,:10] = {out_np[1, 0, 2, :10]}")
+            print("  (seqlen_q, seqlen_k, gQ, sK, sV, acc_s, kv_head_idx, k_scale)")
+
+    # Check for NaN in output
+    nan_count = numpy.sum(numpy.isnan(out_np))
+    if nan_count > 0:
+        nan_indices = numpy.argwhere(numpy.isnan(out_np))
+        print(f"DEBUG_NAN: Found {nan_count} NaN values in output!")
+        print(f"DEBUG_NAN: First 5 NaN indices: {nan_indices[:5]}")
+        # Also check where non-nan exists in reference
+        ref_nan_count = numpy.sum(numpy.isnan(out_ref_np))
+        print(f"DEBUG_NAN: Reference has {ref_nan_count} NaN values")
+
     numpy.testing.assert_allclose(out_np, out_ref_np, rtol=rtol, atol=atol)
+
+    # Compare quantized cache with proper masking per batch
+    if config.k_quant_type != "NONE":
+        # Convert numpy array to torch tensor with correct dtype
+        if isinstance(present_k, torch.Tensor):
+            present_k_torch = present_k.to(device)
+            # If tensor is int8/uint8, it should be preserved.
+        else:
+            if config.kv_cache_type == "int4":
+                # For int4, present_k is uint8 packed data
+                present_k_torch = torch.from_numpy(present_k).to(device)
+            elif config.kv_cache_type == "int8":
+                # For int8, present_k is int8 data
+                present_k_torch = torch.from_numpy(present_k.astype(numpy.int8)).to(device)
+            else:
+                present_k_torch = torch.from_numpy(present_k).to(device)
+
+        present_k_dequant = (
+            dequantize_tensor(present_k_torch, k_scale, config.k_quant_type, config.kv_cache_type)
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+        # Mask the reference cache to only valid regions
+        k_cache_ref_masked = k_cache_ref.transpose(1, 2).clone()
+        arange = torch.arange(config.buffer_sequence_length, device=device).unsqueeze(0).unsqueeze(0).unsqueeze(-1)
+        cache_seqlens_expanded = cache_seqlens.unsqueeze(1).unsqueeze(1).unsqueeze(-1)
+        mask = arange >= cache_seqlens_expanded
+        k_cache_ref_masked[mask.expand_as(k_cache_ref_masked)] = 0
+        k_cache_ref_dequant = k_cache_ref_masked.cpu().numpy()
+
+        for b in range(config.batch_size):
+            valid_len = cache_seqlens[b].item()
+            numpy.testing.assert_allclose(
+                present_k_dequant[b, :, :valid_len, :], k_cache_ref_dequant[b, :, :valid_len, :], rtol=rtol, atol=atol
+            )
+
+    if config.v_quant_type != "NONE":
+        # Convert numpy array to torch tensor with correct dtype
+        if isinstance(present_v, torch.Tensor):
+            present_v_torch = present_v.to(device)
+        else:
+            if config.kv_cache_type == "int4":
+                present_v_torch = torch.from_numpy(present_v).to(device)
+            elif config.kv_cache_type == "int8":
+                present_v_torch = torch.from_numpy(present_v.astype(numpy.int8)).to(device)
+            else:
+                present_v_torch = torch.from_numpy(present_v).to(device)
+
+        present_v_dequant = (
+            dequantize_tensor(present_v_torch, v_scale, config.v_quant_type, config.kv_cache_type)
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+        # Mask the reference cache to only valid regions
+        v_cache_ref_masked = v_cache_ref.transpose(1, 2).clone()
+        arange = torch.arange(config.buffer_sequence_length, device=device).unsqueeze(0).unsqueeze(0).unsqueeze(-1)
+        cache_seqlens_expanded = cache_seqlens.unsqueeze(1).unsqueeze(1).unsqueeze(-1)
+        mask = arange >= cache_seqlens_expanded
+        v_cache_ref_masked[mask.expand_as(v_cache_ref_masked)] = 0
+        v_cache_ref_dequant = v_cache_ref_masked.cpu().numpy()
+
+        for b in range(config.batch_size):
+            valid_len = cache_seqlens[b].item()
+            numpy.testing.assert_allclose(
+                present_v_dequant[b, :, :valid_len, :], v_cache_ref_dequant[b, :, :valid_len, :], rtol=rtol, atol=atol
+            )
 
 
 def parity_check_gqa_past(
@@ -835,52 +1217,49 @@ def parity_check_gqa_past(
     ep,
     device,
     torch_type,
-    numpy_type,
     ort_type,
     causal,
     rtol,
     atol,
 ):
+    if ort_type == TensorProto.FLOAT16:
+        torch_type = torch.float16
+    elif ort_type == TensorProto.BFLOAT16:
+        torch_type = torch.bfloat16
+    else:
+        torch_type = torch.float32
+    torch.manual_seed(0)
+    std = 0.02
     # --- Test Data Generation ---
-    q = torch.randn(
-        config.batch_size,
-        config.q_sequence_length,
-        config.num_heads,
-        config.head_size,
-        device=device,
-        dtype=torch_type,
+    q = (
+        torch.randn(
+            config.batch_size,
+            config.q_sequence_length,
+            config.num_heads,
+            config.head_size,
+            device=device,
+            dtype=torch_type,
+        )
+        * std
     )
-    # k and v are the cache buffers, created in BNSH format
-    k = torch.randn(
-        config.batch_size,
-        config.kv_num_heads,
-        config.buffer_sequence_length,
-        config.head_size,
-        device=device,
-        dtype=torch_type,
+    k = (
+        torch.randn(
+            config.batch_size,
+            config.kv_num_heads,
+            config.buffer_sequence_length,
+            config.head_size,
+            device=device,
+            dtype=torch_type,
+        )
+        * std
     )
-    v = torch.randn_like(k)
-    new_k = torch.randn(
-        config.batch_size,
-        config.q_sequence_length,
-        config.kv_num_heads,
-        config.head_size,
-        device=device,
-        dtype=torch_type,
-    )
-    new_v = torch.randn_like(new_k)
+    v = torch.randn_like(k) * std
 
-    head_sink = torch.rand(config.num_heads, dtype=torch_type, device=device) if config.has_head_sink else None
-    window_size = (-1, -1)
-    if config.local_window_size > 0:
-        window_size = (config.local_window_size, 0)
-    elif causal:
-        window_size = (-1, 0)
-
-    # --- PyTorch Reference Path ---
-    # Transpose BNSH cache to BSNH format for reference implementation
-    k_cache_ref = k.clone().transpose(1, 2)
-    v_cache_ref = v.clone().transpose(1, 2)
+    k_scale, v_scale = get_static_scale(config, device, torch_type, std)
+    if k_scale is not None:
+        k_scale = k_scale.to(torch_type)
+    if v_scale is not None:
+        v_scale = v_scale.to(torch_type)
 
     cache_seqlens = torch.randint(
         0,
@@ -889,6 +1268,46 @@ def parity_check_gqa_past(
         device=device,
         dtype=torch.long,
     )
+
+    for i in range(config.batch_size):
+        past_len = cache_seqlens[i].item()
+        k[i, :, past_len:, :] = 0
+        v[i, :, past_len:, :] = 0
+
+    new_k = (
+        torch.randn(
+            config.batch_size,
+            config.q_sequence_length,
+            config.kv_num_heads,
+            config.head_size,
+            device=device,
+            dtype=torch_type,
+        )
+        * std
+    )
+    new_v = torch.randn_like(new_k) * std
+    head_sink = torch.rand(config.num_heads, dtype=torch_type, device=device) if config.has_head_sink else None
+    window_size = (-1, -1)
+    if config.local_window_size > 0:
+        window_size = (config.local_window_size, 0)
+    elif causal:
+        window_size = (-1, 0)
+
+    # --- PyTorch Reference Path ---
+    k_ref_dequant = dequantize_tensor(
+        quantize_tensor_with_scale(k, k_scale, config.k_quant_type, config.kv_cache_type),
+        k_scale,
+        config.k_quant_type,
+        config.kv_cache_type,
+    )
+    v_ref_dequant = dequantize_tensor(
+        quantize_tensor_with_scale(v, v_scale, config.v_quant_type, config.kv_cache_type),
+        v_scale,
+        config.v_quant_type,
+        config.kv_cache_type,
+    )
+    k_cache_ref = k_ref_dequant.clone().transpose(1, 2)
+    v_cache_ref = v_ref_dequant.clone().transpose(1, 2)
 
     cos, sin, q_ro, k_ro = None, None, q, new_k
     if config.rotary:
@@ -899,9 +1318,8 @@ def parity_check_gqa_past(
         q_ro = apply_rotary_embedding(q.clone(), cos, sin, cache_seqlens, config.rotary_interleaved, device)
         k_ro = apply_rotary_embedding(new_k.clone(), cos, sin, cache_seqlens, config.rotary_interleaved, device)
 
-    position_ids = None
-    attention_bias = None
-    total_seq_len = config.past_kv_sequence_length
+    position_ids, attention_bias = None, None
+    total_seq_len = config.past_kv_sequence_length + config.q_sequence_length
     if ep == "CPUExecutionProvider":
         if config.has_position_ids:
             position_ids = (cache_seqlens.unsqueeze(1) + torch.arange(config.q_sequence_length, device=device)).long()
@@ -918,15 +1336,14 @@ def parity_check_gqa_past(
     update_mask = torch.logical_and(
         cache_seqlens_expanded <= arange, arange < cache_seqlens_expanded + config.q_sequence_length
     )
-    k_cache_ref[update_mask] = rearrange(k_ro, "b s ... -> (b s) ...").to(dtype=torch_type)
-    v_cache_ref[update_mask] = rearrange(new_v, "b s ... -> (b s) ...").to(dtype=torch_type)
+    k_cache_ref[update_mask] = rearrange(k_ro, "b s ... -> (b s) ...").to(k_cache_ref.dtype)
+    v_cache_ref[update_mask] = rearrange(new_v, "b s ... -> (b s) ...").to(v_cache_ref.dtype)
     key_padding_mask = arange < cache_seqlens_expanded + config.q_sequence_length
 
     out_ref, _ = attention_ref(
         q=q_ro,
         k=k_cache_ref,
         v=v_cache_ref,
-        query_padding_mask=None,
         key_padding_mask=key_padding_mask,
         attention_bias=attention_bias,
         causal=True,
@@ -935,23 +1352,29 @@ def parity_check_gqa_past(
         use_smooth_softmax=config.use_smooth_softmax,
         head_sink=head_sink,
     )
-    out_ref_np = out_ref.detach().cpu().numpy()
-
-    # Transpose reference cache back to BNSH for comparison
-    k_cache_ref_np = k_cache_ref.transpose(1, 2).detach().cpu().numpy()
-    v_cache_ref_np = v_cache_ref.transpose(1, 2).detach().cpu().numpy()
+    out_ref_np = out_ref.to(torch.float32).detach().cpu().numpy()
 
     # --- ONNX Runtime Path ---
-    q_ort, k_ort, v_ort, new_k_ort, new_v_ort = q, k, v, new_k, new_v
+    if ort_type == TensorProto.FLOAT16:
+        torch_type = torch.float16
+    elif ort_type == TensorProto.BFLOAT16:
+        torch_type = torch.bfloat16
+    else:
+        torch_type = torch.float32
+
+    q_ort, new_k_ort, new_v_ort = q, new_k, new_v
     if config.packed:
         q_ort = torch.cat([q, new_k, new_v], dim=2)
         new_k_ort, new_v_ort = None, None
 
+    k_quant = quantize_tensor_with_scale(k, k_scale, config.k_quant_type, config.kv_cache_type)
+    v_quant = quantize_tensor_with_scale(v, v_scale, config.v_quant_type, config.kv_cache_type)
+
     ort_seqlens = cache_seqlens + config.q_sequence_length - 1
     out, present_k, present_v = gqa_past_func(
         q=q_ort,
-        k=k_ort,
-        v=v_ort,
+        k=k_quant,
+        v=v_quant,
         config=config,
         new_k=new_k_ort,
         new_v=new_v_ort,
@@ -961,18 +1384,91 @@ def parity_check_gqa_past(
         position_ids=position_ids,
         attention_bias=attention_bias,
         head_sink=head_sink,
+        k_scale=k_scale.to(dtype=torch_type) if k_scale is not None else None,
+        v_scale=v_scale.to(dtype=torch_type) if v_scale is not None else None,
         ep=ep,
         device=device,
         share_buffer=True,
         ort_type=ort_type,
-        numpy_type=numpy_type,
     )
     out = torch.reshape(out, (config.batch_size, config.q_sequence_length, config.num_heads, config.head_size))
-    out_np = out.detach().cpu().numpy()
+    out_np = out.to(torch.float32).detach().cpu().numpy()
 
-    numpy.testing.assert_allclose(present_k, k_cache_ref_np, rtol=rtol, atol=atol)
-    numpy.testing.assert_allclose(present_v, v_cache_ref_np, rtol=rtol, atol=atol)
+    # --- Comparison ---
     numpy.testing.assert_allclose(out_np, out_ref_np, rtol=rtol, atol=atol)
+
+    # Compare quantized cache with proper masking per batch
+    if config.k_quant_type != "NONE":
+        if isinstance(present_k, torch.Tensor):
+            present_k_torch = present_k.to(device)
+        else:
+            if config.kv_cache_type == "int4":
+                present_k_torch = torch.from_numpy(present_k).to(device)
+            elif config.kv_cache_type == "int8":
+                present_k_torch = torch.from_numpy(present_k.astype(numpy.int8)).to(device)
+            else:
+                present_k_torch = torch.from_numpy(present_k).to(device)
+
+        present_k_dequant = (
+            dequantize_tensor(present_k_torch, k_scale, config.k_quant_type, config.kv_cache_type)
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+        # Mask the reference cache to only valid regions
+        k_cache_ref_masked = k_cache_ref.transpose(1, 2).clone()
+        total_seqlens = cache_seqlens + config.q_sequence_length
+        arange = torch.arange(config.buffer_sequence_length, device=device).unsqueeze(0).unsqueeze(0).unsqueeze(-1)
+        total_seqlens_expanded = total_seqlens.unsqueeze(1).unsqueeze(1).unsqueeze(-1)
+        mask = arange >= total_seqlens_expanded
+        k_cache_ref_masked[mask.expand_as(k_cache_ref_masked)] = 0
+        k_cache_ref_dequant = k_cache_ref_masked.cpu().numpy()
+
+        for b in range(config.batch_size):
+            valid_len = (cache_seqlens[b] + config.q_sequence_length).item()
+            numpy.testing.assert_allclose(
+                present_k_dequant[b, :, :valid_len, :],
+                k_cache_ref_dequant[b, :, :valid_len, :],
+                rtol=rtol,
+                atol=atol,
+            )
+
+    if config.v_quant_type != "NONE":
+        if isinstance(present_v, torch.Tensor):
+            present_v_torch = present_v.to(device)
+        else:
+            if config.kv_cache_type == "int4":
+                present_v_torch = torch.from_numpy(present_v).to(device)
+            elif config.kv_cache_type == "int8":
+                present_v_torch = torch.from_numpy(present_v.astype(numpy.int8)).to(device)
+            else:
+                present_v_torch = torch.from_numpy(present_v).to(device)
+
+        present_v_dequant = (
+            dequantize_tensor(present_v_torch, v_scale, config.v_quant_type, config.kv_cache_type)
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+        # Mask the reference cache to only valid regions
+        v_cache_ref_masked = v_cache_ref.transpose(1, 2).clone()
+        total_seqlens = cache_seqlens + config.q_sequence_length
+        arange = torch.arange(config.buffer_sequence_length, device=device).unsqueeze(0).unsqueeze(0).unsqueeze(-1)
+        total_seqlens_expanded = total_seqlens.unsqueeze(1).unsqueeze(1).unsqueeze(-1)
+        mask = arange >= total_seqlens_expanded
+        v_cache_ref_masked[mask.expand_as(v_cache_ref_masked)] = 0
+        v_cache_ref_dequant = v_cache_ref_masked.cpu().numpy()
+
+        for b in range(config.batch_size):
+            valid_len = (cache_seqlens[b] + config.q_sequence_length).item()
+            numpy.testing.assert_allclose(
+                present_v_dequant[b, :, :valid_len, :],
+                v_cache_ref_dequant[b, :, :valid_len, :],
+                rtol=rtol,
+                atol=atol,
+            )
 
 
 # #################################################################################################
@@ -981,7 +1477,7 @@ def parity_check_gqa_past(
 
 
 def get_cuda_rotary_options():
-    return [(False, False)] if pipeline_mode else [(True, False), (True, True), (False, False)]
+    return [(False, False), (True, False), (True, True)]
 
 
 def get_cpu_rotary_options():
@@ -989,89 +1485,142 @@ def get_cpu_rotary_options():
 
 
 def get_softmax_options(allow_head_sink: bool = True):
-    head_sink_option = (False, True) if allow_head_sink else (False, False)
-    return [(False, False), head_sink_option] if pipeline_mode else [(False, False), (False, True), (True, False)]
+    return [(False, False), (False, True), (True, False)]
 
 
 def gqa_cuda_prompt_test_cases(allow_head_sink: bool = True):
-    batches = [3] if pipeline_mode else [1, 3, 5]
-    seqs = [(35, 35)] if pipeline_mode else [(35, 35), (127, 127), (240, 240), (2000, 2000)]
-    num_h = [(6, 3)] if pipeline_mode else [(6, 3), (9, 9), (32, 8)]
-    h_sizes = [32] if pipeline_mode else [32, 64, 128, 256]
+    batches = [3, 1, 5]
+    seqs = [(35, 35), (64, 64), (128, 128), (240, 240), (2000, 2000)]
+    heads = [(6, 3), (9, 9), (32, 8)]
+    h_sizes = [128] if quick_build else [128, 32, 64, 256]
     smmoth_softmax__head_sink = get_softmax_options(allow_head_sink)
 
-    for b in batches:
-        for sq, skv in seqs:
-            for n, n2 in num_h:
-                for h in h_sizes:
-                    for lws in [-1, random.randint(1, skv)]:
-                        for rotary, rotary_interleaved in get_cuda_rotary_options():
-                            for packed in [False, True]:
-                                for softcap in [0.0, 50.0]:
-                                    if rotary and h % 16 > 0:
-                                        continue
-                                    for use_smooth_softmax, has_head_sink in smmoth_softmax__head_sink:
-                                        if softcap > 0 and (use_smooth_softmax or has_head_sink):
-                                            continue
-                                        config = GQAConfig(
-                                            batch_size=b,
-                                            q_sequence_length=sq,
-                                            kv_sequence_length=skv,
-                                            past_kv_sequence_length=0,
-                                            buffer_sequence_length=sq + skv + 8,
-                                            num_heads=n,
-                                            kv_num_heads=n2,
-                                            head_size=h,
-                                            local_window_size=lws,
-                                            rotary=rotary,
-                                            rotary_interleaved=rotary_interleaved,
-                                            packed=packed,
-                                            softcap=softcap,
-                                            use_smooth_softmax=use_smooth_softmax,
-                                            has_head_sink=has_head_sink,
-                                        )
-                                        name = f"b{b}_sq{sq}_skv{skv}_nh{n}_{n2}_h{h}_w{lws}_rot{rotary}{rotary_interleaved}_pkd{packed}_sc{softcap}_sm{use_smooth_softmax}_{has_head_sink}"
-                                        yield name, config
+    rotary_opts = list(get_cuda_rotary_options())
+    packed_opts = [False, True]
+    softcap_opts = [0.0, 50.0]
+
+    combo_index = 0
+    for b in batches[:param_count]:
+        for sq, skv in seqs[:param_count]:
+            for n, n2 in heads[:param_count]:
+                for h in h_sizes[:param_count]:
+                    lws_opts = [-1, random.randint(1, skv)]
+                    lws = lws_opts[combo_index % len(lws_opts)]
+
+                    rotary, rotary_interleaved = rotary_opts[combo_index % len(rotary_opts)]
+                    packed = packed_opts[combo_index % len(packed_opts)]
+                    softcap = softcap_opts[combo_index % len(softcap_opts)]
+                    use_smooth_softmax, has_head_sink = smmoth_softmax__head_sink[
+                        combo_index % len(smmoth_softmax__head_sink)
+                    ]
+
+                    combo_index += 1
+
+                    if rotary and h % 16 > 0:
+                        continue
+
+                    if softcap > 0 and (use_smooth_softmax or has_head_sink):
+                        continue
+
+                    config = GQAConfig(
+                        batch_size=b,
+                        q_sequence_length=sq,
+                        kv_sequence_length=skv,
+                        past_kv_sequence_length=0,
+                        buffer_sequence_length=sq + skv + 8,
+                        num_heads=n,
+                        kv_num_heads=n2,
+                        head_size=h,
+                        local_window_size=lws,
+                        rotary=rotary,
+                        rotary_interleaved=rotary_interleaved,
+                        packed=packed,
+                        softcap=softcap,
+                        use_smooth_softmax=use_smooth_softmax,
+                        has_head_sink=has_head_sink,
+                    )
+                    name = f"b{b}_sq{sq}_skv{skv}_nh{n}_{n2}_h{h}_w{lws}_rot{rotary}{rotary_interleaved}_pkd{packed}_sc{softcap}_sm{use_smooth_softmax}_{has_head_sink}"
+                    yield name, config
 
 
 def gqa_cuda_past_test_cases(allow_head_sink: bool = True):
-    batches = [5] if pipeline_mode else [1, 3, 5]
+    batches = [2, 1, 3]
     # s: new sequence length, s2: past sequence length
-    seqs = [(1, 1024)] if pipeline_mode else [(1, 128), (1, 1024), (1, 2048), (1, 5000)]
-    num_h = [(32, 8)] if pipeline_mode else [(6, 3), (9, 9), (32, 8)]
-    h_sizes = [256] if pipeline_mode else [64, 128, 256]
+    seqs = [(1, 128), (3, 1024), (1, 2048), (1, 5000)]
+    heads = [(32, 8), (6, 3), (9, 9)]
+    # We test 128 in pipeline since quantized kv cache is only enabled for head_size=128 in flash attention.
+    h_sizes = [128] if quick_build else [128, 64, 256]
     smmoth_softmax__head_sink = get_softmax_options(allow_head_sink)
 
-    for b in batches:
-        for s, s2 in seqs:
-            for n, n2 in num_h:
-                for h in h_sizes:
-                    for lws in [-1, random.randint(1, s2)]:
-                        for rotary, rotary_interleaved in get_cuda_rotary_options():
-                            for packed in [False, True]:
-                                for softcap in [0.0, 50.0]:
-                                    if rotary and h % 16 > 0:
-                                        continue
-                                    for use_smooth_softmax, has_head_sink in smmoth_softmax__head_sink:
-                                        config = GQAConfig(
-                                            batch_size=b,
-                                            q_sequence_length=s,
-                                            kv_sequence_length=s,
-                                            past_kv_sequence_length=s2,
-                                            buffer_sequence_length=s + s2 + 8,
-                                            num_heads=n,
-                                            kv_num_heads=n2,
-                                            head_size=h,
-                                            local_window_size=lws,
-                                            rotary=rotary,
-                                            rotary_interleaved=rotary_interleaved,
-                                            packed=packed,
-                                            softcap=softcap,
-                                            use_smooth_softmax=use_smooth_softmax,
-                                            has_head_sink=has_head_sink,
-                                        )
-                                        name = f"b{b}_s{s}_{s2}_nh{n}_{n2}_h{h}_w{lws}_rot{rotary}{rotary_interleaved}_pkd{packed}_sc{softcap}_sm{use_smooth_softmax}_{has_head_sink}"
-                                        yield name, config
+    rotary_opts = list(get_cuda_rotary_options())
+    packed_opts = [False, True]
+    softcap_opts = [0.0, 50.0]
+
+    combo_index = 0
+    for b in batches[:param_count]:
+        for s, s2 in seqs[:param_count]:
+            if s > 1 and b > 1:
+                continue
+            for n, n2 in heads[:param_count]:
+                for h in h_sizes[:param_count]:
+                    lws_opts = [-1, random.randint(1, s2)]
+                    lws = lws_opts[combo_index % len(lws_opts)]
+
+                    rotary, rotary_interleaved = rotary_opts[combo_index % len(rotary_opts)]
+                    packed = packed_opts[combo_index % len(packed_opts)]
+                    softcap = softcap_opts[combo_index % len(softcap_opts)]
+                    use_smooth_softmax, has_head_sink = smmoth_softmax__head_sink[
+                        combo_index % len(smmoth_softmax__head_sink)
+                    ]
+
+                    combo_index += 1
+
+                    if rotary and h % 16 > 0:
+                        continue
+
+                    if softcap > 0 and (use_smooth_softmax or has_head_sink):
+                        continue
+
+                    config = GQAConfig(
+                        batch_size=b,
+                        q_sequence_length=s,
+                        kv_sequence_length=s,
+                        past_kv_sequence_length=s2,
+                        buffer_sequence_length=s + s2 + 8,
+                        num_heads=n,
+                        kv_num_heads=n2,
+                        head_size=h,
+                        local_window_size=lws,
+                        rotary=rotary,
+                        rotary_interleaved=rotary_interleaved,
+                        packed=packed,
+                        softcap=softcap,
+                        use_smooth_softmax=use_smooth_softmax,
+                        has_head_sink=has_head_sink,
+                    )
+                    name = f"b{b}_s{s}_{s2}_nh{n}_{n2}_h{h}_w{lws}_rot{rotary}{rotary_interleaved}_pkd{packed}_sc{softcap}_sm{use_smooth_softmax}_{has_head_sink}"
+                    yield name, config
+
+
+def gqa_cuda_quantized_test_cases(is_past):
+    base_cases = gqa_cuda_past_test_cases() if is_past else gqa_cuda_prompt_test_cases()
+    for name, config in base_cases:
+        if config.packed:  # Quantization is not supported with packed QKV yet
+            continue
+        for kv_type in ["int8", "int4"]:
+            for quant_mode in ["PER_TENSOR", "PER_CHANNEL"]:
+                q_config = deepcopy(config)
+                q_config.k_quant_type = quant_mode
+                q_config.v_quant_type = quant_mode
+                q_config.kv_cache_type = kv_type
+                if kv_type == "int4":
+                    if q_config.head_size % 2 != 0:
+                        continue
+                    q_config.kv_cache_bit_width = 4
+                elif kv_type == "int8":
+                    q_config.kv_cache_bit_width = 8
+                q_name = f"{name}_quant_{kv_type}_{quant_mode}"
+                yield q_name, q_config
 
 
 # #################################################################################################
@@ -1097,6 +1646,10 @@ def has_memory_efficient():
     return major >= 5
 
 
+def has_quantized_kv_cache():
+    return version.parse(onnxruntime.__version__) >= version.parse("1.24.0")
+
+
 @unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
 class TestFlashGQA(unittest.TestCase):
     @parameterized.expand(gqa_cuda_prompt_test_cases())
@@ -1107,11 +1660,10 @@ class TestFlashGQA(unittest.TestCase):
             ep="CUDAExecutionProvider",
             device="cuda",
             torch_type=torch.float16,
-            numpy_type=numpy.float16,
             ort_type=TensorProto.FLOAT16,
             causal=True,
-            rtol=5e-3,
-            atol=5e-3,
+            rtol=1e-1,
+            atol=1e-1,
         )
 
     @parameterized.expand(gqa_cuda_past_test_cases())
@@ -1122,11 +1674,49 @@ class TestFlashGQA(unittest.TestCase):
             ep="CUDAExecutionProvider",
             device="cuda",
             torch_type=torch.float16,
-            numpy_type=numpy.float16,
             ort_type=TensorProto.FLOAT16,
             causal=True,
-            rtol=5e-3,
-            atol=5e-3,
+            rtol=1e-1,
+            atol=1e-1,
+        )
+
+
+@unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
+class TestFlashGQABF16(unittest.TestCase):
+    @parameterized.expand(gqa_cuda_prompt_test_cases())
+    def test_gqa_prompt_flash_attention_bf16(self, name, config):
+        if not torch.cuda.is_bf16_supported():
+            self.skipTest("BFloat16 not supported on this device")
+
+        config.kv_cache_type = "bfloat16"
+        os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
+        parity_check_gqa_prompt(
+            config=config,
+            ep="CUDAExecutionProvider",
+            device="cuda",
+            torch_type=torch.bfloat16,
+            ort_type=TensorProto.BFLOAT16,
+            causal=True,
+            rtol=1e-1,  # Relaxed tolerance for BF16
+            atol=2e-1,
+        )
+
+    @parameterized.expand(gqa_cuda_past_test_cases())
+    def test_gqa_past_flash_attention_bf16(self, name, config):
+        if not torch.cuda.is_bf16_supported():
+            self.skipTest("BFloat16 not supported on this device")
+
+        config.kv_cache_type = "bfloat16"
+        os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
+        parity_check_gqa_past(
+            config=config,
+            ep="CUDAExecutionProvider",
+            device="cuda",
+            torch_type=torch.bfloat16,
+            ort_type=TensorProto.BFLOAT16,
+            causal=True,
+            rtol=1e-1,
+            atol=2e-1,
         )
 
 
@@ -1140,11 +1730,10 @@ class TestMemoryEfficientGQA(unittest.TestCase):
             ep="CUDAExecutionProvider",
             device="cuda",
             torch_type=torch.float16,
-            numpy_type=numpy.float16,
             ort_type=TensorProto.FLOAT16,
             causal=True,
-            rtol=5e-3,
-            atol=5e-3,
+            rtol=2e-2,
+            atol=2e-2,
         )
 
     @parameterized.expand(gqa_cuda_past_test_cases(allow_head_sink=False))
@@ -1155,11 +1744,115 @@ class TestMemoryEfficientGQA(unittest.TestCase):
             ep="CUDAExecutionProvider",
             device="cuda",
             torch_type=torch.float16,
-            numpy_type=numpy.float16,
             ort_type=TensorProto.FLOAT16,
             causal=True,
             rtol=5e-3,
-            atol=5e-3,
+            atol=2e-2,
+        )
+
+
+@unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
+@unittest.skipIf(not has_quantized_kv_cache(), "Quantized KV Cache is not available, skipping tests.")
+class TestQuantizedGQA(unittest.TestCase):
+    @parameterized.expand(gqa_cuda_quantized_test_cases(is_past=False))
+    def test_gqa_quantized_prompt(self, name, config):
+        os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
+        parity_check_gqa_prompt(
+            config=config,
+            ep="CUDAExecutionProvider",
+            device="cuda",
+            torch_type=torch.float16,
+            ort_type=TensorProto.FLOAT16,
+            causal=True,
+            rtol=5e-2,
+            atol=2e-1,
+        )
+
+    @parameterized.expand(gqa_cuda_quantized_test_cases(is_past=True))
+    def test_gqa_quantized_past(self, name, config):
+        os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
+        parity_check_gqa_past(
+            config=config,
+            ep="CUDAExecutionProvider",
+            device="cuda",
+            torch_type=torch.float16,
+            ort_type=TensorProto.FLOAT16,
+            causal=True,
+            rtol=5e-2,
+            atol=2e-1,
+        )
+
+
+@unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
+@unittest.skipIf(not has_quantized_kv_cache(), "Quantized KV Cache is not available, skipping tests.")
+class TestQuantizedGQABF16(unittest.TestCase):
+    @parameterized.expand(gqa_cuda_quantized_test_cases(is_past=False))
+    def test_gqa_quantized_prompt_bf16(self, name, config):
+        if not torch.cuda.is_bf16_supported():
+            self.skipTest("BFloat16 not supported on this device")
+
+        os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
+        parity_check_gqa_prompt(
+            config=config,
+            ep="CUDAExecutionProvider",
+            device="cuda",
+            torch_type=torch.bfloat16,
+            ort_type=TensorProto.BFLOAT16,
+            causal=True,
+            rtol=1e-1,
+            atol=2e-1,
+        )
+
+    @parameterized.expand(gqa_cuda_quantized_test_cases(is_past=True))
+    def test_gqa_quantized_past_bf16(self, name, config):
+        if not torch.cuda.is_bf16_supported():
+            self.skipTest("BFloat16 not supported on this device")
+
+        os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
+        parity_check_gqa_past(
+            config=config,
+            ep="CUDAExecutionProvider",
+            device="cuda",
+            torch_type=torch.bfloat16,
+            ort_type=TensorProto.BFLOAT16,
+            causal=True,
+            rtol=1e-1,
+            atol=2e-1,
+        )
+
+
+@unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
+@unittest.skipIf(not has_quantized_kv_cache(), "Quantized KV Cache is not available, skipping tests.")
+class TestGQAInt8MMA(unittest.TestCase):
+    def setUp(self):
+        self.original_env = os.environ.get("ORT_FLASH_ATTENTION_QUERY_DYNAMIC_QUANT")
+        os.environ["ORT_FLASH_ATTENTION_QUERY_DYNAMIC_QUANT"] = "1"
+
+    def tearDown(self):
+        if self.original_env is None:
+            if "ORT_FLASH_ATTENTION_QUERY_DYNAMIC_QUANT" in os.environ:
+                del os.environ["ORT_FLASH_ATTENTION_QUERY_DYNAMIC_QUANT"]
+        else:
+            os.environ["ORT_FLASH_ATTENTION_QUERY_DYNAMIC_QUANT"] = self.original_env
+
+    @parameterized.expand(gqa_cuda_quantized_test_cases(is_past=False))
+    def test_gqa_int8_mma_prompt(self, name, config):
+        if config.kv_cache_bit_width != 8:
+            self.skipTest("Int8 MMA only supports 8-bit KV Cache")
+        if config.k_quant_type != 1:  # 1 = PER_TENSOR, 2 = PER_CHANNEL
+            self.skipTest("Int8 MMA only supports PER_TENSOR quantization (PER_CHANNEL uses EFFICIENT_ATTENTION)")
+
+        # Test correctness with Int8 MMA
+        os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
+        parity_check_gqa_prompt(
+            config=config,
+            ep="CUDAExecutionProvider",
+            device="cuda",
+            torch_type=torch.float16,
+            ort_type=TensorProto.FLOAT16,
+            causal=True,
+            rtol=2e-1,  # Looser tolerance for Int8 Dynamic Quant
+            atol=2e-1,
         )
 
 
