@@ -229,7 +229,17 @@ Our code of cutlass kernel is from older version of TensorRT LLM.Here is newer v
 TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm
 TensorRT-LLM/cpp/tensorrt_llm/cutlass_extensions
 
+# Format Code
+
+Please run the following command to format code:
+lintrunner -a
+It will automatically fix most of the warnings.
+
+You can run it again to verify that all warnings are fixed. If not, please modify the code to fix the warnings until
+`lintrunner -a` command does not show any warnings.
+
 # How to build and install wheel
+
 It is recommended to use run.sh to build and install wheel:
 ./run.sh --build --install
 
@@ -249,7 +259,7 @@ run test_moe_cuda.py:
 run test_qmoe_cuda.py:
 ./run.sh --test_qmoe
 
-If you need to run a specific test case, you can use the following command:
+If you need to run a specific test case, you can use --test_moe_case or --test_qmoe_case option like:
 ./run.sh --test_qmoe_case TestSwigluQMoE.test_swiglu_qmoe_blockwise_parity_3
 
 If you want to enable debug node inputs and outputs (Current build need to be built with --dump option):

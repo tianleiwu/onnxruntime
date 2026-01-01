@@ -2,6 +2,7 @@
 #include "contrib_ops/cuda/moe/qmoe_kernels.h"
 #include "core/providers/cuda/cuda_common.h"
 #include "contrib_ops/cuda/llm/moe_gemm/moe_kernels.h"
+#include <cuda_bf16.h>
 #include <cub/cub.cuh>
 #include <limits>
 
@@ -106,6 +107,20 @@ void LaunchSoftmaxTopK(
   SoftmaxTopKKernel<half><<<grid, block, 0, stream>>>(logits, topk_scales, topk_indices, num_rows, num_experts, k, normalize_scales);
 }
 
+void LaunchSoftmaxTopK(
+    const __nv_bfloat16* logits,
+    float* topk_scales,
+    int* topk_indices,
+    int num_rows,
+    int num_experts,
+    int k,
+    bool normalize_scales,
+    cudaStream_t stream) {
+  int block = 256;
+  int grid = (num_rows + block - 1) / block;
+  SoftmaxTopKKernel<__nv_bfloat16><<<grid, block, 0, stream>>>(logits, topk_scales, topk_indices, num_rows, num_experts, k, normalize_scales);
+}
+
 template <typename T>
 __global__ void QMoEPrePackZPKernel(const uint8_t* zp, const T* scales, T* out, int num_elements, float offset) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -139,6 +154,17 @@ void LaunchQMoEPrePackZP(
   int block = 256;
   int grid = (num_elements + block - 1) / block;
   QMoEPrePackZPKernel<half><<<grid, block, 0, stream>>>(zp, scales, output, num_elements, 0.0f);
+}
+
+void LaunchQMoEPrePackZP(
+    const uint8_t* zp,
+    const __nv_bfloat16* scales,
+    __nv_bfloat16* output,
+    int num_elements,
+    cudaStream_t stream) {
+  int block = 256;
+  int grid = (num_elements + block - 1) / block;
+  QMoEPrePackZPKernel<__nv_bfloat16><<<grid, block, 0, stream>>>(zp, scales, output, num_elements, 0.0f);
 }
 
 template <typename T>
@@ -190,6 +216,18 @@ void LaunchQMoEPrePackPacked4BitZPKernel(
   QMoEPrePackPacked4BitZPKernel<half><<<grid, block, 0, stream>>>(packed_zp, scales, output, num_elements, N);
 }
 
+void LaunchQMoEPrePackPacked4BitZPKernel(
+    const uint8_t* packed_zp,
+    const __nv_bfloat16* scales,
+    __nv_bfloat16* output,
+    int num_elements,
+    int N,
+    cudaStream_t stream) {
+  int block = 256;
+  int grid = (num_elements + block - 1) / block;
+  QMoEPrePackPacked4BitZPKernel<__nv_bfloat16><<<grid, block, 0, stream>>>(packed_zp, scales, output, num_elements, N);
+}
+
 void LaunchQMoEPrePackOffsetBias(
     const uint8_t* zp,
     const float* scales,
@@ -212,6 +250,18 @@ void LaunchQMoEPrePackOffsetBias(
   int block = 256;
   int grid = (num_elements + block - 1) / block;
   QMoEPrePackZPKernel<half><<<grid, block, 0, stream>>>(zp, scales, output, num_elements, offset);
+}
+
+void LaunchQMoEPrePackOffsetBias(
+    const uint8_t* zp,
+    const __nv_bfloat16* scales,
+    __nv_bfloat16* output,
+    int num_elements,
+    float offset,
+    cudaStream_t stream) {
+  int block = 256;
+  int grid = (num_elements + block - 1) / block;
+  QMoEPrePackZPKernel<__nv_bfloat16><<<grid, block, 0, stream>>>(zp, scales, output, num_elements, offset);
 }
 
 __global__ void QMoEShiftWeightsKernel(const uint8_t* input, uint8_t* output, int num_elements) {
@@ -389,6 +439,17 @@ void LaunchSparseMixerTop2(
   LaunchSparseMixerTop2Impl<half>(input, output, indices, source_rows, num_rows, num_experts, stream);
 }
 
+void LaunchSparseMixerTop2(
+    const __nv_bfloat16* input,
+    float* output,
+    int* indices,
+    int* source_rows,
+    int num_rows,
+    int num_experts,
+    cudaStream_t stream) {
+  LaunchSparseMixerTop2Impl<__nv_bfloat16>(input, output, indices, source_rows, num_rows, num_experts, stream);
+}
+
 template <typename T>
 __global__ void QMoETranspose2DKernel(const T* input, T* output, int num_elements_per_batch, int rows, int cols) {
   int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -424,6 +485,18 @@ void LaunchQMoETranspose2D(
   dim3 block(32, 32);
   dim3 grid((cols + block.x - 1) / block.x, (rows + block.y - 1) / block.y, batch_size);
   QMoETranspose2DKernel<half><<<grid, block, 0, stream>>>(input, output, rows * cols, rows, cols);
+}
+
+void LaunchQMoETranspose2D(
+    const __nv_bfloat16* input,
+    __nv_bfloat16* output,
+    int batch_size,
+    int rows,
+    int cols,
+    cudaStream_t stream) {
+  dim3 block(32, 32);
+  dim3 grid((cols + block.x - 1) / block.x, (rows + block.y - 1) / block.y, batch_size);
+  QMoETranspose2DKernel<__nv_bfloat16><<<grid, block, 0, stream>>>(input, output, rows * cols, rows, cols);
 }
 
 void LaunchQMoETranspose2D(

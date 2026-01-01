@@ -40,6 +40,7 @@ except ImportError:
     class TensorProtoPlaceholder:
         FLOAT16 = 10
         FLOAT = 1
+        BFLOAT16 = 16
 
 
 class ClassInstantier(OrderedDict):
@@ -61,6 +62,7 @@ if not has_onnx:
         FLOAT16 = 10
         FLOAT = 1
         UINT8 = 2
+        BFLOAT16 = 16
 
     TensorProto = TensorProtoPlaceholder
 
@@ -82,6 +84,7 @@ numpy.random.seed(42)
 onnx_to_torch_type_map = {
     TensorProto.FLOAT16: torch.float16,
     TensorProto.FLOAT: torch.float,
+    TensorProto.BFLOAT16: torch.bfloat16,
     TensorProto.UINT8: torch.uint8,
 }
 
@@ -94,6 +97,7 @@ ort_to_numpy_type_map = {
 ort_dtype_name_map = {
     TensorProto.FLOAT16: "FP16",
     TensorProto.FLOAT: "FP32",
+    TensorProto.BFLOAT16: "BF16",
 }
 
 
@@ -148,7 +152,10 @@ def preprocess_weights_for_mixed_gemm(
 
     if pybind and hasattr(pybind, "pack_weights_for_cuda_mixed_gemm") and torch.cuda.is_available():
         for i in range(num_experts):
-            weight = tensor[i].cpu().numpy()
+            if tensor[i].dtype == torch.bfloat16:
+                weight = tensor[i].to(torch.float32).cpu().numpy()
+            else:
+                weight = tensor[i].cpu().numpy()
             packed = pybind.pack_weights_for_cuda_mixed_gemm(weight, n, k, quant_bits, sm)
             # pack_weights_for_cuda_mixed_gemm returns int8 array of shape [packed_size]
             # We need to reshape it to (k, n/2) for 4-bit, (k, n) for 8-bit.
@@ -188,7 +195,11 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
         # Use existing binding which determines implementation based on type
         # Assuming weights are float16 or float32. Binding supports both (via overload or check).
         # We need to pass numpy array.
-        weights_np = weights_t.detach().cpu().numpy()
+        # We need to pass numpy array.
+        if weights_t.dtype == torch.bfloat16:
+            weights_np = weights_t.detach().to(torch.float32).cpu().numpy()
+        else:
+            weights_np = weights_t.detach().cpu().numpy()
 
         _quantize.quantize_matmul_4bits(q_weight, weights_np, scale, zero_point, block_size, n, k, is_symmetric)
 
@@ -249,7 +260,10 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
         zero_point = numpy.zeros((n, block_per_k), dtype=numpy.uint8)
 
         is_symmetric = not asymmetric
-        weights_np = weights_t.detach().cpu().numpy()
+        if weights_t.dtype == torch.bfloat16:
+            weights_np = weights_t.detach().to(torch.float32).cpu().numpy()
+        else:
+            weights_np = weights_t.detach().cpu().numpy()
 
         _quantize.quantize_matmul_8bits(q_weight, weights_np, scale, zero_point, block_size, n, k, is_symmetric)
 
@@ -467,12 +481,10 @@ def create_moe_onnx_graph(
         fc2_scale_shape = [num_experts, hidden_size]
 
     # Handle scale tensors
-    fc1_scale_tensor = fc1_scales.to(torch_dtype).flatten().detach().cpu().numpy()
-    fc2_scale_tensor = fc2_scales.to(torch_dtype).flatten().detach().cpu().numpy()
-
     # Process scale tensors for proper data format
-    fc1_scale_data = fc1_scale_tensor.tolist()
-    fc2_scale_data = fc2_scale_tensor.tolist()
+    # Use tolist() directly to avoid numpy conversion issues with BFloat16
+    fc1_scale_data = fc1_scales.to(torch_dtype).flatten().detach().cpu().tolist()
+    fc2_scale_data = fc2_scales.to(torch_dtype).flatten().detach().cpu().tolist()
 
     initializers.extend(
         [
@@ -901,10 +913,6 @@ class SparseMoeBlockORTHelper(nn.Module):
 
             # DEBUG
             # print(f"DEBUG: Expert {i} w1 dtype={self.experts[i].w1.weight.dtype}, w2 dtype={self.experts[i].w2.weight.dtype}")
-            if i == 0:
-                print(
-                    f"DEBUG: Expert {i} w1 dtype={self.experts[i].w1.weight.dtype}, bias={self.experts[i].w1.bias.dtype if self.experts[i].w1.bias is not None else 'None'}"
-                )
 
             w1_list.append(pre_qweight1)
             w2_list.append(pre_qweight2)
@@ -970,7 +978,7 @@ class SparseMoeBlockORTHelper(nn.Module):
         if not model_updated:
             raise AssertionError("Model update failed")
 
-        dtype = torch.float16 if self.onnx_dtype == TensorProto.FLOAT16 else torch.float32
+        dtype = onnx_to_torch_type_map.get(self.onnx_dtype, torch.float32)
         hidden_state = torch.randn(self.batch_size, self.sequence_length, self.hidden_dim).to(device).to(dtype)
         torch_output = self.forward(hidden_state)
         ort_output = self.ort_forward(hidden_state)
@@ -1057,6 +1065,8 @@ class SparseMoeBlockORTHelper(nn.Module):
             "FP16:8": (1.0, 0.01),
             "FP32:4": (0.11, 0.01),
             "FP32:8": (0.11, 0.01),
+            "BF16:4": (2.0, 0.02),
+            "BF16:8": (2.0, 0.02),
         }
 
         dtype_str = ort_dtype_name_map[self.onnx_dtype]
@@ -1140,11 +1150,7 @@ class SwigluMoEBlock(SparseMoeBlockORTHelper):
                     scale1, pre_qweight1, w1_qdq, zp1 = quant_dequant_blockwise(
                         expert.w1.weight, self.block_size, is_4_bit, asymmetric=self.use_asymmetric_quant
                     )
-                    if expert == 0:
-                        print(
-                            f"Debug: scale1.shape={scale1.shape}, pre_qweight1.shape={pre_qweight1.shape}, w1_qdq.shape={w1_qdq.shape}, zp1.shape={zp1.shape}"
-                        )
-                        print(f"Debug: scale1={scale1}, pre_qweight1={pre_qweight1}, w1_qdq={w1_qdq}, zp1={zp1}")
+
                     scale2, pre_qweight2, w2_qdq, zp2 = quant_dequant_blockwise(
                         expert.w2.weight, self.block_size, is_4_bit, asymmetric=self.use_asymmetric_quant
                     )
@@ -1178,10 +1184,10 @@ class SwigluMoEBlock(SparseMoeBlockORTHelper):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate(hidden_states)
-        print("[Torch] router_logits", router_logits.shape)
+
         routing_weights, selected_experts = torch.topk(router_logits, self.top_k, dim=-1)
         routing_weights = F.softmax(routing_weights, dim=1, dtype=torch.float)
-        print("[Torch] routing_weights", routing_weights)
+
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         final_hidden_states = torch.zeros(
@@ -1189,7 +1195,6 @@ class SwigluMoEBlock(SparseMoeBlockORTHelper):
         )
 
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-        print("[Torch] expert_mask", expert_mask.shape)
 
         for expert_idx in range(self.num_experts):
             expert_layer = self.experts[expert_idx]
@@ -1409,6 +1414,33 @@ class TestPhiQMoE(unittest.TestCase):
         phi3_moe.parity_check()
 
     @parameterized.expand(phi3_test_cases)
+    def test_phi3_qmoe_parity_bf16(self, batch_size, sequence_length, quant_bits):
+        base_seed = 2500
+        param_hash = hash((batch_size, sequence_length, quant_bits))
+        unique_seed = base_seed + abs(param_hash) % 1000
+        torch.manual_seed(unique_seed)
+        numpy.random.seed(unique_seed)
+
+        test_config = f"batch_size={batch_size}, sequence_length={sequence_length}, quant_bits={quant_bits}, seed={unique_seed} (BF16)"
+        print(f"Running Phi3 QMoE test (BF16): {test_config}")
+
+        config = PhiMoEConfig(hidden_size=128, intermediate_size=256, num_local_experts=4, num_experts_per_tok=2)
+
+        phi3_moe = PhiMoESparseMoeBlock(
+            config,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            quant_bits=quant_bits,
+            onnx_dtype=TensorProto.BFLOAT16,
+            use_asymmetric_quant=False,
+        )
+
+        hidden_states = torch.randn(batch_size, sequence_length, config.hidden_size).to(device).to(torch.bfloat16)
+        torch_result = phi3_moe.forward(hidden_states)
+
+        phi3_moe.parity_check()
+
+    @parameterized.expand(phi3_test_cases)
     def test_phi3_qmoe_asymmetric_parity(self, batch_size, sequence_length, quant_bits):
         base_seed = 3000
         param_hash = hash((batch_size, sequence_length, quant_bits))
@@ -1464,6 +1496,33 @@ class TestPhiQMoE(unittest.TestCase):
         self.assertEqual(torch_result.shape, expected_shape)
         self.assertFalse(torch.isnan(torch_result).any())
         self.assertFalse(torch.isinf(torch_result).any())
+
+        phi3_moe.parity_check()
+
+    @parameterized.expand(phi3_blockwise_test_cases)
+    def test_phi3_qmoe_blockwise_parity_bf16(self, batch_size, sequence_length, quant_bits, block_size):
+        if quant_bits == 8:
+            self.skipTest("8-bit blockwise quantization is not supported on CUDA")
+        torch.manual_seed(142)
+        numpy.random.seed(142)
+
+        test_config = f"batch_size={batch_size}, sequence_length={sequence_length}, quant_bits={quant_bits}, block_size={block_size} (BF16)"
+        print(f"Running Phi3 QMoE block-wise test (BF16): {test_config}")
+
+        config = PhiMoEConfig(hidden_size=128, intermediate_size=256, num_local_experts=4, num_experts_per_tok=2)
+
+        phi3_moe = PhiMoESparseMoeBlock(
+            config,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            quant_bits=quant_bits,
+            onnx_dtype=TensorProto.BFLOAT16,
+            block_size=block_size,
+            use_asymmetric_quant=False,
+        )
+
+        hidden_states = torch.randn(batch_size, sequence_length, config.hidden_size).to(device).to(torch.bfloat16)
+        torch_result = phi3_moe.forward(hidden_states)
 
         phi3_moe.parity_check()
 
@@ -1545,6 +1604,33 @@ class TestSwigluQMoE(unittest.TestCase):
         swiglu_moe.parity_check()
 
     @parameterized.expand(swiglu_test_cases)
+    def test_swiglu_qmoe_parity_bf16(self, batch_size, sequence_length, quant_bits):
+        base_seed = 1500
+        param_hash = hash((batch_size, sequence_length, quant_bits))
+        unique_seed = base_seed + abs(param_hash) % 1000
+        torch.manual_seed(unique_seed)
+        numpy.random.seed(unique_seed)
+
+        test_config = f"batch_size={batch_size}, sequence_length={sequence_length}, quant_bits={quant_bits}, seed={unique_seed} (BF16)"
+        print(f"Running SwiGLU test (BF16): {test_config}")
+
+        config = SwigluMoeConfig(hidden_size=128, intermediate_size=256, num_local_experts=4, num_experts_per_token=2)
+
+        swiglu_moe = SwigluMoEBlock(
+            config,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            quant_bits=quant_bits,
+            onnx_dtype=TensorProto.BFLOAT16,
+            use_asymmetric_quant=False,
+        )
+
+        hidden_states = torch.randn(batch_size, sequence_length, config.hidden_size).to(device).to(torch.bfloat16)
+        torch_result = swiglu_moe.forward(hidden_states)
+
+        swiglu_moe.parity_check()
+
+    @parameterized.expand(swiglu_test_cases)
     def test_swiglu_qmoe_asymmetric_parity(self, batch_size, sequence_length, quant_bits):
         base_seed = 1100
         param_hash = hash((batch_size, sequence_length, quant_bits))
@@ -1603,6 +1689,33 @@ class TestSwigluQMoE(unittest.TestCase):
         swiglu_moe.parity_check()
 
     @parameterized.expand(swiglu_blockwise_test_cases)
+    def test_swiglu_qmoe_blockwise_parity_bf16(self, batch_size, sequence_length, quant_bits, block_size):
+        # if quant_bits == 8:
+        #     self.skipTest("8-bit blockwise quantization is not supported on CUDA")
+        torch.manual_seed(142)
+        numpy.random.seed(142)
+
+        test_config = f"batch_size={batch_size}, sequence_length={sequence_length}, quant_bits={quant_bits}, block_size={block_size} (BF16)"
+        print(f"Running SwiGLU block-wise test (BF16): {test_config}")
+
+        config = SwigluMoeConfig(hidden_size=128, intermediate_size=256, num_local_experts=4, num_experts_per_token=2)
+
+        swiglu_moe = SwigluMoEBlock(
+            config,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            quant_bits=quant_bits,
+            onnx_dtype=TensorProto.BFLOAT16,
+            block_size=block_size,
+            use_asymmetric_quant=False,
+        )
+
+        hidden_states = torch.randn(batch_size, sequence_length, config.hidden_size).to(device).to(torch.bfloat16)
+        torch_result = swiglu_moe.forward(hidden_states)
+
+        swiglu_moe.parity_check()
+
+    @parameterized.expand(swiglu_blockwise_test_cases)
     def test_swiglu_qmoe_blockwise_asymmetric_parity(self, batch_size, sequence_length, quant_bits, block_size):
         torch.manual_seed(43)
         numpy.random.seed(43)
@@ -1621,6 +1734,59 @@ class TestSwigluQMoE(unittest.TestCase):
             block_size=block_size,
             use_asymmetric_quant=True,
         )
+        swiglu_moe.parity_check()
+
+
+def has_bf16_qmoe():
+    """Check if BF16 QMoE is supported (requires Ampere or newer GPU)."""
+    if "CUDAExecutionProvider" not in onnxruntime.get_available_providers() or not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major >= 8
+
+
+# BF16 test cases for int4 and int8 quantization
+bf16_test_cases = [
+    (1, 32, 4),  # batch_size, sequence_length, quant_bits
+    (1, 32, 8),
+    (2, 16, 4),
+    (2, 16, 8),
+]
+
+
+@unittest.skipIf(not has_bf16_qmoe(), "skipping bf16 QMoE tests (requires Ampere+ GPU).")
+class TestSwigluQMoEBf16(unittest.TestCase):
+    """BF16 QMoE tests for int4 and int8 quantization."""
+
+    @parameterized.expand(bf16_test_cases)
+    def test_swiglu_qmoe_bf16_parity(self, batch_size, sequence_length, quant_bits):
+        """Test BF16 QMoE with symmetric quantization."""
+        torch.manual_seed(42)
+        numpy.random.seed(42)
+
+        test_config = f"batch_size={batch_size}, sequence_length={sequence_length}, quant_bits={quant_bits}"
+        print(f"Running BF16 SwiGLU QMoE test: {test_config}")
+
+        config = SwigluMoeConfig(hidden_size=128, intermediate_size=256, num_local_experts=4, num_experts_per_token=2)
+
+        swiglu_moe = SwigluMoEBlock(
+            config,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            quant_bits=quant_bits,
+            onnx_dtype=TensorProto.BFLOAT16,
+            use_asymmetric_quant=False,
+        )
+
+        hidden_states = torch.randn(batch_size, sequence_length, config.hidden_size).to(device).to(torch.bfloat16)
+
+        torch_result = swiglu_moe.forward(hidden_states)
+
+        expected_shape = (batch_size, sequence_length, config.hidden_size)
+        self.assertEqual(torch_result.shape, expected_shape)
+        self.assertFalse(torch.isnan(torch_result).any())
+        self.assertFalse(torch.isinf(torch_result).any())
+
         swiglu_moe.parity_check()
 
 

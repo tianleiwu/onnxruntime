@@ -40,11 +40,7 @@ namespace cuda {
       QMoE);
 
 REGISTER_KERNEL_TYPED(MLFloat16)
-
-#define QUICK_BUILD 1
-#if QUICK_BUILD == 0
 REGISTER_KERNEL_TYPED(BFloat16)
-#endif
 
 QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoEBase(op_kernel_info, GetDeviceProp()) {
   ORT_ENFORCE(op_kernel_info.GetAttr<int64_t>("expert_weight_bits", &expert_weight_bits_).IsOK());
@@ -201,9 +197,20 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   // Perform Softmax + TopK
   // Input router_probs is (num_rows, num_experts)
   bool is_fp16 = input->IsDataType<MLFloat16>();
+  bool is_bf16 = input->IsDataType<BFloat16>();
   if (is_fp16) {
     LaunchSoftmaxTopK(
         reinterpret_cast<const half*>(router_probs->DataRaw()),
+        expert_scales,
+        expert_indices,
+        static_cast<int>(moe_params.num_rows),
+        static_cast<int>(moe_params.num_experts),
+        static_cast<int>(k_),
+        normalize_routing_weights_,
+        stream);
+  } else if (is_bf16) {
+    LaunchSoftmaxTopK(
+        reinterpret_cast<const __nv_bfloat16*>(router_probs->DataRaw()),
         expert_scales,
         expert_indices,
         static_cast<int>(moe_params.num_rows),
@@ -472,6 +479,8 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
       auto type = tensor.DataType();
       if (type == DataTypeImpl::GetType<MLFloat16>()) {
         LaunchQMoETranspose2D(static_cast<const half*>(p_src), static_cast<half*>(packed_buf.get()), batch, rows, cols, stream);
+      } else if (type == DataTypeImpl::GetType<BFloat16>()) {
+        LaunchQMoETranspose2D(static_cast<const __nv_bfloat16*>(p_src), static_cast<__nv_bfloat16*>(packed_buf.get()), batch, rows, cols, stream);
       } else if (type == DataTypeImpl::GetType<float>()) {
         LaunchQMoETranspose2D(static_cast<const float*>(p_src), static_cast<float*>(packed_buf.get()), batch, rows, cols, stream);
       } else if (type == DataTypeImpl::GetType<uint8_t>()) {

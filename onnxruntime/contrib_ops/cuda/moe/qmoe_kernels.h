@@ -5,6 +5,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <stdint.h>
 
 namespace onnxruntime {
@@ -31,6 +32,16 @@ void LaunchSoftmaxTopK(
     bool normalize_scales,
     cudaStream_t stream);
 
+void LaunchSoftmaxTopK(
+    const __nv_bfloat16* logits,
+    float* topk_scales,
+    int* topk_indices,
+    int num_rows,
+    int num_experts,
+    int k,
+    bool normalize_scales,
+    cudaStream_t stream);
+
 void LaunchSparseMixerTop2(
     const float* input,
     float* output,
@@ -49,6 +60,15 @@ void LaunchSparseMixerTop2(
     int num_experts,
     cudaStream_t stream);
 
+void LaunchSparseMixerTop2(
+    const __nv_bfloat16* input,
+    float* output,
+    int* indices,
+    int* source_rows,
+    int num_rows,
+    int num_experts,
+    cudaStream_t stream);
+
 void LaunchQMoEPrePackZP(
     const uint8_t* zp,
     const float* scales,
@@ -60,6 +80,13 @@ void LaunchQMoEPrePackZP(
     const uint8_t* zp,
     const half* scales,
     half* output,
+    int num_elements,
+    cudaStream_t stream);
+
+void LaunchQMoEPrePackZP(
+    const uint8_t* zp,
+    const __nv_bfloat16* scales,
+    __nv_bfloat16* output,
     int num_elements,
     cudaStream_t stream);
 
@@ -75,6 +102,14 @@ void LaunchQMoEPrePackPacked4BitZPKernel(
     const uint8_t* packed_zp,
     const half* scales,
     half* output,
+    int num_elements,
+    int N,
+    cudaStream_t stream);
+
+void LaunchQMoEPrePackPacked4BitZPKernel(
+    const uint8_t* packed_zp,
+    const __nv_bfloat16* scales,
+    __nv_bfloat16* output,
     int num_elements,
     int N,
     cudaStream_t stream);
@@ -91,6 +126,14 @@ void LaunchQMoEPrePackOffsetBias(
     const uint8_t* zp,
     const half* scales,
     half* output,
+    int num_elements,
+    float offset,
+    cudaStream_t stream);
+
+void LaunchQMoEPrePackOffsetBias(
+    const uint8_t* zp,
+    const __nv_bfloat16* scales,
+    __nv_bfloat16* output,
     int num_elements,
     float offset,
     cudaStream_t stream);
@@ -112,6 +155,14 @@ void LaunchQMoETranspose2D(
 void LaunchQMoETranspose2D(
     const half* input,
     half* output,
+    int batch_size,
+    int rows,
+    int cols,
+    cudaStream_t stream);
+
+void LaunchQMoETranspose2D(
+    const __nv_bfloat16* input,
+    __nv_bfloat16* output,
     int batch_size,
     int rows,
     int cols,
