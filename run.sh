@@ -38,6 +38,8 @@ RUN_TEST_MOE=false
 RUN_TEST_QMOE=false
 RUN_TEST_QMOE_CASE=false
 TEST_QMOE_CASE=""
+RUN_TEST_MOE_CASE=false
+TEST_MOE_CASE=""
 RUN_BENCHMARK=false
 RUN_PROFILE=false
 ENABLE_DUMP="OFF"
@@ -81,6 +83,12 @@ while [[ "$#" -gt 0 ]]; do
         --test_qmoe)
             RUN_TEST_QMOE=true
             echo "==== 🚫 Test QMoE run enabled ===="
+            ;;
+        --test_moe_case)
+            RUN_TEST_MOE_CASE=true
+            TEST_MOE_CASE="$2"
+            echo "==== 🚫 Test MoE case run enabled: $TEST_MOE_CASE ===="
+            shift
             ;;
         --test_qmoe_case)
             RUN_TEST_QMOE_CASE=true
@@ -131,6 +139,7 @@ if [ "$RUN_BUILD" = true ]; then
             --use_binskim_compliant_compile_flags \
             --cmake_extra_defines onnxruntime_DEBUG_NODE_INPUTS_OUTPUTS=$ENABLE_DUMP \
             --cmake_extra_defines onnxruntime_DUMP_TENSOR=$ENABLE_DUMP \
+            --cmake_extra_defines onnxruntime_LLM_VERBOSE=$ENABLE_DUMP \
             --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES="90" \
             --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF \
             --cmake_extra_defines onnxruntime_USE_FPA_INTB_GEMM=OFF \
@@ -194,6 +203,16 @@ if [ "$RUN_TEST_QMOE_CASE" = true ]; then
         exit $test_exit_code
     fi
     echo "==== ✅ test_qmoe_cuda.py -k $TEST_QMOE_CASE passed! ===="
+fi
+
+if [ "$RUN_TEST_MOE_CASE" = true ]; then
+    python test_moe_cuda.py -k "$TEST_MOE_CASE"
+    test_exit_code=$?
+    if [ $test_exit_code -ne 0 ]; then
+        echo "==== ❌ test_moe_cuda.py -k $TEST_MOE_CASE failed with exit code $test_exit_code! Exiting. ===="
+        exit $test_exit_code
+    fi
+    echo "==== ✅ test_moe_cuda.py -k $TEST_MOE_CASE passed! ===="
 fi
 
 if [ "$RUN_BENCHMARK" = true ]; then

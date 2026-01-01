@@ -65,7 +65,7 @@ void sm90_generic_mixed_gemm_kernelLauncher(
     ScaleZeroType const* weight_scales, ScaleZeroType const* weight_zero_points, BiasType const* biases,
     float const alpha, OutputType* C, int m, int n, int k, int const group_size, tkc::CutlassGemmConfig /*gemm_config*/,
     char* workspace, size_t workspace_bytes, cudaStream_t stream, int* occupancy) {
-  ORT_LLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+  ORT_LLM_LOG_ENTRY();
 
   using CutlassActivationType = typename CudaToCutlassTypeAdapter<ActivationType>::type;
 
@@ -273,7 +273,7 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const*, WeightType co
                                             ScaleZeroType const*, ScaleZeroType const*, BiasType const*,
                                             float const, OutputType*, int, int, int, int const, tkc::CutlassGemmConfig,
                                             char*, size_t, cudaStream_t, int*) {
-  ORT_LLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+  ORT_LLM_LOG_ENTRY();
   ORT_THROW("[fpA_intB_gemm] Please recompile with support for hopper by passing 90a-real as an arch.");
 }
 #endif  // COMPILE_HOPPER_TMA_GEMMS

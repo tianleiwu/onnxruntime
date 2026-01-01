@@ -7,6 +7,7 @@
 #include "core/providers/cuda/cuda_kernel.h"
 #include "contrib_ops/cuda/moe/moe_base.h"
 #include "contrib_ops/cuda/llm/moe_gemm/moe_kernels.h"
+#include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_profiler.h"
 
 namespace onnxruntime {
 namespace contrib {
@@ -40,6 +41,10 @@ class QMoE final : public CudaKernel, public MoEBase {
   IAllocatorUniquePtr<void> packed_fc2_bias_;
   IAllocatorUniquePtr<void> packed_fc3_scales_;
   IAllocatorUniquePtr<void> packed_fc3_bias_;
+
+  mutable onnxruntime::llm::kernels::cutlass_kernels::MoeGemmProfiler mGemmProfiler;
+  mutable onnxruntime::llm::kernels::cutlass_kernels::MoeGemmId mGemmId1;
+  mutable onnxruntime::llm::kernels::cutlass_kernels::MoeGemmId mGemmId2;
 };
 
 }  // namespace cuda

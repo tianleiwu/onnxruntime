@@ -12,6 +12,7 @@
 #include "cutlass/numeric_types.h"
 #include "core/common/safeint.h"
 #include "contrib_ops/cuda/moe/qmoe_kernels.h"
+#include "contrib_ops/cuda/llm/common/env_utils.h"
 
 #include "contrib_ops/cuda/utils/dump_cuda_tensor.h"
 #include "contrib_ops/cpu/utils/debug_macros.h"
@@ -125,6 +126,57 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   constexpr bool min_latency_mode = false;
   bool use_awq = (fc1_zeros != nullptr) || (packed_fc1_bias_ != nullptr);
   onnxruntime::llm::kernels::cutlass_kernels::MOEParallelismConfig parallelism_config{};
+
+  // Use profiler with proper weight type for quantized weights
+  if (onnxruntime::llm::common::getEnvForceDeterministicMOE()) {
+    auto tactics = m_moe_runner->getTactics();
+    if (!tactics.empty()) {
+      m_moe_runner->setTactic(tactics[0], tactics[0]);
+    }
+  } else {
+    mGemmProfiler.setAllocator(this->Info().GetAllocator(OrtMemType::OrtMemTypeDefault));
+    mGemmProfiler.setProfilerParams(static_cast<int>(moe_params.num_experts), static_cast<int>(k_),
+                                    static_cast<int64_t>(moe_params.hidden_size), static_cast<int64_t>(moe_params.inter_size),
+                                    static_cast<int64_t>(block_size_), activation_type_,
+                                    false, false, false, true, parallelism_config, false, sm_);
+
+    onnxruntime::llm::nvinfer::DataType dtype = is_fp16_ ? onnxruntime::llm::nvinfer::DataType::kHALF : onnxruntime::llm::nvinfer::DataType::kBF16;
+    // Weight type: INT4 for 4-bit, INT8 for 8-bit quantization
+    onnxruntime::llm::nvinfer::DataType wtype = (expert_weight_bits_ == 4)
+                                                    ? onnxruntime::llm::nvinfer::DataType::kINT4
+                                                    : onnxruntime::llm::nvinfer::DataType::kINT8;
+
+    using onnxruntime::llm::kernels::cutlass_kernels::MoeGemmId;
+    using onnxruntime::llm::kernels::weight_only::GemmDims;
+
+    // For gated activations (SwiGLU), fc1_out_size is doubled
+    int64_t fc1_out_size = static_cast<int64_t>(moe_params.inter_size);
+    if (is_fused_swiglu) {
+      fc1_out_size = static_cast<int64_t>(moe_params.inter_size) * 2;
+    }
+
+    // GEMM 1: N=fc1_out_size (doubled for gated), K=hidden_size
+    MoeGemmId id1(static_cast<int>(fc1_out_size), static_cast<int>(moe_params.hidden_size), dtype, wtype, MoeGemmId::GemmType::Gemm1);
+    if (mGemmId1 != id1) {
+      mGemmId1 = id1;
+      GemmDims dims(static_cast<int64_t>(moe_params.num_rows), static_cast<int64_t>(moe_params.num_rows),
+                    fc1_out_size, static_cast<int64_t>(moe_params.hidden_size));
+      mGemmProfiler.profileTactics(m_moe_runner.get(), dtype, dims, id1);
+    }
+    auto config1 = mGemmProfiler.getBestConfig(static_cast<int>(moe_params.num_rows), mGemmId1);
+
+    // GEMM 2
+    MoeGemmId id2(static_cast<int>(moe_params.hidden_size), static_cast<int>(moe_params.inter_size), dtype, wtype, MoeGemmId::GemmType::Gemm2);
+    if (mGemmId2 != id2) {
+      mGemmId2 = id2;
+      GemmDims dims(static_cast<int64_t>(moe_params.num_rows), static_cast<int64_t>(moe_params.num_rows),
+                    static_cast<int64_t>(moe_params.hidden_size), static_cast<int64_t>(moe_params.inter_size));
+      mGemmProfiler.profileTactics(m_moe_runner.get(), dtype, dims, id2);
+    }
+    auto config2 = mGemmProfiler.getBestConfig(static_cast<int>(moe_params.num_rows), mGemmId2);
+
+    m_moe_runner->setTactic(config1, config2);
+  }
 
   size_t workspace_size = m_moe_runner->getWorkspaceSize(
       moe_params.num_rows, moe_params.hidden_size, moe_params.inter_size, moe_params.num_experts, k_,

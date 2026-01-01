@@ -597,16 +597,16 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
   ORT_ENFORCE(!(enable_blackwell && enable_hopper), "Blackwell and hopper flags are mutually exclusive");
 
   if (sm >= 100 && sm < 120 && !kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType>()) {
-    ORT_LLM_LOG_TRACE("Blackwell is not supported for this configuration, not selecting any TMA WS implementations");
+    ORT_LLM_LOG_DEBUG("Blackwell is not supported for this configuration, not selecting any TMA WS implementations");
     return {};
   }
   if ((sm == 120 || sm == 121) && !kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>()) {
-    ORT_LLM_LOG_TRACE(
+    ORT_LLM_LOG_DEBUG(
         "Blackwell SM120 is not supported for this configuration, not selecting any TMA WS implementations");
     return {};
   }
   if (enable_hopper && !kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType>()) {
-    ORT_LLM_LOG_TRACE("Hopper is not supported for this configuration, not selecting any TMA WS implementations");
+    ORT_LLM_LOG_DEBUG("Hopper is not supported for this configuration, not selecting any TMA WS implementations");
     return {};
   }
 
@@ -638,7 +638,13 @@ int MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getSM() const {
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsFusedGatedActivation(
     bool is_gated_activation, int gemm_n, int gemm_k) const {
-  constexpr bool ENABLE_FUSED_GATED_ACTIVATION = true;
+  // Fused gated activation (Ampere style) is NOT supported for gated activations (SwiGLU, GeGLU).
+  // The Sm80 kernel dispatches to EpilogueOpDefault which is identity, not a fused gated epilogue.
+  // For gated activations, we need the separate doGatedActivationKernel path:
+  // - GEMM outputs 2N to intermediate buffer
+  // - doGatedActivationKernel reduces 2N -> N
+  // Setting this to false ensures fc1_out_size = 2*inter_size for gated activations.
+  constexpr bool ENABLE_FUSED_GATED_ACTIVATION = false;
   return is_gated_activation && std::is_same_v<T, WeightType> && !std::is_same_v<T, float> && !use_fp8 &&
          (this->getSM() >= 80) && (gemm_k % 64 == 0) && (gemm_n % 64 == 0) && ENABLE_FUSED_GATED_ACTIVATION;
 }
@@ -791,7 +797,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getMaxWorkspaceSize(int num_experts) const {
   if (num_experts != num_experts_) {
-    ORT_LLM_LOG_TRACE(onnxruntime::MakeString("Calling getMaxWorkspaceSize() with a new expert count ", num_experts, " vs ", num_experts_));
+    ORT_LLM_LOG_DEBUG(onnxruntime::MakeString("Calling getMaxWorkspaceSize() with a new expert count ", num_experts, " vs ", num_experts_));
     num_experts_ = num_experts;
     gemm_workspace_size_ = calcMaxWorkspaceSize(num_experts);
   }
@@ -826,7 +832,7 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
       max_size = std::max(max_size, size);                                                                                     \
       has_config = true;                                                                                                       \
     } catch (::onnxruntime::OnnxRuntimeException const& e) {                                                                   \
-      ORT_LLM_LOG_TRACE(onnxruntime::MakeString("Unsupported config skipped when calculating MOE workspace size ", e.what())); \
+      ORT_LLM_LOG_DEBUG(onnxruntime::MakeString("Unsupported config skipped when calculating MOE workspace size ", e.what())); \
     }                                                                                                                          \
   } while (0)
 
@@ -871,6 +877,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemmBiasAct(
       runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
       break;
     case ActivationType::Swiglu:
+      // runGemm<cutlass_extensions::EpilogueOpDefaultSwiglu>(inputs, hopper_inputs);
       runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
       break;
     case ActivationType::Geglu:

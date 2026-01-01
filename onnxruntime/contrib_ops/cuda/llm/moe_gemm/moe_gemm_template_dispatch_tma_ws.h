@@ -268,7 +268,7 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
                                                       size_t* workspace_size) {
   using namespace cute;
 
-  ORT_LLM_LOG_TRACE(onnxruntime::MakeString("At ", __PRETTY_FUNCTION__, "gemm_config=", gemm_config.toString()));
+  ORT_LLM_LOG_DEBUG(onnxruntime::MakeString("At ", __PRETTY_FUNCTION__, "gemm_config=", gemm_config.toString()));
 
 #define SHAPE_CASE(SMVERSION, M, N, K)                                                                                                      \
   case cutlass_extensions::CutlassTileConfigSM##SMVERSION::CtaShape##M##x##N##x##K##B: {                                                    \

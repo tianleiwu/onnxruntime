@@ -124,6 +124,7 @@ option(onnxruntime_DONT_VECTORIZE "Do not vectorize operations in Eigen" OFF)
 option(onnxruntime_USE_FULL_PROTOBUF "Link to libprotobuf instead of libprotobuf-lite when this option is ON" OFF)
 option(onnxruntime_DEBUG_NODE_INPUTS_OUTPUTS "Dump debug information about node inputs and outputs when executing the model." OFF)
 option(onnxruntime_DUMP_TENSOR "Dump tensor inside kernel." OFF)
+option(onnxruntime_LLM_VERBOSE "Enable verbose information in LLM code." OFF)
 cmake_dependent_option(onnxruntime_DEBUG_NODE_INPUTS_OUTPUTS_ENABLE_DUMP_TO_SQLDB "Build dump debug information about node inputs and outputs with support for sql database." OFF "onnxruntime_DEBUG_NODE_INPUTS_OUTPUTS" OFF)
 
 # When loading a delay loaded DLL, Windows searches the main EXE's folder first.
@@ -1786,6 +1787,10 @@ endif()
 
 if (onnxruntime_DUMP_TENSOR)
   add_compile_definitions(DUMP_TENSOR_LEVEL=1)
+endif()
+
+if (onnxruntime_LLM_VERBOSE)
+  add_compile_definitions(ORT_LLM_VERBOSE=1)
 endif()
 
 if (onnxruntime_ENABLE_EXTERNAL_CUSTOM_OP_SCHEMAS)

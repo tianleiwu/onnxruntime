@@ -623,8 +623,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 
  private:
   std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput> setupTmaWarpSpecializedInputs(
-      int64_t num_rows, int64_t expanded_num_rows, ActivationType fc1_activation_type, int64_t hidden_size,
-      int64_t inter_size, int64_t num_experts_per_node, void const* input_activations_void,
+      int64_t num_rows, int64_t expanded_num_rows, ActivationType fc1_activation_type, bool use_fused_gated_activation,
+      int64_t hidden_size, int64_t inter_size, int64_t num_experts_per_node, void const* input_activations_void,
       TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, void* final_output,
       WeightType const* fc1_expert_weights, WeightType const* fc2_expert_weights, QuantParams quant_params,
       ScaleBiasType const* fc1_expert_biases, ScaleBiasType const* fc2_expert_biases, bool min_latency_mode,

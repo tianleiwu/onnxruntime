@@ -7,6 +7,7 @@
 #include "contrib_ops/cuda/moe/moe.h"
 #include "contrib_ops/cuda/moe/qmoe_kernels.h"
 #include "contrib_ops/cuda/llm/moe_gemm/moe_kernels.h"
+#include "contrib_ops/cuda/llm/common/env_utils.h"
 
 using namespace onnxruntime::cuda;
 using namespace ::onnxruntime::common;
@@ -90,6 +91,51 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
   constexpr bool min_latency_mode = false;
   constexpr bool use_awq = false;
   onnxruntime::llm::kernels::cutlass_kernels::MOEParallelismConfig parallelism_config{};
+
+  if (onnxruntime::llm::common::getEnvForceDeterministicMOE()) {
+    auto tactics = moe_runner.getTactics();
+    if (!tactics.empty()) {
+      moe_runner.setTactic(tactics[0], tactics[0]);
+    }
+  } else {
+    mGemmProfiler.setAllocator(this->Info().GetAllocator(OrtMemType::OrtMemTypeDefault));
+    mGemmProfiler.setProfilerParams(static_cast<int>(moe_params.num_experts), static_cast<int>(this->k_),
+                                    static_cast<int64_t>(moe_params.hidden_size), static_cast<int64_t>(moe_params.inter_size),
+                                    static_cast<int64_t>(this->block_size_), kernel_activation_type,
+                                    false, false, false, true, parallelism_config, false, this->sm_);
+
+    onnxruntime::llm::nvinfer::DataType dtype = onnxruntime::llm::nvinfer::DataType::kFLOAT;
+    if constexpr (std::is_same_v<CudaT, half>) {
+      dtype = onnxruntime::llm::nvinfer::DataType::kHALF;
+    } else if constexpr (std::is_same_v<CudaT, __nv_bfloat16>) {
+      dtype = onnxruntime::llm::nvinfer::DataType::kBF16;
+    }
+
+    using onnxruntime::llm::kernels::cutlass_kernels::MoeGemmId;
+    using onnxruntime::llm::kernels::weight_only::GemmDims;
+
+    // GEMM 1
+    MoeGemmId id1(static_cast<int>(moe_params.inter_size), static_cast<int>(moe_params.hidden_size), dtype, MoeGemmId::GemmType::Gemm1);
+    if (mGemmId1 != id1) {
+      mGemmId1 = id1;
+      GemmDims dims(static_cast<int64_t>(moe_params.num_rows), static_cast<int64_t>(moe_params.num_rows),
+                    static_cast<int64_t>(moe_params.inter_size), static_cast<int64_t>(moe_params.hidden_size));
+      mGemmProfiler.profileTactics(&moe_runner, dtype, dims, id1);
+    }
+    auto config1 = mGemmProfiler.getBestConfig(static_cast<int>(moe_params.num_rows), mGemmId1);
+
+    // GEMM 2
+    MoeGemmId id2(static_cast<int>(moe_params.hidden_size), static_cast<int>(moe_params.inter_size), dtype, MoeGemmId::GemmType::Gemm2);
+    if (mGemmId2 != id2) {
+      mGemmId2 = id2;
+      GemmDims dims(static_cast<int64_t>(moe_params.num_rows), static_cast<int64_t>(moe_params.num_rows),
+                    static_cast<int64_t>(moe_params.hidden_size), static_cast<int64_t>(moe_params.inter_size));
+      mGemmProfiler.profileTactics(&moe_runner, dtype, dims, id2);
+    }
+    auto config2 = mGemmProfiler.getBestConfig(static_cast<int>(moe_params.num_rows), mGemmId2);
+
+    moe_runner.setTactic(config1, config2);
+  }
 
   size_t ws_size = moe_runner.getWorkspaceSize(
       static_cast<size_t>(moe_params.num_rows), static_cast<size_t>(moe_params.hidden_size),

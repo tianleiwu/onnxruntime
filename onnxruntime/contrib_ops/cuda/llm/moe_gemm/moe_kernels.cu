@@ -406,7 +406,7 @@ bool fusedBuildExpertMapsSortFirstTokenBlockSize(int const* token_selected_exper
                                                  cudaStream_t stream) {
   int const block_size = num_tokens;
   if (num_tokens > 256) {
-    ORT_LLM_LOG_TRACE(onnxruntime::MakeString("Number of tokens ", num_tokens, " is greater than 256, which is not supported for fused moe prologues"));
+    ORT_LLM_LOG_DEBUG(onnxruntime::MakeString("Number of tokens ", num_tokens, " is greater than 256, which is not supported for fused moe prologues"));
     return false;
   }
 
@@ -452,7 +452,7 @@ bool fusedBuildExpertMapsSortFirstTokenBlockSize(int const* token_selected_exper
       break;
     }
     default: {
-      ORT_LLM_LOG_TRACE(onnxruntime::MakeString("Top-K value ", experts_per_token, " does not have supported fused moe prologues"));
+      ORT_LLM_LOG_DEBUG(onnxruntime::MakeString("Top-K value ", experts_per_token, " does not have supported fused moe prologues"));
       return false;
     }
   }
@@ -479,7 +479,7 @@ bool fusedBuildExpertMapsSortFirstToken(int const* token_selected_experts, int* 
                                  unpermuted_row_to_permuted_row, expert_first_token_offset, num_tokens, num_experts_per_node,
                                  experts_per_token, start_expert, end_expert, stream);
   }
-  ORT_LLM_LOG_TRACE(onnxruntime::MakeString("Experts per node ", num_experts_per_node, " does not have supported fused moe prologues"));
+  ORT_LLM_LOG_DEBUG(onnxruntime::MakeString("Experts per node ", num_experts_per_node, " does not have supported fused moe prologues"));
   return false;
 }
 
@@ -840,17 +840,26 @@ __device__ void computeTmaWarpSpecializedInputStrides(
     TmaWarpSpecializedGroupedGemmInput& layout_info, int gemm_m, int gemm_n, int gemm_k, int64_t out_idx) {
   layout_info.stride_a[out_idx] = cutlass::make_cute_packed_stride(
       TmaWarpSpecializedGroupedGemmInput::StrideA{}, cute::make_shape(gemm_m, gemm_k, 1));
+  int stride_b_n = gemm_n;
+  if (layout_info.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::GATED_ACTIVATION) {
+    stride_b_n *= 2;
+  }
   layout_info.stride_b[out_idx] = cutlass::make_cute_packed_stride(
-      TmaWarpSpecializedGroupedGemmInput::StrideB{}, cute::make_shape(gemm_n, gemm_k, 1));
+      TmaWarpSpecializedGroupedGemmInput::StrideB{}, cute::make_shape(stride_b_n, gemm_k, 1));
   if (layout_info.stride_c) {
     assert(false && "CUTLASS does not support a 1xN bias");
     //        layout_info.stride_c[out_idx] = cute::make_stride(0, cute::Int<1>{}, 0);
     layout_info.stride_c[out_idx] = cutlass::make_cute_packed_stride(
         TmaWarpSpecializedGroupedGemmInput::StrideC{}, cute::make_shape(1, gemm_n, 1));
   }
-  if (layout_info.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE) {
+  if (layout_info.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE ||
+      layout_info.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::GATED_ACTIVATION) {
+    int stride_d_n = gemm_n;
+    if (layout_info.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::GATED_ACTIVATION) {
+      stride_d_n /= 2;
+    }
     layout_info.default_epilogue.stride_d[out_idx] = cutlass::make_cute_packed_stride(
-        TmaWarpSpecializedGroupedGemmInput::DefaultEpilogue::StrideD{}, cute::make_shape(gemm_n, gemm_m, 1));
+        TmaWarpSpecializedGroupedGemmInput::DefaultEpilogue::StrideD{}, cute::make_shape(stride_d_n, gemm_m, 1));
   }
   if (layout_info.int4_groupwise_params.enabled) {
     layout_info.int4_groupwise_params.stride_s_a[out_idx] = cutlass::make_cute_packed_stride(TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::StrideSFA{},
@@ -869,9 +878,14 @@ __device__ void computeTmaWarpSpecializedInputPointers(TmaWarpSpecializedGrouped
   // Each expert's weight matrix is a constant size NxK, get the matrix at index `expert`
   layout_info.ptr_b[out_idx] = safe_inc_ptr(weights, expert * (gemm_n * gemm_k));
 
-  if (layout_info.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE) {
+  if (layout_info.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE ||
+      layout_info.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::GATED_ACTIVATION) {
     // The output prior to this contains N elements per token, with `num_tokens_before_expert` tokens
-    layout_info.default_epilogue.ptr_d[out_idx] = safe_inc_ptr(output, num_tokens_before_expert * gemm_n);
+    int64_t ptr_d_n = gemm_n;
+    if (layout_info.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::GATED_ACTIVATION) {
+      ptr_d_n /= 2;
+    }
+    layout_info.default_epilogue.ptr_d[out_idx] = safe_inc_ptr(output, num_tokens_before_expert * ptr_d_n);
   }
   if (layout_info.int4_groupwise_params.enabled) {
     layout_info.int4_groupwise_params.ptr_s_a[out_idx] = safe_inc_ptr(w4a8_weight_scale, expert * (gemm_n * gemm_k / 128));
@@ -1931,7 +1945,7 @@ size_t CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, E
   std::vector<size_t> sizes(sizes_map.size());
   std::transform(sizes_map.begin(), sizes_map.end(), sizes.begin(), [](auto& v) { return v.second.first; });
   size_t size = onnxruntime::llm::common::calculateTotalWorkspaceSize(sizes.data(), sizes.size());
-  ORT_LLM_LOG_TRACE(onnxruntime::MakeString("Mixture Of Experts Plugin requires workspace of ", size / 1024.f / 1024.f, " MiB"));
+  ORT_LLM_LOG_DEBUG(onnxruntime::MakeString("Mixture Of Experts Plugin requires workspace of ", size / 1024.f / 1024.f, " MiB"));
   return size;
 }
 
@@ -2159,7 +2173,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
   bool const is_gated_activation = isGatedActivation(fc1_activation_type);
   bool const use_ampere_activation_fusion = gemm_runner.isFusedGatedActivation(config, is_gated_activation, inter_size, hidden_size);
   size_t const fc1_out_size = ((!use_ampere_activation_fusion) && is_gated_activation) ? inter_size * 2 : inter_size;
+
+#if ORT_LLM_VERBOSE
   printf("DEBUG HOST (v5): gemm1 use_ampere_activation_fusion=%d, is_gated_activation=%d\n", use_ampere_activation_fusion, is_gated_activation);
+#endif
 
   int64_t const* total_tokens_including_expert = expert_first_token_offset + 1;
 
@@ -2663,6 +2680,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
   ORT_ENFORCE(gemm1_config_, "MOE GEMM1 Config is not set");
   ORT_ENFORCE(gemm2_config_, "MOE GEMM2 Config is not set");
 
+  bool is_gated_activation = isGatedActivation(fc1_activation_type);
+  bool const use_ampere_activation_fusion = moe_gemm_runner_.isFusedGatedActivation(*gemm1_config_, is_gated_activation, inter_size, hidden_size);
+
   ORT_ENFORCE(!use_lora || !act_fp4, "MOE does not support LoRA with FP4 model");
 
   if (int_scales_required) {
@@ -2726,7 +2746,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     sync_check_cuda_error(stream);
 
     auto [gemm1_tma_ws_input, gemm2_tma_ws_input] = setupTmaWarpSpecializedInputs(num_rows, expanded_num_rows,
-                                                                                  fc1_activation_type, hidden_size, inter_size, num_experts_per_node, input_activations_void, input_sf,
+                                                                                  fc1_activation_type, use_ampere_activation_fusion, hidden_size, inter_size, num_experts_per_node, input_activations_void, input_sf,
                                                                                   final_output, fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases,
                                                                                   min_latency_mode, min_latency_params, use_lora, start_expert, parallelism_config, stream);
 
@@ -2761,7 +2781,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     }
 
     if (!fused_prologue_result) {
-      ORT_LLM_LOG_TRACE("Falling back to unfused prologue");
+      ORT_LLM_LOG_DEBUG("Falling back to unfused prologue");
       threeStepBuildExpertMapsSortFirstToken(token_selected_experts, permuted_token_selected_experts_,
                                              permuted_row_to_unpermuted_row_, unpermuted_row_to_permuted_row, expert_first_token_offset_,
                                              blocked_expert_counts_, blocked_expert_counts_cumsum_, blocked_row_to_unpermuted_row_, num_rows,
@@ -2797,7 +2817,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     sync_check_cuda_error(stream);
 
     auto [gemm1_tma_ws_input, gemm2_tma_ws_input] = setupTmaWarpSpecializedInputs(num_rows, expanded_num_rows,
-                                                                                  fc1_activation_type, hidden_size, inter_size, num_experts_per_node, input_activations_void, input_sf,
+                                                                                  fc1_activation_type, use_ampere_activation_fusion, hidden_size, inter_size, num_experts_per_node, input_activations_void, input_sf,
                                                                                   final_output, fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases,
                                                                                   min_latency_mode, min_latency_params, use_lora, start_expert, parallelism_config, stream);
 
@@ -2968,8 +2988,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType,
 template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType, class Enable>
 std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
 CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>::setupTmaWarpSpecializedInputs(
-    int64_t num_rows, int64_t expanded_num_rows, ActivationType fc1_activation_type, int64_t hidden_size,
-    int64_t inter_size, int64_t num_experts_per_node, void const* input_activations_void,
+    int64_t num_rows, int64_t expanded_num_rows, ActivationType fc1_activation_type, bool use_fused_gated_activation,
+    int64_t hidden_size, int64_t inter_size, int64_t num_experts_per_node, void const* input_activations_void,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, void* final_output,
     WeightType const* fc1_expert_weights, WeightType const* fc2_expert_weights, QuantParams quant_params,
     ScaleBiasType const* fc1_expert_biases, ScaleBiasType const* fc2_expert_biases, bool min_latency_mode,
@@ -2996,7 +3016,9 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>:
   if (min_latency_mode) {
     auto gemm1_input = input_activations_void;
 
-    gemm1_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
+    gemm1_tma_ws_input.fusion = (is_gated_activation && use_fused_gated_activation)
+                                    ? TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::GATED_ACTIVATION
+                                    : TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
     gemm2_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
 
     ORT_ENFORCE(gemm1_input != gemm1_output, "Input and output buffers are overlapping");
@@ -3010,7 +3032,9 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>:
   } else {
     auto gemm1_input = use_prequant_scale_kernel ? smoothed_act_ : permuted_data_;
 
-    gemm1_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
+    gemm1_tma_ws_input.fusion = (is_gated_activation && use_fused_gated_activation)
+                                    ? TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::GATED_ACTIVATION
+                                    : TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
     gemm2_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
 
     bool apply_bias = parallelism_config.tp_rank == 0;
@@ -3445,7 +3469,7 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
   if ((mWType == nvinfer::DataType::kINT8 || mWType == nvinfer::DataType::kINT4) && mGroupSize < 0) {
     ORT_ENFORCE(quant_1 && quant_2);
     mQuantParams = QuantParams::Int(quant_1, quant_2);
-  } else if (mWType == nvinfer::DataType::kINT4) {
+  } else if (mWType == nvinfer::DataType::kINT4 || mWType == nvinfer::DataType::kINT8) {
     ORT_ENFORCE(quant_1 && quant_2);
     if (mDType == nvinfer::DataType::kFP8) {
       ORT_ENFORCE(w4a8_alpha);
@@ -3582,7 +3606,7 @@ size_t GemmProfilerBackend::getWorkspaceSize(int maxM) {
   std::vector<size_t> sizes(sizes_map.size());
   std::transform(sizes_map.begin(), sizes_map.end(), sizes.begin(), [](auto& v) { return v.second.first; });
   size_t size = calculateTotalWorkspaceSize(sizes.data(), sizes.size());
-  ORT_LLM_LOG_TRACE(onnxruntime::MakeString("MOE profiler workspace size: ", size));
+  ORT_LLM_LOG_DEBUG(onnxruntime::MakeString("MOE profiler workspace size: ", size));
   return size;
 }
 

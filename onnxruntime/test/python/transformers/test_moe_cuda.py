@@ -977,7 +977,8 @@ class SparseMoeBlockORTHelper(nn.Module):
         from onnxruntime import InferenceSession, SessionOptions
 
         sess_options = SessionOptions()
-        sess_options.log_severity_level = 2
+        sess_options.log_severity_level = 0
+        sess_options.log_verbosity_level = 0
 
         try:
             ort_session = InferenceSession(moe_onnx_graph, sess_options, providers=ort_provider)
