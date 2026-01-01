@@ -428,7 +428,14 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
       use_deepseek_fp8_block_scale,
       min_latency_mode,
       min_latency_params,
-      {activation_alpha_, activation_beta_, swiglu_fusion_, swiglu_limit_},
+      [&]() {
+        onnxruntime::llm::kernels::cutlass_kernels::ActivationParams params(activation_type_);
+        params.alpha = activation_alpha_;
+        params.beta = activation_beta_;
+        params.swiglu_fusion = swiglu_fusion_;
+        params.limit = swiglu_limit_;
+        return params;
+      }(),
       stream);
 
   return Status::OK();

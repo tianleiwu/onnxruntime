@@ -877,11 +877,18 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemmBiasAct(
       runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
       break;
     case ActivationType::Swiglu:
-      // runGemm<cutlass_extensions::EpilogueOpDefaultSwiglu>(inputs, hopper_inputs);
-      runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
+      // Match TRT-LLM: use SiLu epilogue for fused path
+      runGemm<cutlass_extensions::EpilogueOpDefaultSilu>(inputs, hopper_inputs);
       break;
     case ActivationType::Geglu:
       runGemm<cutlass_extensions::EpilogueOpDefaultFtGelu>(inputs, hopper_inputs);
+      break;
+    case ActivationType::SwigluBias:
+      // SwigluBias uses SiLu with per-expert alpha/beta/limit
+      runGemm<cutlass_extensions::EpilogueOpDefaultSilu>(inputs, hopper_inputs);
+      break;
+    case ActivationType::Relu2:
+      runGemm<cutlass_extensions::EpilogueOpDefaultReLU>(inputs, hopper_inputs);
       break;
     case ActivationType::InvalidType:
       ORT_THROW("Activation type for fpA_intB must be valid.");
