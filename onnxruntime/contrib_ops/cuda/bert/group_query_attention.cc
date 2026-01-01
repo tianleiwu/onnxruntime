@@ -432,7 +432,7 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
 
   if (use_flash_attention) {
     // --- FLASH ATTENTION PATH ---
-
+#if USE_FLASH_ATTENTION
     data.query = reinterpret_cast<const CudaT*>(query->Data<T>());
     data.key = key == nullptr ? nullptr : reinterpret_cast<const CudaT*>(key->Data<T>());
     data.value = value == nullptr ? nullptr : reinterpret_cast<const CudaT*>(value->Data<T>());
@@ -495,7 +495,7 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
     } else {
       data.unpacked_qkv_buffer = nullptr;
     }
-
+#endif
   } else {
     // --- FALLBACK PATH ---
 

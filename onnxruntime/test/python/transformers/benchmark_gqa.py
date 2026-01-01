@@ -51,7 +51,7 @@ def plot_prompt_performance(
     test_quantization: bool = False,
     dtype: str = "float16",
 ):
-    import triton  # noqa: PLC0415
+    import triton
 
     algos = get_plot_algos(sm, local_window_size, test_quantization)
     configs = [
@@ -139,7 +139,7 @@ def plot_token_performance(
     test_quantization: bool = False,
     dtype: str = "float16",
 ):
-    import triton  # noqa: PLC0415
+    import triton
 
     algos = get_plot_algos(sm, local_window_size, test_quantization)
     configs = [
