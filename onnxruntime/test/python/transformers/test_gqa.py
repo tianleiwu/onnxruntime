@@ -1022,6 +1022,7 @@ def parity_check_gqa_past(
         cache_seqlens_expanded <= arange, arange < cache_seqlens_expanded + config.q_sequence_length
     )
     k_cache_ref[update_mask] = rearrange(k_ro, "b s ... -> (b s) ...").to(k_cache_ref.dtype)
+
     v_cache_ref[update_mask] = rearrange(new_v, "b s ... -> (b s) ...").to(v_cache_ref.dtype)
     key_padding_mask = arange < cache_seqlens_expanded + config.q_sequence_length
 
@@ -1222,18 +1223,15 @@ def has_cuda_provider():
     return "CUDAExecutionProvider" in get_available_providers()
 
 
+def has_cuda_device(min_capability: int = 80):
+    if not has_cuda_provider() or not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor >= min_capability
+
+
 def has_flash_attention():
-    if not has_cuda_provider() or not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 8
-
-
-def has_memory_efficient():
-    if not has_cuda_provider() or not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 5
+    return has_cuda_device(80)
 
 
 @unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
@@ -1306,7 +1304,7 @@ class TestFlashGQABF16(unittest.TestCase):
         )
 
 
-@unittest.skipIf(not has_memory_efficient(), "Memory Efficient Attention is not available, skipping tests.")
+@unittest.skipIf(not has_cuda_device(53), "Memory Efficient Attention is not available, skipping tests.")
 class TestMemoryEfficientGQA(unittest.TestCase):
     @parameterized.expand(gqa_cuda_prompt_test_cases(allow_head_sink=False))
     def test_gqa_prompt_memory_efficient(self, name, config):
@@ -1331,6 +1329,23 @@ class TestMemoryEfficientGQA(unittest.TestCase):
             device="cuda",
             torch_type=torch.float16,
             ort_type=TensorProto.FLOAT16,
+            causal=True,
+            rtol=5e-3,
+            atol=2e-2,
+        )
+
+
+@unittest.skipIf(not has_cuda_device(80), "BF16 requires Ampere or higher GPU, skipping tests.")
+class TestBF16MemoryEfficientGQA(unittest.TestCase):
+    @parameterized.expand(gqa_cuda_past_test_cases(allow_head_sink=False))
+    def test_gqa_past_memory_efficient_bf16(self, name, config):
+        os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "1"
+        parity_check_gqa_past(
+            config=config,
+            ep="CUDAExecutionProvider",
+            device="cuda",
+            torch_type=torch.bfloat16,
+            ort_type=TensorProto.BFLOAT16,
             causal=True,
             rtol=5e-3,
             atol=2e-2,
