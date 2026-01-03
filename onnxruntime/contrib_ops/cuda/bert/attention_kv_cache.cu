@@ -398,7 +398,167 @@ template Status LaunchAddBiasTransAppendKvToPresent(cudaStream_t stream,
 
 // Kernel to append new and past kv in either BSNH or BNSH format
 // Adapted from ConcatTensorToTensor kernel in attention_kv_cache.cu file
-template <typename T>
+// Dispatcher for RoPE application based on VectorT and ElementT
+template <typename VectorT, typename ElementT>
+struct RotaryDispatcher {
+  __device__ static void apply(VectorT& /*val*/, const VectorT* /*cos_cache*/, const VectorT* /*sin_cache*/, const int /*rotary_dim*/, const int /*h_idx*/, const int /*pos_id*/, const bool /*interleaved*/, const VectorT* /*new_kv_base*/, const int /*in_offset*/) {
+    // Default implementation: skip
+  }
+};
+
+template <>
+struct RotaryDispatcher<float2, float> {
+  __device__ static void apply(float2& val, const float2* cos_cache, const float2* sin_cache, const int rotary_dim, const int h_idx, const int pos_id, const bool interleaved, const float2* new_kv_base, const int in_offset) {
+    if (2 * h_idx >= rotary_dim) return;
+
+    const float* cos_ptr = reinterpret_cast<const float*>(cos_cache);
+    const float* sin_ptr = reinterpret_cast<const float*>(sin_cache);
+    const float* kv_ptr = reinterpret_cast<const float*>(new_kv_base);
+    int scalar_in_offset = in_offset * 2;
+    int scalar_h = h_idx * 2;
+    int half_rot = rotary_dim / 2;
+
+    float c, s;
+    float x = val.x;
+    float y = val.y;
+
+    if (interleaved) {
+      int cs_idx = pos_id * half_rot + h_idx;
+      c = cos_ptr[cs_idx];
+      s = sin_ptr[cs_idx];
+      val.x = x * c - y * s;
+      val.y = x * s + y * c;
+    } else {
+      if (scalar_h < half_rot) {
+        int cs_idx = pos_id * half_rot + scalar_h;
+        c = cos_ptr[cs_idx];
+        s = sin_ptr[cs_idx];
+        float pair_x = kv_ptr[scalar_in_offset + scalar_h + half_rot];
+        val.x = x * c - pair_x * s;
+      } else {
+        int cs_idx = pos_id * half_rot + (scalar_h - half_rot);
+        c = cos_ptr[cs_idx];
+        s = sin_ptr[cs_idx];
+        float pair_x = kv_ptr[scalar_in_offset + scalar_h - half_rot];
+        val.x = x * c + pair_x * s;
+      }
+
+      int scalar_hy = scalar_h + 1;
+      if (scalar_hy < half_rot) {
+        int cs_idx = pos_id * half_rot + scalar_hy;
+        c = cos_ptr[cs_idx];
+        s = sin_ptr[cs_idx];
+        float pair_y = kv_ptr[scalar_in_offset + scalar_hy + half_rot];
+        val.y = y * c - pair_y * s;
+      } else {
+        int cs_idx = pos_id * half_rot + (scalar_hy - half_rot);
+        c = cos_ptr[cs_idx];
+        s = sin_ptr[cs_idx];
+        float pair_y = kv_ptr[scalar_in_offset + scalar_hy - half_rot];
+        val.y = y * c + pair_y * s;
+      }
+    }
+  }
+};
+
+template <>
+struct RotaryDispatcher<float4, float> {
+  __device__ static void apply(float4& val, const float4* cos_cache, const float4* sin_cache, const int rotary_dim, const int h_idx, const int pos_id, const bool interleaved, const float4* new_kv_base, const int in_offset) {
+    float2 p1 = make_float2(val.x, val.y);
+    float2 p2 = make_float2(val.z, val.w);
+    const float2* c = reinterpret_cast<const float2*>(cos_cache);
+    const float2* s = reinterpret_cast<const float2*>(sin_cache);
+    const float2* b = reinterpret_cast<const float2*>(new_kv_base);
+    RotaryDispatcher<float2, float>::apply(p1, c, s, rotary_dim, h_idx * 2, pos_id, interleaved, b, in_offset * 2);
+    RotaryDispatcher<float2, float>::apply(p2, c, s, rotary_dim, h_idx * 2 + 1, pos_id, interleaved, b, in_offset * 2);
+    val.x = p1.x;
+    val.y = p1.y;
+    val.z = p2.x;
+    val.w = p2.y;
+  }
+};
+
+template <>
+struct RotaryDispatcher<float2, half> {
+  __device__ static void apply(float2& val, const float2* cos_cache, const float2* sin_cache, const int rotary_dim, const int h_idx, const int pos_id, const bool interleaved, const float2* new_kv_base, const int in_offset) {
+    if (2 * h_idx * 2 >= rotary_dim) return;
+    half2* v_ptr = reinterpret_cast<half2*>(&val);
+    half2 v0 = v_ptr[0];
+    half2 v1 = v_ptr[1];
+    const half2* cos_ptr = reinterpret_cast<const half2*>(cos_cache);
+    const half2* sin_ptr = reinterpret_cast<const half2*>(sin_cache);
+    int half_rot = rotary_dim / 2;
+
+    if (interleaved) {
+      int f0 = 2 * h_idx;
+      int cs0 = pos_id * half_rot + f0;
+      half2 c_pair = cos_ptr[cs0 / 2];
+      half2 s_pair = sin_ptr[cs0 / 2];
+
+      half c0 = c_pair.x;
+      half s0 = s_pair.x;
+      float c0f = __half2float(c0);
+      float s0f = __half2float(s0);
+      float e0f = __half2float(v0.x);
+      float e1f = __half2float(v0.y);
+      v0.x = __float2half(e0f * c0f - e1f * s0f);
+      v0.y = __float2half(e0f * s0f + e1f * c0f);
+
+      half c1 = c_pair.y;
+      half s1 = s_pair.y;
+      float c1f = __half2float(c1);
+      float s1f = __half2float(s1);
+      float e2f = __half2float(v1.x);
+      float e3f = __half2float(v1.y);
+      v1.x = __float2half(e2f * c1f - e3f * s1f);
+      v1.y = __float2half(e2f * s1f + e3f * c1f);
+    }
+    v_ptr[0] = v0;
+    v_ptr[1] = v1;
+  }
+};
+
+template <>
+struct RotaryDispatcher<float2, BFloat16> {
+  __device__ static void apply(float2& val, const float2* cos_cache, const float2* sin_cache, const int rotary_dim, const int h_idx, const int pos_id, const bool interleaved, const float2* new_kv_base, const int in_offset) {
+    if (2 * h_idx * 2 >= rotary_dim) return;
+    using namespace onnxruntime::cuda;
+    __nv_bfloat162* v_ptr = reinterpret_cast<__nv_bfloat162*>(&val);
+    __nv_bfloat162 v0 = v_ptr[0];
+    __nv_bfloat162 v1 = v_ptr[1];
+    const __nv_bfloat162* cos_ptr = reinterpret_cast<const __nv_bfloat162*>(cos_cache);
+    const __nv_bfloat162* sin_ptr = reinterpret_cast<const __nv_bfloat162*>(sin_cache);
+    int half_rot = rotary_dim / 2;
+
+    if (interleaved) {
+      int f0 = 2 * h_idx;
+      int cs0 = pos_id * half_rot + f0;
+      __nv_bfloat162 c_pair = cos_ptr[cs0 / 2];
+      __nv_bfloat162 s_pair = sin_ptr[cs0 / 2];
+      __nv_bfloat16 c0 = c_pair.x;
+      __nv_bfloat16 s0 = s_pair.x;
+      float c0f = __bfloat162float(c0);
+      float s0f = __bfloat162float(s0);
+      float e0f = __bfloat162float(v0.x);
+      float e1f = __bfloat162float(v0.y);
+      v0.x = __float2bfloat16(e0f * c0f - e1f * s0f);
+      v0.y = __float2bfloat16(e0f * s0f + e1f * c0f);
+
+      __nv_bfloat16 c1 = c_pair.y;
+      __nv_bfloat16 s1 = s_pair.y;
+      float c1f = __bfloat162float(c1);
+      float s1f = __bfloat162float(s1);
+      float e2f = __bfloat162float(v1.x);
+      float e3f = __bfloat162float(v1.y);
+      v1.x = __float2bfloat16(e2f * c1f - e3f * s1f);
+      v1.y = __float2bfloat16(e2f * s1f + e3f * c1f);
+    }
+    v_ptr[0] = v0;
+    v_ptr[1] = v1;
+  }
+};
+
+template <typename T, typename ElementT>
 __global__ void ConcatNewToPastKV(const int new_seqlen,
                                   const int past_buffer_seqlen,
                                   const T* past_kv,
@@ -407,7 +567,12 @@ __global__ void ConcatNewToPastKV(const int new_seqlen,
                                   const int* seqlens_k,
                                   const bool past_only,
                                   // const int* seqlens_q,
-                                  const bool is_bsnh) {  // refers to past; otherwise bnsh
+                                  const bool is_bsnh,
+                                  const T* cos_cache,
+                                  const T* sin_cache,
+                                  const int rotary_dim,
+                                  const int64_t* position_ids,
+                                  const bool interleaved) {  // refers to past; otherwise bnsh
   const int h = threadIdx.x;
   const int n = threadIdx.y;
   const int s = blockIdx.x;
@@ -440,12 +605,31 @@ __global__ void ConcatNewToPastKV(const int new_seqlen,
     const int new_row_stride = num_heads * H;
     const int new_head_stride = H;
     const int in_offset = b * new_batch_stride + (s - past_seqlen) * new_row_stride + n * new_head_stride + h;
-    present_kv[out_offset] = new_kv[in_offset];
+
+    // Apply Rotation if needed
+    T val = new_kv[in_offset];
+    if (cos_cache != nullptr && rotary_dim > 0) {
+      int pos_id = 0;
+      if (position_ids) {
+        int new_s_idx = s - past_seqlen;
+        if (new_s_idx >= 0 && new_s_idx < new_seqlen) {
+          pos_id = static_cast<int>(position_ids[b * new_seqlen + new_s_idx]);
+        } else {
+          pos_id = s;
+        }
+      } else {
+        pos_id = s;
+      }
+
+      RotaryDispatcher<T, ElementT>::apply(val, cos_cache, sin_cache, rotary_dim, h, pos_id, interleaved, new_kv, in_offset - h);
+    }
+
+    present_kv[out_offset] = val;
   }
 }
 
 // Use when (H*)*num_heads > 1024
-template <typename T>
+template <typename T, typename ElementT>
 __global__ void ConcatNewToPastKVLarge(const int new_seqlen,
                                        const int past_buffer_seqlen,
                                        const int H,
@@ -455,7 +639,12 @@ __global__ void ConcatNewToPastKVLarge(const int new_seqlen,
                                        T* present_kv,
                                        const int* seqlens_k,
                                        const bool past_only,
-                                       const bool is_bsnh) {
+                                       const bool is_bsnh,
+                                       const T* cos_cache,
+                                       const T* sin_cache,
+                                       const int rotary_dim,
+                                       const int64_t* position_ids,
+                                       const bool interleaved) {
   int i = threadIdx.x + (blockDim.x * blockIdx.x);
   if (i < H * num_heads) {
     const int h = i % H;
@@ -486,7 +675,24 @@ __global__ void ConcatNewToPastKVLarge(const int new_seqlen,
       const int new_row_stride = num_heads * H;
       const int new_head_stride = H;
       const int in_offset = b * new_batch_stride + (s - past_seqlen) * new_row_stride + n * new_head_stride + h;
-      present_kv[out_offset] = new_kv[in_offset];
+
+      T val = new_kv[in_offset];
+      if (cos_cache != nullptr && rotary_dim > 0) {
+        // Same logic
+        int pos_id = s;
+        int new_s_idx = s - past_seqlen;
+        if (position_ids && new_s_idx >= 0 && new_s_idx < new_seqlen) {
+          pos_id = static_cast<int>(position_ids[b * new_seqlen + new_s_idx]);
+        }
+
+        RotaryDispatcher<T, ElementT>::apply(val, cos_cache, sin_cache, rotary_dim, h, pos_id, interleaved, new_kv, in_offset - h);
+        // Add barrier to prevent race condition if new_kv and present_kv alias (in-place).
+        // Thread i needs to read neighbor x[i+offset] from Global Memory before Thread j writes to x[i+offset].
+        // RotaryDispatcher reads from Global Memory.
+        // We must ensure all reads are done before any writes in the block.
+        __syncthreads();
+      }
+      present_kv[out_offset] = val;
     }
   }
 }
@@ -509,51 +715,73 @@ Status LaunchConcatNewToPastKV(const int batch_size,
                                T* present_value,
                                cudaStream_t stream,
                                const int max_threads_per_block,
-                               const bool past_only) {
-  const int H = head_size / 4;  // divide by 4 so kernel can operate on 4 float16 elements at a time.
+                               const bool past_only,
+                               const T* cos_cache,
+                               const T* sin_cache,
+                               const int rotary_dim,
+                               const int64_t* position_ids,
+                               const bool interleaved) {
+  // We use float2 vectorization (8 bytes).
+  // num_elements_per_thread = 8 / sizeof(T).
+  // H = head_size / num_elements_per_thread.
+  int num_elements_per_thread = 8 / sizeof(T);
+  if (num_elements_per_thread == 0) num_elements_per_thread = 1;  // safety
+  const int H = head_size / num_elements_per_thread;
   if (H * kv_num_heads <= max_threads_per_block) {
     const dim3 grid(present_sequence_length, batch_size, 1);
     const dim3 block(H, kv_num_heads, 1);
-    ConcatNewToPastKV<float2><<<grid, block, 0, stream>>>(kv_sequence_length,
-                                                          past_sequence_length,
-                                                          reinterpret_cast<const float2*>(past_key),
-                                                          reinterpret_cast<const float2*>(new_key),
-                                                          reinterpret_cast<float2*>(present_key),
-                                                          seqlens_k,
-                                                          past_only,
-                                                          is_bsnh);
-    ConcatNewToPastKV<float2><<<grid, block, 0, stream>>>(kv_sequence_length,
-                                                          past_sequence_length,
-                                                          reinterpret_cast<const float2*>(past_value),
-                                                          reinterpret_cast<const float2*>(new_value),
-                                                          reinterpret_cast<float2*>(present_value),
-                                                          seqlens_k,
-                                                          past_only,
-                                                          is_bsnh);
+
+    // Apply RoPE ONLY to KEYS, not values
+    ConcatNewToPastKV<float2, T><<<grid, block, 0, stream>>>(kv_sequence_length,
+                                                             past_sequence_length,
+                                                             reinterpret_cast<const float2*>(past_key),
+                                                             reinterpret_cast<const float2*>(new_key),
+                                                             reinterpret_cast<float2*>(present_key),
+                                                             seqlens_k,
+                                                             past_only,
+                                                             is_bsnh,
+                                                             reinterpret_cast<const float2*>(cos_cache),
+                                                             reinterpret_cast<const float2*>(sin_cache),
+                                                             rotary_dim, position_ids, interleaved);
+
+    ConcatNewToPastKV<float2, T><<<grid, block, 0, stream>>>(kv_sequence_length,
+                                                             past_sequence_length,
+                                                             reinterpret_cast<const float2*>(past_value),
+                                                             reinterpret_cast<const float2*>(new_value),
+                                                             reinterpret_cast<float2*>(present_value),
+                                                             seqlens_k,
+                                                             past_only,
+                                                             is_bsnh,
+                                                             nullptr, nullptr, 0, nullptr, false);  // No RoPE for Values
   } else {
     int steps = (H * kv_num_heads + 255) / 256;
     const dim3 grid(steps, present_sequence_length, batch_size);
     const dim3 block(256, 1, 1);
-    ConcatNewToPastKVLarge<float2><<<grid, block, 0, stream>>>(kv_sequence_length,
-                                                               past_sequence_length,
-                                                               H,
-                                                               kv_num_heads,
-                                                               reinterpret_cast<const float2*>(past_key),
-                                                               reinterpret_cast<const float2*>(new_key),
-                                                               reinterpret_cast<float2*>(present_key),
-                                                               seqlens_k,
-                                                               past_only,
-                                                               is_bsnh);
-    ConcatNewToPastKVLarge<float2><<<grid, block, 0, stream>>>(kv_sequence_length,
-                                                               past_sequence_length,
-                                                               H,
-                                                               kv_num_heads,
-                                                               reinterpret_cast<const float2*>(past_value),
-                                                               reinterpret_cast<const float2*>(new_value),
-                                                               reinterpret_cast<float2*>(present_value),
-                                                               seqlens_k,
-                                                               past_only,
-                                                               is_bsnh);
+    ConcatNewToPastKVLarge<float2, T><<<grid, block, 0, stream>>>(kv_sequence_length,
+                                                                  past_sequence_length,
+                                                                  H,
+                                                                  kv_num_heads,
+                                                                  reinterpret_cast<const float2*>(past_key),
+                                                                  reinterpret_cast<const float2*>(new_key),
+                                                                  reinterpret_cast<float2*>(present_key),
+                                                                  seqlens_k,
+                                                                  past_only,
+                                                                  is_bsnh,
+                                                                  reinterpret_cast<const float2*>(cos_cache),
+                                                                  reinterpret_cast<const float2*>(sin_cache),
+                                                                  rotary_dim, position_ids, interleaved);
+
+    ConcatNewToPastKVLarge<float2, T><<<grid, block, 0, stream>>>(kv_sequence_length,
+                                                                  past_sequence_length,
+                                                                  H,
+                                                                  kv_num_heads,
+                                                                  reinterpret_cast<const float2*>(past_value),
+                                                                  reinterpret_cast<const float2*>(new_value),
+                                                                  reinterpret_cast<float2*>(present_value),
+                                                                  seqlens_k,
+                                                                  past_only,
+                                                                  is_bsnh,
+                                                                  nullptr, nullptr, 0, nullptr, false);
   }
   return CUDA_CALL(cudaGetLastError());
 }
@@ -574,7 +802,12 @@ template Status LaunchConcatNewToPastKV<half>(const int batch_size,
                                               half* present_value,
                                               cudaStream_t stream,
                                               const int max_threads_per_block,
-                                              const bool past_only);
+                                              const bool past_only,
+                                              const half* cos_cache,
+                                              const half* sin_cache,
+                                              const int rotary_dim,
+                                              const int64_t* position_ids,
+                                              const bool interleaved);
 
 template Status LaunchConcatNewToPastKV<BFloat16>(const int batch_size,
                                                   const int kv_num_heads,
@@ -592,7 +825,35 @@ template Status LaunchConcatNewToPastKV<BFloat16>(const int batch_size,
                                                   BFloat16* present_value,
                                                   cudaStream_t stream,
                                                   const int max_threads_per_block,
-                                                  const bool past_only);
+                                                  const bool past_only,
+                                                  const BFloat16* cos_cache,
+                                                  const BFloat16* sin_cache,
+                                                  const int rotary_dim,
+                                                  const int64_t* position_ids,
+                                                  const bool interleaved);
+
+template Status LaunchConcatNewToPastKV<float>(const int batch_size,
+                                               const int kv_num_heads,
+                                               const int head_size,
+                                               const int kv_sequence_length,
+                                               const int past_sequence_length,
+                                               const int present_sequence_length,
+                                               const bool is_bsnh,
+                                               const int* seqlens_k,
+                                               const float* past_key,
+                                               const float* past_value,
+                                               const float* new_key,
+                                               const float* new_value,
+                                               float* present_key,
+                                               float* present_value,
+                                               cudaStream_t stream,
+                                               const int max_threads_per_block,
+                                               const bool past_only,
+                                               const float* cos_cache,
+                                               const float* sin_cache,
+                                               const int rotary_dim,
+                                               const int64_t* position_ids,
+                                               const bool interleaved);
 
 // Kernel to append new kv to kv buffer in place
 template <typename T>

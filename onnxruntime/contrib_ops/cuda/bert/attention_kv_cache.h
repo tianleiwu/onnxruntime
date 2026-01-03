@@ -81,7 +81,12 @@ Status LaunchConcatNewToPastKV(const int batch_size,
                                T* present_value,
                                cudaStream_t stream,
                                const int max_threads_per_block,
-                               const bool past_only);
+                               const bool past_only,
+                               const T* cos_cache = nullptr,
+                               const T* sin_cache = nullptr,
+                               const int rotary_dim = 0,
+                               const int64_t* position_ids = nullptr,
+                               const bool interleaved = false);
 
 template <typename T>
 Status LaunchConcatKVInPlace(int batch_size,

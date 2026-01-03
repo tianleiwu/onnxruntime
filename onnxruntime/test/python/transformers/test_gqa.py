@@ -444,8 +444,9 @@ def gqa_prompt_func(
     bind_tensor(io_binding, "seqlens_k", seqlens_k.to(torch.int32), device, TensorProto.INT32)
 
     # total_sequence_length is INT32 [1]
-    tsl = torch.tensor([config.q_sequence_length], dtype=torch.int32, device=device)
-    bind_tensor(io_binding, "total_sequence_length", tsl, device, TensorProto.INT32)
+    # Schema requires this to be on CPU (OrtMemTypeCPUInput)
+    tsl = torch.tensor([config.q_sequence_length], dtype=torch.int32, device="cpu")
+    bind_tensor(io_binding, "total_sequence_length", tsl, "cpu", TensorProto.INT32)
 
     # 5. Optional inputs
     if cos is not None:

@@ -31,18 +31,18 @@ limitations under the License.
 #include <cassert>
 #include <cub/cub.cuh>
 
-// #include "contrib_ops/cpu/bert/attention_base.h"
 #include "contrib_ops/cpu/utils/debug_macros.h"
 #include "contrib_ops/cuda/bert/add_bias_transpose.h"
 #include "contrib_ops/cuda/bert/attention_impl.h"
 #include "contrib_ops/cuda/bert/attention_softmax.h"
 #include "contrib_ops/cuda/bert/bert_padding.h"
 #include "contrib_ops/cuda/bert/flash_attention/flash_api.h"
+#include "contrib_ops/cuda/bert/rotary_embedding_impl.h"
 #include "contrib_ops/cuda/bert/group_query_attention_impl.h"
 
 #include "contrib_ops/cuda/bert/rotary_embedding_impl.h"
 #include "contrib_ops/cuda/bert/transformer_common.h"
-#include "contrib_ops/cuda/utils/dump_cuda_tensor.h"
+
 #include "core/providers/cuda/cu_inc/common.cuh"
 #include "core/providers/cuda/cuda_common.h"
 #include "contrib_ops/cuda/bert/cutlass_fmha/memory_efficient_attention.h"
@@ -90,13 +90,18 @@ Status LaunchGetPastSeqLens(const int32_t* total_seqlens, int32_t* past_seqlens,
 
 // Concat new to past in present. Supports past BSNH or past BNSH
 template <typename T>
-Status LaunchConcatNewToPastKV(GroupQueryAttentionParameters& parameters,
-                               GroupQueryAttentionData<T>& data,
-                               const void* new_key,
-                               const void* new_value,
-                               cudaStream_t stream,
-                               const int max_threads_per_block,
-                               const bool past_only = false) {
+Status LaunchConcatNewToPastKVHelper(GroupQueryAttentionParameters& parameters,
+                                     GroupQueryAttentionData<T>& data,
+                                     const void* new_key,
+                                     const void* new_value,
+                                     cudaStream_t stream,
+                                     const int max_threads_per_block,
+                                     const bool past_only = false,
+                                     const T* cos_cache = nullptr,
+                                     const T* sin_cache = nullptr,
+                                     const int rotary_dim = 0,
+                                     const int64_t* position_ids = nullptr,
+                                     const bool interleaved = false) {
   const int batch_size = parameters.batch_size;
   const int kv_sequence_length = parameters.sequence_length;
   const int past_sequence_length = parameters.seqlen_past_kv_cache;
@@ -124,7 +129,12 @@ Status LaunchConcatNewToPastKV(GroupQueryAttentionParameters& parameters,
                                  data.present_value,
                                  stream,
                                  max_threads_per_block,
-                                 past_only);
+                                 past_only,
+                                 cos_cache,
+                                 sin_cache,
+                                 rotary_dim,
+                                 position_ids,
+                                 interleaved);
 }
 
 // Concat new to kv buffer in place
@@ -487,23 +497,133 @@ Status FlashAttention(
          static_cast<int>(parameters.is_first_prompt),
          static_cast<int>(parameters.kv_share_buffer));
 #endif
+  // DUMP_TENSOR_INIT();
+  // [Standard FP16 Append Logic] (Modified for Pre-Rotated Pipeline)
 
-  // [Standard FP16 Append Logic]
+  // Track whether we keep packed QKV for FA kernels
+  bool use_packed_for_fa = parameters.is_packed_qkv;
+
   if (parameters.is_packed_qkv) {
     // Unpack K and V from Packed QKV into temporary buffer
     T* unpacked_buffer = reinterpret_cast<T*>(data.unpacked_qkv_buffer);
     if (unpacked_buffer != nullptr) {
       size_t q_size = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size;
+      T* unpacked_q = unpacked_buffer;
       T* unpacked_k = unpacked_buffer + q_size;
       size_t k_size = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size;
       T* unpacked_v = unpacked_k + k_size;
 
+      // If we need Q rotation, we MUST unpack Q as well.
+      // If do_rotary is true, unpack Q. Otherwise nullptr for Q (saving BW).
+      T* q_dst = parameters.do_rotary ? unpacked_q : nullptr;
+
       // Always unpack to BSNH as LaunchConcatNewToPastKV expects contiguous BSNH input
-      ORT_RETURN_IF_ERROR((LaunchUnpackQKV<T, false>(reinterpret_cast<const T*>(data.query), nullptr, unpacked_k, unpacked_v, num_heads, kv_num_heads, head_size, sequence_length, batch_size, stream, max_threads_per_block)));
+      ORT_RETURN_IF_ERROR((LaunchUnpackQKV<T, false>(reinterpret_cast<const T*>(data.query), q_dst, unpacked_k, unpacked_v, num_heads, kv_num_heads, head_size, sequence_length, batch_size, stream, max_threads_per_block)));
+
+      if (parameters.do_rotary) {
+        // DUMP_TENSOR("unpacked_q", unpacked_q, batch_size, sequence_length, num_heads, head_size);
+      }
+      // DUMP_TENSOR("unpacked_k", unpacked_k, batch_size, sequence_length, kv_num_heads, head_size);
+      // DUMP_TENSOR("unpacked_v", unpacked_v, batch_size, sequence_length, kv_num_heads, head_size);
 
       // Update key/value to point to unpacked headers
       key = unpacked_k;
       value = unpacked_v;
+
+      if (parameters.do_rotary) {
+        // If we unpacked Q, update query pointer and disable packed flag for FA
+        query = unpacked_q;
+        use_packed_for_fa = false;
+      }
+    }
+  } else if (parameters.do_rotary) {
+    // Unpacked input, but we need to rotate Q and K.
+    // We must copy Q and K to scratch (unpacked_qkv_buffer) and rotate there.
+    T* unpacked_buffer = reinterpret_cast<T*>(data.unpacked_qkv_buffer);
+    if (unpacked_buffer != nullptr) {
+      // 1. Q
+      // We will perform rotation from Input(data.query) to Output(unpacked_buffer) directly below.
+      query = unpacked_buffer;
+
+      // 2. K
+      // If we are rotating K, we need space for it.
+      // unpacked_buffer layout: [Q (B*S*H*D), K (B*S*H_kv*D)]
+      size_t q_size = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size;
+      T* k_dst = unpacked_buffer + q_size;
+      // We will perform rotation from Input(data.key) to Output(k_dst).
+      key = k_dst;
+
+      // is_packed is already false.
+    }
+  }
+
+  // Explicit Q Rotation
+  if (parameters.do_rotary) {
+    // Generate Position IDs on device (needed for Explicit RoPE)
+    if (data.position_ids != nullptr) {
+      ORT_RETURN_IF_ERROR(LaunchSeqlensToPosIds(parameters, data.seqlens_k, data.position_ids, stream, max_threads_per_block));
+      // DUMP_TENSOR("position_ids", data.position_ids, batch_size, sequence_length);
+    }
+
+    // Rotate Q
+    // Q ptr is already set to the destination buffer (unpacked_buffer) above.
+    // Input for Rotation:
+    //   If packed: we unpacked into `query` buffer. So Input==Output (In-place).
+    //   If unpacked: we set `query = unpacked_buffer`. But Input is `data.query`.
+    const T* q_input_for_rope = parameters.is_packed_qkv ? reinterpret_cast<const T*>(query) : reinterpret_cast<const T*>(data.query);
+    T* q_output_for_rope = reinterpret_cast<T*>(query);  // Destination
+
+    ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel(
+        stream,
+        q_output_for_rope,
+        q_input_for_rope,
+        data.position_ids,
+        data.cos_cache,
+        data.sin_cache,
+        batch_size,
+        sequence_length,
+        num_heads,
+        head_size,
+        parameters.rotary_dim,
+        sequence_length,  // max_seq
+        1,                // position_ids_format = 1 (Explicit per token)
+        parameters.rotary_interleaved,
+        max_threads_per_block,
+        false  // is_input_bnsh_format (internal assumes BNSH?) Wait, unpacked unpacked_qkv is BSNH (false). Correct.
+        ));
+    // DUMP_TENSOR("Rotated Q", q_output_for_rope, batch_size, sequence_length, num_heads, head_size);
+
+    // Rotate K (Explicit)
+    if (parameters.do_rotary && data.key != nullptr) {
+      // Source depends on packed/unpacked
+      // If packed: 'key' already points to unpacked_k buffer from above.
+      // If unpacked: 'key' points to k_dst in scratch (set in block above) - BUT we haven't copied yet!
+      // Wait, for Q, we did: Input=data.query, Output=query(scratch).
+      // For K (unpacked): Input=data.key, Output=key(scratch).
+      // For K (packed): Input=unpacked_k(scratch), Output=unpacked_k(scratch) (In-place).
+
+      const T* k_input_for_rope = parameters.is_packed_qkv ? reinterpret_cast<const T*>(key) : reinterpret_cast<const T*>(data.key);
+      T* k_output_for_rope = reinterpret_cast<T*>(key);
+
+      ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel(
+          stream,
+          k_output_for_rope,
+          k_input_for_rope,
+          data.position_ids,
+          data.cos_cache,
+          data.sin_cache,
+          batch_size,
+          sequence_length,
+          kv_num_heads,
+          head_size,
+          parameters.rotary_dim,
+          sequence_length,
+          1,
+          parameters.rotary_interleaved,
+          max_threads_per_block,
+          false  // Unpacked/Scratch is always BSNH (contiguous)
+          ));
+      // DUMP_TENSOR("Rotated K", k_output_for_rope, batch_size, sequence_length, kv_num_heads, head_size);
     }
   }
 
@@ -513,19 +633,23 @@ Status FlashAttention(
   } else {
     // ORT MUST perform the append (using unpacked data for packed case)
     bool skip_new_append = false;
-    ORT_RETURN_IF_ERROR(LaunchConcatNewToPastKV(parameters, data, key, value, stream, max_threads_per_block, skip_new_append));
+    // Pass RoPE params to Concat (applies RoPE to K as it is appended)
+    // EXPLICIT K ROTATION CHANGE: We now pass nullptr for cos/sin/pos_ids to ConcatKV,
+    // because 'key' already contains rotated values!
+    ORT_RETURN_IF_ERROR(LaunchConcatNewToPastKVHelper<T>(parameters, data, key, value, stream, max_threads_per_block, skip_new_append,
+                                                         nullptr, nullptr, 0, nullptr, false));
   }
 
   void* present_key = reinterpret_cast<void*>(const_cast<T*>(data.present_key));
   void* present_value = reinterpret_cast<void*>(const_cast<T*>(data.present_value));
-  void* cos_cache = reinterpret_cast<void*>(const_cast<T*>(data.cos_cache));
-  void* sin_cache = reinterpret_cast<void*>(const_cast<T*>(data.sin_cache));
+  // Disable internal RoPE in Flash Attention (pass nullptr)
+  void* cos_cache = nullptr;
+  void* sin_cache = nullptr;
   void* head_sink = reinterpret_cast<void*>(const_cast<T*>(data.head_sink));
 
-  DUMP_TENSOR_INIT();
-  DUMP_TENSOR("Q", reinterpret_cast<T*>(query), batch_size, sequence_length, num_heads, head_size);
-  DUMP_TENSOR("K", reinterpret_cast<T*>(present_key), batch_size, parameters.seqlen_present_kv_cache, kv_num_heads, head_size);
-  DUMP_TENSOR("V", reinterpret_cast<T*>(present_value), batch_size, parameters.seqlen_present_kv_cache, kv_num_heads, head_size);
+  // DUMP_TENSOR("Q", reinterpret_cast<T*>(query), batch_size, sequence_length, num_heads, head_size);
+  // DUMP_TENSOR("K", reinterpret_cast<T*>(present_key), batch_size, parameters.seqlen_present_kv_cache, kv_num_heads, head_size);
+  // DUMP_TENSOR("V", reinterpret_cast<T*>(present_value), batch_size, parameters.seqlen_present_kv_cache, kv_num_heads, head_size);
 
   // We have already appended (and quantized if needed) the new tokens into present_key/value.
   // Pass nullptr for new_k/new_v to disable the kernel's internal Append_KV logic.
@@ -545,9 +669,9 @@ Status FlashAttention(
       parameters.use_smooth_softmax, past_bsnh, parameters.num_splits,
       reinterpret_cast<void*>(data.softmax_lse_accum),
       reinterpret_cast<void*>(data.out_accum), parameters.local_window_size - 1,
-      parameters.rotary_interleaved, parameters.is_packed_qkv, 0, 1));
+      parameters.rotary_interleaved, use_packed_for_fa, 0, 1));
 
-  DUMP_TENSOR("flash attention output", data.output, batch_size, sequence_length, num_heads, head_size);
+  // DUMP_TENSOR("flash attention output", data.output, batch_size, sequence_length, num_heads, head_size);
 
   return Status::OK();
 }
@@ -605,8 +729,8 @@ Status EfficientAttention(
     auto position_ids_buff = reinterpret_cast<int64_t*>(k_buffer + k_size);
     ORT_RETURN_IF_ERROR(LaunchSeqlensToPosIds(parameters, data.seqlens_k, position_ids_buff, stream,
                                               max_threads_per_block));
-    DUMP_TENSOR_INIT();
-    DUMP_TENSOR("position_ids", position_ids_buff, batch_size, sequence_length);
+    // DUMP_TENSOR_INIT();
+    // DUMP_TENSOR("position_ids", position_ids_buff, batch_size, sequence_length);
     // Launch rotary embedding kernel
     ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel<T>(stream, q_buffer, reinterpret_cast<const T*>(query),
                                                        position_ids_buff, data.cos_cache, data.sin_cache,
@@ -654,7 +778,7 @@ Status EfficientAttention(
                              "Past and present kv share the same tensor but kv_share_buffer is not on.");
     }
     // Copy past and concat new KV to present buffer
-    ORT_RETURN_IF_ERROR(LaunchConcatNewToPastKV(parameters, data, key, value, stream, max_threads_per_block));
+    ORT_RETURN_IF_ERROR(LaunchConcatNewToPastKVHelper<T>(parameters, data, key, value, stream, max_threads_per_block));
   }
 
   // Ungroup if grouped, otherwise use present kv directly
@@ -675,8 +799,8 @@ Status EfficientAttention(
     value = reinterpret_cast<const void*>(data.v);
   }
 
-  DUMP_TENSOR_INIT();
-  DUMP_TENSOR("seqlens_k", seqlens_k, batch_size, 1);
+  // DUMP_TENSOR_INIT();
+  // DUMP_TENSOR("seqlens_k", seqlens_k, batch_size, 1);
 
   MemoryEfficientAttentionParams p;
   p.sm = device_prop.major * 10 + device_prop.minor;
@@ -710,7 +834,7 @@ Status EfficientAttention(
   p.local_window_size = parameters.local_window_size;
   run_memory_efficient_attention(p);
 
-  DUMP_TENSOR("efficient attention output", data.output, batch_size, sequence_length, num_heads, head_size);
+  // DUMP_TENSOR("efficient attention output", data.output, batch_size, sequence_length, num_heads, head_size);
 
   return Status::OK();
 }

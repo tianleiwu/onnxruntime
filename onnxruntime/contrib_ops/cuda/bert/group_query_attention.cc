@@ -162,6 +162,13 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
   auto seqlens_k_buffer = GetScratchBuffer<void>(sizeof(int) * parameters.batch_size, context->GetComputeStream());
   data.seqlens_k_buff = reinterpret_cast<int*>(seqlens_k_buffer.get());
 
+  IAllocatorUniquePtr<void> position_ids_buffer;
+  if (do_rotary_) {
+    size_t pos_bytes = static_cast<size_t>(parameters.batch_size) * parameters.sequence_length * sizeof(int64_t);
+    position_ids_buffer = GetScratchBuffer<void>(pos_bytes, context->GetComputeStream());
+    data.position_ids = reinterpret_cast<int64_t*>(position_ids_buffer.get());
+  }
+
   // Input pointers for both paths
   data.query = reinterpret_cast<const CudaT*>(query->Data<T>());
   data.key = key == nullptr ? nullptr : reinterpret_cast<const CudaT*>(key->Data<T>());
@@ -199,9 +206,14 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
     data.softmax_lse_accum = reinterpret_cast<CudaT*>(softmax_lse_accum_buffer.get());
     data.out_accum = reinterpret_cast<CudaT*>(out_accum_buffer.get());
 
-    size_t unpacked_qkv_bytes = parameters.is_packed_qkv && (parameters.num_heads != parameters.kv_num_heads)
+    size_t unpacked_qkv_bytes = parameters.is_packed_qkv
                                     ? (static_cast<size_t>(parameters.batch_size) * parameters.sequence_length * (parameters.num_heads + 2 * parameters.kv_num_heads) * parameters.head_size * sizeof(T))
                                     : 0;
+    if (parameters.do_rotary && unpacked_qkv_bytes == 0) {
+      // Unpacked case, Q and K rotation
+      unpacked_qkv_bytes = (static_cast<size_t>(parameters.batch_size) * parameters.sequence_length * (parameters.num_heads + parameters.kv_num_heads) * parameters.head_size * sizeof(T));
+    }
+
     if (unpacked_qkv_bytes > 0) {
       unpacked_qkv_buffer = GetScratchBuffer<void>(unpacked_qkv_bytes, context->GetComputeStream());
       data.unpacked_qkv_buffer = reinterpret_cast<CudaT*>(unpacked_qkv_buffer.get());
