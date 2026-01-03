@@ -491,6 +491,7 @@ struct RotaryDispatcher<float2, half> {
 
     if (interleaved) {
       int f0 = 2 * h_idx;
+      // Interleaved Logic
       int cs0 = pos_id * half_rot + f0;
       half2 c_pair = cos_ptr[cs0 / 2];
       half2 s_pair = sin_ptr[cs0 / 2];
@@ -901,6 +902,7 @@ Status LaunchConcatNewToPastKV(const int batch_size,
   int num_elements_per_thread = 8 / sizeof(T);
   if (num_elements_per_thread == 0) num_elements_per_thread = 1;  // safety
   const int H = head_size / num_elements_per_thread;
+
   if (H * kv_num_heads <= max_threads_per_block) {
     const dim3 grid(present_sequence_length, batch_size, 1);
     const dim3 block(H, kv_num_heads, 1);

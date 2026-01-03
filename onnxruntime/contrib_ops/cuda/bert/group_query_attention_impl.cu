@@ -593,7 +593,7 @@ Status FlashAttention(
         ));
     // DUMP_TENSOR("Rotated Q", q_output_for_rope, batch_size, sequence_length, num_heads, head_size);
 
-    // Rotate K (Explicit)
+    // Rotate K (Explicit or Fused)
     if (parameters.do_rotary && data.key != nullptr) {
       // Source depends on packed/unpacked
       // If packed: 'key' already points to unpacked_k buffer from above.
@@ -605,24 +605,29 @@ Status FlashAttention(
       const T* k_input_for_rope = parameters.is_packed_qkv ? reinterpret_cast<const T*>(key) : reinterpret_cast<const T*>(data.key);
       T* k_output_for_rope = reinterpret_cast<T*>(key);
 
-      ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel(
-          stream,
-          k_output_for_rope,
-          k_input_for_rope,
-          data.position_ids,
-          data.cos_cache,
-          data.sin_cache,
-          batch_size,
-          sequence_length,
-          kv_num_heads,
-          head_size,
-          parameters.rotary_dim,
-          sequence_length,
-          1,
-          parameters.rotary_interleaved,
-          max_threads_per_block,
-          false  // Unpacked/Scratch is always BSNH (contiguous)
-          ));
+      // For kv_share_buffer path, we MUST do explicit K rotation because LaunchConcatKVInPlace
+      // doesn't support Fused RoPE. For non-share-buffer path, we use Fused RoPE in ConcatKV.
+      if (parameters.kv_share_buffer && !parameters.is_first_prompt) {
+        ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel(
+            stream,
+            k_output_for_rope,
+            k_input_for_rope,
+            data.position_ids,
+            data.cos_cache,
+            data.sin_cache,
+            batch_size,
+            sequence_length,
+            kv_num_heads,
+            head_size,
+            parameters.rotary_dim,
+            sequence_length,
+            1,
+            parameters.rotary_interleaved,
+            max_threads_per_block,
+            false  // Unpacked/Scratch is always BSNH (contiguous)
+            ));
+      }
+      // For non-share-buffer path: Fused RoPE is applied in LaunchConcatNewToPastKVHelper
       // DUMP_TENSOR("Rotated K", k_output_for_rope, batch_size, sequence_length, kv_num_heads, head_size);
     }
   }
@@ -633,11 +638,12 @@ Status FlashAttention(
   } else {
     // ORT MUST perform the append (using unpacked data for packed case)
     bool skip_new_append = false;
-    // Pass RoPE params to Concat (applies RoPE to K as it is appended)
-    // EXPLICIT K ROTATION CHANGE: We now pass nullptr for cos/sin/pos_ids to ConcatKV,
-    // because 'key' already contains rotated values!
-    ORT_RETURN_IF_ERROR(LaunchConcatNewToPastKVHelper<T>(parameters, data, key, value, stream, max_threads_per_block, skip_new_append,
-                                                         nullptr, nullptr, 0, nullptr, false));
+    // FUSED ROPE: Pass RoPE params to ConcatKV (applies RoPE to K as it is appended)
+    // IMPORTANT: For Fused RoPE with unpacked input, we must pass data.key (the original input),
+    // not the scratch buffer 'key' which is empty since explicit rotation was skipped.
+    const void* key_for_concat = parameters.is_packed_qkv ? key : data.key;
+    ORT_RETURN_IF_ERROR(LaunchConcatNewToPastKVHelper<T>(parameters, data, key_for_concat, value, stream, max_threads_per_block, skip_new_append,
+                                                         data.cos_cache, data.sin_cache, parameters.rotary_dim, data.position_ids, parameters.rotary_interleaved));
   }
 
   void* present_key = reinterpret_cast<void*>(const_cast<T*>(data.present_key));
@@ -721,17 +727,18 @@ Status EfficientAttention(
     value = reinterpret_cast<const void*>(v);
   }
 
+  int64_t* position_ids_buff = nullptr;
   if (parameters.do_rotary) {
     size_t q_size = static_cast<size_t>(batch_size * sequence_length * num_heads * head_size);
     size_t k_size = static_cast<size_t>(batch_size * sequence_length * kv_num_heads * head_size);
     auto q_buffer = reinterpret_cast<T*>(data.rotary_buffer);
     auto k_buffer = q_buffer + q_size;
-    auto position_ids_buff = reinterpret_cast<int64_t*>(k_buffer + k_size);
+    position_ids_buff = reinterpret_cast<int64_t*>(k_buffer + k_size);
     ORT_RETURN_IF_ERROR(LaunchSeqlensToPosIds(parameters, data.seqlens_k, position_ids_buff, stream,
                                               max_threads_per_block));
     // DUMP_TENSOR_INIT();
     // DUMP_TENSOR("position_ids", position_ids_buff, batch_size, sequence_length);
-    // Launch rotary embedding kernel
+    // Launch rotary embedding kernel for Q
     ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel<T>(stream, q_buffer, reinterpret_cast<const T*>(query),
                                                        position_ids_buff, data.cos_cache, data.sin_cache,
                                                        parameters.batch_size, parameters.sequence_length,
@@ -739,15 +746,22 @@ Status EfficientAttention(
                                                        parameters.rotary_dim, parameters.seqlen_present_kv_cache,
                                                        /*position_ids_format*/ 1, parameters.rotary_interleaved,
                                                        device_prop.maxThreadsPerBlock, /*transposed*/ false));
-    ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel<T>(stream, k_buffer, reinterpret_cast<const T*>(key),
-                                                       position_ids_buff, data.cos_cache, data.sin_cache,
-                                                       parameters.batch_size, parameters.sequence_length,
-                                                       parameters.kv_num_heads, parameters.head_size,
-                                                       parameters.rotary_dim, parameters.seqlen_present_kv_cache,
-                                                       /*position_ids_format*/ 1, parameters.rotary_interleaved,
-                                                       device_prop.maxThreadsPerBlock, /*transposed*/ false));
     query = reinterpret_cast<const void*>(q_buffer);
-    key = reinterpret_cast<const void*>(k_buffer);
+
+    // For kv_share_buffer path, we MUST do explicit K rotation because LaunchConcatKVInPlace
+    // doesn't support Fused RoPE. For non-share-buffer path, we use Fused RoPE in ConcatKV.
+    if (parameters.kv_share_buffer) {
+      ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel<T>(stream, k_buffer, reinterpret_cast<const T*>(key),
+                                                         position_ids_buff, data.cos_cache, data.sin_cache,
+                                                         parameters.batch_size, parameters.sequence_length,
+                                                         parameters.kv_num_heads, parameters.head_size,
+                                                         parameters.rotary_dim, parameters.seqlen_present_kv_cache,
+                                                         /*position_ids_format*/ 1, parameters.rotary_interleaved,
+                                                         device_prop.maxThreadsPerBlock, /*transposed*/ false));
+      key = reinterpret_cast<const void*>(k_buffer);
+    }
+    // For non-share-buffer path: 'key' remains pointing to original source,
+    // and Fused RoPE in LaunchConcatNewToPastKVHelper will rotate K in-place.
   }
 
   if (parameters.is_subsequent_prompt || !parameters.is_first_prompt) {
@@ -778,7 +792,9 @@ Status EfficientAttention(
                              "Past and present kv share the same tensor but kv_share_buffer is not on.");
     }
     // Copy past and concat new KV to present buffer
-    ORT_RETURN_IF_ERROR(LaunchConcatNewToPastKVHelper<T>(parameters, data, key, value, stream, max_threads_per_block));
+    // FUSED ROPE: Pass RoPE params to ConcatKV
+    ORT_RETURN_IF_ERROR(LaunchConcatNewToPastKVHelper<T>(parameters, data, key, value, stream, max_threads_per_block, false,
+                                                         data.cos_cache, data.sin_cache, parameters.rotary_dim, position_ids_buff, parameters.rotary_interleaved));
   }
 
   // Ungroup if grouped, otherwise use present kv directly
