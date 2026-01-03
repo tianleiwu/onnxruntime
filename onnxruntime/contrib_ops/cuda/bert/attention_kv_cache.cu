@@ -512,6 +512,93 @@ struct RotaryDispatcher<float2, half> {
       float e3f = __half2float(v1.y);
       v1.x = __float2half(e2f * c1f - e3f * s1f);
       v1.y = __float2half(e2f * s1f + e3f * c1f);
+    } else {
+      // Half-Split Logic
+      const half* kv_ptr = reinterpret_cast<const half*>(new_kv_base);
+      int base_idx = 4 * h_idx;
+      int scalar_in_offset = in_offset * 4;
+      int half_rot = rotary_dim / 2;
+
+      // Process v0.x (idx)
+      {
+        int idx = base_idx;
+        if (idx < rotary_dim) {
+          int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
+          float sign = (idx < half_rot) ? -1.0f : 1.0f;
+          int cos_idx = idx % half_rot;
+          int cs_idx = pos_id * half_rot + cos_idx;
+
+          half c = reinterpret_cast<const half*>(cos_ptr)[cs_idx];
+          half s = reinterpret_cast<const half*>(sin_ptr)[cs_idx];
+
+          float val_f = __half2float(v0.x);
+          float pair_f = __half2float(kv_ptr[scalar_in_offset + pair_idx]);
+          float cf = __half2float(c);
+          float sf = __half2float(s);
+
+          v0.x = __float2half(val_f * cf + sign * pair_f * sf);
+        }
+      }
+      // Process v0.y (idx+1)
+      {
+        int idx = base_idx + 1;
+        if (idx < rotary_dim) {
+          int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
+          float sign = (idx < half_rot) ? -1.0f : 1.0f;
+          int cos_idx = idx % half_rot;
+          int cs_idx = pos_id * half_rot + cos_idx;
+
+          half c = reinterpret_cast<const half*>(cos_ptr)[cs_idx];
+          half s = reinterpret_cast<const half*>(sin_ptr)[cs_idx];
+
+          float val_f = __half2float(v0.y);
+          float pair_f = __half2float(kv_ptr[scalar_in_offset + pair_idx]);
+          float cf = __half2float(c);
+          float sf = __half2float(s);
+
+          v0.y = __float2half(val_f * cf + sign * pair_f * sf);
+        }
+      }
+      // Process v1.x (idx+2)
+      {
+        int idx = base_idx + 2;
+        if (idx < rotary_dim) {
+          int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
+          float sign = (idx < half_rot) ? -1.0f : 1.0f;
+          int cos_idx = idx % half_rot;
+          int cs_idx = pos_id * half_rot + cos_idx;
+
+          half c = reinterpret_cast<const half*>(cos_ptr)[cs_idx];
+          half s = reinterpret_cast<const half*>(sin_ptr)[cs_idx];
+
+          float val_f = __half2float(v1.x);
+          float pair_f = __half2float(kv_ptr[scalar_in_offset + pair_idx]);
+          float cf = __half2float(c);
+          float sf = __half2float(s);
+
+          v1.x = __float2half(val_f * cf + sign * pair_f * sf);
+        }
+      }
+      // Process v1.y (idx+3)
+      {
+        int idx = base_idx + 3;
+        if (idx < rotary_dim) {
+          int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
+          float sign = (idx < half_rot) ? -1.0f : 1.0f;
+          int cos_idx = idx % half_rot;
+          int cs_idx = pos_id * half_rot + cos_idx;
+
+          half c = reinterpret_cast<const half*>(cos_ptr)[cs_idx];
+          half s = reinterpret_cast<const half*>(sin_ptr)[cs_idx];
+
+          float val_f = __half2float(v1.y);
+          float pair_f = __half2float(kv_ptr[scalar_in_offset + pair_idx]);
+          float cf = __half2float(c);
+          float sf = __half2float(s);
+
+          v1.y = __float2half(val_f * cf + sign * pair_f * sf);
+        }
+      }
     }
     v_ptr[0] = v0;
     v_ptr[1] = v1;
@@ -552,6 +639,93 @@ struct RotaryDispatcher<float2, BFloat16> {
       float e3f = __bfloat162float(v1.y);
       v1.x = __float2bfloat16(e2f * c1f - e3f * s1f);
       v1.y = __float2bfloat16(e2f * s1f + e3f * c1f);
+    } else {
+      // Half-Split Logic
+      const __nv_bfloat16* kv_ptr = reinterpret_cast<const __nv_bfloat16*>(new_kv_base);
+      int base_idx = 4 * h_idx;
+      int scalar_in_offset = in_offset * 4;
+      int half_rot = rotary_dim / 2;
+
+      // Process v0.x (idx)
+      {
+        int idx = base_idx;
+        if (idx < rotary_dim) {
+          int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
+          float sign = (idx < half_rot) ? -1.0f : 1.0f;
+          int cos_idx = idx % half_rot;
+          int cs_idx = pos_id * half_rot + cos_idx;
+
+          __nv_bfloat16 c = reinterpret_cast<const __nv_bfloat16*>(cos_ptr)[cs_idx];
+          __nv_bfloat16 s = reinterpret_cast<const __nv_bfloat16*>(sin_ptr)[cs_idx];
+
+          float val_f = __bfloat162float(v0.x);
+          float pair_f = __bfloat162float(kv_ptr[scalar_in_offset + pair_idx]);
+          float cf = __bfloat162float(c);
+          float sf = __bfloat162float(s);
+
+          v0.x = __float2bfloat16(val_f * cf + sign * pair_f * sf);
+        }
+      }
+      // Process v0.y (idx+1)
+      {
+        int idx = base_idx + 1;
+        if (idx < rotary_dim) {
+          int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
+          float sign = (idx < half_rot) ? -1.0f : 1.0f;
+          int cos_idx = idx % half_rot;
+          int cs_idx = pos_id * half_rot + cos_idx;
+
+          __nv_bfloat16 c = reinterpret_cast<const __nv_bfloat16*>(cos_ptr)[cs_idx];
+          __nv_bfloat16 s = reinterpret_cast<const __nv_bfloat16*>(sin_ptr)[cs_idx];
+
+          float val_f = __bfloat162float(v0.y);
+          float pair_f = __bfloat162float(kv_ptr[scalar_in_offset + pair_idx]);
+          float cf = __bfloat162float(c);
+          float sf = __bfloat162float(s);
+
+          v0.y = __float2bfloat16(val_f * cf + sign * pair_f * sf);
+        }
+      }
+      // Process v1.x (idx+2)
+      {
+        int idx = base_idx + 2;
+        if (idx < rotary_dim) {
+          int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
+          float sign = (idx < half_rot) ? -1.0f : 1.0f;
+          int cos_idx = idx % half_rot;
+          int cs_idx = pos_id * half_rot + cos_idx;
+
+          __nv_bfloat16 c = reinterpret_cast<const __nv_bfloat16*>(cos_ptr)[cs_idx];
+          __nv_bfloat16 s = reinterpret_cast<const __nv_bfloat16*>(sin_ptr)[cs_idx];
+
+          float val_f = __bfloat162float(v1.x);
+          float pair_f = __bfloat162float(kv_ptr[scalar_in_offset + pair_idx]);
+          float cf = __bfloat162float(c);
+          float sf = __bfloat162float(s);
+
+          v1.x = __float2bfloat16(val_f * cf + sign * pair_f * sf);
+        }
+      }
+      // Process v1.y (idx+3)
+      {
+        int idx = base_idx + 3;
+        if (idx < rotary_dim) {
+          int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
+          float sign = (idx < half_rot) ? -1.0f : 1.0f;
+          int cos_idx = idx % half_rot;
+          int cs_idx = pos_id * half_rot + cos_idx;
+
+          __nv_bfloat16 c = reinterpret_cast<const __nv_bfloat16*>(cos_ptr)[cs_idx];
+          __nv_bfloat16 s = reinterpret_cast<const __nv_bfloat16*>(sin_ptr)[cs_idx];
+
+          float val_f = __bfloat162float(v1.y);
+          float pair_f = __bfloat162float(kv_ptr[scalar_in_offset + pair_idx]);
+          float cf = __bfloat162float(c);
+          float sf = __bfloat162float(s);
+
+          v1.y = __float2bfloat16(val_f * cf + sign * pair_f * sf);
+        }
+      }
     }
     v_ptr[0] = v0;
     v_ptr[1] = v1;
