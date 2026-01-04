@@ -45,6 +45,7 @@ limitations under the License.
 #include "core/providers/cuda/cuda_common.h"
 #include "core/providers/cuda/shared_inc/cuda_call.h"
 #include "core/providers/cuda/shared_inc/fpgeneric.h"
+#include "contrib_ops/cuda/utils/dump_cuda_tensor.h"
 
 using namespace onnxruntime::cuda;
 
@@ -839,12 +840,15 @@ Status FlashAttention(
     }
   }
 
+  const int64_t* position_ids = data.position_ids;
+
   // Explicit Q Rotation (skip if fused path already applied RoPE)
   if (parameters.do_rotary && !used_fused_packed_path) {
     // Generate Position IDs on device (needed for Explicit RoPE)
-    if (data.position_ids != nullptr) {
-      ORT_RETURN_IF_ERROR(LaunchSeqlensToPosIds(parameters, data.seqlens_k, data.position_ids, stream, max_threads_per_block));
-      // DUMP_TENSOR("position_ids", data.position_ids, batch_size, sequence_length);
+    if (position_ids == nullptr) {
+      ORT_RETURN_IF_ERROR(LaunchSeqlensToPosIds(parameters, data.seqlens_k, data.position_ids_buffer, stream, max_threads_per_block));
+      position_ids = data.position_ids_buffer;
+      // DUMP_TENSOR("position_ids", data.position_ids_buffer, batch_size, sequence_length);
     }
 
     // Rotate Q
@@ -859,7 +863,7 @@ Status FlashAttention(
         stream,
         q_output_for_rope,
         q_input_for_rope,
-        data.position_ids,
+        position_ids,
         data.cos_cache,
         data.sin_cache,
         batch_size,
@@ -875,27 +879,7 @@ Status FlashAttention(
         ));
     // DUMP_TENSOR("Rotated Q", q_output_for_rope, batch_size, sequence_length, num_heads, head_size);
 
-    // Rotate K (Explicit or Fused)
-    /*
-    if (data.key != nullptr) {
-      // Source depends on packed/unpacked
-      // If packed: 'key' already points to unpacked_k buffer from above.
-      // If unpacked: 'key' points to k_dst in scratch (set in block above) - BUT we haven't copied yet!
-      // Wait, for Q, we did: Input=data.query, Output=query(scratch).
-      // For K (unpacked): Input=data.key, Output=key(scratch).
-      // For K (packed): Input=unpacked_k(scratch), Output=unpacked_k(scratch) (In-place).
-
-      const T* k_input_for_rope = parameters.is_packed_qkv ? reinterpret_cast<const T*>(key) : reinterpret_cast<const T*>(data.key);
-      T* k_output_for_rope = reinterpret_cast<T*>(key);
-
-      // For kv_share_buffer path with non-first prompt, we use Fused RoPE in LaunchConcatKVInPlaceWithRoPE.
-      // For is_first_prompt, we don't need K rotation here as it's handled in the concat path.
-      // For non-share-buffer path, Fused RoPE is applied in LaunchConcatNewToPastKVHelper.
-      // No explicit K rotation needed here - handled by fused kernels.
-      (void)k_input_for_rope;
-      (void)k_output_for_rope;
-      // DUMP_TENSOR("Rotated K", k_output_for_rope, batch_size, sequence_length, kv_num_heads, head_size);
-    }*/
+    // Rotate K will be done later in fused kernel.
   }
 
   // Skip KV append if we used the fully fused path (KV already in cache)
@@ -925,7 +909,7 @@ Status FlashAttention(
             data.cos_cache,
             data.sin_cache,
             parameters.rotary_dim,
-            nullptr,  // position_ids: pass nullptr so kernel computes position from seqlens_k
+            position_ids,  // If it is nullptr, kernel computes position from seqlens_k
             parameters.rotary_interleaved));
       } else {
         // No RoPE - use original kernel
@@ -957,10 +941,10 @@ Status FlashAttention(
   printf("Q: %p, present_K: %p, present_V: %p\n", query, present_key, present_value);
 #endif
 
-  // DUMP_TENSOR_INIT();
-  // DUMP_TENSOR("Q", reinterpret_cast<const T*>(query), batch_size, sequence_length, num_heads, head_size);
-  // DUMP_TENSOR("present_K", reinterpret_cast<T*>(present_key), batch_size, parameters.seqlen_present_kv_cache, kv_num_heads, head_size);
-  // DUMP_TENSOR("present_V", reinterpret_cast<T*>(present_value), batch_size, parameters.seqlen_present_kv_cache, kv_num_heads, head_size);
+  DUMP_TENSOR_INIT();
+  DUMP_TENSOR("Q", reinterpret_cast<const T*>(query), batch_size, sequence_length, num_heads, head_size);
+  DUMP_TENSOR("present_K", reinterpret_cast<T*>(present_key), batch_size, parameters.seqlen_present_kv_cache, kv_num_heads, head_size);
+  DUMP_TENSOR("present_V", reinterpret_cast<T*>(present_value), batch_size, parameters.seqlen_present_kv_cache, kv_num_heads, head_size);
 
   // We have already appended (and quantized if needed) the new tokens into present_key/value.
   // Pass nullptr for new_k/new_v to disable the kernel's internal Append_KV logic.
@@ -981,8 +965,6 @@ Status FlashAttention(
       reinterpret_cast<void*>(data.softmax_lse_accum),
       reinterpret_cast<void*>(data.out_accum), parameters.local_window_size - 1,
       parameters.rotary_interleaved, use_packed_for_fa, 0, 1));
-
-  // DUMP_TENSOR("flash attention output", data.output, batch_size, sequence_length, num_heads, head_size);
 
   return Status::OK();
 }
@@ -1032,19 +1014,23 @@ Status EfficientAttention(
     value = reinterpret_cast<const void*>(v);
   }
 
-  int64_t* position_ids_buff = nullptr;
+  const int64_t* position_ids = data.position_ids;
   if (parameters.do_rotary) {
-    size_t q_size = static_cast<size_t>(batch_size * sequence_length * num_heads * head_size);
-    size_t k_size = static_cast<size_t>(batch_size * sequence_length * kv_num_heads * head_size);
     auto q_buffer = reinterpret_cast<T*>(data.rotary_buffer);
-    auto k_buffer = q_buffer + q_size;
-    position_ids_buff = reinterpret_cast<int64_t*>(k_buffer + k_size);
-    ORT_RETURN_IF_ERROR(LaunchSeqlensToPosIds(parameters, data.seqlens_k, position_ids_buff, stream,
-                                              max_threads_per_block));
+
+    if (position_ids == nullptr) {
+      const int* seqlens_k_ptr = data.seqlens_k;
+      if (seqlens_k_ptr == nullptr) {
+        seqlens_k_ptr = data.seqlens_k_buff;
+      }
+      ORT_RETURN_IF_ERROR(LaunchSeqlensToPosIds(parameters, seqlens_k_ptr, data.position_ids_buffer, stream,
+                                                max_threads_per_block));
+      position_ids = data.position_ids_buffer;
+    }
 
     // Launch rotary embedding kernel for Q
     ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel<T>(stream, q_buffer, reinterpret_cast<const T*>(query),
-                                                       position_ids_buff, data.cos_cache, data.sin_cache,
+                                                       position_ids, data.cos_cache, data.sin_cache,
                                                        parameters.batch_size, parameters.sequence_length,
                                                        parameters.num_heads, parameters.head_size,
                                                        parameters.rotary_dim, parameters.max_sequence_length,
@@ -1060,7 +1046,7 @@ Status EfficientAttention(
     // key remains pointing to original source for use in fused kernel below
   }
 
-  if (parameters.is_subsequent_prompt || !parameters.is_first_prompt) {
+  if ((parameters.is_subsequent_prompt || !parameters.is_first_prompt) && data.seqlens_k != nullptr) {
     ORT_RETURN_IF_ERROR(LaunchGetSeqlensTotal(data.seqlens_k, data.seqlens_k_buff, batch_size, stream, 256));
   } else {
     // Launch kernel to copy seqlen
@@ -1105,7 +1091,7 @@ Status EfficientAttention(
           data.cos_cache,
           data.sin_cache,
           parameters.rotary_dim,
-          nullptr,  // position_ids: kernel computes from seqlens_k (decoding) or 0+s (first_prompt)
+          position_ids,  // If it is nullptr, kernel computes from seqlens_k (decoding) or 0+s (first_prompt)
           parameters.rotary_interleaved));
     } else {
       // No RoPE - use original kernel

@@ -37,8 +37,6 @@ param_count = int(os.getenv("PARAM_COUNT", "3")) if not pipeline_mode else 2
 # Quick build mode: only test hdim128 for faster development iteration
 quick_build = os.getenv("QUICK_BUILD", "0") == "1"
 
-debug_gqa = os.getenv("DEBUG_GQA", "0") == "1"
-
 # #################################################################################################
 #  Configuration and Helper Classes
 # #################################################################################################
@@ -823,7 +821,12 @@ def parity_check_gqa_prompt(
 
     position_ids, attention_bias = None, None
     if config.has_position_ids:
-        position_ids = torch.arange(config.q_sequence_length, device=device).unsqueeze(0).expand(config.batch_size, -1)
+        position_ids = (
+            torch.arange(config.q_sequence_length, device=device)
+            .unsqueeze(0)
+            .expand(config.batch_size, -1)
+            .contiguous()
+        )
     if config.has_attention_bias:
         attention_bias = torch.zeros(
             config.batch_size,

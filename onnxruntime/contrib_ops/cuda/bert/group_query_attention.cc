@@ -161,12 +161,15 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
   // This buffer is used to store the effective sequence lengths (including past) for each batch entry.
   auto seqlens_k_buffer = GetScratchBuffer<void>(sizeof(int) * parameters.batch_size, context->GetComputeStream());
   data.seqlens_k_buff = reinterpret_cast<int*>(seqlens_k_buffer.get());
+  CUDA_CALL_THROW(cudaMemsetAsync(data.seqlens_k_buff, 0, sizeof(int) * parameters.batch_size, static_cast<cudaStream_t>(context->GetComputeStream()->GetHandle())));
+
+  data.position_ids = (position_ids != nullptr) ? position_ids->Data<int64_t>() : nullptr;
 
   IAllocatorUniquePtr<void> position_ids_buffer;
-  if (do_rotary_) {
+  if (do_rotary_ && data.position_ids == nullptr) {
     size_t pos_bytes = static_cast<size_t>(parameters.batch_size) * parameters.sequence_length * sizeof(int64_t);
     position_ids_buffer = GetScratchBuffer<void>(pos_bytes, context->GetComputeStream());
-    data.position_ids = reinterpret_cast<int64_t*>(position_ids_buffer.get());
+    data.position_ids_buffer = reinterpret_cast<int64_t*>(position_ids_buffer.get());
   }
 
   // Input pointers for both paths
