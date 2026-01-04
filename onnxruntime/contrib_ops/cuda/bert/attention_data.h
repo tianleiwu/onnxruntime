@@ -163,6 +163,7 @@ struct GroupQueryAttentionData {
   T* softmax_lse_accum = nullptr;
   T* out_accum = nullptr;
   int* seqlens_k_buff = nullptr;
+  int64_t* position_ids = nullptr;
 
   // Memory Efficient buffers
   T* fmha_buffer = nullptr;

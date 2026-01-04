@@ -64,6 +64,8 @@ Status LaunchAddBiasTransAppendKvToPresent(cudaStream_t stream,
                                            const T* qkv_buffer,
                                            T* present);
 
+// Fused KV Append for Separate Buffer Mode: Appends New K & V to Past in one kernel
+// Uses blockIdx.z to distinguish between K and V
 template <typename T>
 Status LaunchConcatNewToPastKV(const int batch_size,
                                const int kv_num_heads,
@@ -81,7 +83,12 @@ Status LaunchConcatNewToPastKV(const int batch_size,
                                T* present_value,
                                cudaStream_t stream,
                                const int max_threads_per_block,
-                               const bool past_only);
+                               const bool past_only,
+                               const T* cos_cache = nullptr,
+                               const T* sin_cache = nullptr,
+                               const int rotary_dim = 0,
+                               const int64_t* position_ids = nullptr,
+                               const bool interleaved = false);
 
 template <typename T>
 Status LaunchConcatKVInPlace(int batch_size,
@@ -99,6 +106,32 @@ Status LaunchConcatKVInPlace(int batch_size,
                              bool is_new_kv_bnsh_format,
                              cudaStream_t stream,
                              const int max_threads_per_block);
+
+// Truly fused K+V In-Place Append with RoPE
+// Single kernel that appends K (with RoPE rotation) and V (without rotation) to KV cache.
+// This eliminates a separate kernel launch for V, saving kernel overhead.
+template <typename T>
+Status LaunchConcatKVInPlaceFused(int batch_size,
+                                  int kv_num_heads,
+                                  int head_size,
+                                  int max_sequence_length,
+                                  const int* seqlens_k,
+                                  const int* total_seqlens_k,
+                                  int new_seq_len,
+                                  const T* new_key,
+                                  const T* new_value,
+                                  T* present_key,
+                                  T* present_value,
+                                  bool is_past_kv_bnsh_format,
+                                  bool is_new_kv_bnsh_format,
+                                  cudaStream_t stream,
+                                  const int max_threads_per_block,
+                                  // RoPE parameters (for K only)
+                                  const T* cos_cache,
+                                  const T* sin_cache,
+                                  int rotary_dim,
+                                  const int64_t* position_ids,
+                                  bool interleaved);
 
 }  // namespace cuda
 }  // namespace contrib
