@@ -845,11 +845,15 @@ Status FlashAttention(
   // Explicit Q Rotation (skip if fused path already applied RoPE)
   if (parameters.do_rotary && !used_fused_packed_path) {
     // Generate Position IDs on device (needed for Explicit RoPE)
+    // We can skip generating explicit position_ids if we use the fused mode in RotaryEmbeddingBSNH (format=2)
+    // But we need to ensure position_ids pointer is set correctly for subsequent calls if needed.
+    // For Q rotation, we will use seqlens_k implicitly.
+
+    /*
     if (position_ids == nullptr) {
-      ORT_RETURN_IF_ERROR(LaunchSeqlensToPosIds(parameters, data.seqlens_k, data.position_ids_buffer, stream, max_threads_per_block));
-      position_ids = data.position_ids_buffer;
-      // DUMP_TENSOR("position_ids", data.position_ids_buffer, batch_size, sequence_length);
+       // Skipped LaunchSeqlensToPosIds
     }
+    */
 
     // Rotate Q
     // Q ptr is already set to the destination buffer (unpacked_buffer) above.
@@ -863,7 +867,8 @@ Status FlashAttention(
         stream,
         q_output_for_rope,
         q_input_for_rope,
-        position_ids,
+        nullptr,                                       // position_ids unused for format 2
+        reinterpret_cast<const int*>(data.seqlens_k),  // past_sequence_lengths
         data.cos_cache,
         data.sin_cache,
         batch_size,
@@ -872,7 +877,7 @@ Status FlashAttention(
         head_size,
         parameters.rotary_dim,
         parameters.max_sequence_length,
-        1,  // position_ids_format (Explicit per token)
+        2,  // position_ids_format = 2 (Implicit: seqlens_k[b] + s)
         parameters.rotary_interleaved,
         max_threads_per_block,
         false  // is_input_bnsh_format (Q is BSNH)
@@ -909,7 +914,7 @@ Status FlashAttention(
             data.cos_cache,
             data.sin_cache,
             parameters.rotary_dim,
-            position_ids,  // If it is nullptr, kernel computes position from seqlens_k
+            position_ids,  // If it is nullptr, kernel computes from seqlens_k (decoding) or 0+s (first_prompt)
             parameters.rotary_interleaved));
       } else {
         // No RoPE - use original kernel
@@ -923,7 +928,7 @@ Status FlashAttention(
       // not the scratch buffer 'key' which is empty since explicit rotation was skipped.
       const void* key_for_concat = parameters.is_packed_qkv ? key : data.key;
       ORT_RETURN_IF_ERROR(LaunchConcatNewToPastKVHelper<T>(parameters, data, key_for_concat, value, stream, max_threads_per_block, skip_new_append,
-                                                           data.cos_cache, data.sin_cache, parameters.rotary_dim, data.position_ids, parameters.rotary_interleaved));
+                                                           data.cos_cache, data.sin_cache, parameters.rotary_dim, nullptr, parameters.rotary_interleaved));
     }
   }
 
@@ -1019,6 +1024,12 @@ Status EfficientAttention(
     auto q_buffer = reinterpret_cast<T*>(data.rotary_buffer);
 
     if (position_ids == nullptr) {
+      // Loop seqlens_k to determine if prompt or token phase?
+      // Actually LaunchRotaryEmbeddingKernel with format 2 works for both if seqlens_k is correct.
+      // For prompt, seqlens_k is 0. 0+s. Correct.
+      // For token, seqlens_k is past. past+s. Correct.
+
+      /*
       const int* seqlens_k_ptr = data.seqlens_k;
       if (seqlens_k_ptr == nullptr) {
         seqlens_k_ptr = data.seqlens_k_buff;
@@ -1026,17 +1037,73 @@ Status EfficientAttention(
       ORT_RETURN_IF_ERROR(LaunchSeqlensToPosIds(parameters, seqlens_k_ptr, data.position_ids_buffer, stream,
                                                 max_threads_per_block));
       position_ids = data.position_ids_buffer;
+      */
     }
+    // WAIT. The kernel takes const int64_t* position_ids.
+    // If we pass int*, stride is 4 bytes. Kernel reads 8 bytes. This is WRONG.
+    // We MUST generate position_ids OR overload kernel to accept int*.
+    // The user said "Fuse". The kernel modified in step 394 expects int64_t*.
+    // "position_id = static_cast<int>(position_ids[b]) + s;"
+    // position_ids[b] will read 8 bytes at offset b*8.
+    // seqlens_k is int* (4 bytes).
+    // So I CANNOT just pass seqlens_k pointer if the kernel expects int64_t pointer logic.
+    // I will abort this specific edit chunk and fix the kernel first to accept int*.
 
     // Launch rotary embedding kernel for Q
-    ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel<T>(stream, q_buffer, reinterpret_cast<const T*>(query),
-                                                       position_ids, data.cos_cache, data.sin_cache,
-                                                       parameters.batch_size, parameters.sequence_length,
-                                                       parameters.num_heads, parameters.head_size,
-                                                       parameters.rotary_dim, parameters.max_sequence_length,
-                                                       /*position_ids_format*/ 1, parameters.rotary_interleaved,
-                                                       device_prop.maxThreadsPerBlock,
-                                                       /*is_input_bnsh_format*/ false));
+    // Logic for Position IDs:
+    // Priority 1: User provided position_ids. Use Format 1.
+    // Priority 2: Interactive Decoding (is_subsequent_prompt). Generate explicit IDs if missing. Use Format 1.
+    // Priority 3: First Prompt or Decoding. Use Fused Format 2 (Implicit).
+
+    if (position_ids != nullptr) {
+      // User provided explicit position_ids - Use Format 1
+      ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel<T>(
+          stream, q_buffer, reinterpret_cast<const T*>(query),
+          position_ids, nullptr, data.cos_cache, data.sin_cache,
+          parameters.batch_size, parameters.sequence_length,
+          parameters.num_heads, parameters.head_size,
+          parameters.rotary_dim, parameters.max_sequence_length,
+          1,  // Format 1: Explicit position_ids
+          parameters.rotary_interleaved,
+          max_threads_per_block,
+          false));
+    } else if (parameters.is_subsequent_prompt) {
+      // Interactive Mode: Enforce explicit position_ids if not provided
+      const int* seqlens_k_ptr = data.seqlens_k;
+      if (seqlens_k_ptr == nullptr) seqlens_k_ptr = data.seqlens_k_buff;
+
+      ORT_RETURN_IF_ERROR(LaunchSeqlensToPosIds(parameters, seqlens_k_ptr, data.position_ids_buffer, stream,
+                                                max_threads_per_block));
+      position_ids = data.position_ids_buffer;
+
+      ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel<T>(
+          stream, q_buffer, reinterpret_cast<const T*>(query),
+          position_ids, nullptr, data.cos_cache, data.sin_cache,
+          parameters.batch_size, parameters.sequence_length,
+          parameters.num_heads, parameters.head_size,
+          parameters.rotary_dim, parameters.max_sequence_length,
+          1,  // Format 1: Explicit position_ids
+          parameters.rotary_interleaved,
+          max_threads_per_block,
+          false));
+    } else {
+      // First Prompt or Decoding: Use Fused Format 2
+      const int* seqlens_k_ptr = parameters.is_first_prompt ? nullptr : data.seqlens_k;
+      if (!parameters.is_first_prompt && seqlens_k_ptr == nullptr) {
+        seqlens_k_ptr = data.seqlens_k_buff;
+      }
+
+      ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel<T>(
+          stream, q_buffer, reinterpret_cast<const T*>(query),
+          nullptr, seqlens_k_ptr, data.cos_cache, data.sin_cache,
+          parameters.batch_size, parameters.sequence_length,
+          parameters.num_heads, parameters.head_size,
+          parameters.rotary_dim, parameters.max_sequence_length,
+          2,  // Format 2: Implicit (past + s)
+          parameters.rotary_interleaved,
+          max_threads_per_block,
+          false));
+    }
     query = reinterpret_cast<const void*>(q_buffer);
 
     // For kv_share_buffer path, we use Fused RoPE in LaunchConcatKVInPlaceWithRoPE.
