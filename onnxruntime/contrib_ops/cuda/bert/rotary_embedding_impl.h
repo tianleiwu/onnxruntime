@@ -15,6 +15,7 @@ Status LaunchRotaryEmbeddingKernel(
     T* output,
     const T* input,
     const int64_t* position_ids,
+    const int* past_sequence_lengths,
     const T* cos_cache,
     const T* sin_cache,
     const int batch_size,
@@ -26,7 +27,7 @@ Status LaunchRotaryEmbeddingKernel(
     const int position_ids_format,
     const bool interleaved,
     const int max_threads_per_block,
-    const bool is_input_bnsh_format);
+    const bool is_input_bnsh_format = true);
 
 template <typename T>
 Status LaunchRotaryEmbeddingKernel(
@@ -34,6 +35,7 @@ Status LaunchRotaryEmbeddingKernel(
     T* output,
     const T* input,
     const int64_t* position_ids,
+    const int* past_sequence_lengths,
     const T* cos_cache,
     const T* sin_cache,
     const int batch_size,

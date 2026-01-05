@@ -164,6 +164,11 @@ struct GroupQueryAttentionData {
   T* out_accum = nullptr;
   int* seqlens_k_buff = nullptr;
 
+  // Position IDs from Input
+  const int64_t* position_ids = nullptr;
+  // Buffer for position ids if not provided.
+  int64_t* position_ids_buffer = nullptr;
+
   // Memory Efficient buffers
   T* fmha_buffer = nullptr;
   T* unpacked_qkv_buffer = nullptr;
