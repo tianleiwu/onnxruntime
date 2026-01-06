@@ -19,7 +19,7 @@ limitations under the License.
 */
 
 // Modifications:
-// (1) support GPT-2 past state, unidirectional mask (causal)
+// (1) support past state, unidirectional mask (causal)
 // (2) use flash attention kernel from (https://github.com/Dao-AILab/flash-attention)
 // (3) support different number of heads for Q and KV
 // Copyright (c) Microsoft Corporation. All rights reserved.
@@ -58,27 +58,6 @@ namespace contrib {
 namespace cuda {
 
 ////////// Auxiliary Kernels for KV prep
-
-// Kernel for seqlens_k
-// __global__ void GetPastSeqLens(const int32_t* total_seqlens_minus_1,
-//                                int32_t* past_seq_lens, const int batch_size,
-//                                const int sequence_length) {
-//   int tid = blockDim.x * blockIdx.x + threadIdx.x;
-//   if (tid < batch_size) {
-//     past_seq_lens[tid] = total_seqlens_minus_1[tid] + 1 - sequence_length;
-//   }
-// }
-
-// Status LaunchGetPastSeqLens(const int32_t* total_seqlens_minus_1, int32_t* past_seq_lens,
-//                             const int batch_size, const int sequence_length,
-//                             cudaStream_t stream,
-//                             const int max_threads_per_block) {
-//   const int threads = std::min(batch_size, max_threads_per_block);
-//   const int blocks = (batch_size + threads - 1) / threads;
-//   GetPastSeqLens<<<blocks, threads, 0, stream>>>(total_seqlens_minus_1, past_seq_lens,
-//                                                  batch_size, sequence_length);
-//   return CUDA_CALL(cudaGetLastError());
-// }
 
 // Concat new to past in present. Supports past BSNH or past BNSH
 template <typename T>
@@ -272,46 +251,6 @@ Status LaunchUngroup(GroupQueryAttentionParameters& parameters,
   }
   return CUDA_CALL(cudaGetLastError());
 }
-
-// __global__ void PastToTotalSeqlen(int32_t* seqlens_k,
-//                                   int32_t* seqlens_k_buff,
-//                                   const int add_seqlen) {
-//   // seqlens_k value is total sequence length of a batch minus 1.
-//   // When add_seqlen = 1, we can get total sequence length of a batch.
-//   seqlens_k_buff[threadIdx.x] = seqlens_k[threadIdx.x] + add_seqlen;
-// }
-
-// // Calculate total sequence length from seqlens_k
-// Status LaunchGetSeqlensTotal(int32_t* seqlens_k, int32_t* seqlens_k_buff, const int batch_size, cudaStream_t stream,
-//                              const int /*threads_per_block*/) {
-//   const dim3 grid(1, 1, 1);
-//   // TODO(aciddelgado): unlikely but could have a bigger batch_size than max_threads
-//   const dim3 block(batch_size, 1, 1);
-//   PastToTotalSeqlen<<<grid, block, 0, stream>>>(seqlens_k, seqlens_k_buff, 1);
-//   return CUDA_CALL(cudaGetLastError());
-// }
-
-// // Currently, interactive decoding only works for batch_size 1
-// __global__ void GetSeqlensInteractive(const int32_t* seqlens_k, int32_t* seqlens_k_buff,
-//                                       const int batch_size, const int sequence_length) {
-//   int tid = blockDim.x * blockIdx.x + threadIdx.x;
-//   if (tid < batch_size) {
-//     // seqlens_k value is total sequence length of a batch minus 1.
-//     // Here we store the past sequence length to seqlens_k_buff
-//     seqlens_k_buff[tid] = seqlens_k[tid] + 1 - sequence_length;
-//   }
-// }
-
-// // Calculate past sequence length for each batch entry for flash attention kernel
-// Status LaunchGetSeqlensInteractive(const int32_t* seqlens_k, int32_t* seqlens_k_buff,
-//                                    const int batch_size, const int sequence_length, cudaStream_t stream,
-//                                    const int max_threads_per_block) {
-//   const int threads = std::min(batch_size, max_threads_per_block);
-//   const int blocks = (batch_size + threads - 1) / threads;
-//   GetSeqlensInteractive<<<blocks, threads, 0, stream>>>(seqlens_k, seqlens_k_buff, batch_size,
-//                                                         sequence_length);
-//   return CUDA_CALL(cudaGetLastError());
-// }
 
 // Kernel to unpack qkv from packed qkv
 template <typename T, bool output_bnsh>
@@ -676,33 +615,6 @@ Status LaunchGetSequenceLengths(
   return CUDA_CALL(cudaGetLastError());
 }
 
-// __global__ void SeqlensToPosIds(const int32_t* total_seq_lens, int64_t* position_ids, const int seqlen, const int batch_size) {
-//   int tid = blockDim.x * blockIdx.x + threadIdx.x;
-//   int b = tid / seqlen;
-//   int s = tid % seqlen;
-//   if (b < batch_size) {
-//     const int total_seqlen = total_seq_lens[b];
-//     const int past_seqlen = total_seqlen - seqlen;
-//     if (past_seqlen + s < total_seqlen) {
-//       position_ids[tid] = past_seqlen + s;
-//     } else {
-//       position_ids[tid] = 1;
-//     }
-//   }
-// }
-
-// // Convert total sequence lengths to position_ids
-// Status LaunchSeqlensToPosIds(GroupQueryAttentionParameters& parameters, const int32_t* total_seq_lens,
-//                              int64_t* position_ids, cudaStream_t stream,
-//                              const int max_threads_per_block) {
-//   const int seqlen = parameters.sequence_length;
-//   const int batch_size = parameters.batch_size;
-//   const int threads = max_threads_per_block;
-//   const int blocks = (batch_size * seqlen + threads - 1) / threads;
-//   SeqlensToPosIds<<<blocks, threads, 0, stream>>>(total_seq_lens, position_ids, seqlen, batch_size);
-//   return CUDA_CALL(cudaGetLastError());
-// }
-
 ////////// Launch Kernels
 
 #if USE_FLASH_ATTENTION
@@ -817,24 +729,16 @@ Status FlashAttention(
         }
       }
     }
-  } else if (parameters.do_rotary) {
-    // Unpacked input, but we need to rotate Q and K.
-    // We must copy Q and K to scratch (unpacked_qkv_buffer) and rotate there.
-    T* unpacked_buffer = reinterpret_cast<T*>(data.unpacked_qkv_buffer);
-    if (unpacked_buffer != nullptr) {
-      // 1. Q
-      // We will perform rotation from Input(data.query) to Output(unpacked_buffer) directly below.
-      query = unpacked_buffer;
-
-      // 2. K
-      // If we are rotating K, we need space for it.
-      // unpacked_buffer layout: [Q (B*S*H*D), K (B*S*H_kv*D)]
-      size_t q_size = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size;
-      T* k_dst = unpacked_buffer + q_size;
-      // We will perform rotation from Input(data.key) to Output(k_dst).
-      key = k_dst;
-
-      // is_packed is already false.
+  } else {  // is_packed_qkv == false
+    if (parameters.do_rotary) {
+      // For unpacked input, we need to rotate Q and K.
+      // The rotated Q and K will be stored in unpacked_qkv_buffer with layout [Q (B*S*H*D), K (B*S*H_kv*D)].
+      T* unpacked_buffer = reinterpret_cast<T*>(data.unpacked_qkv_buffer);
+      if (unpacked_buffer != nullptr) {
+        query = unpacked_buffer;
+        size_t q_size = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size;
+        key = unpacked_buffer + q_size;
+      }
     }
   }
 
@@ -1014,16 +918,12 @@ Status EfficientAttention(
     auto q_buffer = reinterpret_cast<T*>(data.rotary_buffer);
 
     // Launch rotary embedding kernel for Q
-    // Logic for Position IDs:
-    // Priority 1: User provided position_ids. Use Format 1.
-    // Priority 2: Interactive Decoding (is_subsequent_prompt). Generate explicit IDs if missing. Use Format 1.
-    // Priority 3: First Prompt or Decoding. Use Fused Format 2 (Implicit).
-
     if (position_ids != nullptr) {
       // User provided explicit position_ids - Use Format 1
       ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel<T>(
           stream, q_buffer, reinterpret_cast<const T*>(query),
-          position_ids, nullptr, data.cos_cache, data.sin_cache,
+          position_ids, nullptr /*past_seq_lens not used in format 1*/,
+          data.cos_cache, data.sin_cache,
           parameters.batch_size, parameters.sequence_length,
           parameters.num_heads, parameters.head_size,
           parameters.rotary_dim, parameters.max_sequence_length,
@@ -1034,11 +934,12 @@ Status EfficientAttention(
     } else {
       ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel<T>(
           stream, q_buffer, reinterpret_cast<const T*>(query),
-          nullptr, data.total_seq_lens, data.cos_cache, data.sin_cache,
+          nullptr, data.past_seq_lens,
+          data.cos_cache, data.sin_cache,
           parameters.batch_size, parameters.sequence_length,
           parameters.num_heads, parameters.head_size,
           parameters.rotary_dim, parameters.max_sequence_length,
-          2,  // Format 2: Implicit (total_seq_lens[b] - sequence_length + s)
+          2,  // Format 2: Implicit (past_seq_lens[b] + s)
           parameters.rotary_interleaved,
           max_threads_per_block,
           false));
@@ -1051,16 +952,6 @@ Status EfficientAttention(
 
     // key remains pointing to original source for use in fused kernel below
   }
-
-  // int* total_seq_lens = data.seqlens_k_buff;
-  // if (!parameters.is_first_prompt) {
-  //   ORT_RETURN_IF_ERROR(LaunchGetSeqlensTotal(data.seqlens_k, total_seq_lens, batch_size, stream, 256));
-  // } else {
-  //   // Launch kernel to copy seqlen
-  //   constexpr int thr_per_blk = 256;
-  //   int blk_in_grid = (batch_size + thr_per_blk - 1) / thr_per_blk;
-  //   repeat_seqlen<<<blk_in_grid, thr_per_blk, 0, stream>>>(total_seq_lens, parameters.sequence_length, batch_size);
-  // }
 
   if (parameters.kv_share_buffer) {
     // Concatenate new kv in place
@@ -1133,7 +1024,7 @@ Status EfficientAttention(
   p.causal = true;
   p.scale = scale;
   p.softcap = parameters.softcap;
-  p.seqlen_k_ptr = data.total_seq_lens;
+  p.seqlen_k_ptr = parameters.is_first_prompt ? data.padded_seq_lens : data.total_seq_lens;
   p.seqstart_q_ptr = nullptr;
   p.seqstart_k_ptr = nullptr;
   p.query = query;
