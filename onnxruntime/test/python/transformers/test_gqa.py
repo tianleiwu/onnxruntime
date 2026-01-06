@@ -1287,8 +1287,7 @@ def gqa_cuda_prompt_test_cases(allow_head_sink: bool = True):
                     use_smooth_softmax, has_head_sink = smmoth_softmax__head_sink[
                         combo_index % len(smmoth_softmax__head_sink)
                     ]
-                    # Also toggle position_ids
-                    has_position_ids = False  # if pipeline_mode else combo_index % 2 == 0
+                    has_position_ids = False if pipeline_mode else combo_index % 2 == 0
 
                     combo_index += 1
 
@@ -1352,8 +1351,7 @@ def gqa_cuda_past_test_cases(allow_head_sink: bool = True):
                     use_smooth_softmax, has_head_sink = smmoth_softmax__head_sink[
                         combo_index % len(smmoth_softmax__head_sink)
                     ]
-                    # Also toggle position_ids
-                    has_position_ids = False  # if pipeline_mode else combo_index % 2 == 0
+                    has_position_ids = s > 1 if pipeline_mode else combo_index % 2 == 0
 
                     combo_index += 1
 

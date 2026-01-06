@@ -673,7 +673,7 @@ Status FlashAttention(
       T* unpacked_q = unpacked_buffer;
 
       // Check if we can use the fully fused path
-      if (parameters.kv_share_buffer && parameters.do_rotary && !parameters.is_first_prompt) {
+      if (parameters.kv_share_buffer && parameters.do_rotary) {
         // FULLY FUSED PATH: Unpack + RoPE Q + RoPE K + Append KV in single kernel
         // This eliminates 4 kernel launches!
         ORT_RETURN_IF_ERROR(LaunchUnpackQKVWithRoPEAndAppendKV<T>(
@@ -784,7 +784,8 @@ Status FlashAttention(
       constexpr bool is_new_kv_bnsh_format = false;
       if (parameters.do_rotary) {
         // Use truly fused kernel for K (with RoPE) + V append in single kernel
-        const T* k_for_concat = parameters.is_packed_qkv ? reinterpret_cast<const T*>(key) : data.key;
+        // Since packed QKV + Rotary + Share Buffer is handled by the main fused kernel,
+        // we only reach here for unpacked inputs.
         ORT_RETURN_IF_ERROR(LaunchConcatKVInPlaceFused<T>(
             batch_size,
             kv_num_heads,
@@ -793,8 +794,8 @@ Status FlashAttention(
             data.past_seq_lens,
             data.total_seq_lens,
             sequence_length,
-            k_for_concat,
-            reinterpret_cast<const T*>(value),
+            data.key,
+            data.value,
             data.present_key,
             data.present_value,
             !past_bsnh,  // is_past_kv_bnsh_format
