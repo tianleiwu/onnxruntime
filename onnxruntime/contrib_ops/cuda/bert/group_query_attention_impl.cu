@@ -961,8 +961,6 @@ Status FlashAttention(
   void* sin_cache = nullptr;
   void* head_sink = reinterpret_cast<void*>(const_cast<T*>(data.head_sink));
 
-  void* head_sink = reinterpret_cast<void*>(const_cast<T*>(data.head_sink));
-
   // We have already appended (and quantized if needed) the new tokens into present_key/value.
   // Pass nullptr for new_k/new_v to disable the kernel's internal Append_KV logic.
   // Pass new_k/new_v (key/value) to enable the kernel's internal Append_KV logic if quantization is needed.
