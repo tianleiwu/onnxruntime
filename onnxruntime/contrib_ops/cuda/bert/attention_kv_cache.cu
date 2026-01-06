@@ -7,6 +7,8 @@
 
 using namespace onnxruntime::cuda;
 
+constexpr bool kFillZerosAfterTotalSeqLen = false;
+
 namespace onnxruntime {
 namespace contrib {
 namespace cuda {
@@ -809,8 +811,10 @@ __global__ void ConcatNewToPastKVFused(const int new_seqlen,
       RotaryDispatcher<T, ElementT>::apply(val, cos_cache, sin_cache, rotary_dim, h, pos_id, interleaved, new_key, in_offset - h);
     }
     present_ptr[out_offset] = val;
-  } else if (s >= total_seq_lens[b]) {
-    present_ptr[out_offset] = T{};
+  } else if constexpr (kFillZerosAfterTotalSeqLen) {
+    if (s >= total_seq_lens[b]) {
+      present_ptr[out_offset] = T{};
+    }
   }
 }
 
@@ -882,8 +886,10 @@ __global__ void ConcatNewToPastKVFusedLarge(const int new_seqlen,
         __syncthreads();
       }
       present_ptr[out_offset] = val;
-    } else if (s >= total_seq_lens[b]) {
-      present_ptr[out_offset] = T{};
+    } else if constexpr (kFillZerosAfterTotalSeqLen) {
+      if (s >= total_seq_lens[b]) {
+        present_ptr[out_offset] = T{};
+      }
     }
   }
 }
@@ -1067,7 +1073,7 @@ __global__ void ConcatKVInPlace(const int max_seqlen,
 
   if (s + past_seq_len < total_seq_lens[b]) {
     kv_buff[out_offset] = new_kv[in_offset];
-  } else {
+  } else if constexpr (kFillZerosAfterTotalSeqLen) {
     kv_buff[out_offset] = T{};
   }
 }
@@ -1106,7 +1112,7 @@ __global__ void ConcatKVInPlaceLarge(const int max_seqlen,
 
     if (s + past_seq_len < total_seq_lens[b]) {
       kv_buff[out_offset] = new_kv[in_offset];
-    } else {
+    } else if constexpr (kFillZerosAfterTotalSeqLen) {
       kv_buff[out_offset] = T{};
     }
   }
@@ -1286,7 +1292,7 @@ __global__ void ConcatKVInPlaceFused(const int max_seqlen,
 
     // Process V without RoPE (simple copy)
     v_buff[out_offset] = new_v[in_offset];
-  } else {
+  } else if constexpr (kFillZerosAfterTotalSeqLen) {
     k_buff[out_offset] = T{};
     v_buff[out_offset] = T{};
   }
@@ -1354,7 +1360,7 @@ __global__ void ConcatKVInPlaceFusedLarge(const int max_seqlen,
 
       // Process V without RoPE (simple copy)
       v_buff[out_offset] = new_v[in_offset];
-    } else {
+    } else if constexpr (kFillZerosAfterTotalSeqLen) {
       k_buff[out_offset] = T{};
       v_buff[out_offset] = T{};
     }
