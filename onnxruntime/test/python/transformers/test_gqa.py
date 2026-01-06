@@ -31,8 +31,11 @@ random.seed(69)
 # Reduces number of tests to run for faster pipeline checks
 pipeline_mode = os.getenv("PIPELINE_MODE", "1") == "1"
 
-# Maximum number of values per parameter
+# Number of values per parameter (compared to pipeline mode)
 param_count = int(os.getenv("PARAM_COUNT", "3")) if not pipeline_mode else 2
+
+# Quick build mode: only test hdim128 for faster development iteration
+quick_build = os.getenv("QUICK_BUILD", "0") == "1"
 
 # #################################################################################################
 #  Configuration and Helper Classes
@@ -83,11 +86,12 @@ class GQAConfig:
     packed: bool = False
     softcap: float = 0.0
     use_smooth_softmax: bool = False
-    # CPU-only parameters
-    has_position_ids: bool = False
-    has_attention_bias: bool = False
     has_head_sink: bool = False
     kv_cache_type: str = ""
+    share_buffer: bool = True
+
+    has_position_ids: bool = False
+    has_attention_bias: bool = False
 
 
 # #################################################################################################
@@ -439,8 +443,9 @@ def gqa_prompt_func(
     bind_tensor(io_binding, "seqlens_k", seqlens_k.to(torch.int32), device, TensorProto.INT32)
 
     # total_sequence_length is INT32 [1]
-    tsl = torch.tensor([config.q_sequence_length], dtype=torch.int32, device=device)
-    bind_tensor(io_binding, "total_sequence_length", tsl, device, TensorProto.INT32)
+    # Schema requires this to be on CPU (OrtMemTypeCPUInput)
+    tsl = torch.tensor([config.q_sequence_length], dtype=torch.int32, device="cpu")
+    bind_tensor(io_binding, "total_sequence_length", tsl, "cpu", TensorProto.INT32)
 
     # 5. Optional inputs
     if cos is not None:
@@ -561,14 +566,17 @@ def gqa_past_func(
         bind_tensor(io_binding, "past_key", k, device, cache_ort_type)
         bind_tensor(io_binding, "past_value", v, device, cache_ort_type)
     else:
-        # If not sharing buffer, 'k' and 'v' are the *past* states passed in (usually smaller?)
-        # Actually logic in test_gqa: k, v are the cache tensors.
-        # We bind them.
-        bind_tensor(io_binding, "past_key", k, device, cache_ort_type)
-        bind_tensor(io_binding, "past_value", v, device, cache_ort_type)
+        # If not sharing buffer, 'k' and 'v' are the *past* states passed in.
+        # We must slice the buffer to the valid past length expected by the graph.
+        past_len = config.past_kv_sequence_length
+        k_sliced = k[:, :, :past_len, :].contiguous()
+        v_sliced = v[:, :, :past_len, :].contiguous()
+        bind_tensor(io_binding, "past_key", k_sliced, device, cache_ort_type)
+        bind_tensor(io_binding, "past_value", v_sliced, device, cache_ort_type)
 
     # 4. Scalars
-    bind_tensor(io_binding, "seqlens_k", seqlens_k.to(torch.int32), device, TensorProto.INT32)
+    seqlens_k_int32 = seqlens_k.to(dtype=torch.int32, device=device)
+    bind_tensor(io_binding, "seqlens_k", seqlens_k_int32, device, TensorProto.INT32)
 
     tsl = torch.tensor([total_seq_len], dtype=torch.int32, device=device)
     bind_tensor(io_binding, "total_sequence_length", tsl, device, TensorProto.INT32)
@@ -607,7 +615,7 @@ def gqa_past_func(
     if share_buffer:
         present_seqlen = config.buffer_sequence_length
     else:
-        present_seqlen = total_seq_len  # For past_func, total seq len is accumulated
+        present_seqlen = total_seq_len
 
     present_dims = [config.batch_size, config.kv_num_heads, present_seqlen, config.head_size]
 
@@ -813,20 +821,22 @@ def parity_check_gqa_prompt(
         k_ro = apply_rotary_embedding(new_k.clone(), cos, sin, rotary_seqlens, config.rotary_interleaved, device)
 
     position_ids, attention_bias = None, None
-    if ep == "CPUExecutionProvider":
-        if config.has_position_ids:
-            position_ids = (
-                torch.arange(config.q_sequence_length, device=device).unsqueeze(0).expand(config.batch_size, -1)
-            )
-        if config.has_attention_bias:
-            attention_bias = torch.zeros(
-                config.batch_size,
-                1,
-                config.q_sequence_length,
-                config.kv_sequence_length,
-                device=device,
-                dtype=torch_type,
-            )
+    if config.has_position_ids:
+        position_ids = (
+            torch.arange(config.q_sequence_length, device=device)
+            .unsqueeze(0)
+            .expand(config.batch_size, -1)
+            .contiguous()
+        )
+    if config.has_attention_bias:
+        attention_bias = torch.zeros(
+            config.batch_size,
+            1,
+            config.q_sequence_length,
+            config.kv_sequence_length,
+            device=device,
+            dtype=torch_type,
+        )
 
     arange = rearrange(torch.arange(config.buffer_sequence_length, device=device), "s -> 1 s")
     kv_seqlens_expanded = rearrange(cache_seqlens, "b -> b 1")
@@ -878,7 +888,7 @@ def parity_check_gqa_prompt(
         head_sink=head_sink,
         ep=ep,
         device=device,
-        share_buffer=True,
+        share_buffer=config.share_buffer,
         ort_type=ort_type,
     )
     out = torch.reshape(out, (config.batch_size, config.q_sequence_length, config.num_heads, config.head_size))
@@ -902,6 +912,10 @@ def parity_check_gqa_prompt(
     v_cache_ref_np = v_cache_ref.transpose(1, 2).to(torch.float32).detach().cpu().numpy()
     present_k_np = present_k.to(torch.float32).detach().cpu().numpy()
     present_v_np = present_v.to(torch.float32).detach().cpu().numpy()
+
+    if not config.share_buffer:
+        k_cache_ref_np = k_cache_ref_np[:, :, : config.kv_sequence_length, :]
+        v_cache_ref_np = v_cache_ref_np[:, :, : config.kv_sequence_length, :]
 
     numpy.testing.assert_allclose(present_k_np, k_cache_ref_np, rtol=rtol, atol=atol)
     numpy.testing.assert_allclose(present_v_np, v_cache_ref_np, rtol=rtol, atol=atol)
@@ -952,6 +966,7 @@ def parity_check_gqa_past(
     )
     v = torch.randn_like(k) * std
 
+    # Random past sequence lengths. This tests paddings in decoding.
     cache_seqlens = torch.randint(
         0,
         config.past_kv_sequence_length - config.q_sequence_length + 1,
@@ -1000,16 +1015,15 @@ def parity_check_gqa_past(
 
     position_ids, attention_bias = None, None
     total_seq_len = config.past_kv_sequence_length + config.q_sequence_length
-    if ep == "CPUExecutionProvider":
-        if config.has_position_ids:
-            position_ids = (cache_seqlens.unsqueeze(1) + torch.arange(config.q_sequence_length, device=device)).long()
-        if config.has_attention_bias:
-            attention_bias = torch.zeros(
-                config.batch_size, 1, config.q_sequence_length, total_seq_len, device=device, dtype=torch_type
-            )
-            for b in range(config.batch_size):
-                end_pos = cache_seqlens[b] + config.q_sequence_length
-                attention_bias[b, :, :, end_pos:] = float("-inf")
+    if config.has_position_ids:
+        position_ids = (cache_seqlens.unsqueeze(1) + torch.arange(config.q_sequence_length, device=device)).long()
+    if config.has_attention_bias:
+        attention_bias = torch.zeros(
+            config.batch_size, 1, config.q_sequence_length, total_seq_len, device=device, dtype=torch_type
+        )
+        for b in range(config.batch_size):
+            end_pos = cache_seqlens[b] + config.q_sequence_length
+            attention_bias[b, :, :, end_pos:] = float("-inf")
 
     arange = rearrange(torch.arange(config.buffer_sequence_length, device=device), "s -> 1 s")
     cache_seqlens_expanded = rearrange(cache_seqlens, "b -> b 1")
@@ -1057,7 +1071,7 @@ def parity_check_gqa_past(
         head_sink=head_sink,
         ep=ep,
         device=device,
-        share_buffer=True,
+        share_buffer=config.share_buffer,
         ort_type=ort_type,
     )
     out = torch.reshape(out, (config.batch_size, config.q_sequence_length, config.num_heads, config.head_size))
@@ -1071,10 +1085,162 @@ def parity_check_gqa_past(
     present_k_np = present_k.to(torch.float32).detach().cpu().numpy()
     present_v_np = present_v.to(torch.float32).detach().cpu().numpy()
 
+    if not config.share_buffer:
+        total_len = config.past_kv_sequence_length + config.q_sequence_length
+        k_cache_ref_np = k_cache_ref_np[:, :, :total_len, :]
+        v_cache_ref_np = v_cache_ref_np[:, :, :total_len, :]
+
     numpy.testing.assert_allclose(present_k_np, k_cache_ref_np, rtol=rtol, atol=atol)
     numpy.testing.assert_allclose(present_v_np, v_cache_ref_np, rtol=rtol, atol=atol)
 
     numpy.testing.assert_allclose(out_np, out_ref_np, rtol=rtol, atol=atol)
+
+
+def parity_test_gqa_padding_prompt():
+    device = "cuda"
+    torch_type = torch.float16
+    ort_type = TensorProto.FLOAT16
+
+    # config
+    config = GQAConfig(
+        batch_size=2,
+        q_sequence_length=16,
+        kv_sequence_length=16,
+        num_heads=8,
+        kv_num_heads=2,
+        head_size=128,
+        buffer_sequence_length=16,
+        share_buffer=True,
+        packed=False,
+        rotary=True,
+    )
+
+    # Inputs
+    torch.manual_seed(0)
+    std = 0.02
+    q = (
+        torch.randn(
+            config.batch_size,
+            config.q_sequence_length,
+            config.num_heads,
+            config.head_size,
+            device=device,
+            dtype=torch_type,
+        )
+        * std
+    )
+    k = (
+        torch.randn(
+            config.batch_size,
+            config.kv_num_heads,
+            config.kv_sequence_length,
+            config.head_size,
+            device=device,
+            dtype=torch_type,
+        )
+        * std
+    )
+    v = torch.randn_like(k) * std
+
+    new_k = k.transpose(1, 2).contiguous()
+    new_v = v.transpose(1, 2).contiguous()
+
+    seqlens_k = torch.tensor([9, 15], dtype=torch.int32, device=device)
+
+    # Generate Rotary Embeddings
+    rotary_dim = config.head_size
+    max_seq_len = config.buffer_sequence_length
+    cos = torch.randn(1, max_seq_len, 1, rotary_dim // 2, device=device, dtype=torch_type)
+    sin = torch.randn(1, max_seq_len, 1, rotary_dim // 2, device=device, dtype=torch_type)
+
+    # Apply Rotary to inputs for Reference
+    rotary_op = LlamaMSRotaryEmbedding()
+    pos = torch.zeros(config.batch_size, device=device, dtype=torch.long)
+
+    # In ORT, we pass raw Q/K and ORT applies rotary.
+    # For REF, we must apply rotary manually.
+    # But wait, ORT only rotates 'q' and 'k' inside the attention kernel.
+    # Wait, if `share_buffer=True`, `past_key` is used.
+    # In prompt mode, `new_k` is appended to `past_key`.
+    # ORT will apply rotary to Q.
+    # Does ORT apply rotary to K? Yes, if `do_rotary` is true.
+    # So we rotate Q and K for REF.
+
+    q_ref = rotary_op.rotate_tensor(q, cos, sin, pos, False)
+    k_ref = rotary_op.rotate_tensor(new_k, cos, sin, pos, False)
+    v_ref = new_v
+
+    # Run ONNX Runtime
+    out_ort, present_key_ort, present_value_ort = gqa_prompt_func(
+        q=q,
+        k=k,
+        v=v,
+        config=config,
+        new_k=new_k,
+        new_v=new_v,
+        cos=cos.squeeze(2).squeeze(0),
+        sin=sin.squeeze(2).squeeze(0),
+        seqlens_k=seqlens_k,
+        position_ids=None,
+        attention_bias=None,
+        head_sink=None,
+        ep="CUDAExecutionProvider",
+        device=device,
+        share_buffer=config.share_buffer,
+        ort_type=ort_type,
+    )
+
+    # Compare present_key and present_value with reference
+    # ORT present_key is BNSH format: [batch, kv_num_heads, seq, head_size]
+    # k_ref is BSNH format: [batch, seq, kv_num_heads, head_size]
+    # Transpose k_ref to BNSH for comparison
+    k_ref_bnsh = k_ref.transpose(1, 2)  # BSNH -> BNSH
+    v_ref_bnsh = v_ref.transpose(1, 2)  # BSNH -> BNSH
+
+    # Compare only valid positions (positions 0..9 for Batch 0, 0..15 for Batch 1)
+    torch.testing.assert_close(present_key_ort[0, :, :10, :], k_ref_bnsh[0, :, :10, :], rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(present_key_ort[1, :, :16, :], k_ref_bnsh[1, :, :16, :], rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(present_value_ort[0, :, :10, :], v_ref_bnsh[0, :, :10, :], rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(present_value_ort[1, :, :16, :], v_ref_bnsh[1, :, :16, :], rtol=1e-3, atol=1e-3)
+
+    # Run Reference
+    # key_padding_mask is a "Validity Mask" where True=Valid, False=Invalid
+    key_padding_mask = torch.zeros((config.batch_size, config.q_sequence_length), dtype=torch.bool, device=device)
+
+    # Batch 0: Valid 0..9 (length 10)
+    key_padding_mask[0, :10] = True
+
+    # Batch 1: Valid 0..15 (length 16)
+    key_padding_mask[1, :16] = True
+
+    out_ref, _ = attention_ref(
+        q_ref, k_ref, v_ref, key_padding_mask=key_padding_mask, query_padding_mask=key_padding_mask, causal=True
+    )
+
+    # Compare
+    # Batch 0: 10..15 are padding
+    out_ort[0, 10:] = 0
+    out_ref[0, 10:] = 0
+
+    # Reshape ref to match ORT
+    out_ref = out_ref.reshape(config.batch_size, config.q_sequence_length, -1)
+
+    # Debugging
+    diff = (out_ort - out_ref).abs()
+    max_diff = diff.max()
+    # Check Batch 0
+    b0_diff = diff[0].max()
+    # Check Batch 1
+    b1_diff = diff[1].max()
+
+    if not torch.allclose(out_ort, out_ref, rtol=1e-2, atol=1e-2):
+        msg = f"Mismatch! Max Diff: {max_diff}, Batch 0 Max: {b0_diff}, Batch 1 Max: {b1_diff}\n"
+        msg += f"ORT[0,0,0]: {out_ort[0, 0, 0]}, REF[0,0,0]: {out_ref[0, 0, 0]}\n"
+        msg += f"ORT[0,9,0]: {out_ort[0, 9, 0]}, REF[0,9,0]: {out_ref[0, 9, 0]}\n"
+        msg += f"ORT[0,0,66]: {out_ort[0, 0, 66]}, REF[0,0,66]: {out_ref[0, 0, 66]}\n"
+        raise AssertionError(msg)
+
+    torch.testing.assert_close(out_ort, out_ref, rtol=1e-2, atol=1e-2)
 
 
 # #################################################################################################
@@ -1098,11 +1264,12 @@ def gqa_cuda_prompt_test_cases(allow_head_sink: bool = True):
     batches = [3, 1, 5]
     seqs = [(35, 35), (64, 64), (128, 128), (240, 240), (2000, 2000)]
     heads = [(6, 3), (9, 9), (32, 8)]
-    h_sizes = [128, 32, 64, 256]
+    h_sizes = [128] if quick_build else [128, 32, 64, 256]
     smmoth_softmax__head_sink = get_softmax_options(allow_head_sink)
 
     rotary_opts = list(get_cuda_rotary_options())
     packed_opts = [False, True]
+    share_buffer_opts = [True, False]
     softcap_opts = [0.0, 50.0]
 
     combo_index = 0
@@ -1115,10 +1282,13 @@ def gqa_cuda_prompt_test_cases(allow_head_sink: bool = True):
 
                     rotary, rotary_interleaved = rotary_opts[combo_index % len(rotary_opts)]
                     packed = packed_opts[combo_index % len(packed_opts)]
+                    share_buffer = share_buffer_opts[combo_index % len(share_buffer_opts)]
                     softcap = softcap_opts[combo_index % len(softcap_opts)]
                     use_smooth_softmax, has_head_sink = smmoth_softmax__head_sink[
                         combo_index % len(smmoth_softmax__head_sink)
                     ]
+                    # Also toggle position_ids
+                    has_position_ids = False  # if pipeline_mode else combo_index % 2 == 0
 
                     combo_index += 1
 
@@ -1141,11 +1311,13 @@ def gqa_cuda_prompt_test_cases(allow_head_sink: bool = True):
                         rotary=rotary,
                         rotary_interleaved=rotary_interleaved,
                         packed=packed,
+                        share_buffer=share_buffer,
                         softcap=softcap,
                         use_smooth_softmax=use_smooth_softmax,
                         has_head_sink=has_head_sink,
+                        has_position_ids=has_position_ids,
                     )
-                    name = f"b{b}_sq{sq}_skv{skv}_nh{n}_{n2}_h{h}_w{lws}_rot{rotary}{rotary_interleaved}_pkd{packed}_sc{softcap}_sm{use_smooth_softmax}_{has_head_sink}"
+                    name = f"b{b}_sq{sq}_skv{skv}_nh{n}_{n2}_h{h}_w{lws}_rot{rotary}{rotary_interleaved}_pkd{packed}_sb{share_buffer}_sc{softcap}_sm{use_smooth_softmax}_{has_head_sink}_pid{has_position_ids}"
                     yield name, config
 
 
@@ -1154,11 +1326,13 @@ def gqa_cuda_past_test_cases(allow_head_sink: bool = True):
     # s: new sequence length, s2: past sequence length
     seqs = [(1, 128), (3, 1024), (1, 2048), (1, 5000)]
     heads = [(32, 8), (6, 3), (9, 9)]
-    h_sizes = [128, 64, 256]
+    # We test 128 in pipeline since quantized kv cache is only enabled for head_size=128 in flash attention.
+    h_sizes = [128] if quick_build else [128, 64, 256]
     smmoth_softmax__head_sink = get_softmax_options(allow_head_sink)
 
     rotary_opts = list(get_cuda_rotary_options())
     packed_opts = [False, True]
+    share_buffer_opts = [True] if pipeline_mode else [True, False]
     softcap_opts = [0.0, 50.0]
 
     combo_index = 0
@@ -1173,10 +1347,13 @@ def gqa_cuda_past_test_cases(allow_head_sink: bool = True):
 
                     rotary, rotary_interleaved = rotary_opts[combo_index % len(rotary_opts)]
                     packed = packed_opts[combo_index % len(packed_opts)]
+                    share_buffer = share_buffer_opts[combo_index % len(share_buffer_opts)]
                     softcap = softcap_opts[combo_index % len(softcap_opts)]
                     use_smooth_softmax, has_head_sink = smmoth_softmax__head_sink[
                         combo_index % len(smmoth_softmax__head_sink)
                     ]
+                    # Also toggle position_ids
+                    has_position_ids = False  # if pipeline_mode else combo_index % 2 == 0
 
                     combo_index += 1
 
@@ -1199,11 +1376,13 @@ def gqa_cuda_past_test_cases(allow_head_sink: bool = True):
                         rotary=rotary,
                         rotary_interleaved=rotary_interleaved,
                         packed=packed,
+                        share_buffer=share_buffer,
                         softcap=softcap,
                         use_smooth_softmax=use_smooth_softmax,
                         has_head_sink=has_head_sink,
+                        has_position_ids=has_position_ids,
                     )
-                    name = f"b{b}_s{s}_{s2}_nh{n}_{n2}_h{h}_w{lws}_rot{rotary}{rotary_interleaved}_pkd{packed}_sc{softcap}_sm{use_smooth_softmax}_{has_head_sink}"
+                    name = f"b{b}_s{s}_{s2}_nh{n}_{n2}_h{h}_w{lws}_rot{rotary}{rotary_interleaved}_pkd{packed}_sb{share_buffer}_sc{softcap}_sm{use_smooth_softmax}_{has_head_sink}_pid{has_position_ids}"
                     yield name, config
 
 
@@ -1227,6 +1406,10 @@ def has_flash_attention():
     return has_cuda_device(80)
 
 
+rtol = {"fp16": 5e-3, "bf16": 5e-2}
+atol = {"fp16": 5e-3, "bf16": 1e-2}
+
+
 @unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
 class TestFlashGQA(unittest.TestCase):
     @parameterized.expand(gqa_cuda_prompt_test_cases())
@@ -1239,8 +1422,8 @@ class TestFlashGQA(unittest.TestCase):
             torch_type=torch.float16,
             ort_type=TensorProto.FLOAT16,
             causal=True,
-            rtol=1e-1,
-            atol=1e-1,
+            rtol=rtol["fp16"],
+            atol=atol["fp16"],
         )
 
     @parameterized.expand(gqa_cuda_past_test_cases())
@@ -1253,8 +1436,8 @@ class TestFlashGQA(unittest.TestCase):
             torch_type=torch.float16,
             ort_type=TensorProto.FLOAT16,
             causal=True,
-            rtol=1e-1,
-            atol=1e-1,
+            rtol=rtol["fp16"],
+            atol=atol["fp16"],
         )
 
 
@@ -1274,8 +1457,8 @@ class TestFlashGQABF16(unittest.TestCase):
             torch_type=torch.bfloat16,
             ort_type=TensorProto.BFLOAT16,
             causal=True,
-            rtol=1e-1,  # Relaxed tolerance for BF16
-            atol=2e-1,
+            rtol=rtol["bf16"],
+            atol=atol["bf16"],
         )
 
     @parameterized.expand(gqa_cuda_past_test_cases())
@@ -1292,8 +1475,8 @@ class TestFlashGQABF16(unittest.TestCase):
             torch_type=torch.bfloat16,
             ort_type=TensorProto.BFLOAT16,
             causal=True,
-            rtol=1e-1,
-            atol=2e-1,
+            rtol=rtol["bf16"],
+            atol=atol["bf16"],
         )
 
 
@@ -1309,8 +1492,8 @@ class TestMemoryEfficientGQA(unittest.TestCase):
             torch_type=torch.float16,
             ort_type=TensorProto.FLOAT16,
             causal=True,
-            rtol=2e-2,
-            atol=2e-2,
+            rtol=rtol["fp16"],
+            atol=atol["fp16"] * 4,
         )
 
     @parameterized.expand(gqa_cuda_past_test_cases(allow_head_sink=False))
@@ -1323,8 +1506,8 @@ class TestMemoryEfficientGQA(unittest.TestCase):
             torch_type=torch.float16,
             ort_type=TensorProto.FLOAT16,
             causal=True,
-            rtol=5e-3,
-            atol=2e-2,
+            rtol=rtol["fp16"],
+            atol=atol["fp16"],
         )
 
 
@@ -1340,9 +1523,23 @@ class TestBF16MemoryEfficientGQA(unittest.TestCase):
             torch_type=torch.bfloat16,
             ort_type=TensorProto.BFLOAT16,
             causal=True,
-            rtol=5e-3,
-            atol=2e-2,
+            rtol=rtol["bf16"],
+            atol=atol["bf16"],
         )
+
+
+@unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
+class TestFlashGQAPaddingPrompt(unittest.TestCase):
+    def test_gqa_padding_prompt_flash_attention(self):
+        os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
+        parity_test_gqa_padding_prompt()
+
+
+@unittest.skipIf(not has_cuda_device(53), "Memory Efficient Attention is not available, skipping tests.")
+class TestMemoryEfficientGQAPaddingPrompt(unittest.TestCase):
+    def test_gqa_padding_prompt_memory_efficient_attention(self):
+        os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "1"
+        parity_test_gqa_padding_prompt()
 
 
 if __name__ == "__main__":

@@ -28,6 +28,17 @@ Status LaunchUnpackQKV(const T* packed_qkv, T* unpacked_q, T* unpacked_k, T* unp
                        const int kv_num_heads, const int head_size, const int sequence_length, const int batch_size,
                        cudaStream_t stream, const int max_threads_per_block);
 
+Status LaunchGetSequenceLengths(
+    const int* total_seq_lens_minus_one,
+    int* past_seq_lens,
+    int* total_seq_lens,
+    int* padded_seq_lens,
+    const int batch_size,
+    const int sequence_length,
+    const bool is_first_prompt,
+    cudaStream_t stream,
+    const int max_threads_per_block);
+
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime
