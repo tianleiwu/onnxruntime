@@ -192,6 +192,7 @@ struct GroupQueryAttentionData {
   // Kernel Flags
   bool use_flash_attention = false;
   bool use_memory_efficient_attention = false;
+  bool use_flash_attention_fast_decode = false;
 };
 
 template <typename T>

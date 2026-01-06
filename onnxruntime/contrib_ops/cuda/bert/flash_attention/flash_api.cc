@@ -545,15 +545,6 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
     params.knew_head_stride = head_size;
     params.vnew_head_stride = head_size;
 
-    // Calculate pointers based on offsets
-    // Q is at offset 0
-    // K is at offset num_heads * head_size
-    // V is at offset (num_heads + num_heads_k) * head_size
-    char* q_base = static_cast<char*>(q);
-    params.knew_ptr = static_cast<void*>(q_base + num_heads * head_size * sizeof(half));  // Assuming half/bf16 type size handled by stride?
-
-    // We explicitly disable internal append for Packed QKV because of stride issues.
-    // ORT handles append externally via LaunchConcatNewToPastKV.
     params.knew_ptr = nullptr;
     params.vnew_ptr = nullptr;
   } else {

@@ -615,9 +615,69 @@ Status LaunchGetSequenceLengths(
   return CUDA_CALL(cudaGetLastError());
 }
 
-////////// Launch Kernels
+////////// Kernels (supports right padding but not left padding)
 
 #if USE_FLASH_ATTENTION
+
+// Use flash attention for all workloads (rotary, kv append, attention, etc.). No extra kernel is used in this path.
+// It is for decoding or subsequent prompt. Not for the first prompt.
+template <typename T>
+Status FlashAttentionDecoding(
+    const cudaDeviceProp& device_prop,
+    cudaStream_t stream,
+    GroupQueryAttentionParameters& parameters,
+    GroupQueryAttentionData<T>& data,
+    float scale) {
+  assert(!parameters.is_first_prompt && parameters.kv_share_buffer);
+
+  const int batch_size = parameters.batch_size;
+  const int sequence_length = parameters.sequence_length;
+  const int kv_sequence_length = parameters.sequence_length;
+  const int num_heads = parameters.num_heads;
+  const int kv_num_heads = parameters.kv_num_heads;
+  const int head_size = parameters.head_size;
+  AttentionQkvFormat past_kv_format = parameters.past_kv_format;
+  bool is_causal = parameters.is_unidirectional;
+  bool is_bf16 = std::is_same<T, BFloat16>::value;
+
+  void* query = reinterpret_cast<void*>(const_cast<T*>(data.query));
+  void* key;
+  void* value;
+
+  if (!parameters.is_packed_qkv) {
+    key = reinterpret_cast<void*>(const_cast<T*>(data.key));
+    value = reinterpret_cast<void*>(const_cast<T*>(data.value));
+  } else {
+    const size_t key_offset = static_cast<size_t>(num_heads * head_size);
+    const size_t value_offset = static_cast<size_t>(kv_num_heads * head_size);
+    key = reinterpret_cast<T*>(query) + key_offset;
+    value = reinterpret_cast<T*>(key) + value_offset;
+  }
+
+  void* seqlens_k = reinterpret_cast<void*>(data.past_seq_lens);
+
+  void* present_key = reinterpret_cast<void*>(const_cast<T*>(data.present_key));
+  void* present_value = reinterpret_cast<void*>(const_cast<T*>(data.present_value));
+  void* cos_cache = reinterpret_cast<void*>(const_cast<T*>(data.cos_cache));
+  void* sin_cache = reinterpret_cast<void*>(const_cast<T*>(data.sin_cache));
+  void* head_sink = reinterpret_cast<void*>(const_cast<T*>(data.head_sink));
+
+  bool past_bsnh = past_kv_format == AttentionQkvFormat::Q_K_V_BSNH;
+
+  ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd_kvcache(
+      device_prop, stream, query, present_key, present_value, key, value, data.output,
+      reinterpret_cast<void*>(data.softmax_lse), seqlens_k, cos_cache, sin_cache, head_sink, /*block_table*/ nullptr,
+      batch_size, num_heads, kv_num_heads, head_size, sequence_length,
+      parameters.seqlen_present_kv_cache, kv_sequence_length, parameters.rotary_dim,
+      scale, parameters.softcap, is_causal, is_bf16, parameters.use_smooth_softmax, past_bsnh, parameters.num_splits,
+      reinterpret_cast<void*>(data.softmax_lse_accum), reinterpret_cast<void*>(data.out_accum),
+      parameters.local_window_size - 1, parameters.rotary_interleaved, parameters.is_packed_qkv));
+
+  return Status::OK();
+}
+
+// Use extra kernel(s) for unpacking, rotary and kv append.
+// Flash attention is used for attention only.
 template <typename T>
 Status FlashAttention(
     const cudaDeviceProp& device_prop,
@@ -1060,6 +1120,10 @@ Status QkvToContext(
   const float scale = parameters.scale == 0.0f ? 1.f / sqrt(static_cast<float>(parameters.head_size)) : parameters.scale;
 
 #if USE_FLASH_ATTENTION
+  if (data.use_flash_attention_fast_decode) {
+    return FlashAttentionDecoding(device_prop, stream, parameters, data, scale);
+  }
+
   if (data.use_flash_attention) {
     return FlashAttention(device_prop, stream, parameters, data, scale);
   }

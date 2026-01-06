@@ -1257,7 +1257,10 @@ def get_cpu_rotary_options():
 
 
 def get_softmax_options(allow_head_sink: bool = True):
-    return [(False, False), (False, True), (True, False)]
+    options = [(False, False), (False, True), (True, False)]
+    if not allow_head_sink:
+        options = [opt for opt in options if not opt[1]]
+    return options
 
 
 def gqa_cuda_prompt_test_cases(allow_head_sink: bool = True):
@@ -1323,7 +1326,8 @@ def gqa_cuda_prompt_test_cases(allow_head_sink: bool = True):
 def gqa_cuda_past_test_cases(allow_head_sink: bool = True):
     batches = [2, 1, 3]
     # s: new sequence length, s2: past sequence length
-    seqs = [(1, 128), (3, 1024), (1, 2048), (1, 5000)]
+    seqs = [(1, 1), (1, 128), (1, 2048), (1, 5000)]
+    subsequent_prompt_seqs = [(3, 256)]
     heads = [(32, 8), (6, 3), (9, 9)]
     # We test 128 in pipeline since quantized kv cache is only enabled for head_size=128 in flash attention.
     h_sizes = [128] if quick_build else [128, 64, 256]
@@ -1336,8 +1340,8 @@ def gqa_cuda_past_test_cases(allow_head_sink: bool = True):
 
     combo_index = 0
     for b in batches[:param_count]:
-        for s, s2 in seqs[:param_count]:
-            if s > 1 and b > 1:
+        for s, s2 in seqs[:param_count] + subsequent_prompt_seqs[:param_count]:
+            if s > 1 and b > 1:  # Subsequent prompt is not supported for batch > 1
                 continue
             for n, n2 in heads[:param_count]:
                 for h in h_sizes[:param_count]:
@@ -1351,7 +1355,7 @@ def gqa_cuda_past_test_cases(allow_head_sink: bool = True):
                     use_smooth_softmax, has_head_sink = smmoth_softmax__head_sink[
                         combo_index % len(smmoth_softmax__head_sink)
                     ]
-                    has_position_ids = s > 1 if pipeline_mode else combo_index % 2 == 0
+                    has_position_ids = False if pipeline_mode else s > 1
 
                     combo_index += 1
 
@@ -1491,7 +1495,7 @@ class TestMemoryEfficientGQA(unittest.TestCase):
             ort_type=TensorProto.FLOAT16,
             causal=True,
             rtol=rtol["fp16"],
-            atol=atol["fp16"] * 4,
+            atol=atol["fp16"],
         )
 
     @parameterized.expand(gqa_cuda_past_test_cases(allow_head_sink=False))

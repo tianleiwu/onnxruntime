@@ -158,28 +158,12 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
   IAllocatorUniquePtr<void> rotary_buffer;
   IAllocatorUniquePtr<void> fmha_buffer;
   IAllocatorUniquePtr<void> unpacked_qkv_buffer;
+  IAllocatorUniquePtr<int> seq_lens_buffer;
 
   // Flash Attention buffers
   IAllocatorUniquePtr<void> softmax_lse_buffer;
   IAllocatorUniquePtr<void> softmax_lse_accum_buffer;
   IAllocatorUniquePtr<void> out_accum_buffer;
-
-  // Compute sequence length buffers (past_seq_lens and total_seq_lens).
-  // Allocate buffer for both: first half is past_seq_lens, second half is total_seq_lens.
-  auto seq_lens_buffer = GetScratchBuffer<int>(3 * parameters.batch_size, context->GetComputeStream());
-  auto cuda_stream = static_cast<cudaStream_t>(context->GetComputeStream()->GetHandle());
-  data.past_seq_lens = seq_lens_buffer.get();
-  data.total_seq_lens = seq_lens_buffer.get() + parameters.batch_size;
-  data.padded_seq_lens = data.total_seq_lens + parameters.batch_size;
-  ORT_RETURN_IF_ERROR(LaunchGetSequenceLengths(total_seq_lens_minus_one->Data<int>(),
-                                               data.past_seq_lens,
-                                               data.total_seq_lens,
-                                               data.padded_seq_lens,
-                                               parameters.batch_size,
-                                               parameters.sequence_length,
-                                               parameters.is_first_prompt,
-                                               cuda_stream,
-                                               device_prop.maxThreadsPerBlock));
 
   data.position_ids = (position_ids != nullptr) ? position_ids->Data<int64_t>() : nullptr;
 
@@ -200,6 +184,7 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
                                                               parameters.head_size,
                                                               parameters.num_heads,
                                                               parameters.kv_num_heads);
+  data.use_flash_attention_fast_decode = use_flash_attention && !parameters.is_first_prompt && parameters.kv_share_buffer;
   if (use_flash_attention) {
     data.use_flash_attention = true;
     data.use_memory_efficient_attention = false;
@@ -219,24 +204,45 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
     data.softmax_lse_accum = reinterpret_cast<CudaT*>(softmax_lse_accum_buffer.get());
     data.out_accum = reinterpret_cast<CudaT*>(out_accum_buffer.get());
 
-    size_t unpacked_qkv_bytes = parameters.is_packed_qkv
-                                    ? (static_cast<size_t>(parameters.batch_size) * parameters.sequence_length * (parameters.num_heads + 2 * parameters.kv_num_heads) * parameters.head_size * sizeof(T))
-                                    : 0;
-    if (parameters.do_rotary && unpacked_qkv_bytes == 0) {
-      // Unpacked case, Q and K rotation
-      unpacked_qkv_bytes = (static_cast<size_t>(parameters.batch_size) * parameters.sequence_length * (parameters.num_heads + parameters.kv_num_heads) * parameters.head_size * sizeof(T));
-    }
+    if (!data.use_flash_attention_fast_decode) {
+      size_t unpacked_qkv_bytes = parameters.is_packed_qkv
+                                      ? (static_cast<size_t>(parameters.batch_size) * parameters.sequence_length * (parameters.num_heads + 2 * parameters.kv_num_heads) * parameters.head_size * sizeof(T))
+                                      : 0;
+      if (parameters.do_rotary && unpacked_qkv_bytes == 0) {
+        // Unpacked case, Q and K rotation
+        unpacked_qkv_bytes = (static_cast<size_t>(parameters.batch_size) * parameters.sequence_length * (parameters.num_heads + parameters.kv_num_heads) * parameters.head_size * sizeof(T));
+      }
 
-    if (unpacked_qkv_bytes > 0) {
-      unpacked_qkv_buffer = GetScratchBuffer<void>(unpacked_qkv_bytes, context->GetComputeStream());
-      data.unpacked_qkv_buffer = reinterpret_cast<CudaT*>(unpacked_qkv_buffer.get());
-    } else {
-      data.unpacked_qkv_buffer = nullptr;
+      if (unpacked_qkv_bytes > 0) {
+        unpacked_qkv_buffer = GetScratchBuffer<void>(unpacked_qkv_bytes, context->GetComputeStream());
+        data.unpacked_qkv_buffer = reinterpret_cast<CudaT*>(unpacked_qkv_buffer.get());
+      }
     }
   }
 #else
-  constexpr bool use_flash_attention = false;
 #endif
+
+  if (data.use_flash_attention_fast_decode && !parameters.is_subsequent_prompt) {
+    data.past_seq_lens = const_cast<int*>(total_seq_lens_minus_one->Data<int>());
+    // total_seq_lens and padded_seq_lens are not used in fast decode.
+  } else {
+    // Compute sequence length buffers (past_seq_lens and total_seq_lens).
+    // Allocate buffer for both: first half is past_seq_lens, second half is total_seq_lens.
+    seq_lens_buffer = GetScratchBuffer<int>(3 * parameters.batch_size, context->GetComputeStream());
+    auto cuda_stream = static_cast<cudaStream_t>(context->GetComputeStream()->GetHandle());
+    data.past_seq_lens = seq_lens_buffer.get();
+    data.total_seq_lens = seq_lens_buffer.get() + parameters.batch_size;
+    data.padded_seq_lens = data.total_seq_lens + parameters.batch_size;
+    ORT_RETURN_IF_ERROR(LaunchGetSequenceLengths(total_seq_lens_minus_one->Data<int>(),
+                                                 data.past_seq_lens,
+                                                 data.total_seq_lens,
+                                                 data.padded_seq_lens,
+                                                 parameters.batch_size,
+                                                 parameters.sequence_length,
+                                                 parameters.is_first_prompt,
+                                                 cuda_stream,
+                                                 device_prop.maxThreadsPerBlock));
+  }
 
   if (!use_flash_attention) {
     // Fall back to memory efficient attention.
