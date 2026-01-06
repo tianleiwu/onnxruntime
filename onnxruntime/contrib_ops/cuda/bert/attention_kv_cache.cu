@@ -733,75 +733,75 @@ struct RotaryDispatcher<float2, BFloat16> {
   }
 };
 
-template <typename T, typename ElementT>
-__global__ void ConcatNewToPastKV(const int new_seqlen,
-                                  const int past_buffer_seqlen,
-                                  const T* past_kv,
-                                  const T* new_kv,
-                                  T* present_kv,
-                                  const int* seqlens_k,
-                                  const bool past_only,
-                                  // const int* seqlens_q,
-                                  const bool is_bsnh,
-                                  const T* cos_cache,
-                                  const T* sin_cache,
-                                  const int rotary_dim,
-                                  const int64_t* position_ids,
-                                  const bool interleaved) {  // refers to past; otherwise bnsh
-  const int h = threadIdx.x;
-  const int n = threadIdx.y;
-  const int s = blockIdx.x;
-  const int b = blockIdx.y;
+// template <typename T, typename ElementT>
+// __global__ void ConcatNewToPastKV(const int new_seqlen,
+//                                   const int past_buffer_seqlen,
+//                                   const T* past_kv,
+//                                   const T* new_kv,
+//                                   T* present_kv,
+//                                   const int* seqlens_k,
+//                                   const bool past_only,
+//                                   // const int* seqlens_q,
+//                                   const bool is_bsnh,
+//                                   const T* cos_cache,
+//                                   const T* sin_cache,
+//                                   const int rotary_dim,
+//                                   const int64_t* position_ids,
+//                                   const bool interleaved) {  // refers to past; otherwise bnsh
+//   const int h = threadIdx.x;
+//   const int n = threadIdx.y;
+//   const int s = blockIdx.x;
+//   const int b = blockIdx.y;
 
-  const int present_buffer_seqlen = gridDim.x;
-  const int num_heads = blockDim.y;
-  const int H = blockDim.x;
+//   const int present_buffer_seqlen = gridDim.x;
+//   const int num_heads = blockDim.y;
+//   const int H = blockDim.x;
 
-  const int present_batch_stride = present_buffer_seqlen * num_heads * H;
-  const int row_stride = is_bsnh ? num_heads * H : H;
-  const int present_head_stride = is_bsnh ? H : present_buffer_seqlen * H;
+//   const int present_batch_stride = present_buffer_seqlen * num_heads * H;
+//   const int row_stride = is_bsnh ? num_heads * H : H;
+//   const int present_head_stride = is_bsnh ? H : present_buffer_seqlen * H;
 
-  // past_kv:     BPNH or BNPH
-  // new_kv:      BLNH
-  // present_kv:  BTNH or BNTH, where T = P + L
+//   // past_kv:     BPNH or BNPH
+//   // new_kv:      BLNH
+//   // present_kv:  BTNH or BNTH, where T = P + L
 
-  // prompt, token, and interactive decoding cases
-  const int past_seqlen = seqlens_k == nullptr ? 0 : seqlens_k[b] + 1 - new_seqlen;
+//   // prompt, token, and interactive decoding cases
+//   const int past_seqlen = seqlens_k == nullptr ? 0 : seqlens_k[b] + 1 - new_seqlen;
 
-  int out_offset = b * present_batch_stride + s * row_stride + n * present_head_stride + h;
-  if (s < past_seqlen) {
-    const int past_batch_stride = past_buffer_seqlen * num_heads * H;
-    const int past_head_stride = is_bsnh ? H : past_buffer_seqlen * H;
-    const int in_offset = b * past_batch_stride + s * row_stride + n * past_head_stride + h;
-    present_kv[out_offset] = past_kv[in_offset];
-  } else if (!past_only && s < past_seqlen + new_seqlen) {
-    // Note: new KV always BSNH
-    const int new_batch_stride = new_seqlen * num_heads * H;
-    const int new_row_stride = num_heads * H;
-    const int new_head_stride = H;
-    const int in_offset = b * new_batch_stride + (s - past_seqlen) * new_row_stride + n * new_head_stride + h;
+//   int out_offset = b * present_batch_stride + s * row_stride + n * present_head_stride + h;
+//   if (s < past_seqlen) {
+//     const int past_batch_stride = past_buffer_seqlen * num_heads * H;
+//     const int past_head_stride = is_bsnh ? H : past_buffer_seqlen * H;
+//     const int in_offset = b * past_batch_stride + s * row_stride + n * past_head_stride + h;
+//     present_kv[out_offset] = past_kv[in_offset];
+//   } else if (!past_only && s < past_seqlen + new_seqlen) {
+//     // Note: new KV always BSNH
+//     const int new_batch_stride = new_seqlen * num_heads * H;
+//     const int new_row_stride = num_heads * H;
+//     const int new_head_stride = H;
+//     const int in_offset = b * new_batch_stride + (s - past_seqlen) * new_row_stride + n * new_head_stride + h;
 
-    // Apply Rotation if needed
-    T val = new_kv[in_offset];
-    if (cos_cache != nullptr && rotary_dim > 0) {
-      int pos_id = 0;
-      if (position_ids) {
-        int new_s_idx = s - past_seqlen;
-        if (new_s_idx >= 0 && new_s_idx < new_seqlen) {
-          pos_id = static_cast<int>(position_ids[b * new_seqlen + new_s_idx]);
-        } else {
-          pos_id = s;
-        }
-      } else {
-        pos_id = s;
-      }
+//     // Apply Rotation if needed
+//     T val = new_kv[in_offset];
+//     if (cos_cache != nullptr && rotary_dim > 0) {
+//       int pos_id = 0;
+//       if (position_ids) {
+//         int new_s_idx = s - past_seqlen;
+//         if (new_s_idx >= 0 && new_s_idx < new_seqlen) {
+//           pos_id = static_cast<int>(position_ids[b * new_seqlen + new_s_idx]);
+//         } else {
+//           pos_id = s;
+//         }
+//       } else {
+//         pos_id = s;
+//       }
 
-      RotaryDispatcher<T, ElementT>::apply(val, cos_cache, sin_cache, rotary_dim, h, pos_id, interleaved, new_kv, in_offset - h);
-    }
+//       RotaryDispatcher<T, ElementT>::apply(val, cos_cache, sin_cache, rotary_dim, h, pos_id, interleaved, new_kv, in_offset - h);
+//     }
 
-    present_kv[out_offset] = val;
-  }
-}
+//     present_kv[out_offset] = val;
+//   }
+// }
 
 // Fused versions that handle both K and V using blockIdx.z
 // blockIdx.z == 0 -> Process K (with RoPE if enabled)
@@ -817,7 +817,8 @@ __global__ void ConcatNewToPastKVFused(const int new_seqlen,
                                        const T* new_value,
                                        T* present_key,
                                        T* present_value,
-                                       const int* seqlens_k,
+                                       const int* past_seq_lens,
+                                       const int* total_seq_lens,
                                        const bool past_only,
                                        const bool is_bsnh,
                                        const T* cos_cache,
@@ -844,7 +845,7 @@ __global__ void ConcatNewToPastKVFused(const int new_seqlen,
   const T* new_ptr = (kind == 0) ? new_key : new_value;
   T* present_ptr = (kind == 0) ? present_key : present_value;
 
-  const int past_seqlen = seqlens_k == nullptr ? 0 : seqlens_k[b] + 1 - new_seqlen;
+  const int past_seqlen = past_seq_lens[b];
 
   int out_offset = b * present_batch_stride + s * row_stride + n * present_head_stride + h;
 
@@ -878,6 +879,8 @@ __global__ void ConcatNewToPastKVFused(const int new_seqlen,
       RotaryDispatcher<T, ElementT>::apply(val, cos_cache, sin_cache, rotary_dim, h, pos_id, interleaved, new_key, in_offset - h);
     }
     present_ptr[out_offset] = val;
+  } else if (s >= total_seq_lens[b]) {
+    present_ptr[out_offset] = T{};
   }
 }
 
@@ -892,7 +895,8 @@ __global__ void ConcatNewToPastKVFusedLarge(const int new_seqlen,
                                             const T* new_value,
                                             T* present_key,
                                             T* present_value,
-                                            const int* seqlens_k,
+                                            const int* past_seq_lens,
+                                            const int* total_seq_lens,
                                             const bool past_only,
                                             const bool is_bsnh,
                                             const T* cos_cache,
@@ -920,7 +924,7 @@ __global__ void ConcatNewToPastKVFusedLarge(const int new_seqlen,
     const T* new_ptr = (kind == 0) ? new_key : new_value;
     T* present_ptr = (kind == 0) ? present_key : present_value;
 
-    const int past_seqlen = seqlens_k == nullptr ? 0 : seqlens_k[b] + 1 - new_seqlen;
+    const int past_seqlen = past_seq_lens[b];
 
     int out_offset = b * present_batch_stride + s * row_stride + n * present_head_stride + h;
 
@@ -948,6 +952,8 @@ __global__ void ConcatNewToPastKVFusedLarge(const int new_seqlen,
         __syncthreads();
       }
       present_ptr[out_offset] = val;
+    } else if (s >= total_seq_lens[b]) {
+      present_ptr[out_offset] = T{};
     }
   }
 }
@@ -960,7 +966,8 @@ Status LaunchConcatNewToPastKV(const int batch_size,
                                const int past_sequence_length,
                                const int present_sequence_length,
                                const bool is_bsnh,
-                               const int* seqlens_k,
+                               const int* past_seq_lens,
+                               const int* total_seq_lens,
                                const T* past_key,
                                const T* past_value,
                                const T* new_key,
@@ -992,7 +999,8 @@ Status LaunchConcatNewToPastKV(const int batch_size,
                                                                   reinterpret_cast<const float2*>(new_value),
                                                                   reinterpret_cast<float2*>(present_key),
                                                                   reinterpret_cast<float2*>(present_value),
-                                                                  seqlens_k,
+                                                                  past_seq_lens,
+                                                                  total_seq_lens,
                                                                   past_only,
                                                                   is_bsnh,
                                                                   reinterpret_cast<const float2*>(cos_cache),
@@ -1016,7 +1024,8 @@ Status LaunchConcatNewToPastKV(const int batch_size,
                                                                        reinterpret_cast<const float2*>(new_value),
                                                                        reinterpret_cast<float2*>(present_key),
                                                                        reinterpret_cast<float2*>(present_value),
-                                                                       seqlens_k,
+                                                                       past_seq_lens,
+                                                                       total_seq_lens,
                                                                        past_only,
                                                                        is_bsnh,
                                                                        reinterpret_cast<const float2*>(cos_cache),
@@ -1033,7 +1042,8 @@ template Status LaunchConcatNewToPastKV<half>(const int batch_size,
                                               const int past_sequence_length,
                                               const int present_sequence_length,
                                               const bool is_bsnh,
-                                              const int* seqlens_k,
+                                              const int* past_seq_lens,
+                                              const int* total_seq_lens,
                                               const half* past_key,
                                               const half* past_value,
                                               const half* new_key,
@@ -1056,7 +1066,8 @@ template Status LaunchConcatNewToPastKV<BFloat16>(const int batch_size,
                                                   const int past_sequence_length,
                                                   const int present_sequence_length,
                                                   const bool is_bsnh,
-                                                  const int* seqlens_k,
+                                                  const int* past_seq_lens,
+                                                  const int* total_seq_lens,
                                                   const BFloat16* past_key,
                                                   const BFloat16* past_value,
                                                   const BFloat16* new_key,
@@ -1079,7 +1090,8 @@ template Status LaunchConcatNewToPastKV<float>(const int batch_size,
                                                const int past_sequence_length,
                                                const int present_sequence_length,
                                                const bool is_bsnh,
-                                               const int* seqlens_k,
+                                               const int* past_seq_lens,
+                                               const int* total_seq_lens,
                                                const float* past_key,
                                                const float* past_value,
                                                const float* new_key,
@@ -1100,8 +1112,8 @@ template <typename T>
 __global__ void ConcatKVInPlace(const int max_seqlen,
                                 T* kv_buff,
                                 const T* new_kv,
-                                const int* seqlens_k,
-                                const int* total_seqlens_k,
+                                const int* past_seq_lens,
+                                const int* total_seq_lens,
                                 const bool is_past_kv_bnsh_format,
                                 const bool is_new_kv_bnsh_format) {
   const int h = threadIdx.x;
@@ -1113,9 +1125,7 @@ __global__ void ConcatKVInPlace(const int max_seqlen,
   const int kv_num_heads = blockDim.y;
   const int H = blockDim.x;
 
-  const int past_seq_len = (total_seqlens_k != nullptr)
-                               ? (total_seqlens_k[b] - new_seqlen)
-                               : (seqlens_k == nullptr ? 0 : (seqlens_k[b] + 1 - new_seqlen));
+  const int past_seq_len = (past_seq_lens != nullptr) ? past_seq_lens[b] : (total_seq_lens[b] - new_seqlen);
 
   int out_offset = is_past_kv_bnsh_format
                        ? INDEX_4D(kv_num_heads, max_seqlen, H, b, n, s + past_seq_len, h)
@@ -1125,7 +1135,11 @@ __global__ void ConcatKVInPlace(const int max_seqlen,
                       ? INDEX_4D(kv_num_heads, new_seqlen, H, b, n, s, h)
                       : INDEX_4D(new_seqlen, kv_num_heads, H, b, s, n, h);
 
-  kv_buff[out_offset] = new_kv[in_offset];
+  if (s + past_seq_len < total_seq_lens[b]) {
+    kv_buff[out_offset] = new_kv[in_offset];
+  } else {
+    kv_buff[out_offset] = T{};
+  }
 }
 
 template <typename T>
@@ -1134,8 +1148,8 @@ __global__ void ConcatKVInPlaceLarge(const int max_seqlen,
                                      const int kv_num_heads,
                                      T* kv_buff,
                                      const T* new_kv,
-                                     const int* seqlens_k,
-                                     const int* total_seqlens_k,
+                                     const int* past_seq_lens,
+                                     const int* total_seq_lens,
                                      const bool is_past_kv_bnsh_format,
                                      const bool is_new_kv_bnsh_format) {  // refers to kv buff; otherwise bnsh
   int i = threadIdx.x + (blockDim.x * blockIdx.x);
@@ -1145,9 +1159,12 @@ __global__ void ConcatKVInPlaceLarge(const int max_seqlen,
     const int s = blockIdx.y;
     const int b = blockIdx.z;
     const int new_seqlen = gridDim.y;
-    const int past_seq_len = (total_seqlens_k != nullptr)
-                                 ? (total_seqlens_k[b] - new_seqlen)
-                                 : (seqlens_k == nullptr ? 0 : (seqlens_k[b] + 1 - new_seqlen));
+    const int past_seq_len = (past_seq_lens != nullptr) ? past_seq_lens[b] : (total_seq_lens[b] - new_seqlen);
+
+    if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 && b == 0) {
+      int total_len_val = (total_seq_lens != nullptr) ? total_seq_lens[b] : -1;
+      printf("[ConcatKV Debug] b=0, past_seq_len=%d, total_seq_lens[0]=%d, new_seqlen=%d\n", past_seq_len, total_len_val, new_seqlen);
+    }
 
     int out_offset = is_past_kv_bnsh_format
                          ? INDEX_4D(kv_num_heads, max_seqlen, H, b, n, s + past_seq_len, h)
@@ -1157,7 +1174,11 @@ __global__ void ConcatKVInPlaceLarge(const int max_seqlen,
                         ? INDEX_4D(kv_num_heads, new_seqlen, H, b, n, s, h)
                         : INDEX_4D(new_seqlen, kv_num_heads, H, b, s, n, h);
 
-    kv_buff[out_offset] = new_kv[in_offset];
+    if (s + past_seq_len < total_seq_lens[b]) {
+      kv_buff[out_offset] = new_kv[in_offset];
+    } else {
+      kv_buff[out_offset] = T{};
+    }
   }
 }
 
@@ -1166,8 +1187,8 @@ Status LaunchConcatKVInPlace(int batch_size,
                              int kv_num_heads,
                              int head_size,
                              int max_sequence_length,
-                             const int* seqlens_k,
-                             const int* total_seqlens_k,
+                             const int* past_seq_lens,
+                             const int* total_seq_lens,
                              int new_seq_len,
                              const T* new_key,
                              const T* new_value,
@@ -1187,15 +1208,15 @@ Status LaunchConcatKVInPlace(int batch_size,
     ConcatKVInPlace<float2><<<grid, block, 0, stream>>>(max_sequence_length,
                                                         reinterpret_cast<float2*>(present_key),
                                                         reinterpret_cast<const float2*>(new_key),
-                                                        seqlens_k,
-                                                        total_seqlens_k,
+                                                        past_seq_lens,
+                                                        total_seq_lens,
                                                         is_past_kv_bnsh_format,
                                                         is_new_kv_bnsh_format);
     ConcatKVInPlace<float2><<<grid, block, 0, stream>>>(max_sequence_length,
                                                         reinterpret_cast<float2*>(present_value),
                                                         reinterpret_cast<const float2*>(new_value),
-                                                        seqlens_k,
-                                                        total_seqlens_k,
+                                                        past_seq_lens,
+                                                        total_seq_lens,
                                                         is_past_kv_bnsh_format,
                                                         is_new_kv_bnsh_format);
   } else {
@@ -1207,8 +1228,8 @@ Status LaunchConcatKVInPlace(int batch_size,
                                                              kv_num_heads,
                                                              reinterpret_cast<float2*>(present_key),
                                                              reinterpret_cast<const float2*>(new_key),
-                                                             seqlens_k,
-                                                             total_seqlens_k,
+                                                             past_seq_lens,
+                                                             total_seq_lens,
                                                              is_past_kv_bnsh_format,
                                                              is_new_kv_bnsh_format);
     ConcatKVInPlaceLarge<float2><<<grid, block, 0, stream>>>(max_sequence_length,
@@ -1216,8 +1237,8 @@ Status LaunchConcatKVInPlace(int batch_size,
                                                              kv_num_heads,
                                                              reinterpret_cast<float2*>(present_value),
                                                              reinterpret_cast<const float2*>(new_value),
-                                                             seqlens_k,
-                                                             total_seqlens_k,
+                                                             past_seq_lens,
+                                                             total_seq_lens,
                                                              is_past_kv_bnsh_format,
                                                              is_new_kv_bnsh_format);
   }
@@ -1228,8 +1249,8 @@ template Status LaunchConcatKVInPlace<half>(int batch_size,
                                             int kv_num_heads,
                                             int head_size,
                                             int max_sequence_length,
-                                            const int* seqlens_k,
-                                            const int* total_seqlens_k,
+                                            const int* past_seq_lens,
+                                            const int* total_seq_lens,
                                             int new_seq_len,
                                             const half* new_key,
                                             const half* new_value,
@@ -1244,8 +1265,8 @@ template Status LaunchConcatKVInPlace<BFloat16>(int batch_size,
                                                 int kv_num_heads,
                                                 int head_size,
                                                 int max_sequence_length,
-                                                const int* seqlens_k,
-                                                const int* total_seqlens_k,
+                                                const int* past_seq_lens,
+                                                const int* total_seq_lens,
                                                 int new_seq_len,
                                                 const BFloat16* new_key,
                                                 const BFloat16* new_value,
@@ -1260,8 +1281,8 @@ template Status LaunchConcatKVInPlace<float>(int batch_size,
                                              int kv_num_heads,
                                              int head_size,
                                              int max_sequence_length,
-                                             const int* seqlens_k,
-                                             const int* total_seqlens_k,
+                                             const int* past_seq_lens,
+                                             const int* total_seq_lens,
                                              int new_seq_len,
                                              const float* new_key,
                                              const float* new_value,
@@ -1286,8 +1307,8 @@ __global__ void ConcatKVInPlaceFused(const int max_seqlen,
                                      T* v_buff,
                                      const T* new_k,
                                      const T* new_v,
-                                     const int* seqlens_k,
-                                     const int* total_seqlens_k,
+                                     const int* past_seq_lens,
+                                     const int* total_seq_lens,
                                      const bool is_past_kv_bnsh_format,
                                      const bool is_new_kv_bnsh_format,
                                      // RoPE parameters (for K only)
@@ -1304,9 +1325,7 @@ __global__ void ConcatKVInPlaceFused(const int max_seqlen,
   const int kv_num_heads = blockDim.y;
   const int H = blockDim.x;
 
-  const int past_seq_len = (total_seqlens_k != nullptr)
-                               ? (total_seqlens_k[b] - new_seqlen)
-                               : (seqlens_k == nullptr ? 0 : (seqlens_k[b] + 1 - new_seqlen));
+  const int past_seq_len = (past_seq_lens != nullptr) ? past_seq_lens[b] : (total_seq_lens[b] - new_seqlen);
 
   int out_offset = is_past_kv_bnsh_format
                        ? INDEX_4D(kv_num_heads, max_seqlen, H, b, n, s + past_seq_len, h)
@@ -1317,65 +1336,7 @@ __global__ void ConcatKVInPlaceFused(const int max_seqlen,
                       : INDEX_4D(new_seqlen, kv_num_heads, H, b, s, n, h);
 
   // Process K with RoPE
-  T k_val = new_k[in_offset];
-  if (cos_cache != nullptr && rotary_dim > 0) {
-    int pos_id = 0;
-    if (position_ids != nullptr) {
-      pos_id = static_cast<int>(position_ids[b * new_seqlen + s]);
-    } else {
-      pos_id = past_seq_len + s;
-    }
-    if (pos_id >= max_seqlen) pos_id = max_seqlen - 1;
-    if (pos_id < 0) pos_id = 0;
-
-    int in_offset_base = in_offset - h;
-    RotaryDispatcher<T, ElementT>::apply(k_val, cos_cache, sin_cache, rotary_dim, h, pos_id, interleaved, new_k, in_offset_base);
-  }
-  k_buff[out_offset] = k_val;
-
-  // Process V without RoPE (simple copy)
-  v_buff[out_offset] = new_v[in_offset];
-}
-
-// Large version for when H * kv_num_heads > max_threads_per_block
-template <typename T, typename ElementT>
-__global__ void ConcatKVInPlaceFusedLarge(const int max_seqlen,
-                                          const int new_seqlen,
-                                          const int H,
-                                          const int kv_num_heads,
-                                          T* k_buff,
-                                          T* v_buff,
-                                          const T* new_k,
-                                          const T* new_v,
-                                          const int* seqlens_k,
-                                          const int* total_seqlens_k,
-                                          const bool is_past_kv_bnsh_format,
-                                          const bool is_new_kv_bnsh_format,
-                                          // RoPE parameters (for K only)
-                                          const T* cos_cache,
-                                          const T* sin_cache,
-                                          const int rotary_dim,
-                                          const int64_t* position_ids,
-                                          const bool interleaved) {
-  int i = threadIdx.x + (blockDim.x * blockIdx.x);
-  if (i < H * kv_num_heads) {
-    const int h = i % H;
-    const int n = i / H;
-    const int s = blockIdx.y;
-    const int b = blockIdx.z;
-
-    const int past_seq_len = (total_seqlens_k != nullptr)
-                                 ? (total_seqlens_k[b] - new_seqlen)
-                                 : (seqlens_k == nullptr ? 0 : (seqlens_k[b] + 1 - new_seqlen));
-
-    int out_offset = is_past_kv_bnsh_format
-                         ? INDEX_4D(kv_num_heads, max_seqlen, H, b, n, s + past_seq_len, h)
-                         : INDEX_4D(max_seqlen, kv_num_heads, H, b, s + past_seq_len, n, h);
-
-    int in_offset = is_new_kv_bnsh_format
-                        ? INDEX_4D(kv_num_heads, new_seqlen, H, b, n, s, h)
-                        : INDEX_4D(new_seqlen, kv_num_heads, H, b, s, n, h);
-
+  if (s + past_seq_len < total_seq_lens[b]) {
     // Process K with RoPE
     T k_val = new_k[in_offset];
     if (cos_cache != nullptr && rotary_dim > 0) {
@@ -1395,6 +1356,78 @@ __global__ void ConcatKVInPlaceFusedLarge(const int max_seqlen,
 
     // Process V without RoPE (simple copy)
     v_buff[out_offset] = new_v[in_offset];
+  } else {
+    k_buff[out_offset] = T{};
+    v_buff[out_offset] = T{};
+  }
+}
+
+// Large version for when H * kv_num_heads > max_threads_per_block
+template <typename T, typename ElementT>
+__global__ void ConcatKVInPlaceFusedLarge(const int max_seqlen,
+                                          const int new_seqlen,
+                                          const int H,
+                                          const int kv_num_heads,
+                                          T* k_buff,
+                                          T* v_buff,
+                                          const T* new_k,
+                                          const T* new_v,
+                                          const int* past_seq_lens,
+                                          const int* total_seq_lens,
+                                          const bool is_past_kv_bnsh_format,
+                                          const bool is_new_kv_bnsh_format,
+                                          // RoPE parameters (for K only)
+                                          const T* cos_cache,
+                                          const T* sin_cache,
+                                          const int rotary_dim,
+                                          const int64_t* position_ids,
+                                          const bool interleaved) {
+  int i = threadIdx.x + (blockDim.x * blockIdx.x);
+  if (i < H * kv_num_heads) {
+    const int h = i % H;
+    const int n = i / H;
+    const int s = blockIdx.y;
+    const int b = blockIdx.z;
+
+    const int past_seq_len = (past_seq_lens != nullptr) ? past_seq_lens[b] : (total_seq_lens[b] - new_seqlen);
+
+    if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 && b == 0) {
+      int total_len_val = (total_seq_lens != nullptr) ? total_seq_lens[b] : -1;
+      printf("[ConcatKV Debug] b=0, past_seq_len=%d, total_seq_lens[0]=%d, new_seqlen=%d\n", past_seq_len, total_len_val, new_seqlen);
+    }
+
+    int out_offset = is_past_kv_bnsh_format
+                         ? INDEX_4D(kv_num_heads, max_seqlen, H, b, n, s + past_seq_len, h)
+                         : INDEX_4D(max_seqlen, kv_num_heads, H, b, s + past_seq_len, n, h);
+
+    int in_offset = is_new_kv_bnsh_format
+                        ? INDEX_4D(kv_num_heads, new_seqlen, H, b, n, s, h)
+                        : INDEX_4D(new_seqlen, kv_num_heads, H, b, s, n, h);
+
+    if (s + past_seq_len < total_seq_lens[b]) {
+      // Process K with RoPE
+      T k_val = new_k[in_offset];
+      if (cos_cache != nullptr && rotary_dim > 0) {
+        int pos_id = 0;
+        if (position_ids != nullptr) {
+          pos_id = static_cast<int>(position_ids[b * new_seqlen + s]);
+        } else {
+          pos_id = past_seq_len + s;
+        }
+        if (pos_id >= max_seqlen) pos_id = max_seqlen - 1;
+        if (pos_id < 0) pos_id = 0;
+
+        int in_offset_base = in_offset - h;
+        RotaryDispatcher<T, ElementT>::apply(k_val, cos_cache, sin_cache, rotary_dim, h, pos_id, interleaved, new_k, in_offset_base);
+      }
+      k_buff[out_offset] = k_val;
+
+      // Process V without RoPE (simple copy)
+      v_buff[out_offset] = new_v[in_offset];
+    } else {
+      k_buff[out_offset] = T{};
+      v_buff[out_offset] = T{};
+    }
   }
 }
 
@@ -1404,8 +1437,8 @@ Status LaunchConcatKVInPlaceFused(int batch_size,
                                   int kv_num_heads,
                                   int head_size,
                                   int max_sequence_length,
-                                  const int* seqlens_k,
-                                  const int* total_seqlens_k,
+                                  const int* past_seq_lens,
+                                  const int* total_seq_lens,
                                   int new_seq_len,
                                   const T* new_key,
                                   const T* new_value,
@@ -1436,8 +1469,8 @@ Status LaunchConcatKVInPlaceFused(int batch_size,
         reinterpret_cast<float2*>(present_value),
         reinterpret_cast<const float2*>(new_key),
         reinterpret_cast<const float2*>(new_value),
-        seqlens_k,
-        total_seqlens_k,
+        past_seq_lens,
+        total_seq_lens,
         is_past_kv_bnsh_format,
         is_new_kv_bnsh_format,
         reinterpret_cast<const float2*>(cos_cache),
@@ -1460,8 +1493,8 @@ Status LaunchConcatKVInPlaceFused(int batch_size,
         reinterpret_cast<float2*>(present_value),
         reinterpret_cast<const float2*>(new_key),
         reinterpret_cast<const float2*>(new_value),
-        seqlens_k,
-        total_seqlens_k,
+        past_seq_lens,
+        total_seq_lens,
         is_past_kv_bnsh_format,
         is_new_kv_bnsh_format,
         reinterpret_cast<const float2*>(cos_cache),
@@ -1477,8 +1510,8 @@ template Status LaunchConcatKVInPlaceFused<half>(int batch_size,
                                                  int kv_num_heads,
                                                  int head_size,
                                                  int max_sequence_length,
-                                                 const int* seqlens_k,
-                                                 const int* total_seqlens_k,
+                                                 const int* past_seq_lens,
+                                                 const int* total_seq_lens,
                                                  int new_seq_len,
                                                  const half* new_key,
                                                  const half* new_value,
@@ -1498,8 +1531,8 @@ template Status LaunchConcatKVInPlaceFused<BFloat16>(int batch_size,
                                                      int kv_num_heads,
                                                      int head_size,
                                                      int max_sequence_length,
-                                                     const int* seqlens_k,
-                                                     const int* total_seqlens_k,
+                                                     const int* past_seq_lens,
+                                                     const int* total_seq_lens,
                                                      int new_seq_len,
                                                      const BFloat16* new_key,
                                                      const BFloat16* new_value,
@@ -1514,6 +1547,27 @@ template Status LaunchConcatKVInPlaceFused<BFloat16>(int batch_size,
                                                      int rotary_dim,
                                                      const int64_t* position_ids,
                                                      bool interleaved);
+
+template Status LaunchConcatKVInPlaceFused<float>(int batch_size,
+                                                  int kv_num_heads,
+                                                  int head_size,
+                                                  int max_sequence_length,
+                                                  const int* past_seq_lens,
+                                                  const int* total_seq_lens,
+                                                  int new_seq_len,
+                                                  const float* new_key,
+                                                  const float* new_value,
+                                                  float* present_key,
+                                                  float* present_value,
+                                                  bool is_past_kv_bnsh_format,
+                                                  bool is_new_kv_bnsh_format,
+                                                  cudaStream_t stream,
+                                                  const int max_threads_per_block,
+                                                  const float* cos_cache,
+                                                  const float* sin_cache,
+                                                  int rotary_dim,
+                                                  const int64_t* position_ids,
+                                                  bool interleaved);
 
 }  // namespace cuda
 }  // namespace contrib

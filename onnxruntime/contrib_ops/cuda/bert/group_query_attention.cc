@@ -75,8 +75,14 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
   const Tensor* value = context->Input<Tensor>(2);
   const Tensor* past_key = context->Input<Tensor>(3);
   const Tensor* past_value = context->Input<Tensor>(4);
-  const Tensor* seqlens_k = context->Input<Tensor>(5);
+
+  // The input seqlens_k is total sequence length - 1 for historical reasons.
+  // Rename it to total_seq_lens_minus_one in cuda kernel to avoid confusion.
+  const Tensor* total_seq_lens_minus_one = context->Input<Tensor>(5);
+
+  // The max of total sequence lengths. The content of this tensor is a scalar stored in CPU memory.
   const Tensor* total_seqlen = context->Input<Tensor>(6);
+
   const Tensor* cos_cache = context->Input<Tensor>(7);
   const Tensor* sin_cache = context->Input<Tensor>(8);
   const Tensor* position_ids = context->Input<Tensor>(9);
@@ -103,7 +109,7 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
                                                                 &parameters,
                                                                 num_heads_,
                                                                 kv_num_heads_,
-                                                                seqlens_k,
+                                                                total_seq_lens_minus_one,
                                                                 total_seqlen,
                                                                 scale_,
                                                                 softcap_,
@@ -157,11 +163,22 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
   IAllocatorUniquePtr<void> softmax_lse_accum_buffer;
   IAllocatorUniquePtr<void> out_accum_buffer;
 
-  // Allocate seqlens_k_buffer here so it is available for both Flash Attention and Memory Efficient Attention paths.
-  // This buffer is used to store the effective sequence lengths (including past) for each batch entry.
-  auto seqlens_k_buffer = GetScratchBuffer<void>(sizeof(int) * parameters.batch_size, context->GetComputeStream());
-  data.seqlens_k_buff = reinterpret_cast<int*>(seqlens_k_buffer.get());
-  CUDA_CALL_THROW(cudaMemsetAsync(data.seqlens_k_buff, 0, sizeof(int) * parameters.batch_size, static_cast<cudaStream_t>(context->GetComputeStream()->GetHandle())));
+  // Compute sequence length buffers (past_seq_lens and total_seq_lens).
+  // Allocate buffer for both: first half is past_seq_lens, second half is total_seq_lens.
+  auto seq_lens_buffer = GetScratchBuffer<int>(3 * parameters.batch_size, context->GetComputeStream());
+  auto cuda_stream = static_cast<cudaStream_t>(context->GetComputeStream()->GetHandle());
+  data.past_seq_lens = seq_lens_buffer.get();
+  data.total_seq_lens = seq_lens_buffer.get() + parameters.batch_size;
+  data.padded_seq_lens = data.total_seq_lens + parameters.batch_size;
+  ORT_RETURN_IF_ERROR(LaunchGetSequenceLengths(total_seq_lens_minus_one->Data<int>(),
+                                               data.past_seq_lens,
+                                               data.total_seq_lens,
+                                               data.padded_seq_lens,
+                                               parameters.batch_size,
+                                               parameters.sequence_length,
+                                               parameters.is_first_prompt,
+                                               cuda_stream,
+                                               device_prop.maxThreadsPerBlock));
 
   data.position_ids = (position_ids != nullptr) ? position_ids->Data<int64_t>() : nullptr;
 
@@ -176,7 +193,6 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
   data.query = reinterpret_cast<const CudaT*>(query->Data<T>());
   data.key = key == nullptr ? nullptr : reinterpret_cast<const CudaT*>(key->Data<T>());
   data.value = value == nullptr ? nullptr : reinterpret_cast<const CudaT*>(value->Data<T>());
-  data.seqlens_k = const_cast<int*>(seqlens_k->Data<int>());
 
   // Handle Past/Present pointers
   data.past_key = (past_key == nullptr) ? nullptr : reinterpret_cast<const CudaT*>(past_key->Data<T>());
@@ -282,8 +298,10 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
 
   if (data.past_key == data.present_key) {
     parameters.kv_share_buffer = true;
+    ORT_ENFORCE(data.past_value == data.present_value, "past_value and present_value must be the same tensor when kv_share_buffer is true");
   } else {
     parameters.kv_share_buffer = false;
+    ORT_ENFORCE(data.past_value != data.present_value, "past_value and present_value must be different tensors when kv_share_buffer is false");
   }
 
   data.output = reinterpret_cast<CudaT*>(output->MutableData<T>());

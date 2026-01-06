@@ -62,13 +62,6 @@ __global__ void RotaryEmbeddingBSNH(T* output,                         // BxSxNx
     // used for Decoding (past_sequence_length = seqlens_k[b]) or First Prompt (past=0 if nullptr)
     int past = (past_sequence_lengths == nullptr) ? 0 : past_sequence_lengths[b];
     position_id = past + s;
-  } else if (position_ids_format == 3) {
-    // format 3: Interactive (Chunked Prefill)
-    // seqlens_k is Total Sequence Length - 1.
-    // past_start = (Total - 1) + 1 - sequence_length = seqlens_k[b] + 1 - sequence_length
-    // pos = past_start + s
-    int past_total_minus_1 = (past_sequence_lengths == nullptr) ? 0 : past_sequence_lengths[b];
-    position_id = (past_total_minus_1 + 1 - sequence_length) + s;
   }
   const int cache_offset = position_id * half_rotary_embedding_dim;
   const T* cos_data = cos_cache + cache_offset;
