@@ -1235,9 +1235,6 @@ def parity_test_gqa_padding_prompt():
 
     if not torch.allclose(out_ort, out_ref, rtol=1e-2, atol=1e-2):
         msg = f"Mismatch! Max Diff: {max_diff}, Batch 0 Max: {b0_diff}, Batch 1 Max: {b1_diff}\n"
-        msg += f"ORT[0,0,0]: {out_ort[0, 0, 0]}, REF[0,0,0]: {out_ref[0, 0, 0]}\n"
-        msg += f"ORT[0,9,0]: {out_ort[0, 9, 0]}, REF[0,9,0]: {out_ref[0, 9, 0]}\n"
-        msg += f"ORT[0,0,66]: {out_ort[0, 0, 66]}, REF[0,0,66]: {out_ref[0, 0, 66]}\n"
         raise AssertionError(msg)
 
     torch.testing.assert_close(out_ort, out_ref, rtol=1e-2, atol=1e-2)

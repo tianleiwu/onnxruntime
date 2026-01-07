@@ -879,7 +879,6 @@ __global__ void ConcatNewToPastKVFusedLarge(const int new_seqlen,
         }
 
         RotaryDispatcher<T, ElementT>::apply(val, cos_cache, sin_cache, rotary_dim, h, pos_id, interleaved, new_key, in_offset - h);
-        __syncthreads();
       }
       present_ptr[out_offset] = val;
     } else if (s >= total_seq_lens[b]) {
@@ -912,8 +911,7 @@ Status LaunchConcatNewToPastKV(const int batch_size,
                                const int rotary_dim,
                                const int64_t* position_ids,
                                const bool interleaved) {
-  int num_elements_per_thread = 8 / sizeof(T);
-  if (num_elements_per_thread == 0) num_elements_per_thread = 1;
+  constexpr int num_elements_per_thread = std::max(1, 8 / int(sizeof(T)));
   const int H = head_size / num_elements_per_thread;
 
   if (H * kv_num_heads <= max_threads_per_block) {
@@ -1090,11 +1088,6 @@ __global__ void ConcatKVInPlaceLarge(const int max_seqlen,
     const int b = blockIdx.z;
     const int new_seqlen = gridDim.y;
     const int past_seq_len = (past_seq_lens != nullptr) ? past_seq_lens[b] : (total_seq_lens[b] - new_seqlen);
-
-    if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 && b == 0) {
-      int total_len_val = (total_seq_lens != nullptr) ? total_seq_lens[b] : -1;
-      printf("[ConcatKV Debug] b=0, past_seq_len=%d, total_seq_lens[0]=%d, new_seqlen=%d\n", past_seq_len, total_len_val, new_seqlen);
-    }
 
     int out_offset = is_past_kv_bnsh_format
                          ? INDEX_4D(kv_num_heads, max_seqlen, H, b, n, s + past_seq_len, h)
@@ -1320,11 +1313,6 @@ __global__ void ConcatKVInPlaceFusedLarge(const int max_seqlen,
     const int b = blockIdx.z;
 
     const int past_seq_len = (past_seq_lens != nullptr) ? past_seq_lens[b] : (total_seq_lens[b] - new_seqlen);
-
-    if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 && b == 0) {
-      int total_len_val = (total_seq_lens != nullptr) ? total_seq_lens[b] : -1;
-      printf("[ConcatKV Debug] b=0, past_seq_len=%d, total_seq_lens[0]=%d, new_seqlen=%d\n", past_seq_len, total_len_val, new_seqlen);
-    }
 
     int out_offset = is_past_kv_bnsh_format
                          ? INDEX_4D(kv_num_heads, max_seqlen, H, b, n, s + past_seq_len, h)

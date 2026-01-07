@@ -286,6 +286,10 @@ __global__ void UnpackQKV(const T* packed_qkv, T* unpacked_q, T* unpacked_k, T* 
 
         int unpacked_i = INDEX_4D(head_count, sequence_length, head_size, b, n, s, h);
         unpacked[unpacked_i] = packed_qkv[tid];
+      } else {
+#ifndef NDEBUG
+        assert(false && "Unexpected null 'unpacked' pointer in GroupQueryAttention unpack kernel");
+#endif
       }
     } else {  // output BSNH
       if (offset < q_hidden) {

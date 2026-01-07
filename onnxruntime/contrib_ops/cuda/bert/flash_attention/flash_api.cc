@@ -598,6 +598,8 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
 
   // Only split kernel supports appending to KV cache
   // or if using packed QKV (to ensure correct handling of strided inputs which might be better supported or isolated in split kernel logic).
+  // Note: if the fused kernel handles packing/rotary/appending, it should pass is_packed_qkv=false to this API (via use_packed_for_fa=false),
+  // effectively bypassing this check and allowing standard kernels if otherwise eligible.
   bool force_split = (k_new != nullptr) || is_packed_qkv;
 
   run_mha_fwd(params, stream, force_split);
