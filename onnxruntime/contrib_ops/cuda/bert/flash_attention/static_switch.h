@@ -1,5 +1,7 @@
-// Inspired by https://github.com/NVIDIA/DALI/blob/main/include/dali/core/static_switch.h
+// Inspired by
+// https://github.com/NVIDIA/DALI/blob/main/include/dali/core/static_switch.h
 // and https://github.com/pytorch/pytorch/blob/master/aten/src/ATen/Dispatch.h
+
 #pragma once
 
 /// @param COND       - a boolean expression to switch by
@@ -12,6 +14,7 @@
 ///     some_function<BoolConst>(...);
 /// });
 /// ```
+
 #define BOOL_SWITCH(COND, CONST_NAME, ...)      \
   [&] {                                         \
     if (COND) {                                 \
@@ -23,7 +26,9 @@
     }                                           \
   }()
 
-#define FLASHATTENTION_DISABLE_ALIBI  // TEMP: Remove if we enable alibi
+// ORT does not support alibi.
+#define FLASHATTENTION_DISABLE_ALIBI 1
+
 #ifdef FLASHATTENTION_DISABLE_ALIBI
 #define ALIBI_SWITCH(COND, CONST_NAME, ...)   \
   [&] {                                       \

@@ -80,6 +80,7 @@ struct Flash_fwd_params : public Qkv_params {
   // array of length b+1 holding starting offset of each sequence.
   int* __restrict__ cu_seqlens_q = nullptr;
   int* __restrict__ cu_seqlens_k = nullptr;
+  int* __restrict__ leftpad_k = nullptr;
 
   // If provided, the actual length of each k sequence.
   int* __restrict__ seqused_k = nullptr;
@@ -114,6 +115,20 @@ struct Flash_fwd_params : public Qkv_params {
   int window_size_left = -1;
   int window_size_right = -1;
 
+  // Dropout probability (probability to drop). 0.0 = no dropout.
+  float p_dropout = 0.0f;
+  uint8_t p_dropout_in_uint8_t = 0;
+  float rp_dropout = 1.0f;  // reciprocal of (1-p_dropout)
+
+#ifndef FLASHATTENTION_DISABLE_DROPOUT
+  // RNG state for dropout (not used for inference)
+  struct PhiloxCudaState {
+    uint64_t seed = 0;
+    uint64_t offset = 0;
+  } philox_args;
+  uint64_t* rng_state = nullptr;
+#endif
+
   bool is_bf16 = false;
   bool is_causal = false;
 
@@ -131,15 +146,17 @@ struct Flash_fwd_params : public Qkv_params {
   void* __restrict__ alibi_slopes_ptr = nullptr;
   index_t alibi_slopes_batch_stride = 0;
 
-  bool unpadded_lse = false;
+  bool unpadded_lse = false;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
   const cudaDeviceProp* dprops = nullptr;
+  bool seqlenq_ngroups_swapped = false;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename T, int Headdim>
+template <typename T, int Headdim, bool Is_causal>
 void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream);
-template <typename T, int Headdim>
+
+template <typename T, int Headdim, bool Is_causal>
 void run_mha_fwd_splitkv_dispatch(Flash_fwd_params& params, cudaStream_t stream);
 
 }  // namespace flash
