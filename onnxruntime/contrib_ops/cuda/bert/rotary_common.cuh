@@ -1,6 +1,44 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+// ============================================================================
+// rotary_common.cuh - Vectorized Rotary Position Embedding (RoPE) Dispatcher
+// ============================================================================
+//
+// PURPOSE:
+//   Provides a unified, vectorized interface for applying Rotary Position
+//   Embedding (RoPE) to K or Q tensors directly within fused kernels.
+//   This enables RoPE application during KV cache append operations without
+//   requiring separate kernel launches.
+//
+// USAGE:
+//   Called from ConcatNewToPastKVFused and UnpackQKVWithRoPEAndAppendKV kernels
+//   to apply in-place rotation to Key vectors as they are being appended to cache.
+//
+// SUPPORTED TYPES:
+//   - float2 + float:    2 fp32 elements (8 bytes)
+//   - float4 + float:    4 fp32 elements (16 bytes)
+//   - float2 + half:     4 fp16 elements (8 bytes)
+//   - float4 + half:     8 fp16 elements (16 bytes)
+//   - float2 + BFloat16: 4 bf16 elements (8 bytes)
+//   - float4 + BFloat16: 8 bf16 elements (16 bytes)
+//
+// ROTATION MODES:
+//   1. INTERLEAVED: Adjacent pairs (x0,x1), (x2,x3), ... are rotated together
+//      Formula: (x, y) -> (x*cos - y*sin, x*sin + y*cos)
+//
+//   2. HALF-SPLIT (Non-Interleaved): First half pairs with second half
+//      Pairs: (x0, x_{d/2}), (x1, x_{d/2+1}), ...
+//      Formula: x_i -> x_i * cos + sign * x_{pair} * sin
+//               where sign = -1 if i < d/2, else +1
+//
+// INPUT REQUIREMENTS:
+//   - cos_cache, sin_cache: [max_position, rotary_dim/2]
+//   - new_kv_base: Contiguous BSNH tensor for fetching pair values (half-split mode)
+//   - in_offset: Element offset into new_kv_base for current thread's data
+//
+// ============================================================================
+
 #pragma once
 
 #include <cuda_fp16.h>
@@ -11,6 +49,29 @@ namespace onnxruntime {
 namespace contrib {
 namespace cuda {
 
+// ============================================================================
+// RotaryDispatcher Template
+// ============================================================================
+// Template struct for vectorized RoPE application.
+//
+// TEMPLATE PARAMETERS:
+//   VectorT  - Vector type used for memory access (float2, float4)
+//   ElementT - Underlying element type (float, half, BFloat16)
+//
+// STATIC METHOD: apply()
+//   Applies RoPE to 'val' in-place.
+//
+// PARAMETERS:
+//   val         - [in/out] Vector of elements to rotate
+//   cos_cache   - Precomputed cosine values [max_pos, rotary_dim/2]
+//   sin_cache   - Precomputed sine values [max_pos, rotary_dim/2]
+//   rotary_dim  - Number of dimensions with rotation (must be <= head_size)
+//   h_idx       - Vector index within head (determines which rotary elements)
+//   pos_id      - Position ID for this token (used to index cos/sin caches)
+//   interleaved - True for interleaved mode, false for half-split
+//   new_kv_base - Base pointer for fetching pair values (half-split mode only)
+//   in_offset   - Offset to current element in new_kv_base (vector units)
+// ============================================================================
 template <typename VectorT, typename ElementT>
 struct RotaryDispatcher {
   __device__ static void apply(VectorT& val, const VectorT* cos_cache, const VectorT* sin_cache,
@@ -18,7 +79,12 @@ struct RotaryDispatcher {
                                const bool interleaved, const VectorT* new_kv_base, const int64_t in_offset);
 };
 
-// Specialization for float2 (float)
+// ============================================================================
+// Specialization: float2 + float (2 fp32 elements per vector)
+// ============================================================================
+// Handles 2 scalar float values per thread.
+// For half-split mode, fetches pair values from new_kv_base at runtime.
+// ============================================================================
 template <>
 struct RotaryDispatcher<float2, float> {
   __device__ static void apply(float2& val, const float2* cos_cache, const float2* sin_cache,
@@ -84,7 +150,11 @@ struct RotaryDispatcher<float2, float> {
   }
 };
 
-// Specialization for float4 (float)
+// ============================================================================
+// Specialization: float4 + float (4 fp32 elements per vector)
+// ============================================================================
+// Delegates to float2+float specialization for each half of the float4.
+// ============================================================================
 template <>
 struct RotaryDispatcher<float4, float> {
   __device__ static void apply(float4& val, const float4* cos_cache, const float4* sin_cache,
@@ -107,7 +177,12 @@ struct RotaryDispatcher<float4, float> {
   }
 };
 
-// Specialization for float2 (half)
+// ============================================================================
+// Specialization: float2 + half (4 fp16 elements packed in float2)
+// ============================================================================
+// Uses half2 intrinsics for efficient fp16 computation.
+// Each float2 contains 2 half2 values = 4 fp16 elements.
+// ============================================================================
 template <>
 struct RotaryDispatcher<float2, half> {
   __device__ static void apply(float2& val, const float2* cos_cache, const float2* sin_cache,
@@ -177,7 +252,12 @@ struct RotaryDispatcher<float2, half> {
   }
 };
 
-// Specialization for float2 (BFloat16)
+// ============================================================================
+// Specialization: float2 + BFloat16 (4 bf16 elements packed in float2)
+// ============================================================================
+// Uses __nv_bfloat162 intrinsics for bf16 computation.
+// Requires SM 80+ (Ampere) for native bf16 support.
+// ============================================================================
 template <>
 struct RotaryDispatcher<float2, BFloat16> {
   __device__ static void apply(float2& val, const float2* cos_cache, const float2* sin_cache,
@@ -252,8 +332,11 @@ struct RotaryDispatcher<float2, BFloat16> {
   }
 };
 
-
-// Specialization for float4 (half)
+// ============================================================================
+// Specialization: float4 + half (8 fp16 elements per vector)
+// ============================================================================
+// Delegates to float2+half specialization for each half of the float4.
+// ============================================================================
 template <>
 struct RotaryDispatcher<float4, half> {
   __device__ static void apply(float4& val, const float4* cos_cache, const float4* sin_cache,
@@ -275,7 +358,11 @@ struct RotaryDispatcher<float4, half> {
   }
 };
 
-// Specialization for float4 (BFloat16)
+// ============================================================================
+// Specialization: float4 + BFloat16 (8 bf16 elements per vector)
+// ============================================================================
+// Delegates to float2+BFloat16 specialization for each half of the float4.
+// ============================================================================
 template <>
 struct RotaryDispatcher<float4, BFloat16> {
   __device__ static void apply(float4& val, const float4* cos_cache, const float4* sin_cache,

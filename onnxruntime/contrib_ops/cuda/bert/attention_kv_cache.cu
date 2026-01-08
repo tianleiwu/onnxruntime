@@ -12,6 +12,32 @@ namespace onnxruntime {
 namespace contrib {
 namespace cuda {
 
+// ============================================================================
+// ConcatTensorToTensor Kernel
+// ============================================================================
+// PURPOSE:
+//   Concatenates past KV cache with new KV tokens to create present KV cache.
+//   Used for non-shared buffer mode (separate past and present tensors).
+//
+// INPUTS:
+//   tensor_add_sequence_length - Number of new tokens to append (L)
+//   tensor_in  - Past KV cache [K, B, N, P, H] where P is past sequence length
+//   tensor_add - New KV tokens [K, B, N, L, H] where L is new sequence length
+//
+// OUTPUTS:
+//   tensor_out - Present KV cache [K, B, N, T, H] where T = P + L
+//
+// THREAD MAPPING:
+//   threadIdx.x = h (head dimension element)
+//   threadIdx.y = n (head index)
+//   blockIdx.x  = s (sequence position in output)
+//   blockIdx.y  = b (batch index)
+//   blockIdx.z  = chunk_id (K dimension, typically 2 for K and V)
+//
+// ASSUMPTIONS:
+//   - H * num_heads <= max_threads_per_block (use ConcatTensorToTensorLarge otherwise)
+//   - Output format is BNSH
+// ============================================================================
 template <typename T>
 __global__ void ConcatTensorToTensor(const int tensor_add_sequence_length,
                                      const T* tensor_in,
@@ -738,7 +764,37 @@ template Status LaunchConcatNewToPastKV<float>(const int batch_size,
                                                const int64_t* position_ids,
                                                const bool interleaved);
 
-// Kernel to append new kv to kv buffer in place
+// ============================================================================
+// ConcatKVInPlace Kernel
+// ============================================================================
+// PURPOSE:
+//   Appends new KV tokens to existing KV cache buffer IN-PLACE.
+//   Used when past and present KV share the same memory (kv_share_buffer=true).
+//
+// INPUTS:
+//   max_seqlen           - Maximum sequence length (buffer size)
+//   new_kv               - New KV tokens to append
+//   past_seq_lens        - Per-batch offset where to write (can be null)
+//   total_seq_lens       - Per-batch total valid tokens after appending
+//   is_past_kv_bnsh_format - True if KV buffer is BNSH, false for BSNH
+//   is_new_kv_bnsh_format  - True if new_kv is BNSH, false for BSNH
+//
+// OUTPUTS:
+//   kv_buff - Updated KV cache with new tokens appended at past_seq_len offset
+//
+// THREAD MAPPING:
+//   threadIdx.x = h (head dimension element)
+//   threadIdx.y = n (head index)
+//   blockIdx.x  = s (new token sequence position, 0 to new_seqlen-1)
+//   blockIdx.y  = b (batch index)
+//
+// BOUNDS CHECK:
+//   Only writes when (s + past_seq_len < total_seq_lens[b]) to prevent
+//   out-of-bounds access with variable-length sequences.
+//
+// ASSUMPTIONS:
+//   - H * kv_num_heads <= max_threads_per_block (use ConcatKVInPlaceLarge otherwise)
+// ============================================================================
 template <typename T>
 __global__ void ConcatKVInPlace(const int max_seqlen,
                                 T* kv_buff,
@@ -919,13 +975,28 @@ template Status LaunchConcatKVInPlace<float>(int batch_size,
                                              const int max_threads_per_block);
 
 // ============================================================================
-// TRULY FUSED K+V KERNEL: Single kernel for both K and V
-// This eliminates the separate ConcatKVInPlace call for V, saving one kernel launch.
-// RoPE should be applied BEFORE calling this kernel.
+// ConcatKVInPlaceFused Kernel
 // ============================================================================
-
-// Fused kernel: Append K and V in a single kernel
-// Each thread handles one element of K and one element of V
+// PURPOSE:
+//   Fused kernel that appends BOTH K and V in a single kernel launch.
+//   Eliminates one kernel launch compared to calling ConcatKVInPlace twice.
+//
+// INPUTS:
+//   max_seqlen, new_seqlen - Buffer and new sequence dimensions
+//   new_k, new_v           - New K and V tokens to append (must be pre-rotated if RoPE is needed)
+//   past_seq_lens          - Per-batch write offset (can be null)
+//   total_seq_lens         - Per-batch total valid tokens
+//   is_past_kv_bnsh_format - True if KV buffer is BNSH, false for BSNH
+//   is_new_kv_bnsh_format  - True if new K/V is BNSH, false for BSNH
+//
+// OUTPUTS:
+//   k_buff - Updated K cache
+//   v_buff - Updated V cache
+//
+// NOTE:
+//   RoPE should be applied BEFORE calling this kernel.
+//   For fused RoPE+append, use ConcatNewToPastKVFused instead.
+// ============================================================================
 template <typename T>
 __global__ void ConcatKVInPlaceFused(const int max_seqlen,
                                      const int new_seqlen,

@@ -142,7 +142,32 @@ Status LaunchConcatKVInPlace(GroupQueryAttentionParameters& parameters,
                                max_threads_per_block);
 }
 
-// Kernel for use with memory efficient kernel... kv_in is grouped and of bnsh or bsnh... kv_out is ungrouped and bsnh
+// ============================================================================
+// Ungroup Kernel
+// ============================================================================
+// PURPOSE:
+//   Expands grouped KV heads to match Q heads for Memory Efficient Attention.
+//   Each KV head is replicated q_num_heads/kv_num_heads times.
+//
+// INPUTS:
+//   kv_in      - Grouped KV tensor with kv_num_heads heads
+//   in_seqlen  - Sequence length of input tensor
+//   kv_num_heads - Number of KV heads (fewer than Q heads)
+//   is_bsnh    - True for BSNH format, False for BNSH format
+//
+// OUTPUTS:
+//   kv_out     - Ungrouped tensor with q_num_heads heads (BSNH format)
+//
+// THREAD MAPPING:
+//   threadIdx.x = h (head dimension element)
+//   threadIdx.y = out_n (output head index)
+//   blockIdx.x  = s (sequence position)
+//   blockIdx.y  = b (batch index)
+//
+// ASSUMPTIONS:
+//   - q_num_heads is divisible by kv_num_heads
+//   - H * q_num_heads <= max_threads_per_block (use UngroupLarge otherwise)
+// ============================================================================
 template <typename T>
 __global__ void Ungroup(const T* kv_in,
                         T* kv_out,
@@ -173,6 +198,19 @@ __global__ void Ungroup(const T* kv_in,
   kv_out[out_offset] = kv_in[in_offset];
 }
 
+// ============================================================================
+// UngroupLarge Kernel
+// ============================================================================
+// PURPOSE:
+//   Same as Ungroup but for cases where H * q_num_heads > max_threads_per_block.
+//   Uses a 1D thread grid to avoid block dimension limit.
+//
+// THREAD MAPPING:
+//   Each thread processes one element indexed by (threadIdx.x + blockDim.x * blockIdx.x)
+//   This linear index is decomposed into (h, out_n) within the kernel.
+//   blockIdx.y = s (sequence position)
+//   blockIdx.z = b (batch index)
+// ============================================================================
 template <typename T>
 __global__ void UngroupLarge(const T* kv_in,
                              T* kv_out,
@@ -255,7 +293,33 @@ Status LaunchUngroup(const GroupQueryAttentionParameters& parameters,
   return CUDA_CALL(cudaGetLastError());
 }
 
-// Kernel to unpack qkv from packed qkv
+// ============================================================================
+// UnpackQKV Kernel
+// ============================================================================
+// PURPOSE:
+//   Unpacks packed QKV tensor into separate Q, K, V tensors.
+//   Packed input has interleaved [Q, K, V] per token.
+//
+// INPUTS:
+//   packed_qkv - Input tensor of shape [B, S, (Q_heads + 2*KV_heads) * head_size]
+//   num_heads  - Number of Q heads
+//   kv_num_heads - Number of KV heads
+//   head_size  - Head dimension
+//   sequence_length - Token sequence length
+//   batch_size - Batch size
+//
+// OUTPUTS:
+//   unpacked_q - Q tensor [B, S, num_heads, head_size] if BSNH, or [B, num_heads, S, head_size] if BNSH
+//   unpacked_k - K tensor [B, S, kv_num_heads, head_size] if BSNH, or [B, kv_num_heads, S, head_size] if BNSH
+//   unpacked_v - V tensor (same layout as K)
+//
+// TEMPLATE PARAM:
+//   output_bnsh - If true, outputs BNSH format; if false, outputs BSNH format
+//
+// THREAD MAPPING:
+//   One thread per element in packed_qkv. Thread determines which of Q/K/V
+//   the element belongs to based on the offset within the hidden dimension.
+// ============================================================================
 template <typename T, bool output_bnsh>
 __global__ void UnpackQKV(const T* packed_qkv, T* unpacked_q, T* unpacked_k, T* unpacked_v, const int num_heads,
                           const int kv_num_heads, const int head_size, const int sequence_length,
@@ -545,6 +609,33 @@ template Status LaunchUnpackQKVWithRoPEAndAppendKV<BFloat16>(
     const BFloat16*, const BFloat16*, int, const int64_t*, bool, bool,
     cudaStream_t, int);
 
+// ============================================================================
+// GetSequenceLengths Kernel
+// ============================================================================
+// PURPOSE:
+//   Computes derived sequence length buffers from input seqlens_k.
+//   Input seqlens_k contains (total_sequence_length - 1) for historical reasons.
+//
+// INPUTS:
+//   total_seq_lens_minus_one - Input from ONNX graph: total_len - 1 per batch [B]
+//   sequence_length          - Current Q sequence length (new tokens)
+//   is_first_prompt          - True if this is the first prompt (no past)
+//
+// OUTPUTS:
+//   past_seq_lens   - Offset where new KV should be appended [B]
+//                     First prompt: 0
+//                     Otherwise: total_len - sequence_length
+//   total_seq_lens  - Total valid tokens including new ones [B]
+//   padded_seq_lens - Padded length for masking (first prompt only) [B]
+//                     First prompt: sequence_length
+//                     Otherwise: not set (undefined)
+//
+// THREAD MAPPING:
+//   One thread per batch element.
+//
+// USAGE:
+//   Called once per inference to derive all sequence length variants.
+// ============================================================================
 __global__ void GetSequenceLengths(const int* total_seq_lens_minus_one,
                                    int* past_seq_lens,
                                    int* total_seq_lens,
