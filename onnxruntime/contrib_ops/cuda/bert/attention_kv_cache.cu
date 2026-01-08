@@ -1217,13 +1217,14 @@ template Status LaunchConcatKVInPlace<float>(int batch_size,
                                              const int max_threads_per_block);
 
 // ============================================================================
-// TRULY FUSED K+V KERNEL: Single kernel for both K (with RoPE) and V (no RoPE)
+// TRULY FUSED K+V KERNEL: Single kernel for both K and V
 // This eliminates the separate ConcatKVInPlace call for V, saving one kernel launch.
+// RoPE should be applied BEFORE calling this kernel.
 // ============================================================================
 
-// Fused kernel: Append K (with RoPE) and V (without RoPE) in a single kernel
+// Fused kernel: Append K and V in a single kernel
 // Each thread handles one element of K and one element of V
-template <typename T, typename ElementT>
+template <typename T>
 __global__ void ConcatKVInPlaceFused(const int max_seqlen,
                                      const int new_seqlen,
                                      T* k_buff,
@@ -1233,13 +1234,7 @@ __global__ void ConcatKVInPlaceFused(const int max_seqlen,
                                      const int* past_seq_lens,
                                      const int* total_seq_lens,
                                      const bool is_past_kv_bnsh_format,
-                                     const bool is_new_kv_bnsh_format,
-                                     // RoPE parameters (for K only)
-                                     const T* cos_cache,
-                                     const T* sin_cache,
-                                     const int rotary_dim,
-                                     const int64_t* position_ids,
-                                     const bool interleaved) {
+                                     const bool is_new_kv_bnsh_format) {
   const int h = threadIdx.x;
   const int n = threadIdx.y;
   const int s = blockIdx.x;
@@ -1250,43 +1245,27 @@ __global__ void ConcatKVInPlaceFused(const int max_seqlen,
 
   const int past_seq_len = (past_seq_lens != nullptr) ? past_seq_lens[b] : (total_seq_lens[b] - new_seqlen);
 
-  int out_offset = is_past_kv_bnsh_format
-                       ? INDEX_4D(kv_num_heads, max_seqlen, H, b, n, s + past_seq_len, h)
-                       : INDEX_4D(max_seqlen, kv_num_heads, H, b, s + past_seq_len, n, h);
-
-  int in_offset = is_new_kv_bnsh_format
-                      ? INDEX_4D(kv_num_heads, new_seqlen, H, b, n, s, h)
-                      : INDEX_4D(new_seqlen, kv_num_heads, H, b, s, n, h);
-
-  // Process K with RoPE
-  if (s + past_seq_len < total_seq_lens[b]) {
-    // Process K with RoPE
-    T k_val = new_k[in_offset];
-    if (cos_cache != nullptr && rotary_dim > 0) {
-      int pos_id = 0;
-      if (position_ids != nullptr) {
-        pos_id = static_cast<int>(position_ids[b * new_seqlen + s]);
-      } else {
-        pos_id = past_seq_len + s;
-      }
-      if (pos_id >= max_seqlen) pos_id = max_seqlen - 1;
-      if (pos_id < 0) pos_id = 0;
-
-      int in_offset_base = in_offset - h;
-      RotaryDispatcher<T, ElementT>::apply(k_val, cos_cache, sin_cache, rotary_dim, h, pos_id, interleaved, new_k, in_offset_base);
-    }
-    k_buff[out_offset] = k_val;
-
-    // Process V without RoPE (simple copy)
-    v_buff[out_offset] = new_v[in_offset];
-  } else {
-    k_buff[out_offset] = T{};
-    v_buff[out_offset] = T{};
+  // Early exit to prevent out-of-bounds access and redundant writes
+  if (s + past_seq_len >= total_seq_lens[b]) {
+    return;
   }
+
+  // Use int64_t for offsets to prevent overflow
+  int64_t out_offset = is_past_kv_bnsh_format
+                           ? INDEX_4D(int64_t(kv_num_heads), int64_t(max_seqlen), int64_t(H), int64_t(b), int64_t(n), int64_t(s + past_seq_len), int64_t(h))
+                           : INDEX_4D(int64_t(max_seqlen), int64_t(kv_num_heads), int64_t(H), int64_t(b), int64_t(s + past_seq_len), int64_t(n), int64_t(h));
+
+  int64_t in_offset = is_new_kv_bnsh_format
+                          ? INDEX_4D(int64_t(kv_num_heads), int64_t(new_seqlen), int64_t(H), int64_t(b), int64_t(n), int64_t(s), int64_t(h))
+                          : INDEX_4D(int64_t(new_seqlen), int64_t(kv_num_heads), int64_t(H), int64_t(b), int64_t(s), int64_t(n), int64_t(h));
+
+  // Simple copy for K and V
+  k_buff[out_offset] = new_k[in_offset];
+  v_buff[out_offset] = new_v[in_offset];
 }
 
 // Large version for when H * kv_num_heads > max_threads_per_block
-template <typename T, typename ElementT>
+template <typename T>
 __global__ void ConcatKVInPlaceFusedLarge(const int max_seqlen,
                                           const int new_seqlen,
                                           const int H,
@@ -1298,13 +1277,7 @@ __global__ void ConcatKVInPlaceFusedLarge(const int max_seqlen,
                                           const int* past_seq_lens,
                                           const int* total_seq_lens,
                                           const bool is_past_kv_bnsh_format,
-                                          const bool is_new_kv_bnsh_format,
-                                          // RoPE parameters (for K only)
-                                          const T* cos_cache,
-                                          const T* sin_cache,
-                                          const int rotary_dim,
-                                          const int64_t* position_ids,
-                                          const bool interleaved) {
+                                          const bool is_new_kv_bnsh_format) {
   int i = threadIdx.x + (blockDim.x * blockIdx.x);
   if (i < H * kv_num_heads) {
     const int h = i % H;
@@ -1314,42 +1287,24 @@ __global__ void ConcatKVInPlaceFusedLarge(const int max_seqlen,
 
     const int past_seq_len = (past_seq_lens != nullptr) ? past_seq_lens[b] : (total_seq_lens[b] - new_seqlen);
 
-    int out_offset = is_past_kv_bnsh_format
-                         ? INDEX_4D(kv_num_heads, max_seqlen, H, b, n, s + past_seq_len, h)
-                         : INDEX_4D(max_seqlen, kv_num_heads, H, b, s + past_seq_len, n, h);
-
-    int in_offset = is_new_kv_bnsh_format
-                        ? INDEX_4D(kv_num_heads, new_seqlen, H, b, n, s, h)
-                        : INDEX_4D(new_seqlen, kv_num_heads, H, b, s, n, h);
-
-    if (s + past_seq_len < total_seq_lens[b]) {
-      // Process K with RoPE
-      T k_val = new_k[in_offset];
-      if (cos_cache != nullptr && rotary_dim > 0) {
-        int pos_id = 0;
-        if (position_ids != nullptr) {
-          pos_id = static_cast<int>(position_ids[b * new_seqlen + s]);
-        } else {
-          pos_id = past_seq_len + s;
-        }
-        if (pos_id >= max_seqlen) pos_id = max_seqlen - 1;
-        if (pos_id < 0) pos_id = 0;
-
-        int in_offset_base = in_offset - h;
-        RotaryDispatcher<T, ElementT>::apply(k_val, cos_cache, sin_cache, rotary_dim, h, pos_id, interleaved, new_k, in_offset_base);
-      }
-      k_buff[out_offset] = k_val;
-
-      // Process V without RoPE (simple copy)
-      v_buff[out_offset] = new_v[in_offset];
-    } else {
-      k_buff[out_offset] = T{};
-      v_buff[out_offset] = T{};
+    if (s + past_seq_len >= total_seq_lens[b]) {
+      return;
     }
+
+    int64_t out_offset = is_past_kv_bnsh_format
+                             ? INDEX_4D(int64_t(kv_num_heads), int64_t(max_seqlen), int64_t(H), int64_t(b), int64_t(n), int64_t(s + past_seq_len), int64_t(h))
+                             : INDEX_4D(int64_t(max_seqlen), int64_t(kv_num_heads), int64_t(H), int64_t(b), int64_t(s + past_seq_len), int64_t(n), int64_t(h));
+
+    int64_t in_offset = is_new_kv_bnsh_format
+                            ? INDEX_4D(int64_t(kv_num_heads), int64_t(new_seqlen), int64_t(H), int64_t(b), int64_t(n), int64_t(s), int64_t(h))
+                            : INDEX_4D(int64_t(new_seqlen), int64_t(kv_num_heads), int64_t(H), int64_t(b), int64_t(s), int64_t(n), int64_t(h));
+
+    k_buff[out_offset] = new_k[in_offset];
+    v_buff[out_offset] = new_v[in_offset];
   }
 }
 
-// Launcher for truly fused K+V append (single kernel for both K and V)
+// Launcher for fused K+V append
 template <typename T>
 Status LaunchConcatKVInPlaceFused(int batch_size,
                                   int kv_num_heads,
@@ -1365,22 +1320,24 @@ Status LaunchConcatKVInPlaceFused(int batch_size,
                                   bool is_past_kv_bnsh_format,
                                   bool is_new_kv_bnsh_format,
                                   cudaStream_t stream,
-                                  const int max_threads_per_block,
-                                  // RoPE parameters
-                                  const T* cos_cache,
-                                  const T* sin_cache,
-                                  int rotary_dim,
-                                  const int64_t* position_ids,
-                                  bool interleaved) {
-  assert(head_size % 4 == 0);
+                                  const int max_threads_per_block) {
+  // Determine vectorization factor (float2 is 8 bytes)
+  constexpr int vector_bytes = sizeof(float2);
+  constexpr int element_bytes = sizeof(T);
+  constexpr int elements_per_vector = vector_bytes / element_bytes;
 
-  const int H = head_size / 4;
+  if (head_size % elements_per_vector != 0) {
+    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Head size must be divisible by ", elements_per_vector, " for vectorized kernel.");
+  }
+
+  const int H = head_size / elements_per_vector;
+
   if (H * kv_num_heads <= max_threads_per_block) {
     const dim3 grid(new_seq_len, batch_size, 1);
     const dim3 block(H, kv_num_heads, 1);
 
-    // Single kernel for both K (with RoPE) and V (without RoPE)
-    ConcatKVInPlaceFused<float2, T><<<grid, block, 0, stream>>>(
+    // Single kernel for both K and V
+    ConcatKVInPlaceFused<float2><<<grid, block, 0, stream>>>(
         max_sequence_length,
         new_seq_len,
         reinterpret_cast<float2*>(present_key),
@@ -1390,19 +1347,13 @@ Status LaunchConcatKVInPlaceFused(int batch_size,
         past_seq_lens,
         total_seq_lens,
         is_past_kv_bnsh_format,
-        is_new_kv_bnsh_format,
-        reinterpret_cast<const float2*>(cos_cache),
-        reinterpret_cast<const float2*>(sin_cache),
-        rotary_dim,
-        position_ids,
-        interleaved);
+        is_new_kv_bnsh_format);
   } else {
     int steps = int(ceil(float(H * kv_num_heads) / 256.0));
     const dim3 grid(steps, new_seq_len, batch_size);
     const dim3 block(256, 1, 1);
 
-    // Single kernel for both K (with RoPE) and V (without RoPE)
-    ConcatKVInPlaceFusedLarge<float2, T><<<grid, block, 0, stream>>>(
+    ConcatKVInPlaceFusedLarge<float2><<<grid, block, 0, stream>>>(
         max_sequence_length,
         new_seq_len,
         H,
@@ -1414,12 +1365,7 @@ Status LaunchConcatKVInPlaceFused(int batch_size,
         past_seq_lens,
         total_seq_lens,
         is_past_kv_bnsh_format,
-        is_new_kv_bnsh_format,
-        reinterpret_cast<const float2*>(cos_cache),
-        reinterpret_cast<const float2*>(sin_cache),
-        rotary_dim,
-        position_ids,
-        interleaved);
+        is_new_kv_bnsh_format);
   }
   return CUDA_CALL(cudaGetLastError());
 }
@@ -1438,12 +1384,7 @@ template Status LaunchConcatKVInPlaceFused<half>(int batch_size,
                                                  bool is_past_kv_bnsh_format,
                                                  bool is_new_kv_bnsh_format,
                                                  cudaStream_t stream,
-                                                 const int max_threads_per_block,
-                                                 const half* cos_cache,
-                                                 const half* sin_cache,
-                                                 int rotary_dim,
-                                                 const int64_t* position_ids,
-                                                 bool interleaved);
+                                                 const int max_threads_per_block);
 
 template Status LaunchConcatKVInPlaceFused<BFloat16>(int batch_size,
                                                      int kv_num_heads,
@@ -1459,12 +1400,7 @@ template Status LaunchConcatKVInPlaceFused<BFloat16>(int batch_size,
                                                      bool is_past_kv_bnsh_format,
                                                      bool is_new_kv_bnsh_format,
                                                      cudaStream_t stream,
-                                                     const int max_threads_per_block,
-                                                     const BFloat16* cos_cache,
-                                                     const BFloat16* sin_cache,
-                                                     int rotary_dim,
-                                                     const int64_t* position_ids,
-                                                     bool interleaved);
+                                                     const int max_threads_per_block);
 
 template Status LaunchConcatKVInPlaceFused<float>(int batch_size,
                                                   int kv_num_heads,
@@ -1480,12 +1416,7 @@ template Status LaunchConcatKVInPlaceFused<float>(int batch_size,
                                                   bool is_past_kv_bnsh_format,
                                                   bool is_new_kv_bnsh_format,
                                                   cudaStream_t stream,
-                                                  const int max_threads_per_block,
-                                                  const float* cos_cache,
-                                                  const float* sin_cache,
-                                                  int rotary_dim,
-                                                  const int64_t* position_ids,
-                                                  bool interleaved);
+                                                  const int max_threads_per_block);
 
 }  // namespace cuda
 }  // namespace contrib

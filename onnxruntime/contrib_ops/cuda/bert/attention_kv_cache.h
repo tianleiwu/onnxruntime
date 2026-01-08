@@ -126,13 +126,7 @@ Status LaunchConcatKVInPlaceFused(int batch_size,
                                   bool is_past_kv_bnsh_format,
                                   bool is_new_kv_bnsh_format,
                                   cudaStream_t stream,
-                                  const int max_threads_per_block,
-                                  // RoPE parameters (for K only)
-                                  const T* cos_cache,
-                                  const T* sin_cache,
-                                  int rotary_dim,
-                                  const int64_t* position_ids,
-                                  bool interleaved);
+                                  const int max_threads_per_block);
 
 }  // namespace cuda
 }  // namespace contrib

@@ -27,6 +27,7 @@ limitations under the License.
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <cstdlib>  // For getenv
 
 #include <cassert>
 #include <cub/cub.cuh>
@@ -204,7 +205,8 @@ __global__ void UngroupLarge(const T* kv_in,
 }
 
 // Ungroup kv or present kv for use in Memory Efficient kernel. If present kv is not null and is BNSH, transposes it.
-Status LaunchUngroup(GroupQueryAttentionParameters& parameters,
+template <typename T>
+Status LaunchUngroup(const GroupQueryAttentionParameters& parameters,
                      float2* k_buff, float2* v_buff,
                      const float2* k_og, const float2* v_og,
                      const int buff_seqlen, const int og_seqlen,
@@ -363,10 +365,8 @@ __global__ void UnpackQKVWithRoPEAndAppendKV(
 
     T val = packed_qkv[tid];
 
-    // Calculate past_seq_len for cache offset
     const int past_seq_len = past_seq_lens[b];
 
-    // Get position ID for RoPE
     int pos_id = 0;
     if (position_ids != nullptr) {
       pos_id = static_cast<int>(position_ids[b * sequence_length + s]);
@@ -378,15 +378,10 @@ __global__ void UnpackQKVWithRoPEAndAppendKV(
       // Q: Apply RoPE and write to unpacked_q buffer (BSNH format)
       const int h = offset % head_size;
 
-      // Apply RoPE to Q if enabled
       if (cos_cache != nullptr && rotary_dim > 0 && h < rotary_dim) {
-        // For RoPE, we need to access the paired element
-        // Each pair of elements (h, h+rotary_dim/2) are rotated together for non-interleaved
-        // For interleaved, pairs are (2k, 2k+1)
         const int half_rotary = rotary_dim / 2;
 
         if (interleaved) {
-          // Interleaved: pairs are (0,1), (2,3), etc.
           if (h < rotary_dim) {
             const int pair_idx = h / 2;
             const bool is_first = (h % 2) == 0;
@@ -394,7 +389,6 @@ __global__ void UnpackQKVWithRoPEAndAppendKV(
             const T cos_val = cos_cache[pos_id * half_rotary + pair_idx];
             const T sin_val = sin_cache[pos_id * half_rotary + pair_idx];
 
-            // Get the paired element
             const int pair_offset = is_first ? 1 : -1;
             const int pair_tid = tid + pair_offset;
             const T pair_val = packed_qkv[pair_tid];
@@ -406,12 +400,10 @@ __global__ void UnpackQKVWithRoPEAndAppendKV(
             }
           }
         } else {
-          // Non-interleaved: pairs are (0, half), (1, half+1), etc.
           if (h < half_rotary) {
             const T cos_val = cos_cache[pos_id * half_rotary + h];
             const T sin_val = sin_cache[pos_id * half_rotary + h];
 
-            // Get the paired element at h + half_rotary
             const int pair_tid = tid + half_rotary;
             const T pair_val = packed_qkv[pair_tid];
 
@@ -421,7 +413,6 @@ __global__ void UnpackQKVWithRoPEAndAppendKV(
             const T cos_val = cos_cache[pos_id * half_rotary + h_idx];
             const T sin_val = sin_cache[pos_id * half_rotary + h_idx];
 
-            // Get the paired element at h - half_rotary
             const int pair_tid = tid - half_rotary;
             const T pair_val = packed_qkv[pair_tid];
 
@@ -430,7 +421,6 @@ __global__ void UnpackQKVWithRoPEAndAppendKV(
         }
       }
 
-      // Write to Q buffer (BSNH format)
       const int q_idx = b * sequence_length * num_heads * head_size +
                         s * num_heads * head_size + offset;
       unpacked_q[q_idx] = val;
@@ -441,7 +431,6 @@ __global__ void UnpackQKVWithRoPEAndAppendKV(
       const int n = k_offset / head_size;
       const int h = k_offset % head_size;
 
-      // Apply RoPE to K if enabled
       if (cos_cache != nullptr && rotary_dim > 0 && h < rotary_dim) {
         const int half_rotary = rotary_dim / 2;
 
@@ -485,7 +474,6 @@ __global__ void UnpackQKVWithRoPEAndAppendKV(
         }
       }
 
-      // Write directly to K cache
       const int cache_s = past_seq_len + s;
       int cache_idx;
       if (is_cache_bnsh) {
@@ -624,8 +612,7 @@ Status LaunchGetSequenceLengths(
 #if USE_FLASH_ATTENTION
 
 // Use flash attention for all workloads (rotary, kv append, attention, etc.). No extra kernel is used in this path.
-// This is for new sequence length == 1. Even though we name it as flash attention decoding,
-// it can be used for subsequent prompt or first prompt as long as query sequence length is 1.
+// Currently, only decoding or subsequent prompt can use this path. First prompt will not use this path.
 template <typename T>
 Status FlashAttentionDecoding(
     const cudaDeviceProp& device_prop,
@@ -738,7 +725,7 @@ Status FlashAttention(
       T* unpacked_q = unpacked_buffer;
 
       // Check if we can use the fully fused path
-      if (parameters.kv_share_buffer && parameters.do_rotary) {
+      if (parameters.kv_share_buffer && parameters.do_rotary && !data.disable_fused_kv) {
         // FULLY FUSED PATH: Unpack + RoPE Q + RoPE K + Append KV in single kernel
         // This eliminates 4 kernel launches!
         ORT_RETURN_IF_ERROR(LaunchUnpackQKVWithRoPEAndAppendKV<T>(
@@ -801,8 +788,9 @@ Status FlashAttention(
       T* unpacked_buffer = reinterpret_cast<T*>(data.unpacked_qkv_buffer);
       if (unpacked_buffer != nullptr) {
         query = unpacked_buffer;
-        size_t q_size = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size;
-        key = unpacked_buffer + q_size;
+        // Do not update key here for Unpacked path.
+        // key must remain pointing to data.key (Input) for Explicit K Rotation (k_src).
+        // k_dst will be calculated from unpacked_buffer explicitly.
       }
     }
   }
@@ -848,30 +836,54 @@ Status FlashAttention(
     if (parameters.kv_share_buffer && !parameters.is_first_prompt) {
       constexpr bool is_new_kv_bnsh_format = false;
       if (parameters.do_rotary) {
-        // Use truly fused kernel for K (with RoPE) + V append in single kernel
-        // Since packed QKV + Rotary + Share Buffer is handled by the main fused kernel,
-        // we only reach here for unpacked inputs.
-        ORT_RETURN_IF_ERROR(LaunchConcatKVInPlaceFused<T>(
-            batch_size,
-            kv_num_heads,
-            head_size,
-            parameters.seqlen_present_kv_cache,
-            data.past_seq_lens,
-            data.total_seq_lens,
-            sequence_length,
-            data.key,
-            data.value,
-            data.present_key,
-            data.present_value,
-            !past_bsnh,  // is_past_kv_bnsh_format
-            is_new_kv_bnsh_format,
+        // Explicit K Rotation (replacing internal RoPE in fused kernel)
+        size_t q_elements = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size;
+        T* k_dst = reinterpret_cast<T*>(data.unpacked_qkv_buffer) + q_elements;
+        const T* k_src = reinterpret_cast<const T*>(key);
+
+        ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel(
             stream,
-            max_threads_per_block,
+            k_dst,
+            k_src,
+            position_ids,
+            data.past_seq_lens,
             data.cos_cache,
             data.sin_cache,
+            batch_size,
+            sequence_length,
+            kv_num_heads,
+            head_size,
             parameters.rotary_dim,
-            position_ids,  // If it is nullptr, kernel computes from seqlens_k (decoding) or 0+s (first_prompt)
-            parameters.rotary_interleaved));
+            parameters.max_sequence_length,
+            position_ids != nullptr ? 1 : 2,
+            parameters.rotary_interleaved,
+            max_threads_per_block,
+            false));
+
+        if (!data.disable_fused_kv) {
+          // Use fused kernel for K (rotated) + V append
+          ORT_RETURN_IF_ERROR(LaunchConcatKVInPlaceFused<T>(
+              batch_size,
+              kv_num_heads,
+              head_size,
+              parameters.seqlen_present_kv_cache,
+              data.past_seq_lens,
+              data.total_seq_lens,
+              sequence_length,
+              k_dst,
+              reinterpret_cast<const T*>(data.value),
+              data.present_key,
+              data.present_value,
+              !past_bsnh,
+              is_new_kv_bnsh_format,
+              stream,
+              max_threads_per_block));
+        } else {
+          // Unfused Fallback: LaunchConcatKVInPlace
+          // We must pass the ROTATED K (k_dst) to it.
+          ORT_RETURN_IF_ERROR(LaunchConcatKVInPlace(
+              parameters, data, k_dst, value, is_new_kv_bnsh_format, stream, max_threads_per_block));
+        }
       } else {
         // No RoPE - use original kernel
         ORT_RETURN_IF_ERROR(LaunchConcatKVInPlace(parameters, data, key, value, is_new_kv_bnsh_format, stream, max_threads_per_block));
@@ -1024,28 +1036,53 @@ Status EfficientAttention(
     constexpr bool is_new_kv_bnsh_format = false;
 
     if (parameters.do_rotary) {
-      // Use truly fused kernel for K (with RoPE) + V append in single kernel
-      ORT_RETURN_IF_ERROR(LaunchConcatKVInPlaceFused<T>(
-          batch_size,
-          parameters.kv_num_heads,
-          parameters.head_size,
-          parameters.seqlen_present_kv_cache,
-          data.past_seq_lens,
-          data.total_seq_lens,
-          parameters.sequence_length,
-          reinterpret_cast<const T*>(key),
-          reinterpret_cast<const T*>(value),
-          data.present_key,
-          data.present_value,
-          past_kv_format != AttentionQkvFormat::Q_K_V_BSNH,  // is_past_kv_bnsh_format
-          is_new_kv_bnsh_format,
+      // Explicit K Rotation
+      size_t q_elements = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size;
+      T* k_dst = reinterpret_cast<T*>(data.rotary_buffer) + q_elements;
+      const T* k_src = reinterpret_cast<const T*>(key);
+
+      ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel(
           stream,
-          max_threads_per_block,
+          k_dst,
+          k_src,
+          position_ids,
+          data.past_seq_lens,
           data.cos_cache,
           data.sin_cache,
+          batch_size,
+          sequence_length,
+          parameters.kv_num_heads,
+          parameters.head_size,
           parameters.rotary_dim,
-          position_ids,  // If it is nullptr, kernel computes from seqlens_k (decoding) or 0+s (first_prompt)
-          parameters.rotary_interleaved));
+          parameters.max_sequence_length,
+          position_ids != nullptr ? 1 : 2,
+          parameters.rotary_interleaved,
+          max_threads_per_block,
+          false));
+
+      if (!data.disable_fused_kv) {
+        // Use truly fused kernel for K (already rotated) + V append in single kernel
+        ORT_RETURN_IF_ERROR(LaunchConcatKVInPlaceFused<T>(
+            batch_size,
+            parameters.kv_num_heads,
+            parameters.head_size,
+            parameters.seqlen_present_kv_cache,
+            data.past_seq_lens,
+            data.total_seq_lens,
+            parameters.sequence_length,
+            k_dst,
+            reinterpret_cast<const T*>(value),
+            data.present_key,
+            data.present_value,
+            past_kv_format != AttentionQkvFormat::Q_K_V_BSNH,  // is_past_kv_bnsh_format
+            is_new_kv_bnsh_format,
+            stream,
+            max_threads_per_block));
+      } else {
+        // Unfused Fallback
+        ORT_RETURN_IF_ERROR(LaunchConcatKVInPlace(
+            parameters, data, k_dst, value, is_new_kv_bnsh_format, stream, max_threads_per_block));
+      }
     } else {
       // No RoPE - use original kernel
       ORT_RETURN_IF_ERROR(LaunchConcatKVInPlace(
@@ -1070,8 +1107,8 @@ Status EfficientAttention(
     float2* v_buff = reinterpret_cast<float2*>(data.v);
     const float2* k_og = reinterpret_cast<const float2*>(data.present_key);
     const float2* v_og = reinterpret_cast<const float2*>(data.present_value);
-    ORT_RETURN_IF_ERROR(LaunchUngroup(parameters, k_buff, v_buff, k_og, v_og, present_sequence_length,
-                                      present_sequence_length, is_bsnh, stream, max_threads_per_block));
+    ORT_RETURN_IF_ERROR(LaunchUngroup<T>(parameters, k_buff, v_buff, k_og, v_og, present_sequence_length,
+                                         present_sequence_length, is_bsnh, stream, max_threads_per_block));
     key = reinterpret_cast<const void*>(data.k);
     value = reinterpret_cast<const void*>(data.v);
   }
