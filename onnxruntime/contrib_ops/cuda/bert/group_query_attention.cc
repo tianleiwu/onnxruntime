@@ -205,12 +205,28 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
     data.out_accum = reinterpret_cast<CudaT*>(out_accum_buffer.get());
 
     if (!data.use_flash_attention_fast_decode) {
-      size_t unpacked_qkv_bytes = parameters.is_packed_qkv
-                                      ? (static_cast<size_t>(parameters.batch_size) * parameters.sequence_length * (parameters.num_heads + 2 * parameters.kv_num_heads) * parameters.head_size * sizeof(T))
-                                      : 0;
-      if (parameters.do_rotary && unpacked_qkv_bytes == 0) {
-        // Unpacked case, Q and K rotation
-        unpacked_qkv_bytes = (static_cast<size_t>(parameters.batch_size) * parameters.sequence_length * (parameters.num_heads + parameters.kv_num_heads) * parameters.head_size * sizeof(T));
+      size_t unpacked_qkv_bytes = 0;
+
+      if (parameters.is_packed_qkv) {
+        // Packed QKV
+        if (parameters.kv_share_buffer && parameters.do_rotary) {
+          // Fused Kernel Path (Packed + Shared + Rotary)
+          // The fused kernel only unpacks/rotates Q into the buffer. K and V are handled directly into cache.
+          unpacked_qkv_bytes = (static_cast<size_t>(parameters.batch_size) * parameters.sequence_length * parameters.num_heads * parameters.head_size * sizeof(T));
+        } else {
+          // Standard Path
+          // We need space for K and V unconditionally for the standard unpack kernel.
+          // We need space for Q if rotary is enabled (to store rotated Q).
+          // Even if rotary is disabled, we keep the full allocation here to avoid changing pointer arithmetic in .cu
+          unpacked_qkv_bytes = (static_cast<size_t>(parameters.batch_size) * parameters.sequence_length * (parameters.num_heads + 2 * parameters.kv_num_heads) * parameters.head_size * sizeof(T));
+        }
+      } else {
+        // Unpacked QKV
+        if (parameters.do_rotary) {
+          // Unpacked + Rotary
+          // We only need to store rotated Q. K is rotated on-the-fly during append.
+          unpacked_qkv_bytes = (static_cast<size_t>(parameters.batch_size) * parameters.sequence_length * parameters.num_heads * parameters.head_size * sizeof(T));
+        }
       }
 
       if (unpacked_qkv_bytes > 0) {
