@@ -213,9 +213,13 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
 #endif
 
   if (data.use_flash_attention_fast_decode && parameters.sequence_length == 1) {
-    // total_seq_lens and padded_seq_lens are not used in FlashAttentionDecoding.
-    // In fast path, we pass past_seq_lens = total_len - 1 as seqlens_k to Flash Attention.
-    // This formula for past_seq_lens is correct only when new sequence length is exactly 1.
+    // FlashAttentionDecoding Fast Path:
+    // - Uses Flash Attention's internal KV append logic, so total_seq_lens and padded_seq_lens are not needed.
+    // - Past_seq_lens is passed as seqlens_k to Flash Attention, which uses it to:
+    //   1. Determine where to append new K/V in the cache
+    //   2. Apply correct causal masking (attention only to positions [0, past_seq_len])
+    // - The input seqlens_k from ONNX graph is (total_len - 1), which equals past_seq_len when seq_len == 1.
+    // - This optimization avoids launching GetSequenceLengths kernel for single-token decoding.
     data.past_seq_lens = const_cast<int*>(total_seq_lens_minus_one->Data<int>());
   } else {
     // Compute sequence length buffers (past_seq_lens and total_seq_lens).

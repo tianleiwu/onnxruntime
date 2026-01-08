@@ -1542,5 +1542,153 @@ class TestMemoryEfficientGQAPaddingPrompt(unittest.TestCase):
         parity_test_gqa_padding_prompt()
 
 
+# #################################################################################################
+# Fused Kernel Parity Tests (ORT_DISABLE_FUSED_KV and ORT_DISABLE_FLASH_DECODE)
+# #################################################################################################
+
+
+def fused_kernel_test_cases():
+    """Test cases specifically for fused vs unfused kernel parity."""
+    configs = [
+        # Decoding with RoPE and shared buffer
+        GQAConfig(
+            batch_size=2,
+            q_sequence_length=1,
+            kv_sequence_length=1,
+            num_heads=16,
+            kv_num_heads=4,
+            head_size=128,
+            past_kv_sequence_length=128,
+            buffer_sequence_length=256,
+            rotary=True,
+            packed=False,
+            share_buffer=True,
+        ),
+        # Packed QKV decoding with RoPE
+        GQAConfig(
+            batch_size=2,
+            q_sequence_length=1,
+            kv_sequence_length=1,
+            num_heads=8,
+            kv_num_heads=2,
+            head_size=128,
+            past_kv_sequence_length=64,
+            buffer_sequence_length=128,
+            rotary=True,
+            packed=True,
+            share_buffer=True,
+        ),
+        # Subsequent prompt with RoPE
+        GQAConfig(
+            batch_size=1,
+            q_sequence_length=4,
+            kv_sequence_length=4,
+            num_heads=8,
+            kv_num_heads=4,
+            head_size=128,
+            past_kv_sequence_length=32,
+            buffer_sequence_length=64,
+            rotary=True,
+            packed=False,
+            share_buffer=True,
+        ),
+    ]
+    for i, config in enumerate(configs):
+        yield f"fused_config_{i}", config
+
+
+@unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
+class TestFusedKernelParity(unittest.TestCase):
+    """Tests that verify fused kernels produce the same results as unfused kernels."""
+
+    @parameterized.expand(fused_kernel_test_cases())
+    def test_fused_kv_parity(self, name, config):
+        """Test ORT_DISABLE_FUSED_KV: fused vs unfused KV append kernels."""
+        os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
+
+        # Run with fused kernels (default)
+        if "ORT_DISABLE_FUSED_KV" in os.environ:
+            del os.environ["ORT_DISABLE_FUSED_KV"]
+
+        parity_check_gqa_past(
+            config=config,
+            ep="CUDAExecutionProvider",
+            device="cuda",
+            torch_type=torch.float16,
+            ort_type=TensorProto.FLOAT16,
+            causal=True,
+            rtol=rtol["fp16"],
+            atol=atol["fp16"],
+        )
+
+        # Run with unfused kernels
+        os.environ["ORT_DISABLE_FUSED_KV"] = "1"
+
+        parity_check_gqa_past(
+            config=config,
+            ep="CUDAExecutionProvider",
+            device="cuda",
+            torch_type=torch.float16,
+            ort_type=TensorProto.FLOAT16,
+            causal=True,
+            rtol=rtol["fp16"],
+            atol=atol["fp16"],
+        )
+
+        # Clean up
+        del os.environ["ORT_DISABLE_FUSED_KV"]
+
+    def test_flash_decode_parity(self):
+        """Test ORT_DISABLE_FLASH_DECODE: fast decode vs standard path."""
+        os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
+
+        # Decoding config (seq_len=1, share_buffer=True)
+        config = GQAConfig(
+            batch_size=2,
+            q_sequence_length=1,
+            kv_sequence_length=1,
+            num_heads=16,
+            kv_num_heads=4,
+            head_size=128,
+            past_kv_sequence_length=128,
+            buffer_sequence_length=256,
+            rotary=True,
+            packed=False,
+            share_buffer=True,
+        )
+
+        # Run with flash decode enabled (default)
+        if "ORT_DISABLE_FLASH_DECODE" in os.environ:
+            del os.environ["ORT_DISABLE_FLASH_DECODE"]
+
+        parity_check_gqa_past(
+            config=config,
+            ep="CUDAExecutionProvider",
+            device="cuda",
+            torch_type=torch.float16,
+            ort_type=TensorProto.FLOAT16,
+            causal=True,
+            rtol=rtol["fp16"],
+            atol=atol["fp16"],
+        )
+
+        # Run with flash decode disabled
+        os.environ["ORT_DISABLE_FLASH_DECODE"] = "1"
+
+        parity_check_gqa_past(
+            config=config,
+            ep="CUDAExecutionProvider",
+            device="cuda",
+            torch_type=torch.float16,
+            ort_type=TensorProto.FLOAT16,
+            causal=True,
+            rtol=rtol["fp16"],
+            atol=atol["fp16"],
+        )
+
+        # Clean up
+        del os.environ["ORT_DISABLE_FLASH_DECODE"]
+
+
 if __name__ == "__main__":
     unittest.main()
