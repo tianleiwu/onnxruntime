@@ -463,16 +463,22 @@ __global__ void UnpackQKVWithRoPEAndAppendKV(
     // Determine Q, K, or V based on offset
     if (offset < q_hidden) {
       // Q: Apply RoPE and write to unpacked_q buffer (BSNH format)
+      const int q_head_idx = offset / head_size;
       const int h = offset % head_size;
       const int h_idx = h / elements_per_thread;
 
       if (cos_cache != nullptr && rotary_dim > 0 && h < rotary_dim) {
+        // For half-split RoPE, pair values should be read relative to the START of the current Q head.
+        // Calculate offset to head start: (b, s, q_head_n, 0) in packed QKV.
+        const int64_t q_head_start_in_packed = static_cast<int64_t>(b) * sequence_length * d +
+                                               static_cast<int64_t>(s) * d +
+                                               static_cast<int64_t>(q_head_idx) * head_size;
         RotaryDispatcher<LoadT, T>::apply(val_vec,
                                           reinterpret_cast<const LoadT*>(cos_cache),
                                           reinterpret_cast<const LoadT*>(sin_cache),
                                           rotary_dim, h_idx, pos_id, interleaved,
                                           reinterpret_cast<const LoadT*>(packed_qkv),
-                                          static_cast<int64_t>(global_element_idx) / elements_per_thread);
+                                          q_head_start_in_packed / elements_per_thread);
       }
 
       const int q_idx = b * sequence_length * num_heads * head_size +
@@ -488,12 +494,18 @@ __global__ void UnpackQKVWithRoPEAndAppendKV(
       const int h_idx = h / elements_per_thread;
 
       if (cos_cache != nullptr && rotary_dim > 0 && h < rotary_dim) {
+        // For half-split RoPE, pair values should be read relative to the START of the current K head.
+        // Calculate offset to head start: (b, s, k_head_n, 0) in packed QKV.
+        const int64_t k_head_start_in_packed = static_cast<int64_t>(b) * sequence_length * d +
+                                               static_cast<int64_t>(s) * d +
+                                               q_hidden +
+                                               static_cast<int64_t>(n) * head_size;
         RotaryDispatcher<LoadT, T>::apply(val_vec,
                                           reinterpret_cast<const LoadT*>(cos_cache),
                                           reinterpret_cast<const LoadT*>(sin_cache),
                                           rotary_dim, h_idx, pos_id, interleaved,
                                           reinterpret_cast<const LoadT*>(packed_qkv),
-                                          static_cast<int64_t>(global_element_idx) / elements_per_thread);
+                                          k_head_start_in_packed / elements_per_thread);
       }
 
       const int cache_s = past_seq_len + s;
