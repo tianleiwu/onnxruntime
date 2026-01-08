@@ -190,6 +190,9 @@ struct RotaryDispatcher<float2, half> {
                                const bool interleaved, const float2* new_kv_base, const int64_t in_offset) {
     if (2 * h_idx * 2 >= rotary_dim) return;
 
+    // Vector layout: float2 = 8 bytes = 4 half values
+    // v0 contains elements [4*h_idx, 4*h_idx+1] as half2 (2 fp16 values)
+    // v1 contains elements [4*h_idx+2, 4*h_idx+3] as half2 (2 fp16 values)
     half2* v_ptr = reinterpret_cast<half2*>(&val);
     half2 v0 = v_ptr[0];
     half2 v1 = v_ptr[1];
@@ -266,6 +269,9 @@ struct RotaryDispatcher<float2, BFloat16> {
     if (2 * h_idx * 2 >= rotary_dim) return;
 
     using namespace onnxruntime::cuda;
+    // Vector layout: float2 = 8 bytes = 4 bf16 values
+    // v0 contains elements [4*h_idx, 4*h_idx+1] as bfloat162 (2 bf16 values)
+    // v1 contains elements [4*h_idx+2, 4*h_idx+3] as bfloat162 (2 bf16 values)
     __nv_bfloat162* v_ptr = reinterpret_cast<__nv_bfloat162*>(&val);
     __nv_bfloat162 v0 = v_ptr[0];
     __nv_bfloat162 v1 = v_ptr[1];

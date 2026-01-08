@@ -403,6 +403,12 @@ Status LaunchUnpackQKV(const T* packed_qkv, T* unpacked_q, T* unpacked_k, T* unp
 //     buffer is allocated with seqlen_present_kv_cache >= total_seq_lens[b] for all b.
 //   - The kernel processes exactly batch_size * sequence_length * (Q+K+V hidden) elements,
 //     which matches the packed_qkv input size allocated by the model.
+//
+// RoPE Contiguity Requirement:
+//   - packed_qkv MUST be strictly contiguous with layout [B, S, (H_q + 2*H_kv) * D]
+//   - The half-split RoPE logic (RotaryDispatcher::apply) fetches pair elements at offset
+//     (h + rotary_dim/2) relative to the start of each head
+//   - If strided/non-contiguous inputs are ever supported, this pointer arithmetic must change
 template <typename T>
 __global__ void UnpackQKVWithRoPEAndAppendKV(
     const T* packed_qkv,  // Input: packed QKV [B, S, (Q+K+V) hidden]
