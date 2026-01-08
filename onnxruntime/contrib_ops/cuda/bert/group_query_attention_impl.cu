@@ -409,6 +409,13 @@ Status LaunchUnpackQKV(const T* packed_qkv, T* unpacked_q, T* unpacked_k, T* unp
 //   - The half-split RoPE logic (RotaryDispatcher::apply) fetches pair elements at offset
 //     (h + rotary_dim/2) relative to the start of each head
 //   - If strided/non-contiguous inputs are ever supported, this pointer arithmetic must change
+//
+// Performance Optimization:
+//   Uses 3D grid layout to eliminate expensive integer divisions:
+//   - blockIdx.z = batch index (b)
+//   - blockIdx.y = sequence index (s)
+//   - blockIdx.x * blockDim.x + threadIdx.x = offset within QKV hidden dimension
+//   This removes 4 divisions (/, %) per thread that would otherwise be needed.
 template <typename T>
 __global__ void UnpackQKVWithRoPEAndAppendKV(
     const T* packed_qkv,  // Input: packed QKV [B, S, (Q+K+V) hidden]
@@ -418,11 +425,9 @@ __global__ void UnpackQKVWithRoPEAndAppendKV(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int sequence_length,  // New sequence length
-    const int batch_size,
+    const int d,           // QKV hidden stride = (num_heads + 2*kv_num_heads) * head_size
     const int max_seqlen,  // KV cache max sequence length
     const int* past_seq_lens,
-    const int* total_seq_lens,
     // RoPE params
     const T* cos_cache,
     const T* sin_cache,
@@ -434,120 +439,119 @@ __global__ void UnpackQKVWithRoPEAndAppendKV(
   using LoadT = float4;
   constexpr int elements_per_thread = sizeof(LoadT) / sizeof(T);
 
-  const int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  const int d = (num_heads + 2 * kv_num_heads) * head_size;  // QKV stride
-  const int qkv_size = batch_size * sequence_length * d;
+  // 3D grid layout eliminates integer division:
+  // - blockIdx.z = batch index (b) - obtained from grid dimension, no division needed
+  // - blockIdx.y = sequence index (s) - obtained from grid dimension, no division needed
+  // - linear thread index within (b, s) gives offset directly
+  const int b = blockIdx.z;
+  const int s = blockIdx.y;
+  const int offset_vec_idx = blockIdx.x * blockDim.x + threadIdx.x;  // Vector index within d
+  const int offset = offset_vec_idx * elements_per_thread;           // Element offset within d
+
+  // Bounds check: offset must be within the QKV hidden dimension
+  if (offset >= d) return;
+
   const int q_hidden = num_heads * head_size;
   const int k_hidden = kv_num_heads * head_size;
+  const int sequence_length = gridDim.y;  // Get from grid dimension
 
-  // Each thread processes 'elements_per_thread' items
-  const int global_element_idx = tid * elements_per_thread;
+  // Calculate linear index for packed_qkv load
+  const int64_t packed_idx = static_cast<int64_t>(b) * sequence_length * d +
+                             static_cast<int64_t>(s) * d + offset;
 
-  if (global_element_idx < qkv_size) {
-    // Load vector from packed buffer
-    // Reinterpret cast input to LoadT*. Index is tid, not global_element_idx.
-    LoadT val_vec = reinterpret_cast<const LoadT*>(packed_qkv)[tid];
+  // Load vector from packed buffer
+  LoadT val_vec = reinterpret_cast<const LoadT*>(packed_qkv)[packed_idx / elements_per_thread];
 
-    // Determine position (b, s, offset) for the *start* of the vector.
-    // Since head_size is a multiple of elements_per_thread (assuming 8-element alignment),
-    // a vector will never cross the boundary of d (hidden stride) or between Q/K/V.
-    // So b and s are constant for all elements in the vector.
-    const int b = global_element_idx / (d * sequence_length);
-    const int remainder_b = global_element_idx % (d * sequence_length);
-    const int s = remainder_b / d;
-    const int offset = remainder_b % d;
+  // Common RoPE Calculations
+  const int past_seq_len = past_seq_lens[b];
+  int pos_id = 0;
+  if (position_ids != nullptr) {
+    pos_id = static_cast<int>(position_ids[b * sequence_length + s]);
+  } else {
+    pos_id = past_seq_len + s;
+  }
 
-    // Common RoPE Calculations
-    const int past_seq_len = past_seq_lens[b];
-    int pos_id = 0;
-    if (position_ids != nullptr) {
-      pos_id = static_cast<int>(position_ids[b * sequence_length + s]);
-    } else {
-      pos_id = past_seq_len + s;
+  // Determine Q, K, or V based on offset
+  if (offset < q_hidden) {
+    // Q: Apply RoPE and write to unpacked_q buffer (BSNH format)
+    const int q_head_idx = offset / head_size;
+    const int h = offset % head_size;
+    const int h_idx = h / elements_per_thread;
+
+    if (cos_cache != nullptr && rotary_dim > 0 && h < rotary_dim) {
+      // For half-split RoPE, pair values should be read relative to the START of the current Q head.
+      // Calculate offset to head start: (b, s, q_head_n, 0) in packed QKV.
+      const int64_t q_head_start_in_packed = static_cast<int64_t>(b) * sequence_length * d +
+                                             static_cast<int64_t>(s) * d +
+                                             static_cast<int64_t>(q_head_idx) * head_size;
+      RotaryDispatcher<LoadT, T>::apply(val_vec,
+                                        reinterpret_cast<const LoadT*>(cos_cache),
+                                        reinterpret_cast<const LoadT*>(sin_cache),
+                                        rotary_dim, h_idx, pos_id, interleaved,
+                                        reinterpret_cast<const LoadT*>(packed_qkv),
+                                        q_head_start_in_packed / elements_per_thread);
     }
 
-    // Determine Q, K, or V based on offset
-    if (offset < q_hidden) {
-      // Q: Apply RoPE and write to unpacked_q buffer (BSNH format)
-      const int q_head_idx = offset / head_size;
-      const int h = offset % head_size;
-      const int h_idx = h / elements_per_thread;
+    const int64_t q_idx = static_cast<int64_t>(b) * sequence_length * num_heads * head_size +
+                          static_cast<int64_t>(s) * num_heads * head_size + offset;
+    // Vector store to unpacked_q
+    reinterpret_cast<LoadT*>(unpacked_q)[q_idx / elements_per_thread] = val_vec;
 
-      if (cos_cache != nullptr && rotary_dim > 0 && h < rotary_dim) {
-        // For half-split RoPE, pair values should be read relative to the START of the current Q head.
-        // Calculate offset to head start: (b, s, q_head_n, 0) in packed QKV.
-        const int64_t q_head_start_in_packed = static_cast<int64_t>(b) * sequence_length * d +
-                                               static_cast<int64_t>(s) * d +
-                                               static_cast<int64_t>(q_head_idx) * head_size;
-        RotaryDispatcher<LoadT, T>::apply(val_vec,
-                                          reinterpret_cast<const LoadT*>(cos_cache),
-                                          reinterpret_cast<const LoadT*>(sin_cache),
-                                          rotary_dim, h_idx, pos_id, interleaved,
-                                          reinterpret_cast<const LoadT*>(packed_qkv),
-                                          q_head_start_in_packed / elements_per_thread);
-      }
+  } else if (offset < q_hidden + k_hidden) {
+    // K: Apply RoPE and write DIRECTLY to K cache
+    const int k_offset = offset - q_hidden;
+    const int n = k_offset / head_size;
+    const int h = k_offset % head_size;
+    const int h_idx = h / elements_per_thread;
 
-      const int q_idx = b * sequence_length * num_heads * head_size +
-                        s * num_heads * head_size + offset;
-      // Vector store to unpacked_q
-      reinterpret_cast<LoadT*>(unpacked_q)[q_idx / elements_per_thread] = val_vec;
-
-    } else if (offset < q_hidden + k_hidden) {
-      // K: Apply RoPE and write DIRECTLY to K cache
-      const int k_offset = offset - q_hidden;
-      const int n = k_offset / head_size;
-      const int h = k_offset % head_size;
-      const int h_idx = h / elements_per_thread;
-
-      if (cos_cache != nullptr && rotary_dim > 0 && h < rotary_dim) {
-        // For half-split RoPE, pair values should be read relative to the START of the current K head.
-        // Calculate offset to head start: (b, s, k_head_n, 0) in packed QKV.
-        const int64_t k_head_start_in_packed = static_cast<int64_t>(b) * sequence_length * d +
-                                               static_cast<int64_t>(s) * d +
-                                               q_hidden +
-                                               static_cast<int64_t>(n) * head_size;
-        RotaryDispatcher<LoadT, T>::apply(val_vec,
-                                          reinterpret_cast<const LoadT*>(cos_cache),
-                                          reinterpret_cast<const LoadT*>(sin_cache),
-                                          rotary_dim, h_idx, pos_id, interleaved,
-                                          reinterpret_cast<const LoadT*>(packed_qkv),
-                                          k_head_start_in_packed / elements_per_thread);
-      }
-
-      const int cache_s = past_seq_len + s;
-      int cache_idx;
-      if (is_cache_bnsh) {
-        cache_idx = b * kv_num_heads * max_seqlen * head_size +
-                    n * max_seqlen * head_size +
-                    cache_s * head_size + h;
-      } else {  // BSNH
-        cache_idx = b * max_seqlen * kv_num_heads * head_size +
-                    cache_s * kv_num_heads * head_size +
-                    n * head_size + h;
-      }
-      // Vector store to k_cache
-      reinterpret_cast<LoadT*>(k_cache)[cache_idx / elements_per_thread] = val_vec;
-
-    } else {
-      // V: Write DIRECTLY to V cache (no rotation)
-      const int v_offset = offset - q_hidden - k_hidden;
-      const int n = v_offset / head_size;
-      const int h = v_offset % head_size;
-
-      const int cache_s = past_seq_len + s;
-      int cache_idx;
-      if (is_cache_bnsh) {
-        cache_idx = b * kv_num_heads * max_seqlen * head_size +
-                    n * max_seqlen * head_size +
-                    cache_s * head_size + h;
-      } else {  // BSNH
-        cache_idx = b * max_seqlen * kv_num_heads * head_size +
-                    cache_s * kv_num_heads * head_size +
-                    n * head_size + h;
-      }
-      // Vector store to v_cache
-      reinterpret_cast<LoadT*>(v_cache)[cache_idx / elements_per_thread] = val_vec;
+    if (cos_cache != nullptr && rotary_dim > 0 && h < rotary_dim) {
+      // For half-split RoPE, pair values should be read relative to the START of the current K head.
+      // Calculate offset to head start: (b, s, k_head_n, 0) in packed QKV.
+      const int64_t k_head_start_in_packed = static_cast<int64_t>(b) * sequence_length * d +
+                                             static_cast<int64_t>(s) * d +
+                                             q_hidden +
+                                             static_cast<int64_t>(n) * head_size;
+      RotaryDispatcher<LoadT, T>::apply(val_vec,
+                                        reinterpret_cast<const LoadT*>(cos_cache),
+                                        reinterpret_cast<const LoadT*>(sin_cache),
+                                        rotary_dim, h_idx, pos_id, interleaved,
+                                        reinterpret_cast<const LoadT*>(packed_qkv),
+                                        k_head_start_in_packed / elements_per_thread);
     }
+
+    const int cache_s = past_seq_len + s;
+    int64_t cache_idx;
+    if (is_cache_bnsh) {
+      cache_idx = static_cast<int64_t>(b) * kv_num_heads * max_seqlen * head_size +
+                  static_cast<int64_t>(n) * max_seqlen * head_size +
+                  static_cast<int64_t>(cache_s) * head_size + h;
+    } else {  // BSNH
+      cache_idx = static_cast<int64_t>(b) * max_seqlen * kv_num_heads * head_size +
+                  static_cast<int64_t>(cache_s) * kv_num_heads * head_size +
+                  static_cast<int64_t>(n) * head_size + h;
+    }
+    // Vector store to k_cache
+    reinterpret_cast<LoadT*>(k_cache)[cache_idx / elements_per_thread] = val_vec;
+
+  } else {
+    // V: Write DIRECTLY to V cache (no rotation)
+    const int v_offset = offset - q_hidden - k_hidden;
+    const int n = v_offset / head_size;
+    const int h = v_offset % head_size;
+
+    const int cache_s = past_seq_len + s;
+    int64_t cache_idx;
+    if (is_cache_bnsh) {
+      cache_idx = static_cast<int64_t>(b) * kv_num_heads * max_seqlen * head_size +
+                  static_cast<int64_t>(n) * max_seqlen * head_size +
+                  static_cast<int64_t>(cache_s) * head_size + h;
+    } else {  // BSNH
+      cache_idx = static_cast<int64_t>(b) * max_seqlen * kv_num_heads * head_size +
+                  static_cast<int64_t>(cache_s) * kv_num_heads * head_size +
+                  static_cast<int64_t>(n) * head_size + h;
+    }
+    // Vector store to v_cache
+    reinterpret_cast<LoadT*>(v_cache)[cache_idx / elements_per_thread] = val_vec;
   }
 }
 
@@ -586,12 +590,20 @@ Status LaunchUnpackQKVWithRoPEAndAppendKV(
     return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Head size must be divisible by ", elements_per_vector, " for vectorized GQA kernel.");
   }
 
-  const int threads = max_threads_per_block;
-  // Total elements / elements_per_vector
-  const int total_vectors = (batch_size * sequence_length * (num_heads + 2 * kv_num_heads) * head_size) / elements_per_vector;
-  const int blocks = (total_vectors + threads - 1) / threads;
+  // QKV hidden dimension stride
+  const int d = (num_heads + 2 * kv_num_heads) * head_size;
+  const int d_vectors = d / elements_per_vector;  // Number of vectors per (b, s)
 
-  UnpackQKVWithRoPEAndAppendKV<T><<<blocks, threads, 0, stream>>>(
+  // 3D grid layout for eliminating integer divisions in kernel:
+  //   grid.x = number of blocks needed to cover d_vectors with threads_per_block threads
+  //   grid.y = sequence_length
+  //   grid.z = batch_size
+  const int threads_per_block = std::min(max_threads_per_block, d_vectors);
+  const int blocks_x = (d_vectors + threads_per_block - 1) / threads_per_block;
+  const dim3 grid(blocks_x, sequence_length, batch_size);
+  const dim3 block(threads_per_block);
+
+  UnpackQKVWithRoPEAndAppendKV<T><<<grid, block, 0, stream>>>(
       packed_qkv,
       unpacked_q,
       k_cache,
@@ -599,11 +611,9 @@ Status LaunchUnpackQKVWithRoPEAndAppendKV(
       num_heads,
       kv_num_heads,
       head_size,
-      sequence_length,
-      batch_size,
+      d,
       max_seqlen,
       past_seq_lens,
-      total_seq_lens,
       cos_cache,
       sin_cache,
       rotary_dim,
