@@ -624,7 +624,8 @@ Status LaunchGetSequenceLengths(
 #if USE_FLASH_ATTENTION
 
 // Use flash attention for all workloads (rotary, kv append, attention, etc.). No extra kernel is used in this path.
-// It is for decoding or subsequent prompt. Not for the first prompt.
+// This is for new sequence length == 1. Even though we name it as flash attention decoding,
+// it can be used for subsequent prompt or first prompt as long as query sequence length is 1.
 template <typename T>
 Status FlashAttentionDecoding(
     const cudaDeviceProp& device_prop,

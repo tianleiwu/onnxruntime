@@ -184,7 +184,7 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
                                                                  parameters.head_size,
                                                                  parameters.num_heads,
                                                                  parameters.kv_num_heads);
-  data.use_flash_attention_fast_decode = use_flash_attention && !parameters.is_first_prompt && parameters.kv_share_buffer;
+  data.use_flash_attention_fast_decode = use_flash_attention && parameters.sequence_length == 1 && parameters.kv_share_buffer;
   if (use_flash_attention) {
     data.use_flash_attention = true;
     data.use_memory_efficient_attention = false;
@@ -222,14 +222,12 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
 #else
 #endif
 
-  if (data.use_flash_attention_fast_decode && !parameters.is_subsequent_prompt) {
+  if (data.use_flash_attention_fast_decode) {
+    // total_seq_lens and padded_seq_lens are not used in FlashAttentionDecoding.
+    // In fast path, we pass past_seq_lens = total_len - 1 as seqlens_k to Flash Attention.
+    // This formula for past_seq_lens is correct only when new sequence length is exactly 1.
+    assert(parameters.sequence_length == 1);
     data.past_seq_lens = const_cast<int*>(total_seq_lens_minus_one->Data<int>());
-    // total_seq_lens and padded_seq_lens are not used in fast decode.
-    // In fast decode (FlashAttentionDecoding), we pass past_seq_lens (which holds total_len - 1 effectively)
-    // as seqlens_k to Flash Attention. Flash Attention expects accumulated sequence lengths or simple lengths depending on mode.
-    // Actually, for decoding, seqlens_k is just used to determine the context length.
-    // The variable naming 'total_seq_lens_minus_one' and casting to 'past_seq_lens' might be confusing,
-    // but in decoding, past_seq_len == total_seq_len - 1. So we reuse the tensor.
   } else {
     // Compute sequence length buffers (past_seq_lens and total_seq_lens).
     // Allocate buffer for both: first half is past_seq_lens, second half is total_seq_lens.
