@@ -15,6 +15,25 @@ namespace onnxruntime {
 namespace contrib {
 namespace cuda {
 
+// Matrix index constants
+enum class QKV : int {
+  Q = 0,
+  K = 1,
+  V = 2,
+  COUNT = 3
+};
+
+// KV Cache Layout Documentation:
+// BSNH format: [batch_size, sequence_length, num_heads, head_size]
+//   - Preferred for most operations due to better memory coalescing for typical access patterns
+//   - Adjacent threads in a warp (h dimension) access contiguous memory
+//   - Used when is_bsnh=true
+//
+// BNSH format: [batch_size, num_heads, sequence_length, head_size]
+//   - Used when sequence dimension needs to be contiguous
+//   - May suffer from worse coalescing if head_size is small
+//   - Used when is_bsnh=false (or explicit bnsh flags)
+
 Status LaunchConcatTensorToTensor(cudaStream_t stream,
                                   const int all_sequence_length,
                                   const int sequence_length,

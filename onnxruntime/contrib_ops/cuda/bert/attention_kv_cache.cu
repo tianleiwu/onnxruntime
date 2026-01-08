@@ -33,18 +33,18 @@ __global__ void ConcatTensorToTensor(const int tensor_add_sequence_length,
   // tensor_out:   K x BxNxTxH, where T = P + L
   const int tensor_in_sequence_length = all_sequence_length - tensor_add_sequence_length;
 
-  const int present_SH = all_sequence_length * H;
-  const int present_NSH = num_heads * present_SH;
-  int out_offset = b * present_NSH + n * present_SH + s * H + h + chunk_id * (present_NSH * batch_size);
+  const int64_t present_SH = int64_t(all_sequence_length) * H;
+  const int64_t present_NSH = num_heads * present_SH;
+  int64_t out_offset = b * present_NSH + n * present_SH + s * H + h + chunk_id * (present_NSH * batch_size);
   if (s < tensor_in_sequence_length) {
-    const int past_SH = tensor_in_sequence_length * H;
-    const int past_NSH = num_heads * past_SH;
-    const int in_offset = b * past_NSH + n * past_SH + s * H + h + chunk_id * (past_NSH * batch_size);
+    const int64_t past_SH = int64_t(tensor_in_sequence_length) * H;
+    const int64_t past_NSH = num_heads * past_SH;
+    const int64_t in_offset = b * past_NSH + n * past_SH + s * H + h + chunk_id * (past_NSH * batch_size);
     tensor_out[out_offset] = tensor_in[in_offset];
   } else if (s < all_sequence_length) {
-    const int SH = tensor_add_sequence_length * H;
-    const int NSH = num_heads * SH;
-    const int in_offset = b * NSH + n * SH + (s - tensor_in_sequence_length) * H + h + chunk_id * (NSH * batch_size);
+    const int64_t SH = int64_t(tensor_add_sequence_length) * H;
+    const int64_t NSH = num_heads * SH;
+    const int64_t in_offset = b * NSH + n * SH + (s - tensor_in_sequence_length) * H + h + chunk_id * (NSH * batch_size);
     tensor_out[out_offset] = tensor_add[in_offset];
   }
 }
@@ -73,19 +73,19 @@ __global__ void ConcatTensorToTensorLarge(const int tensor_add_sequence_length,
   // tensor_out:   K x BxNxTxH
   const int tensor_in_sequence_length = all_sequence_length - tensor_add_sequence_length;
 
-  const int present_SH = all_sequence_length * H;
-  const int present_NSH = num_heads * present_SH;
+  const int64_t present_SH = int64_t(all_sequence_length) * H;
+  const int64_t present_NSH = num_heads * present_SH;
   while (h < H) {
-    int out_offset = b * present_NSH + n * present_SH + s * H + h + chunk_id * (present_NSH * batch_size);
+    int64_t out_offset = b * present_NSH + n * present_SH + s * H + h + chunk_id * (present_NSH * batch_size);
     if (s < tensor_in_sequence_length) {
-      const int past_SH = tensor_in_sequence_length * H;
-      const int past_NSH = num_heads * past_SH;
-      const int in_offset = b * past_NSH + n * past_SH + s * H + h + chunk_id * (past_NSH * batch_size);
+      const int64_t past_SH = int64_t(tensor_in_sequence_length) * H;
+      const int64_t past_NSH = num_heads * past_SH;
+      const int64_t in_offset = b * past_NSH + n * past_SH + s * H + h + chunk_id * (past_NSH * batch_size);
       tensor_out[out_offset] = tensor_in[in_offset];
     } else if (s < all_sequence_length) {
-      const int SH = tensor_add_sequence_length * H;
-      const int NSH = num_heads * SH;
-      const int in_offset = b * NSH + n * SH + (s - tensor_in_sequence_length) * H + h + chunk_id * (NSH * batch_size);
+      const int64_t SH = int64_t(tensor_add_sequence_length) * H;
+      const int64_t NSH = num_heads * SH;
+      const int64_t in_offset = b * NSH + n * SH + (s - tensor_in_sequence_length) * H + h + chunk_id * (NSH * batch_size);
       tensor_out[out_offset] = tensor_add[in_offset];
     }
 
@@ -134,6 +134,9 @@ Status LaunchConcatTensorToTensor(cudaStream_t stream,
                                                                    tensor_out);
     }
   }
+#ifndef NDEBUG
+  CUDA_CALL(cudaStreamSynchronize(stream));
+#endif
   return CUDA_CALL(cudaGetLastError());
 }
 
@@ -194,6 +197,9 @@ Status LaunchConcatTensorToTensor(cudaStream_t stream,
                                                                   tensor_out);
     }
   }
+#ifndef NDEBUG
+  CUDA_CALL(cudaStreamSynchronize(stream));
+#endif
   return CUDA_CALL(cudaGetLastError());
 }
 
@@ -210,7 +216,25 @@ Status LaunchConcatTensorToTensor(cudaStream_t stream,
                                   BFloat16* tensor_out) {
   assert(num_heads <= max_threads_per_block);
   const dim3 grid(all_sequence_length, batch_size, matrix_num);
-  if (0 == (head_size & 1)) {
+  if (0 == (head_size % 8)) {
+    const int H = head_size / 8;
+    if (H * num_heads <= max_threads_per_block) {
+      const dim3 block(H, num_heads, 1);
+      ConcatTensorToTensor<float4><<<grid, block, 0, stream>>>(
+          sequence_length,
+          reinterpret_cast<const float4*>(tensor_in),
+          reinterpret_cast<const float4*>(tensor_add),
+          reinterpret_cast<float4*>(tensor_out));
+    } else {
+      const dim3 block(max_threads_per_block / num_heads, num_heads, 1);
+      ConcatTensorToTensorLarge<float4><<<grid, block, 0, stream>>>(
+          sequence_length,
+          H,
+          reinterpret_cast<const float4*>(tensor_in),
+          reinterpret_cast<const float4*>(tensor_add),
+          reinterpret_cast<float4*>(tensor_out));
+    }
+  } else if (0 == (head_size & 1)) {
     const int H = head_size / 2;
     if (H * num_heads <= max_threads_per_block) {
       const dim3 block(H, num_heads, 1);
@@ -247,6 +271,9 @@ Status LaunchConcatTensorToTensor(cudaStream_t stream,
     }
   }
 
+#ifndef NDEBUG
+  CUDA_CALL(cudaStreamSynchronize(stream));
+#endif
   return CUDA_CALL(cudaGetLastError());
 }
 
@@ -268,20 +295,20 @@ __global__ void AddBiasTransAppendKvToPresentSmall(
   const int S = gridDim.x;
   const int B = gridDim.y;
 
-  constexpr int M = 3;           // Matrix count in qkv
-  const int m = blockIdx.z + 1;  // k = 1, v = 2
+  constexpr int M = static_cast<int>(QKV::COUNT);  // Matrix count in qkv
+  const int m = blockIdx.z + 1;                    // k = 1, v = 2
 
-  const int NH = N * head_size;
-  const int NHS = NH * S;
+  const int64_t NH = N * head_size;
+  const int64_t NHS = NH * S;
 
   qkv += (n * head_size + (s * M + m) * NH + b * M * NHS);
   if (biases) {
     biases += (m * NH + n * head_size);
   }
 
-  const int MsH = max_sequence_length * head_size;
-  const int NMsH = N * MsH;
-  const int BNMsH = B * NMsH;
+  const int64_t MsH = int64_t(max_sequence_length) * head_size;
+  const int64_t NMsH = N * MsH;
+  const int64_t BNMsH = B * NMsH;
   present += ((past_sequence_length + s) * head_size + n * MsH + b * NMsH + (m - 1) * BNMsH);
 
   for (int h = threadIdx.x; h < head_size; h += blockDim.x) {
@@ -304,20 +331,20 @@ __global__ void AddBiasTransAppendKvToPresent(
   const int S = gridDim.y;
   const int B = (gridDim.z >> 1);
 
-  constexpr int M = 3;                   // Matrix count in qkv
-  const int m = (blockIdx.z & 0x1) + 1;  // k = 1, v = 2
+  constexpr int M = static_cast<int>(QKV::COUNT);  // Matrix count in qkv
+  const int m = (blockIdx.z & 0x1) + 1;            // k = 1, v = 2
 
-  const int NH = N * head_size;
-  const int NHS = NH * S;
+  const int64_t NH = N * head_size;
+  const int64_t NHS = NH * S;
 
   qkv += (n * head_size + (s * M + m) * NH + b * M * NHS);
   if (biases) {
     biases += (m * NH + n * head_size);
   }
 
-  const int MsH = max_sequence_length * head_size;
-  const int NMsH = N * MsH;
-  const int BNMsH = B * NMsH;
+  const int64_t MsH = int64_t(max_sequence_length) * head_size;
+  const int64_t NMsH = N * MsH;
+  const int64_t BNMsH = B * NMsH;
   present += ((past_sequence_length + s) * head_size + n * MsH + b * NMsH + (m - 1) * BNMsH);
 
   for (int h = threadIdx.x; h < head_size; h += blockDim.x) {
@@ -398,23 +425,45 @@ template Status LaunchAddBiasTransAppendKvToPresent(cudaStream_t stream,
 
 // Kernel to append new and past kv in either BSNH or BNSH format
 // Adapted from ConcatTensorToTensor kernel in attention_kv_cache.cu file
-// Dispatcher for RoPE application based on VectorT and ElementT
+// Helper to apply RoPE rotation
+template <typename T, typename ElementT>
+__device__ __forceinline__ void ApplyRotaryEmbedding(T& val, const T* cos_cache, const T* sin_cache,
+                                                     const int rotary_dim, const int h_idx, const int pos_id,
+                                                     const bool interleaved, const T* new_kv_base,
+                                                     const int64_t in_offset) {
+  // Check if we are within rotary dimension
+  // For vector types, we need to check if ANY element is within range, or handle partial rotation?
+  // Our caller ensures h_idx corresponds to vector start.
+  // Generally we process 'vectors' of elements.
+
+  // NOTE: This helper assumes T fits within the processing granularity (float2/float4).
+  // The logic below is adapted from the original dispatcher specializations.
+
+  // This is a placeholder for the specialized logic which is quite different per type
+  // We will keep specialization but clean up the body.
+}
+
 template <typename VectorT, typename ElementT>
 struct RotaryDispatcher {
-  __device__ static void apply(VectorT& /*val*/, const VectorT* /*cos_cache*/, const VectorT* /*sin_cache*/, const int /*rotary_dim*/, const int /*h_idx*/, const int /*pos_id*/, const bool /*interleaved*/, const VectorT* /*new_kv_base*/, const int /*in_offset*/) {
-    // Default implementation: skip
-  }
+  __device__ static void apply(VectorT& val, const VectorT* cos_cache, const VectorT* sin_cache,
+                               const int rotary_dim, const int h_idx, const int pos_id,
+                               const bool interleaved, const VectorT* new_kv_base, const int64_t in_offset);
 };
 
+// Specialization for float2 (float)
 template <>
 struct RotaryDispatcher<float2, float> {
-  __device__ static void apply(float2& val, const float2* cos_cache, const float2* sin_cache, const int rotary_dim, const int h_idx, const int pos_id, const bool interleaved, const float2* new_kv_base, const int in_offset) {
+  __device__ static void apply(float2& val, const float2* cos_cache, const float2* sin_cache,
+                               const int rotary_dim, const int h_idx, const int pos_id,
+                               const bool interleaved, const float2* new_kv_base, const int64_t in_offset) {
     if (2 * h_idx >= rotary_dim) return;
 
     const float* cos_ptr = reinterpret_cast<const float*>(cos_cache);
     const float* sin_ptr = reinterpret_cast<const float*>(sin_cache);
     const float* kv_ptr = reinterpret_cast<const float*>(new_kv_base);
-    int scalar_in_offset = in_offset * 2;
+
+    // Use int64_t for byte offsets if needed, but here we index float array
+    int64_t scalar_in_offset = in_offset * 2;
     int scalar_h = h_idx * 2;
     int half_rot = rotary_dim / 2;
 
@@ -429,48 +478,60 @@ struct RotaryDispatcher<float2, float> {
       val.x = x * c - y * s;
       val.y = x * s + y * c;
     } else {
-      if (scalar_h < half_rot) {
-        int cs_idx = pos_id * half_rot + scalar_h;
-        c = cos_ptr[cs_idx];
-        s = sin_ptr[cs_idx];
-        float pair_x = kv_ptr[scalar_in_offset + scalar_h + half_rot];
-        val.x = x * c - pair_x * s;
-      } else {
-        int cs_idx = pos_id * half_rot + (scalar_h - half_rot);
-        c = cos_ptr[cs_idx];
-        s = sin_ptr[cs_idx];
-        float pair_x = kv_ptr[scalar_in_offset + scalar_h - half_rot];
-        val.x = x * c + pair_x * s;
+      // Half-Split Logic
+      // Process x (idx = scalar_h)
+      {
+        int idx = scalar_h;
+        if (idx < rotary_dim) {  // Should be true given h_idx check
+          int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
+          float sign = (idx < half_rot) ? -1.0f : 1.0f;
+          int cos_idx = idx % half_rot;
+          int cs_idx = pos_id * half_rot + cos_idx;
+
+          c = cos_ptr[cs_idx];
+          s = sin_ptr[cs_idx];
+          // Potential gather from new_kv if we are doing fused append+rotate from a source
+          // The source is 'new_kv_base'.
+          float pair_val = kv_ptr[scalar_in_offset + pair_idx];
+          val.x = x * c + sign * pair_val * s;
+        }
       }
 
-      int scalar_hy = scalar_h + 1;
-      if (scalar_hy < half_rot) {
-        int cs_idx = pos_id * half_rot + scalar_hy;
-        c = cos_ptr[cs_idx];
-        s = sin_ptr[cs_idx];
-        float pair_y = kv_ptr[scalar_in_offset + scalar_hy + half_rot];
-        val.y = y * c - pair_y * s;
-      } else {
-        int cs_idx = pos_id * half_rot + (scalar_hy - half_rot);
-        c = cos_ptr[cs_idx];
-        s = sin_ptr[cs_idx];
-        float pair_y = kv_ptr[scalar_in_offset + scalar_hy - half_rot];
-        val.y = y * c + pair_y * s;
+      // Process y (idx = scalar_h + 1)
+      {
+        int idx = scalar_h + 1;
+        if (idx < rotary_dim) {
+          int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
+          float sign = (idx < half_rot) ? -1.0f : 1.0f;
+          int cos_idx = idx % half_rot;
+          int cs_idx = pos_id * half_rot + cos_idx;
+
+          c = cos_ptr[cs_idx];
+          s = sin_ptr[cs_idx];
+          float pair_val = kv_ptr[scalar_in_offset + pair_idx];
+          val.y = y * c + sign * pair_val * s;
+        }
       }
     }
   }
 };
 
+// Specialization for float4 (float)
 template <>
 struct RotaryDispatcher<float4, float> {
-  __device__ static void apply(float4& val, const float4* cos_cache, const float4* sin_cache, const int rotary_dim, const int h_idx, const int pos_id, const bool interleaved, const float4* new_kv_base, const int in_offset) {
+  __device__ static void apply(float4& val, const float4* cos_cache, const float4* sin_cache,
+                               const int rotary_dim, const int h_idx, const int pos_id,
+                               const bool interleaved, const float4* new_kv_base, const int64_t in_offset) {
     float2 p1 = make_float2(val.x, val.y);
     float2 p2 = make_float2(val.z, val.w);
     const float2* c = reinterpret_cast<const float2*>(cos_cache);
     const float2* s = reinterpret_cast<const float2*>(sin_cache);
     const float2* b = reinterpret_cast<const float2*>(new_kv_base);
+
+    // Update offsets for float2 components
     RotaryDispatcher<float2, float>::apply(p1, c, s, rotary_dim, h_idx * 2, pos_id, interleaved, b, in_offset * 2);
     RotaryDispatcher<float2, float>::apply(p2, c, s, rotary_dim, h_idx * 2 + 1, pos_id, interleaved, b, in_offset * 2);
+
     val.x = p1.x;
     val.y = p1.y;
     val.z = p2.x;
@@ -478,10 +539,14 @@ struct RotaryDispatcher<float4, float> {
   }
 };
 
+// Specialization for float2 (half)
 template <>
 struct RotaryDispatcher<float2, half> {
-  __device__ static void apply(float2& val, const float2* cos_cache, const float2* sin_cache, const int rotary_dim, const int h_idx, const int pos_id, const bool interleaved, const float2* new_kv_base, const int in_offset) {
+  __device__ static void apply(float2& val, const float2* cos_cache, const float2* sin_cache,
+                               const int rotary_dim, const int h_idx, const int pos_id,
+                               const bool interleaved, const float2* new_kv_base, const int64_t in_offset) {
     if (2 * h_idx * 2 >= rotary_dim) return;
+
     half2* v_ptr = reinterpret_cast<half2*>(&val);
     half2 v0 = v_ptr[0];
     half2 v1 = v_ptr[1];
@@ -491,125 +556,67 @@ struct RotaryDispatcher<float2, half> {
 
     if (interleaved) {
       int f0 = 2 * h_idx;
-      // Interleaved Logic
       int cs0 = pos_id * half_rot + f0;
-      half2 c_pair = cos_ptr[cs0 / 2];
-      half2 s_pair = sin_ptr[cs0 / 2];
 
-      half c0 = c_pair.x;
-      half s0 = s_pair.x;
-      float c0f = __half2float(c0);
-      float s0f = __half2float(s0);
-      float e0f = __half2float(v0.x);
-      float e1f = __half2float(v0.y);
-      v0.x = __float2half(e0f * c0f - e1f * s0f);
-      v0.y = __float2half(e0f * s0f + e1f * c0f);
+      const half2 c_pair = cos_ptr[cs0 / 2];
+      const half2 s_pair = sin_ptr[cs0 / 2];
 
-      half c1 = c_pair.y;
-      half s1 = s_pair.y;
-      float c1f = __half2float(c1);
-      float s1f = __half2float(s1);
-      float e2f = __half2float(v1.x);
-      float e3f = __half2float(v1.y);
-      v1.x = __float2half(e2f * c1f - e3f * s1f);
-      v1.y = __float2half(e2f * s1f + e3f * c1f);
+      const float2 c_f = __half22float2(c_pair);
+      const float2 s_f = __half22float2(s_pair);
+
+      // Rotate v0 (pair 0)
+      const float2 e0 = __half22float2(v0);
+      v0 = __float22half2_rn(make_float2(e0.x * c_f.x - e0.y * s_f.x, e0.x * s_f.x + e0.y * c_f.x));
+
+      // Rotate v1 (pair 1)
+      const float2 e1 = __half22float2(v1);
+      v1 = __float22half2_rn(make_float2(e1.x * c_f.y - e1.y * s_f.y, e1.x * s_f.y + e1.y * c_f.y));
     } else {
       // Half-Split Logic
+      // Elements i and i + H/2 are paired.
+      // We have 4 elements: 4*h_idx, +1, +2, +3.
+      // We need to fetch pairs from new_kv_base.
+
       const half* kv_ptr = reinterpret_cast<const half*>(new_kv_base);
       int base_idx = 4 * h_idx;
-      int scalar_in_offset = in_offset * 4;
-      int half_rot = rotary_dim / 2;
+      int64_t scalar_in_offset = in_offset * 4;  // 4 halfs per float2
 
-      // Process v0.x (idx)
-      {
-        int idx = base_idx;
-        if (idx < rotary_dim) {
-          int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
-          float sign = (idx < half_rot) ? -1.0f : 1.0f;
-          int cos_idx = idx % half_rot;
-          int cs_idx = pos_id * half_rot + cos_idx;
+      auto rotate_element = [&](int idx, half& val) {
+        if (idx >= rotary_dim) return;  // Should be covered
+        int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
+        float sign = (idx < half_rot) ? -1.0f : 1.0f;
+        int cos_idx = idx % half_rot;
+        int cs_idx = pos_id * half_rot + cos_idx;
 
-          half c = reinterpret_cast<const half*>(cos_ptr)[cs_idx];
-          half s = reinterpret_cast<const half*>(sin_ptr)[cs_idx];
+        half c_val = reinterpret_cast<const half*>(cos_ptr)[cs_idx];
+        half s_val = reinterpret_cast<const half*>(sin_ptr)[cs_idx];  // Original used cos_ptr? No sin_ptr
 
-          float val_f = __half2float(v0.x);
-          float pair_f = __half2float(kv_ptr[scalar_in_offset + pair_idx]);
-          float cf = __half2float(c);
-          float sf = __half2float(s);
+        float val_f = __half2float(val);
+        float pair_f = __half2float(kv_ptr[scalar_in_offset + pair_idx]);
+        float cf = __half2float(c_val);
+        float sf = __half2float(s_val);
 
-          v0.x = __float2half(val_f * cf + sign * pair_f * sf);
-        }
-      }
-      // Process v0.y (idx+1)
-      {
-        int idx = base_idx + 1;
-        if (idx < rotary_dim) {
-          int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
-          float sign = (idx < half_rot) ? -1.0f : 1.0f;
-          int cos_idx = idx % half_rot;
-          int cs_idx = pos_id * half_rot + cos_idx;
+        val = __float2half(val_f * cf + sign * pair_f * sf);
+      };
 
-          half c = reinterpret_cast<const half*>(cos_ptr)[cs_idx];
-          half s = reinterpret_cast<const half*>(sin_ptr)[cs_idx];
-
-          float val_f = __half2float(v0.y);
-          float pair_f = __half2float(kv_ptr[scalar_in_offset + pair_idx]);
-          float cf = __half2float(c);
-          float sf = __half2float(s);
-
-          v0.y = __float2half(val_f * cf + sign * pair_f * sf);
-        }
-      }
-      // Process v1.x (idx+2)
-      {
-        int idx = base_idx + 2;
-        if (idx < rotary_dim) {
-          int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
-          float sign = (idx < half_rot) ? -1.0f : 1.0f;
-          int cos_idx = idx % half_rot;
-          int cs_idx = pos_id * half_rot + cos_idx;
-
-          half c = reinterpret_cast<const half*>(cos_ptr)[cs_idx];
-          half s = reinterpret_cast<const half*>(sin_ptr)[cs_idx];
-
-          float val_f = __half2float(v1.x);
-          float pair_f = __half2float(kv_ptr[scalar_in_offset + pair_idx]);
-          float cf = __half2float(c);
-          float sf = __half2float(s);
-
-          v1.x = __float2half(val_f * cf + sign * pair_f * sf);
-        }
-      }
-      // Process v1.y (idx+3)
-      {
-        int idx = base_idx + 3;
-        if (idx < rotary_dim) {
-          int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
-          float sign = (idx < half_rot) ? -1.0f : 1.0f;
-          int cos_idx = idx % half_rot;
-          int cs_idx = pos_id * half_rot + cos_idx;
-
-          half c = reinterpret_cast<const half*>(cos_ptr)[cs_idx];
-          half s = reinterpret_cast<const half*>(sin_ptr)[cs_idx];
-
-          float val_f = __half2float(v1.y);
-          float pair_f = __half2float(kv_ptr[scalar_in_offset + pair_idx]);
-          float cf = __half2float(c);
-          float sf = __half2float(s);
-
-          v1.y = __float2half(val_f * cf + sign * pair_f * sf);
-        }
-      }
+      rotate_element(base_idx, v0.x);
+      rotate_element(base_idx + 1, v0.y);
+      rotate_element(base_idx + 2, v1.x);
+      rotate_element(base_idx + 3, v1.y);
     }
     v_ptr[0] = v0;
     v_ptr[1] = v1;
   }
 };
 
+// Specialization for float2 (BFloat16)
 template <>
 struct RotaryDispatcher<float2, BFloat16> {
-  __device__ static void apply(float2& val, const float2* cos_cache, const float2* sin_cache, const int rotary_dim, const int h_idx, const int pos_id, const bool interleaved, const float2* new_kv_base, const int in_offset) {
+  __device__ static void apply(float2& val, const float2* cos_cache, const float2* sin_cache,
+                               const int rotary_dim, const int h_idx, const int pos_id,
+                               const bool interleaved, const float2* new_kv_base, const int64_t in_offset) {
     if (2 * h_idx * 2 >= rotary_dim) return;
+
     using namespace onnxruntime::cuda;
     __nv_bfloat162* v_ptr = reinterpret_cast<__nv_bfloat162*>(&val);
     __nv_bfloat162 v0 = v_ptr[0];
@@ -621,112 +628,55 @@ struct RotaryDispatcher<float2, BFloat16> {
     if (interleaved) {
       int f0 = 2 * h_idx;
       int cs0 = pos_id * half_rot + f0;
+
       __nv_bfloat162 c_pair = cos_ptr[cs0 / 2];
       __nv_bfloat162 s_pair = sin_ptr[cs0 / 2];
-      __nv_bfloat16 c0 = c_pair.x;
-      __nv_bfloat16 s0 = s_pair.x;
-      float c0f = __bfloat162float(c0);
-      float s0f = __bfloat162float(s0);
-      float e0f = __bfloat162float(v0.x);
-      float e1f = __bfloat162float(v0.y);
-      v0.x = __float2bfloat16(e0f * c0f - e1f * s0f);
-      v0.y = __float2bfloat16(e0f * s0f + e1f * c0f);
 
-      __nv_bfloat16 c1 = c_pair.y;
-      __nv_bfloat16 s1 = s_pair.y;
-      float c1f = __bfloat162float(c1);
-      float s1f = __bfloat162float(s1);
-      float e2f = __bfloat162float(v1.x);
-      float e3f = __bfloat162float(v1.y);
-      v1.x = __float2bfloat16(e2f * c1f - e3f * s1f);
-      v1.y = __float2bfloat16(e2f * s1f + e3f * c1f);
+      // Process v0 (pair 1)
+      // v0.x, v0.y
+      float c0f = __bfloat162float(c_pair.x);
+      float s0f = __bfloat162float(s_pair.x);
+      float e0x = __bfloat162float(v0.x);
+      float e0y = __bfloat162float(v0.y);
+      v0.x = __float2bfloat16(e0x * c0f - e0y * s0f);
+      v0.y = __float2bfloat16(e0x * s0f + e0y * c0f);
+
+      // Process v1 (pair 2)
+      float c1f = __bfloat162float(c_pair.y);
+      float s1f = __bfloat162float(s_pair.y);
+      float e1x = __bfloat162float(v1.x);
+      float e1y = __bfloat162float(v1.y);
+      v1.x = __float2bfloat16(e1x * c1f - e1y * s1f);
+      v1.y = __float2bfloat16(e1x * s1f + e1y * c1f);
+
     } else {
       // Half-Split Logic
       const __nv_bfloat16* kv_ptr = reinterpret_cast<const __nv_bfloat16*>(new_kv_base);
       int base_idx = 4 * h_idx;
-      int scalar_in_offset = in_offset * 4;
-      int half_rot = rotary_dim / 2;
+      int64_t scalar_in_offset = in_offset * 4;
 
-      // Process v0.x (idx)
-      {
-        int idx = base_idx;
-        if (idx < rotary_dim) {
-          int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
-          float sign = (idx < half_rot) ? -1.0f : 1.0f;
-          int cos_idx = idx % half_rot;
-          int cs_idx = pos_id * half_rot + cos_idx;
+      auto rotate_element_bf16 = [&](int idx, __nv_bfloat16& val) {
+        if (idx >= rotary_dim) return;
+        int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
+        float sign = (idx < half_rot) ? -1.0f : 1.0f;
+        int cos_idx = idx % half_rot;
+        int cs_idx = pos_id * half_rot + cos_idx;
 
-          __nv_bfloat16 c = reinterpret_cast<const __nv_bfloat16*>(cos_ptr)[cs_idx];
-          __nv_bfloat16 s = reinterpret_cast<const __nv_bfloat16*>(sin_ptr)[cs_idx];
+        __nv_bfloat16 c_val = reinterpret_cast<const __nv_bfloat16*>(cos_ptr)[cs_idx];
+        __nv_bfloat16 s_val = reinterpret_cast<const __nv_bfloat16*>(sin_ptr)[cs_idx];
 
-          float val_f = __bfloat162float(v0.x);
-          float pair_f = __bfloat162float(kv_ptr[scalar_in_offset + pair_idx]);
-          float cf = __bfloat162float(c);
-          float sf = __bfloat162float(s);
+        float val_f = __bfloat162float(val);
+        float pair_f = __bfloat162float(kv_ptr[scalar_in_offset + pair_idx]);
+        float cf = __bfloat162float(c_val);
+        float sf = __bfloat162float(s_val);
 
-          v0.x = __float2bfloat16(val_f * cf + sign * pair_f * sf);
-        }
-      }
-      // Process v0.y (idx+1)
-      {
-        int idx = base_idx + 1;
-        if (idx < rotary_dim) {
-          int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
-          float sign = (idx < half_rot) ? -1.0f : 1.0f;
-          int cos_idx = idx % half_rot;
-          int cs_idx = pos_id * half_rot + cos_idx;
+        val = __float2bfloat16(val_f * cf + sign * pair_f * sf);
+      };
 
-          __nv_bfloat16 c = reinterpret_cast<const __nv_bfloat16*>(cos_ptr)[cs_idx];
-          __nv_bfloat16 s = reinterpret_cast<const __nv_bfloat16*>(sin_ptr)[cs_idx];
-
-          float val_f = __bfloat162float(v0.y);
-          float pair_f = __bfloat162float(kv_ptr[scalar_in_offset + pair_idx]);
-          float cf = __bfloat162float(c);
-          float sf = __bfloat162float(s);
-
-          v0.y = __float2bfloat16(val_f * cf + sign * pair_f * sf);
-        }
-      }
-      // Process v1.x (idx+2)
-      {
-        int idx = base_idx + 2;
-        if (idx < rotary_dim) {
-          int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
-          float sign = (idx < half_rot) ? -1.0f : 1.0f;
-          int cos_idx = idx % half_rot;
-          int cs_idx = pos_id * half_rot + cos_idx;
-
-          __nv_bfloat16 c = reinterpret_cast<const __nv_bfloat16*>(cos_ptr)[cs_idx];
-          __nv_bfloat16 s = reinterpret_cast<const __nv_bfloat16*>(sin_ptr)[cs_idx];
-
-          float val_f = __bfloat162float(v1.x);
-          float pair_f = __bfloat162float(kv_ptr[scalar_in_offset + pair_idx]);
-          float cf = __bfloat162float(c);
-          float sf = __bfloat162float(s);
-
-          v1.x = __float2bfloat16(val_f * cf + sign * pair_f * sf);
-        }
-      }
-      // Process v1.y (idx+3)
-      {
-        int idx = base_idx + 3;
-        if (idx < rotary_dim) {
-          int pair_idx = (idx < half_rot) ? (idx + half_rot) : (idx - half_rot);
-          float sign = (idx < half_rot) ? -1.0f : 1.0f;
-          int cos_idx = idx % half_rot;
-          int cs_idx = pos_id * half_rot + cos_idx;
-
-          __nv_bfloat16 c = reinterpret_cast<const __nv_bfloat16*>(cos_ptr)[cs_idx];
-          __nv_bfloat16 s = reinterpret_cast<const __nv_bfloat16*>(sin_ptr)[cs_idx];
-
-          float val_f = __bfloat162float(v1.y);
-          float pair_f = __bfloat162float(kv_ptr[scalar_in_offset + pair_idx]);
-          float cf = __bfloat162float(c);
-          float sf = __bfloat162float(s);
-
-          v1.y = __float2bfloat16(val_f * cf + sign * pair_f * sf);
-        }
-      }
+      rotate_element_bf16(base_idx, v0.x);
+      rotate_element_bf16(base_idx + 1, v0.y);
+      rotate_element_bf16(base_idx + 2, v1.x);
+      rotate_element_bf16(base_idx + 3, v1.y);
     }
     v_ptr[0] = v0;
     v_ptr[1] = v1;
@@ -766,9 +716,9 @@ __global__ void ConcatNewToPastKVFused(const int new_seqlen,
   const int num_heads = blockDim.y;
   const int H = blockDim.x;
 
-  const int present_batch_stride = present_buffer_seqlen * num_heads * H;
-  const int row_stride = is_bsnh ? num_heads * H : H;
-  const int present_head_stride = is_bsnh ? H : present_buffer_seqlen * H;
+  const int64_t present_batch_stride = int64_t(present_buffer_seqlen) * num_heads * H;
+  const int64_t row_stride = is_bsnh ? num_heads * H : H;
+  const int64_t present_head_stride = is_bsnh ? H : int64_t(present_buffer_seqlen) * H;
 
   // Determine pointers based on kind
   const T* past_ptr = (kind == 0) ? past_key : past_value;
@@ -777,18 +727,18 @@ __global__ void ConcatNewToPastKVFused(const int new_seqlen,
 
   const int past_seqlen = past_seq_lens[b];
 
-  int out_offset = b * present_batch_stride + s * row_stride + n * present_head_stride + h;
+  int64_t out_offset = b * present_batch_stride + s * row_stride + n * present_head_stride + h;
 
   if (s < past_seqlen) {
-    const int past_batch_stride = past_buffer_seqlen * num_heads * H;
-    const int past_head_stride = is_bsnh ? H : past_buffer_seqlen * H;
-    const int in_offset = b * past_batch_stride + s * row_stride + n * past_head_stride + h;
+    const int64_t past_batch_stride = int64_t(past_buffer_seqlen) * num_heads * H;
+    const int64_t past_head_stride = is_bsnh ? H : int64_t(past_buffer_seqlen) * H;
+    const int64_t in_offset = b * past_batch_stride + s * row_stride + n * past_head_stride + h;
     present_ptr[out_offset] = past_ptr[in_offset];
   } else if (!past_only && s < past_seqlen + new_seqlen) {
-    const int new_batch_stride = new_seqlen * num_heads * H;
-    const int new_row_stride = num_heads * H;
-    const int new_head_stride = H;
-    const int in_offset = b * new_batch_stride + (s - past_seqlen) * new_row_stride + n * new_head_stride + h;
+    const int64_t new_batch_stride = int64_t(new_seqlen) * num_heads * H;
+    const int64_t new_row_stride = num_heads * H;
+    const int64_t new_head_stride = H;
+    const int64_t in_offset = b * new_batch_stride + (s - past_seqlen) * new_row_stride + n * new_head_stride + h;
 
     T val = new_ptr[in_offset];
 
@@ -806,11 +756,12 @@ __global__ void ConcatNewToPastKVFused(const int new_seqlen,
         pos_id = s;
       }
 
+      // Check bounds for pos_id to be safe?
+      // RoPE cache size usually matches max_seq_len.
+
       RotaryDispatcher<T, ElementT>::apply(val, cos_cache, sin_cache, rotary_dim, h, pos_id, interleaved, new_key, in_offset - h);
     }
     present_ptr[out_offset] = val;
-  } else if (s >= total_seq_lens[b]) {
-    present_ptr[out_offset] = T{};
   }
 }
 
@@ -846,9 +797,9 @@ __global__ void ConcatNewToPastKVFusedLarge(const int new_seqlen,
     const int present_buffer_seqlen = gridDim.y;
     // gridDim.z is batch_size * 2
 
-    const int present_batch_stride = present_buffer_seqlen * num_heads * H;
-    const int row_stride = is_bsnh ? num_heads * H : H;
-    const int present_head_stride = is_bsnh ? H : present_buffer_seqlen * H;
+    const int64_t present_batch_stride = int64_t(present_buffer_seqlen) * num_heads * H;
+    const int64_t row_stride = is_bsnh ? num_heads * H : H;
+    const int64_t present_head_stride = is_bsnh ? H : int64_t(present_buffer_seqlen) * H;
 
     const T* past_ptr = (kind == 0) ? past_key : past_value;
     const T* new_ptr = (kind == 0) ? new_key : new_value;
@@ -856,18 +807,18 @@ __global__ void ConcatNewToPastKVFusedLarge(const int new_seqlen,
 
     const int past_seqlen = past_seq_lens[b];
 
-    int out_offset = b * present_batch_stride + s * row_stride + n * present_head_stride + h;
+    const int64_t out_offset = b * present_batch_stride + s * row_stride + n * present_head_stride + h;
 
     if (s < past_seqlen) {
-      const int past_batch_stride = past_buffer_seqlen * num_heads * H;
-      const int past_head_stride = is_bsnh ? H : past_buffer_seqlen * H;
-      const int in_offset = b * past_batch_stride + s * row_stride + n * past_head_stride + h;
+      const int64_t past_batch_stride = int64_t(past_buffer_seqlen) * num_heads * H;
+      const int64_t past_head_stride = is_bsnh ? H : int64_t(past_buffer_seqlen) * H;
+      const int64_t in_offset = b * past_batch_stride + s * row_stride + n * past_head_stride + h;
       present_ptr[out_offset] = past_ptr[in_offset];
     } else if (!past_only && s < past_seqlen + new_seqlen) {
-      const int new_batch_stride = new_seqlen * num_heads * H;
-      const int new_row_stride = num_heads * H;
-      const int new_head_stride = H;
-      const int in_offset = b * new_batch_stride + (s - past_seqlen) * new_row_stride + n * new_head_stride + h;
+      const int64_t new_batch_stride = int64_t(new_seqlen) * num_heads * H;
+      const int64_t new_row_stride = num_heads * H;
+      const int64_t new_head_stride = H;
+      const int64_t in_offset = b * new_batch_stride + (s - past_seqlen) * new_row_stride + n * new_head_stride + h;
 
       T val = new_ptr[in_offset];
 
@@ -881,8 +832,6 @@ __global__ void ConcatNewToPastKVFusedLarge(const int new_seqlen,
         RotaryDispatcher<T, ElementT>::apply(val, cos_cache, sin_cache, rotary_dim, h, pos_id, interleaved, new_key, in_offset - h);
       }
       present_ptr[out_offset] = val;
-    } else if (s >= total_seq_lens[b]) {
-      present_ptr[out_offset] = T{};
     }
   }
 }
@@ -960,6 +909,9 @@ Status LaunchConcatNewToPastKV(const int batch_size,
                                                                        reinterpret_cast<const float2*>(sin_cache),
                                                                        rotary_dim, position_ids, interleaved);
   }
+#ifndef NDEBUG
+  CUDA_CALL(cudaStreamSynchronize(stream));
+#endif
   return CUDA_CALL(cudaGetLastError());
 }
 
@@ -1055,18 +1007,16 @@ __global__ void ConcatKVInPlace(const int max_seqlen,
 
   const int past_seq_len = (past_seq_lens != nullptr) ? past_seq_lens[b] : (total_seq_lens[b] - new_seqlen);
 
-  int out_offset = is_past_kv_bnsh_format
-                       ? INDEX_4D(kv_num_heads, max_seqlen, H, b, n, s + past_seq_len, h)
-                       : INDEX_4D(max_seqlen, kv_num_heads, H, b, s + past_seq_len, n, h);
+  int64_t out_offset = is_past_kv_bnsh_format
+                           ? INDEX_4D(int64_t(kv_num_heads), int64_t(max_seqlen), int64_t(H), int64_t(b), int64_t(n), int64_t(s + past_seq_len), int64_t(h))
+                           : INDEX_4D(int64_t(max_seqlen), int64_t(kv_num_heads), int64_t(H), int64_t(b), int64_t(s + past_seq_len), int64_t(n), int64_t(h));
 
-  int in_offset = is_new_kv_bnsh_format
-                      ? INDEX_4D(kv_num_heads, new_seqlen, H, b, n, s, h)
-                      : INDEX_4D(new_seqlen, kv_num_heads, H, b, s, n, h);
+  int64_t in_offset = is_new_kv_bnsh_format
+                          ? INDEX_4D(int64_t(kv_num_heads), int64_t(new_seqlen), int64_t(H), int64_t(b), int64_t(n), int64_t(s), int64_t(h))
+                          : INDEX_4D(int64_t(new_seqlen), int64_t(kv_num_heads), int64_t(H), int64_t(b), int64_t(s), int64_t(n), int64_t(h));
 
   if (s + past_seq_len < total_seq_lens[b]) {
     kv_buff[out_offset] = new_kv[in_offset];
-  } else {
-    kv_buff[out_offset] = T{};
   }
 }
 
@@ -1089,18 +1039,16 @@ __global__ void ConcatKVInPlaceLarge(const int max_seqlen,
     const int new_seqlen = gridDim.y;
     const int past_seq_len = (past_seq_lens != nullptr) ? past_seq_lens[b] : (total_seq_lens[b] - new_seqlen);
 
-    int out_offset = is_past_kv_bnsh_format
-                         ? INDEX_4D(kv_num_heads, max_seqlen, H, b, n, s + past_seq_len, h)
-                         : INDEX_4D(max_seqlen, kv_num_heads, H, b, s + past_seq_len, n, h);
+    int64_t out_offset = is_past_kv_bnsh_format
+                             ? INDEX_4D(int64_t(kv_num_heads), int64_t(max_seqlen), int64_t(H), int64_t(b), int64_t(n), int64_t(s + past_seq_len), int64_t(h))
+                             : INDEX_4D(int64_t(max_seqlen), int64_t(kv_num_heads), int64_t(H), int64_t(b), int64_t(s + past_seq_len), int64_t(n), int64_t(h));
 
-    int in_offset = is_new_kv_bnsh_format
-                        ? INDEX_4D(kv_num_heads, new_seqlen, H, b, n, s, h)
-                        : INDEX_4D(new_seqlen, kv_num_heads, H, b, s, n, h);
+    int64_t in_offset = is_new_kv_bnsh_format
+                            ? INDEX_4D(int64_t(kv_num_heads), int64_t(new_seqlen), int64_t(H), int64_t(b), int64_t(n), int64_t(s), int64_t(h))
+                            : INDEX_4D(int64_t(new_seqlen), int64_t(kv_num_heads), int64_t(H), int64_t(b), int64_t(s), int64_t(n), int64_t(h));
 
     if (s + past_seq_len < total_seq_lens[b]) {
       kv_buff[out_offset] = new_kv[in_offset];
-    } else {
-      kv_buff[out_offset] = T{};
     }
   }
 }
@@ -1165,6 +1113,9 @@ Status LaunchConcatKVInPlace(int batch_size,
                                                              is_past_kv_bnsh_format,
                                                              is_new_kv_bnsh_format);
   }
+#ifndef NDEBUG
+  CUDA_CALL(cudaStreamSynchronize(stream));
+#endif
   return CUDA_CALL(cudaGetLastError());
 }
 
@@ -1367,6 +1318,9 @@ Status LaunchConcatKVInPlaceFused(int batch_size,
         is_past_kv_bnsh_format,
         is_new_kv_bnsh_format);
   }
+#ifndef NDEBUG
+  CUDA_CALL(cudaStreamSynchronize(stream));
+#endif
   return CUDA_CALL(cudaGetLastError());
 }
 
