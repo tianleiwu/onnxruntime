@@ -40,14 +40,15 @@ limitations under the License.
 #include "contrib_ops/cuda/bert/cutlass_fmha/memory_efficient_attention.h"
 #include "contrib_ops/cuda/bert/flash_attention/flash_api.h"
 #include "contrib_ops/cuda/bert/group_query_attention_impl.h"
+#include "contrib_ops/cuda/bert/group_query_attention_qdq.cuh"
 #include "contrib_ops/cuda/bert/rotary_embedding_impl.h"
 #include "contrib_ops/cuda/bert/rotary_common.cuh"
 #include "contrib_ops/cuda/bert/transformer_common.h"
+#include "contrib_ops/cuda/utils/dump_cuda_tensor.h"
 #include "core/providers/cuda/cu_inc/common.cuh"
 #include "core/providers/cuda/cuda_common.h"
 #include "core/providers/cuda/shared_inc/cuda_call.h"
 #include "core/providers/cuda/shared_inc/fpgeneric.h"
-#include "contrib_ops/cuda/utils/dump_cuda_tensor.h"
 
 using namespace onnxruntime::cuda;
 
@@ -716,6 +717,15 @@ Status LaunchGetSequenceLengths(
   return CUDA_CALL(cudaGetLastError());
 }
 
+// Trace function for debugging
+#define ORT_GQA_TRACE(func_name)                                                                                 \
+  DEBUG_PRINTF("[GQA %s] is_packed_qkv: %d, is_first_prompt: %d, is_subsequent_prompt: %d, kv_share_buffer: %d", \
+               func_name,                                                                                        \
+               static_cast<int>(parameters.is_packed_qkv),                                                       \
+               static_cast<int>(parameters.is_first_prompt),                                                     \
+               static_cast<int>(parameters.is_subsequent_prompt),                                                \
+               static_cast<int>(parameters.kv_share_buffer));
+
 ////////// Kernels (supports right padding but not left padding)
 
 #if USE_FLASH_ATTENTION
@@ -723,13 +733,15 @@ Status LaunchGetSequenceLengths(
 // Use flash attention for all workloads (rotary, kv append, attention, etc.). No extra kernel is used in this path.
 // Currently, only decoding or subsequent prompt can use this path. First prompt will not use this path.
 template <typename T>
-Status FlashAttentionDecoding(
+Status FlashDecoding(
     const cudaDeviceProp& device_prop,
     cudaStream_t stream,
     GroupQueryAttentionParameters& parameters,
     GroupQueryAttentionData<T>& data,
     float scale) {
   assert(!parameters.is_first_prompt && parameters.kv_share_buffer);
+
+  ORT_GQA_TRACE("FlashDecoding");
 
   const int batch_size = parameters.batch_size;
   const int sequence_length = parameters.sequence_length;
@@ -764,6 +776,9 @@ Status FlashAttentionDecoding(
   void* head_sink = reinterpret_cast<void*>(const_cast<T*>(data.head_sink));
 
   bool past_bsnh = past_kv_format == AttentionQkvFormat::Q_K_V_BSNH;
+
+  DEBUG_PRINTF("[FlashDecoding] key=%p, value=%p, present_key=%p, present_value=%p, seqlens_k=%p, is_packed_qkv=%d",
+               key, value, present_key, present_value, seqlens_k, static_cast<int>(parameters.is_packed_qkv));
 
   ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd_kvcache(
       device_prop, stream, query, present_key, present_value, key, value, data.output,
@@ -812,13 +827,8 @@ Status FlashAttention(
     value = reinterpret_cast<T*>(key) + value_offset;
   }
 
-#if DUMP_TENSOR_LEVEL > 0
-  printf("[GQA FlashAttention] is_packed_qkv: %d, is_first_prompt: %d, is_subsequent_prompt: %d, kv_share_buffer: %d\n",
-         static_cast<int>(parameters.is_packed_qkv),
-         static_cast<int>(parameters.is_first_prompt),
-         static_cast<int>(parameters.is_subsequent_prompt),
-         static_cast<int>(parameters.kv_share_buffer));
-#endif
+  ORT_GQA_TRACE("FlashAttention");
+
   DUMP_TENSOR_INIT();
 
   // Track whether we keep packed QKV for FA kernels
@@ -865,9 +875,11 @@ Status FlashAttention(
         use_packed_for_fa = false;
         used_fused_packed_path = true;
 
-        // Track buffer usage: Only Q is stored in unpacked_qkv_buffer (fused path writes K/V to cache)
-        size_t q_bytes = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size * sizeof(T);
-        UpdateUnpackedQkvMaxUsed(data, q_bytes);
+        if constexpr (kTrackBufferUsage) {
+          // Track buffer usage: Only Q is stored in unpacked_qkv_buffer (fused path writes K/V to cache)
+          size_t q_bytes = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size * sizeof(T);
+          UpdateUnpackedQkvMaxUsed(data, q_bytes);
+        }
 
         // K and V are already in cache - no need to set key/value pointers
 
@@ -894,9 +906,11 @@ Status FlashAttention(
           use_packed_for_fa = false;
         }
 
-        // Track buffer usage: Q+K+V unpacked
-        size_t total_bytes = (q_size + 2 * k_size) * sizeof(T);
-        UpdateUnpackedQkvMaxUsed(data, total_bytes);
+        if constexpr (kTrackBufferUsage) {
+          // Track buffer usage: Q+K+V unpacked
+          size_t total_bytes = (q_size + 2 * k_size) * sizeof(T);
+          UpdateUnpackedQkvMaxUsed(data, total_bytes);
+        }
       }
     }
   }
@@ -950,7 +964,12 @@ Status FlashAttention(
         ));
     DUMP_TENSOR("Rotated Q", q_output_for_rope, batch_size, sequence_length, num_heads, head_size);
 
-    // Rotate K will be done later in fused kernel.
+    if constexpr (kTrackBufferUsage) {
+      size_t q_bytes = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size * sizeof(T);
+      UpdateUnpackedQkvMaxUsed(data, q_bytes);
+    }
+
+    // Explicit K Rotation will be done later in fused kernel.
   }
 
   // Skip KV append if we used the fully fused path (KV already in cache)
@@ -1007,10 +1026,12 @@ Status FlashAttention(
               parameters, data, k_dst, value, is_new_kv_bnsh_format, stream, max_threads_per_block));
         }
 
-        // Track buffer usage: Q + K rotated in unpacked_qkv_buffer
-        size_t k_elements = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size;
-        size_t total_bytes = (q_elements + k_elements) * sizeof(T);
-        UpdateUnpackedQkvMaxUsed(data, total_bytes);
+        if constexpr (kTrackBufferUsage) {
+          // Track buffer usage: Q + K rotated in unpacked_qkv_buffer
+          size_t k_elements = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size;
+          size_t total_bytes = (q_elements + k_elements) * sizeof(T);
+          UpdateUnpackedQkvMaxUsed(data, total_bytes);
+        }
       } else {
         // No RoPE - use original kernel
         ORT_RETURN_IF_ERROR(LaunchConcatKVInPlace(parameters, data, key, value, is_new_kv_bnsh_format, stream, max_threads_per_block));
@@ -1046,7 +1067,7 @@ Status FlashAttention(
   void* kernel_new_v = nullptr;
 
   // Use padded seq lens for first prompt since mha_fwd_kvcache assumes uniform seqlen_q.
-  // The causal mask offset (seqlen_k - seqlen_q) becomes negative when seqlen_k < seqlen_q, causing incorrect masking.
+  // In flash attention, the causal mask offset (seqlen_k - seqlen_q) becomes negative when seqlen_k < seqlen_q, causing incorrect masking.
   int* seq_lens = parameters.is_first_prompt ? data.padded_seq_lens : data.total_seq_lens;
 
   ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd_kvcache(
@@ -1064,6 +1085,171 @@ Status FlashAttention(
 
   return Status::OK();
 }
+
+#if 0  // still need to implement this
+// Use Flash Attention for float key and value, then quantize key/value to int4/int8 to save to k/v cache.
+template <typename T>
+Status FlashAttentionAndQuantizeKV(
+    const cudaDeviceProp& device_prop,
+    cudaStream_t stream,
+    GroupQueryAttentionParameters& parameters,
+    GroupQueryAttentionData<T>& data,
+    float scale) {
+  assert(parameters.is_first_prompt);  // Only support first prompt for this function.
+  assert(parameters.kv_share_buffer);
+
+  bool is_quantized = parameters.k_quant_type != KVQuantizationType::NONE;
+  assert(is_quantized);
+
+  ORT_GQA_TRACE("FlashAttentionAndQuantizeKV");
+
+  // TODO: for the first prompt, there are two solutions:
+  // (1) Similar to FlashAttention, we do unpack qkv and apply rotary if needed, then call flash attention kernel
+  //     to compute the attention output. Then we quantize float key and value (after rotary) in temp buffers to int4/int8.
+  //     Note that float key and value shall be stored in temp buffers, not in present_key and present_value output.
+  //     In this solution, we may refactor FlashAttention function so that we need not write duplicated code.
+  //     In this mode, we call the float version of flash attention kernel (flash_fwd_kernel). It could be faster but need
+  //     more memory to store float key and value. It could have higher accuracy.
+  // (2) Quantize float key and value (after rotary) to present_key and present_value first, then call flash attention kernel
+  //     to compute the attention output. Then we quantize float key and value (after rotary) in temp buffers to int4/int8.
+  //     Note that float key and value shall be stored in temp buffers, not in present_key and present_value output.
+  //     In this mode, we call the int4/int8 version of flash attention kernel (flash_fwd_kvcache). It could be slower but
+  //     need less memory. The accuracy might not be as good as the float version.
+
+  // We will use solution 1 for prompt.
+  // TODO: use similar code like FlashAttention to compute float attention output
+  // TODO: add code to quantize float key and value (after rotary) and save to present_key and present_value.
+
+  return Status::OK();
+}
+
+// Use Flash Attention with Quantized KV (for Subsequent Prompt or Decoding, need quantize k/v first then call int4/int8 version of flash attention kernel).
+template <typename T>
+Status FlashAttentionWithQuantizeKV(
+    const cudaDeviceProp& device_prop,
+    cudaStream_t stream,
+    GroupQueryAttentionParameters& parameters,
+    GroupQueryAttentionData<T>& data,
+    float scale) {
+  assert(parameters.kv_share_buffer);
+
+  bool is_quantized = parameters.k_quant_type != KVQuantizationType::NONE;
+  assert(is_quantized);
+
+  ORT_GQA_TRACE("FlashAttentionWithQuantizedKV");
+
+  const int batch_size = parameters.batch_size;
+  const int sequence_length = parameters.sequence_length;
+  const int kv_sequence_length = parameters.sequence_length;
+  const int num_heads = parameters.num_heads;
+  const int kv_num_heads = parameters.kv_num_heads;
+  const int head_size = parameters.head_size;
+  AttentionQkvFormat past_kv_format = parameters.past_kv_format;
+  bool is_causal = parameters.is_unidirectional;
+  bool is_bf16 = std::is_same<T, BFloat16>::value;
+
+  void* query = reinterpret_cast<void*>(const_cast<T*>(data.query));
+  void* key;
+  void* value;
+
+  if (!parameters.is_packed_qkv) {
+    key = reinterpret_cast<void*>(const_cast<T*>(data.key));
+    value = reinterpret_cast<void*>(const_cast<T*>(data.value));
+  } else {
+    const size_t key_offset = static_cast<size_t>(num_heads * head_size);
+    const size_t value_offset = static_cast<size_t>(kv_num_heads * head_size);
+    key = reinterpret_cast<T*>(query) + key_offset;
+    value = reinterpret_cast<T*>(key) + value_offset;
+  }
+
+  // TODO: for the consequent prompt or decoding, since past_key and past_value are already quantized, we use the following solution:
+  // Quantize float new key and new value (after rotary) and append to present_key and present_value first, then call flash attention kernel
+  //     to compute the attention output. In this mode, we call the int4/int8 version of flash attention kernel (flash_fwd_kvcache).
+  // if (!parameters.is_packed_qkv) {
+  //   // Int8 flash attention kernel are able to perform on-the-fly quantization (see kEnableOnTheFlyNewKVQuantization).
+  //   // That has only slight performance benefit while make code complicated. So we still use the separate LaunchQuantAppend
+  //   // to make it consistent among int4, int8 and int8_quant cases.
+  //   if (parameters.kv_cache_bit_width == 4 || parameters.kv_cache_bit_width == 8) {
+  //     auto LaunchQuantAppend = [&](void* dst, const T* src, const T* scale, KVQuantizationType q_type) {
+  //       if (parameters.kv_cache_bit_width == 8) {
+  //         return LaunchQuantizeAppendKV<T, int8_t, T>(
+  //             stream, reinterpret_cast<int8_t*>(dst), src, scale,
+  //             data.total_seq_lens, batch_size, kv_num_heads,
+  //             parameters.seqlen_present_kv_cache, head_size, 8, sequence_length, q_type, true);
+  //       } else {
+  //         return LaunchQuantizeAppendKV<T, uint8_t, T>(
+  //             stream, reinterpret_cast<uint8_t*>(dst), src, scale,
+  //             data.total_seq_lens, batch_size, kv_num_heads,
+  //             parameters.seqlen_present_kv_cache, head_size, 4, sequence_length, q_type, true);
+  //       }
+  //     };
+  //     ORT_RETURN_IF_ERROR(LaunchQuantAppend(data.present_key, reinterpret_cast<const T*>(key), data.k_scale, parameters.k_quant_type));
+  //     ORT_RETURN_IF_ERROR(LaunchQuantAppend(data.present_value, reinterpret_cast<const T*>(value), data.v_scale, parameters.v_quant_type));
+  //   }
+  // }
+
+  // TODO: add code to quantize float key and value (after rotary) and save to present_key and present_value here.
+
+  void* present_key = reinterpret_cast<void*>(const_cast<T*>(data.present_key));
+  void* present_value = reinterpret_cast<void*>(const_cast<T*>(data.present_value));
+  void* cos_cache = reinterpret_cast<void*>(const_cast<T*>(data.cos_cache));
+  void* sin_cache = reinterpret_cast<void*>(const_cast<T*>(data.sin_cache));
+  void* head_sink = reinterpret_cast<void*>(const_cast<T*>(data.head_sink));
+  void* k_scale = const_cast<void*>(reinterpret_cast<const void*>(data.k_scale));
+  void* v_scale = const_cast<void*>(reinterpret_cast<const void*>(data.v_scale));
+  bool past_bsnh = past_kv_format == AttentionQkvFormat::Q_K_V_BSNH;
+
+  // We have already appended (and quantized if needed) the new tokens into present_key/value.
+  // Pass nullptr for new_k/new_v to disable the kernel's internal Append_KV logic.
+  void* kernel_new_k = nullptr;
+  void* kernel_new_v = nullptr;
+
+  // We've append the new tokens into present_key/value, so we pass total_seq_lens to the kernel.
+  void* seqlens_k = reinterpret_cast<void*>(data.total_seq_lens);
+
+  ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd_kvcache(
+      device_prop, stream, query, present_key, present_value,
+      kernel_new_k, kernel_new_v,
+      data.output, reinterpret_cast<void*>(data.softmax_lse), seqlens_k,
+      cos_cache, sin_cache, head_sink, /*block_table*/ nullptr, batch_size,
+      num_heads, kv_num_heads, head_size, sequence_length,
+      parameters.seqlen_present_kv_cache, kv_sequence_length,
+      parameters.rotary_dim, scale, parameters.softcap, is_causal, is_bf16,
+      parameters.use_smooth_softmax, past_bsnh, parameters.num_splits,
+      reinterpret_cast<void*>(data.softmax_lse_accum),
+      reinterpret_cast<void*>(data.out_accum), parameters.local_window_size - 1,
+      parameters.rotary_interleaved, parameters.is_packed_qkv, 0, 1, k_scale,
+      v_scale, static_cast<int>(parameters.k_quant_type),
+      static_cast<int>(parameters.v_quant_type),
+      parameters.kv_cache_bit_width,
+      parameters.query_dynamic_quant));
+
+  // // We have already appended (and quantized if needed) the new tokens into present_key/value.
+  // // Pass nullptr for new_k/new_v to disable the kernel's internal Append_KV logic.
+  // // Pass new_k/new_v (key/value) to enable the kernel's internal Append_KV logic if quantization is needed.
+  // // We only enable this for INT8 as INT4 support is not yet added to the fused kernel.
+  // void* kernel_new_k = nullptr;
+  // void* kernel_new_v = nullptr;
+
+  // ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd_kvcache(
+  //     device_prop, stream, query, present_key, present_value,
+  //     kernel_new_k, kernel_new_v,
+  //     data.output, reinterpret_cast<void*>(data.softmax_lse), seqlens_k,
+  //     cos_cache, sin_cache, head_sink, /*block_table*/ nullptr, batch_size,
+  //     num_heads, kv_num_heads, head_size, sequence_length,
+  //     parameters.seqlen_present_kv_cache, kv_sequence_length,
+  //     parameters.rotary_dim, scale, parameters.softcap, is_causal, is_bf16,
+  //     parameters.use_smooth_softmax, past_bsnh, parameters.num_splits,
+  //     reinterpret_cast<void*>(data.softmax_lse_accum),
+  //     reinterpret_cast<void*>(data.out_accum), parameters.local_window_size - 1,
+  //     parameters.rotary_interleaved, parameters.is_packed_qkv, 0, 1, k_scale,
+  //     v_scale, static_cast<int>(parameters.k_quant_type),
+  //     static_cast<int>(parameters.v_quant_type),
+  //     parameters.kv_cache_bit_width,
+  //     parameters.query_dynamic_quant));
+  return Status::OK();
+}
+#endif
 #endif
 
 #if USE_MEMORY_EFFICIENT_ATTENTION
@@ -1083,13 +1269,11 @@ Status EfficientAttention(
   const int head_size = parameters.head_size;
   AttentionQkvFormat past_kv_format = parameters.past_kv_format;
 
-#if DUMP_TENSOR_LEVEL > 0
-  printf("[GQA EfficientAttention] is_packed_qkv: %d, is_first_prompt: %d, is_subsequent_prompt: %d, kv_share_buffer: %d\n",
-         static_cast<int>(parameters.is_packed_qkv),
-         static_cast<int>(parameters.is_first_prompt),
-         static_cast<int>(parameters.is_subsequent_prompt),
-         static_cast<int>(parameters.kv_share_buffer));
-#endif
+  DEBUG_PRINTF("[GQA EfficientAttention] is_packed_qkv: %d, is_first_prompt: %d, is_subsequent_prompt: %d, kv_share_buffer: %d",
+               static_cast<int>(parameters.is_packed_qkv),
+               static_cast<int>(parameters.is_first_prompt),
+               static_cast<int>(parameters.is_subsequent_prompt),
+               static_cast<int>(parameters.kv_share_buffer));
 
   const void* query;
   const void* key;
@@ -1117,9 +1301,11 @@ Status EfficientAttention(
     key = reinterpret_cast<const void*>(k);
     value = reinterpret_cast<const void*>(v);
 
-    // Track buffer usage: Q+K+V unpacked
-    size_t total_bytes = (q_size + 2 * k_size) * sizeof(T);
-    UpdateUnpackedQkvMaxUsed(data, total_bytes);
+    if constexpr (kTrackBufferUsage) {
+      // Track buffer usage: Q+K+V unpacked
+      size_t total_bytes = (q_size + 2 * k_size) * sizeof(T);
+      UpdateUnpackedQkvMaxUsed(data, total_bytes);
+    }
   }
 
   const int64_t* position_ids = data.position_ids;
@@ -1161,15 +1347,17 @@ Status EfficientAttention(
 
     // key remains pointing to original source for use in fused kernel below
 
-    // Track rotary buffer usage: Q rotated (K rotation is fused in KV append)
-    size_t q_bytes = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size * sizeof(T);
-    size_t k_bytes = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size * sizeof(T);
-    // Note: rotary_buffer layout is [Q_rotated, K_rotated] - no position_ids here
-    UpdateRotaryMaxUsed(data, q_bytes + k_bytes);
+    if constexpr (kTrackBufferUsage) {
+      // Track rotary buffer usage: Q rotated (K rotation is fused in KV append)
+      size_t q_bytes = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size * sizeof(T);
+      size_t k_bytes = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size * sizeof(T);
+      // Note: rotary_buffer layout is [Q_rotated, K_rotated] - no position_ids here
+      UpdateRotaryMaxUsed(data, q_bytes + k_bytes);
 
-    // Track position_ids_buffer usage
-    size_t pos_ids_bytes = static_cast<size_t>(batch_size) * sequence_length * sizeof(int64_t);
-    UpdatePositionIdsMaxUsed(data, pos_ids_bytes);
+      // Track position_ids_buffer usage
+      size_t pos_ids_bytes = static_cast<size_t>(batch_size) * sequence_length * sizeof(int64_t);
+      UpdatePositionIdsMaxUsed(data, pos_ids_bytes);
+    }
   }
 
   if (parameters.kv_share_buffer) {
@@ -1225,9 +1413,11 @@ Status EfficientAttention(
             parameters, data, k_dst, value, is_new_kv_bnsh_format, stream, max_threads_per_block));
       }
 
-      // Track rotary buffer usage: Q + K rotated (no position_ids in rotary_buffer)
-      size_t k_elements = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size;
-      UpdateRotaryMaxUsed(data, (q_elements + k_elements) * sizeof(T));
+      if constexpr (kTrackBufferUsage) {
+        // Track rotary buffer usage: Q + K rotated (no position_ids in rotary_buffer)
+        size_t k_elements = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size;
+        UpdateRotaryMaxUsed(data, (q_elements + k_elements) * sizeof(T));
+      }
     } else {
       // No RoPE - use original kernel
       ORT_RETURN_IF_ERROR(LaunchConcatKVInPlace(
@@ -1308,7 +1498,7 @@ Status QkvToContext(
 
 #if USE_FLASH_ATTENTION
   if (data.use_flash_attention_fast_decode) {
-    return FlashAttentionDecoding(device_prop, stream, parameters, data, scale);
+    return FlashDecoding(device_prop, stream, parameters, data, scale);
   }
 
   if (data.use_flash_attention) {

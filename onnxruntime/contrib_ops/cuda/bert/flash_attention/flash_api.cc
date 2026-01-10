@@ -9,6 +9,7 @@
 #include "core/providers/cuda/cuda_common.h"
 #include "contrib_ops/cuda/bert/flash_attention/flash.h"
 #include "contrib_ops/cuda/bert/flash_attention/static_switch.h"
+#include "contrib_ops/cpu/utils/debug_macros.h"
 
 namespace onnxruntime {
 namespace flash {
@@ -173,10 +174,21 @@ size_t get_out_accum_size(size_t num_splits, size_t batch_size, size_t num_heads
 void run_mha_fwd(Flash_fwd_params& params, cudaStream_t stream, bool force_split_kernel = false) {
   FP16_SWITCH(!params.is_bf16, [&] {
     HEADDIM_SWITCH(params.d, [&] {
-      if (params.num_splits <= 1 && !force_split_kernel) {
+      // Use split/dequant path if: force_split, or quantization active
+      if (params.num_splits <= 1 && !force_split_kernel && params.k_quant_type == 0) {
         run_mha_fwd_<elem_type, kHeadDim>(params, stream);
       } else {
-        run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim>(params, stream);
+        if constexpr (kHeadDim == 128) {
+          if (params.kv_cache_bit_width == 4) {
+            run_mha_fwd_dequant_dispatch<elem_type, kHeadDim, 4>(params, stream);
+          } else if (params.kv_cache_bit_width == 8) {
+            run_mha_fwd_dequant_dispatch<elem_type, kHeadDim, 8>(params, stream);
+          } else {
+            run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim>(params, stream);
+          }
+        } else {
+          run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim>(params, stream);
+        }
       }
     });
   });
@@ -436,6 +448,18 @@ bool is_supported(const cudaDeviceProp& dprops, size_t head_size, size_t num_hea
   return (dprops.major >= 8) && (head_size % 8 == 0) && (head_size <= 256) && (num_heads % num_heads_k == 0);
 }
 
+bool is_supported_quantization(bool is_causal, size_t head_size, int k_quant_type, int v_quant_type, int kv_cache_bit_width) {
+  if constexpr (kEnableFlashAttention4Bit) {
+    return (k_quant_type == 0 && v_quant_type == 0) ||  // no quantization supported for all head sizes
+           (is_causal && head_size == 128 &&
+            ((k_quant_type == 1 && v_quant_type == 1 && kv_cache_bit_width == 8) ||
+             (k_quant_type == 2 && v_quant_type == 2 && kv_cache_bit_width == 4)));
+  } else {
+    return (k_quant_type == 0 && v_quant_type == 0) ||  // no quantization supported for all head sizes
+           (is_causal && head_size == 128 && k_quant_type == 1 && v_quant_type == 1 && kv_cache_bit_width == 8);
+  }
+}
+
 // This API is used when past key and value are present... since cached, these are assumed to have sequence length
 // of max_sequence_length, so seqlen_k == max_sequence_length. The actual past sequence length is held in seqlens_k_.
 Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
@@ -473,7 +497,13 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
                        bool is_rotary_interleaved,
                        bool is_packed_qkv,
                        int max_num_blocks_per_seq,
-                       int page_block_size) {
+                       int page_block_size,
+                       void* k_scale,
+                       void* v_scale,
+                       int k_quant_type,
+                       int v_quant_type,
+                       int kv_cache_bit_width,
+                       bool query_dynamic_quant) {
   auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
   const int head_size_rounded = head_size <= 192 ? round_multiple(head_size, 32) : 256;
   const int seqlen_q_rounded = round_multiple(seqlen_q, 128);
@@ -504,6 +534,18 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
                    is_causal ? 0 : -1);
   params.dprops = &dprops;
 
+  if constexpr (kEnableFlashAttention4Bit) {
+    if (kv_cache_bit_width == 4) {
+      // Adjust strides for packed Int4 (2 elements per byte)
+      params.k_batch_stride /= 2;
+      params.v_batch_stride /= 2;
+      params.k_row_stride /= 2;
+      params.v_row_stride /= 2;
+      params.k_head_stride /= 2;
+      params.v_head_stride /= 2;
+    }
+  }
+
   if (k_new != nullptr && v_new != nullptr) {
     params.seqlen_knew = seqlen_k_new;
     params.knew_ptr = k_new;
@@ -516,6 +558,7 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
       params.vnew_batch_stride = (seqlen_q * num_heads * head_size) + (2 * seqlen_k_new * num_heads_k * head_size);
       params.knew_row_stride = (num_heads * head_size) + (2 * num_heads_k * head_size);
       params.vnew_row_stride = (num_heads * head_size) + (2 * num_heads_k * head_size);
+
     } else {
       params.knew_batch_stride = seqlen_k_new * num_heads_k * head_size;
       params.vnew_batch_stride = seqlen_k_new * num_heads_k * head_size;
@@ -544,25 +587,11 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
     params.q_head_stride = head_size;
     params.knew_head_stride = head_size;
     params.vnew_head_stride = head_size;
-
-    params.knew_ptr = nullptr;
-    params.vnew_ptr = nullptr;
-  } else {
-    params.seqlen_knew = 0;
-    params.knew_ptr = nullptr;
-    params.vnew_ptr = nullptr;
-    params.knew_batch_stride = 0;
-    params.vnew_batch_stride = 0;
-    params.knew_row_stride = 0;
-    params.vnew_row_stride = 0;
-    params.knew_head_stride = 0;
-    params.vnew_head_stride = 0;
   }
 
   params.is_seqlens_k_cumulative = seqlens_k_ == nullptr;
   if (seqlens_k_ != nullptr) {
     params.cu_seqlens_k = static_cast<int*>(seqlens_k_);
-    params.seqused_k = static_cast<int*>(seqlens_k_);
   }
 
   if (rotary_cos != nullptr) {
@@ -596,11 +625,23 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
     params.page_block_size = 1;
   }
 
+  params.k_scale_ptr = k_scale;
+  params.v_scale_ptr = v_scale;
+  params.k_quant_type = k_quant_type;
+  params.v_quant_type = v_quant_type;
+  params.kv_cache_bit_width = kv_cache_bit_width;
+  params.query_dynamic_quant = query_dynamic_quant;
+
   // Only split kernel supports appending to KV cache
   // or if using packed QKV (to ensure correct handling of strided inputs which might be better supported or isolated in split kernel logic).
   // Note: if the fused kernel handles packing/rotary/appending, it should pass is_packed_qkv=false to this API (via use_packed_for_fa=false),
   // effectively bypassing this check and allowing standard kernels if otherwise eligible.
-  bool force_split = (k_new != nullptr) || is_packed_qkv;
+  // Force split kernel if quantization is active (k_quant_type != 0)
+  // because only the split kernel instantiation supports dequantization logic.
+  bool force_split = (k_new != nullptr) || is_packed_qkv || (k_quant_type != 0);
+
+  DEBUG_PRINTF("[mha_fwd_kvcache] k_new=%p, v_new=%p, knew_ptr=%p, seqlen_knew=%d, force_split=%d, seqlens_k_=%p, seqlen_k=%d",
+               k_new, v_new, params.knew_ptr, params.seqlen_knew, static_cast<int>(force_split), seqlens_k_, seqlen_k);
 
   run_mha_fwd(params, stream, force_split);
 
