@@ -62,7 +62,7 @@ while [[ "$#" -gt 0 ]]; do
             ;;
         --clean_gqa)
             echo "==== 🧹 Cleaning GQA build artifacts... ===="
-            rm -f build/cuda/$BUILD_TYPE/CMakeFiles/onnxruntime_providers_cuda.dir/home/tlwu/onnxruntime/onnxruntime/contrib_ops/cuda/bert/group_query_attention_*
+            rm -f build/cuda/$BUILD_TYPE/CMakeFiles/onnxruntime_providers_cuda.dir/home/tlwu/onnxruntime/onnxruntime/contrib_ops/cuda/bert/group_query_attention*
             ;;
         --clean_flash)
             echo "==== 🧹 Cleaning flash attention build artifacts... ===="

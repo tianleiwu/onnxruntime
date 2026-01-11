@@ -1908,6 +1908,20 @@ class TestFlashGQA(unittest.TestCase):
             atol=atol["fp16"],
         )
 
+    @parameterized.expand(gqa_cuda_quantized_test_cases(is_past=True))
+    def test_gqa_quantized_past(self, name, config):
+        os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
+        parity_check_gqa_past(
+            config=config,
+            ep="CUDAExecutionProvider",
+            device="cuda",
+            torch_type=torch.float16,
+            ort_type=TensorProto.FLOAT16,
+            causal=True,
+            rtol=0.1,
+            atol=0.02,
+        )
+
 
 @unittest.skipIf(not has_flash_attention(bf16=True), "Flash Attention is not available, skipping tests.")
 class TestFlashGQABF16(unittest.TestCase):

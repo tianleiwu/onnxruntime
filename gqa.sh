@@ -44,7 +44,7 @@ while [[ "$#" -gt 0 ]]; do
             ;;
         --clean_gqa)
             echo "==== 🧹 Cleaning GQA build artifacts... ===="
-            rm -f build/cuda/$BUILD_TYPE/CMakeFiles/onnxruntime_providers_cuda.dir/home/tlwu/onnxruntime/onnxruntime/contrib_ops/cuda/bert/group_query_attention_*
+            rm -f build/cuda/$BUILD_TYPE/CMakeFiles/onnxruntime_providers_cuda.dir/home/tlwu/onnxruntime/onnxruntime/contrib_ops/cuda/bert/group_query_attention*
             ;;
         --clean_flash)
             echo "==== 🧹 Cleaning flash attention build artifacts... ===="
@@ -126,7 +126,7 @@ fi
 
 if [ "$RUN_INSTALL" = true ]; then
     pip uninstall onnxruntime-gpu onnxruntime -y
-    pip install build/cuda/$BUILD_TYPE/dist/onnxruntime_gpu-1.24.0-cp312-cp312-linux_x86_64.whl --force-reinstall
+    pip install build/cuda/$BUILD_TYPE/dist/onnxruntime_gpu-1.24.0-cp312-cp312-linux_x86_64.whl --force-reinstall --no-cache-dir
 fi
 
 case "${ENABLE_DUMP}" in

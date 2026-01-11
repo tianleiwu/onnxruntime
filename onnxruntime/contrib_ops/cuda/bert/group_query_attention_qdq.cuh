@@ -68,19 +68,18 @@ __global__ void DequantizeKernel(T* dequantized_data,
                                  const T_QUANT* quantized_data,
                                  const T_SCALE* scale, const int* past_seq_lens,
                                  int batch_size, int num_heads,
-                                 int cache_sequence_length, int sequence_length,
+                                 int cache_sequence_length,
                                  int head_size, int bit_width,
-                                 KVQuantizationType quant_type,
-                                 bool is_output_bsnh = false) {
-  int S = cache_sequence_length;
-  int total_elements = batch_size * num_heads * S * head_size;
+                                 KVQuantizationType quant_type) {
+  int64_t total_elements = static_cast<int64_t>(batch_size) * num_heads * cache_sequence_length * head_size;
+  int elements_per_head_packed = (bit_width == 4) ? (head_size + 1) / 2 : head_size;
 
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total_elements;
-       i += blockDim.x * gridDim.x) {
-    int h = i % head_size;
-    int s = (i / head_size) % S;
-    int n = (i / (head_size * S)) % num_heads;
-    int b = i / (num_heads * head_size * S);
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < total_elements;
+       i += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    int h = static_cast<int>(i % head_size);
+    int s = static_cast<int>((i / head_size) % cache_sequence_length);
+    int n = static_cast<int>((i / (head_size * cache_sequence_length)) % num_heads);
+    int b = static_cast<int>((i / (num_heads * head_size * cache_sequence_length)));
 
     // Correctly identify padding in the past_kv cache.
     // In the decoding case, `seqlens` contains `past_len + new_len - 1`.
@@ -88,8 +87,7 @@ __global__ void DequantizeKernel(T* dequantized_data,
     if (past_seq_lens != nullptr) {
       // For a given batch entry `b`, the actual length of the past sequence is `past_seq_lens[b]`.
       // If `s` (the current sequence index) is beyond this length, it's padding and should be zeroed.
-      int past_len_b = past_seq_lens[b];
-      if (s >= past_len_b) {
+      if (s >= past_seq_lens[b]) {
         dequantized_data[i] = static_cast<T>(0.0f);
         continue;
       }
@@ -99,18 +97,25 @@ __global__ void DequantizeKernel(T* dequantized_data,
     if (quant_type == KVQuantizationType::PER_TENSOR) {
       scale_val = static_cast<float>(scale[0]);
     } else {  // PER_CHANNEL
-      int scale_idx = n * head_size + h;
+      int64_t scale_idx = static_cast<int64_t>(n) * head_size + h;
       scale_val = static_cast<float>(scale[scale_idx]);
     }
 
     float quantized_float;
+    // The input quantized_data is indexed by the actual cache sequence length (cache_sequence_length = cache_sequence_length)
+    // not the output sequence length.
+    int64_t input_idx = (static_cast<int64_t>(b) * num_heads * cache_sequence_length * elements_per_head_packed +
+                         static_cast<int64_t>(n) * cache_sequence_length * elements_per_head_packed +
+                         static_cast<int64_t>(s) * elements_per_head_packed +
+                         (bit_width == 4 ? h / 2 : h));
+
     if (bit_width == 8) {
       quantized_float = static_cast<float>(
-          reinterpret_cast<const int8_t*>(quantized_data)[i]);
+          reinterpret_cast<const int8_t*>(quantized_data)[input_idx]);
     } else {  // 4
       const uint8_t packed_val =
-          reinterpret_cast<const uint8_t*>(quantized_data)[i / 2];
-      quantized_float = (i % 2 == 0)
+          reinterpret_cast<const uint8_t*>(quantized_data)[input_idx];
+      quantized_float = (h % 2 == 0)
                             ? static_cast<float>((packed_val & 0x0F) - 8)
                             : static_cast<float>((packed_val >> 4) - 8);
     }
@@ -123,21 +128,19 @@ template <typename T, typename T_QUANT, typename T_SCALE>
 Status LaunchDequantizeKV(cudaStream_t stream, T* dequantized_data,
                           const T_QUANT* quantized_data, const T_SCALE* scale,
                           const int* past_seq_lens, int batch_size, int num_heads,
-                          int cache_sequence_length, int sequence_length,
+                          int cache_sequence_length,
                           int head_size, int bit_width,
                           KVQuantizationType quant_type) {
-  int S = cache_sequence_length;
-  if (S == 0) return Status::OK();
+  if (cache_sequence_length == 0) return Status::OK();
 
-  int total_elements = batch_size * num_heads * S * head_size;
+  // Output buffer uses cache_sequence_length stride
+  int64_t total_elements = static_cast<int64_t>(batch_size) * num_heads * cache_sequence_length * head_size;
   const int threads_per_block = 256;
-  const int blocks =
-      (total_elements + threads_per_block - 1) / threads_per_block;
-
+  const int blocks = static_cast<int>((total_elements + threads_per_block - 1) / threads_per_block);
   DequantizeKernel<T, T_QUANT, T_SCALE><<<blocks, threads_per_block, 0, stream>>>(
-      dequantized_data, quantized_data, scale, past_seq_lens, batch_size, num_heads,
-      cache_sequence_length, sequence_length, head_size, bit_width,
-      quant_type, false);
+      dequantized_data, quantized_data, scale, past_seq_lens,
+      batch_size, num_heads, cache_sequence_length,
+      head_size, bit_width, quant_type);
 
   return CUDA_CALL(cudaGetLastError());
 }
@@ -146,7 +149,8 @@ Status LaunchDequantizeKV(cudaStream_t stream, T* dequantized_data,
 template <typename T, typename T_QUANT, typename T_SCALE>
 __global__ void QuantizeKernel(T_QUANT* quantized_data,
                                const T* dequantized_data, const T_SCALE* scale,
-                               const int* total_seq_lens, int total_packed_elements,
+                               const int* total_seq_lens,
+                               int total_packed_elements,
                                int cache_sequence_length, int num_heads, int head_size,
                                int bit_width, KVQuantizationType quant_type,
                                bool is_input_bsnh = false) {
@@ -368,10 +372,12 @@ __global__ void QuantizeAppendKernel(T_QUANT* cache_data,
 template <typename T, typename T_QUANT, typename T_SCALE>
 Status LaunchQuantizeKV(cudaStream_t stream, T_QUANT* quantized_data,
                         const T* dequantized_data, const T_SCALE* scale,
-                        const int* total_seq_lens, int batch_size, int num_heads,
+                        const int* total_seq_lens,
+                        int batch_size, int num_heads,
                         int cache_sequence_length, int head_size, int bit_width,
                         KVQuantizationType quant_type,
                         bool is_input_bsnh) {
+  assert(total_seq_lens != nullptr);
   if (cache_sequence_length == 0) return Status::OK();
 
   int elements_per_head_packed = (bit_width == 4) ? (head_size + 1) / 2 : head_size;
@@ -408,13 +414,13 @@ Status LaunchQuantizeAppendKV(cudaStream_t stream, T_QUANT* cache_data,
 
 // Explicit instantiations for launchers
 template Status LaunchDequantizeKV<half, int8_t, half>(
-    cudaStream_t, half*, const int8_t*, const half*, const int*, int, int, int, int, int, int, KVQuantizationType);
+    cudaStream_t, half*, const int8_t*, const half*, const int*, int, int, int, int, int, KVQuantizationType);
 template Status LaunchDequantizeKV<half, uint8_t, half>(
-    cudaStream_t, half*, const uint8_t*, const half*, const int*, int, int, int, int, int, int, KVQuantizationType);
+    cudaStream_t, half*, const uint8_t*, const half*, const int*, int, int, int, int, int, KVQuantizationType);
 template Status LaunchDequantizeKV<BFloat16, int8_t, BFloat16>(
-    cudaStream_t, BFloat16*, const int8_t*, const BFloat16*, const int*, int, int, int, int, int, int, KVQuantizationType);
+    cudaStream_t, BFloat16*, const int8_t*, const BFloat16*, const int*, int, int, int, int, int, KVQuantizationType);
 template Status LaunchDequantizeKV<BFloat16, uint8_t, BFloat16>(
-    cudaStream_t, BFloat16*, const uint8_t*, const BFloat16*, const int*, int, int, int, int, int, int, KVQuantizationType);
+    cudaStream_t, BFloat16*, const uint8_t*, const BFloat16*, const int*, int, int, int, int, int, KVQuantizationType);
 
 template Status LaunchQuantizeKV<half, int8_t, half>(
     cudaStream_t, int8_t*, const half*, const half*, const int*, int, int, int, int, int, KVQuantizationType, bool);

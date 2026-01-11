@@ -95,12 +95,12 @@ Status LaunchConcatNewToPastKVHelper(GroupQueryAttentionParameters& parameters,
                                  is_bsnh,
                                  data.past_seq_lens,
                                  data.total_seq_lens,
-                                 data.past_key,
-                                 data.past_value,
+                                 reinterpret_cast<const T*>(data.past_key),
+                                 reinterpret_cast<const T*>(data.past_value),
                                  reinterpret_cast<const T*>(new_key),
                                  reinterpret_cast<const T*>(new_value),
-                                 data.present_key,
-                                 data.present_value,
+                                 reinterpret_cast<T*>(data.present_key),
+                                 reinterpret_cast<T*>(data.present_value),
                                  stream,
                                  max_threads_per_block,
                                  past_only,
@@ -135,8 +135,8 @@ Status LaunchConcatKVInPlace(GroupQueryAttentionParameters& parameters,
                                parameters.sequence_length,
                                reinterpret_cast<const T*>(new_key),
                                reinterpret_cast<const T*>(new_value),
-                               data.present_key,
-                               data.present_value,
+                               reinterpret_cast<T*>(data.present_key),
+                               reinterpret_cast<T*>(data.present_value),
                                is_past_kv_bnsh_format,
                                is_new_kv_bnsh_format,
                                stream,
@@ -718,13 +718,13 @@ Status LaunchGetSequenceLengths(
 }
 
 // Trace function for debugging
-#define ORT_GQA_TRACE(func_name)                                                                                 \
-  DEBUG_PRINTF("[GQA %s] is_packed_qkv: %d, is_first_prompt: %d, is_subsequent_prompt: %d, kv_share_buffer: %d", \
-               func_name,                                                                                        \
-               static_cast<int>(parameters.is_packed_qkv),                                                       \
-               static_cast<int>(parameters.is_first_prompt),                                                     \
-               static_cast<int>(parameters.is_subsequent_prompt),                                                \
-               static_cast<int>(parameters.kv_share_buffer));
+#define ORT_GQA_TRACE(func_name)                                                                                           \
+  DEBUG_PRINTF("[GQA %s] is_packed_qkv: %d, is_first_prompt: %d, is_subsequent_prompt: %d, past_present_share_buffer: %d", \
+               func_name,                                                                                                  \
+               static_cast<int>(parameters.is_packed_qkv),                                                                 \
+               static_cast<int>(parameters.is_first_prompt),                                                               \
+               static_cast<int>(parameters.is_subsequent_prompt),                                                          \
+               static_cast<int>(parameters.past_present_share_buffer));
 
 ////////// Kernels (supports right padding but not left padding)
 
@@ -739,7 +739,7 @@ Status FlashDecoding(
     GroupQueryAttentionParameters& parameters,
     GroupQueryAttentionData<T>& data,
     float scale) {
-  assert(!parameters.is_first_prompt && parameters.kv_share_buffer);
+  assert(!parameters.is_first_prompt && parameters.past_present_share_buffer);
 
   ORT_GQA_TRACE("FlashDecoding");
 
@@ -769,8 +769,8 @@ Status FlashDecoding(
 
   void* seqlens_k = reinterpret_cast<void*>(data.past_seq_lens);
 
-  void* present_key = reinterpret_cast<void*>(const_cast<T*>(data.present_key));
-  void* present_value = reinterpret_cast<void*>(const_cast<T*>(data.present_value));
+  void* present_key = data.present_key;
+  void* present_value = data.present_value;
   void* cos_cache = reinterpret_cast<void*>(const_cast<T*>(data.cos_cache));
   void* sin_cache = reinterpret_cast<void*>(const_cast<T*>(data.sin_cache));
   void* head_sink = reinterpret_cast<void*>(const_cast<T*>(data.head_sink));
@@ -846,14 +846,14 @@ Status FlashAttention(
       T* unpacked_q = unpacked_buffer;
 
       // Check if we can use the fully fused path
-      if (parameters.kv_share_buffer && parameters.do_rotary && !data.disable_fused_kv) {
+      if (parameters.past_present_share_buffer && parameters.do_rotary && !data.disable_fused_kv) {
         // FULLY FUSED PATH: Unpack + RoPE Q + RoPE K + Append KV in single kernel
         // This eliminates 4 kernel launches!
         ORT_RETURN_IF_ERROR(LaunchUnpackQKVWithRoPEAndAppendKV<T>(
-            reinterpret_cast<const T*>(data.query),  // packed QKV
-            unpacked_q,                              // Q output buffer (rotated)
-            data.present_key,                        // K cache (direct write)
-            data.present_value,                      // V cache (direct write)
+            reinterpret_cast<const T*>(data.query),    // packed QKV
+            unpacked_q,                                // Q output buffer (rotated)
+            reinterpret_cast<T*>(data.present_key),    // K cache (direct write)
+            reinterpret_cast<T*>(data.present_value),  // V cache (direct write)
             num_heads,
             kv_num_heads,
             head_size,
@@ -974,7 +974,7 @@ Status FlashAttention(
 
   // Skip KV append if we used the fully fused path (KV already in cache)
   if (!used_fused_packed_path) {
-    if (parameters.kv_share_buffer && !parameters.is_first_prompt) {
+    if (parameters.past_present_share_buffer && !parameters.is_first_prompt) {
       constexpr bool is_new_kv_bnsh_format = false;
       if (parameters.do_rotary) {
         // Explicit K Rotation (replacing internal RoPE in fused kernel)
@@ -1013,8 +1013,8 @@ Status FlashAttention(
               sequence_length,
               k_dst,
               reinterpret_cast<const T*>(data.value),
-              data.present_key,
-              data.present_value,
+              reinterpret_cast<T*>(data.present_key),
+              reinterpret_cast<T*>(data.present_value),
               !past_bsnh,
               is_new_kv_bnsh_format,
               stream,
@@ -1050,11 +1050,11 @@ Status FlashAttention(
 
   DUMP_TENSOR("Total Seq Lens", data.total_seq_lens, batch_size, 1);
   DUMP_TENSOR("Past Seq Lens", data.past_seq_lens, batch_size, 1);
-  DUMP_TENSOR("Present Key", data.present_key, batch_size, parameters.seqlen_present_kv_cache, kv_num_heads, head_size);
-  DUMP_TENSOR("Present Value", data.present_value, batch_size, parameters.seqlen_present_kv_cache, kv_num_heads, head_size);
+  // DUMP_TENSOR("Present Key", reinterpret_cast<const T*>(data.present_key), batch_size, parameters.seqlen_present_kv_cache, kv_num_heads, head_size);
+  // DUMP_TENSOR("Present Value", reinterpret_cast<const T*>(data.present_value), batch_size, parameters.seqlen_present_kv_cache, kv_num_heads, head_size);
 
-  void* present_key = reinterpret_cast<void*>(const_cast<T*>(data.present_key));
-  void* present_value = reinterpret_cast<void*>(const_cast<T*>(data.present_value));
+  void* present_key = data.present_key;
+  void* present_value = data.present_value;
 
   // Disable internal RoPE in Flash Attention (pass nullptr)
   void* cos_cache = nullptr;
@@ -1096,7 +1096,7 @@ Status FlashAttentionAndQuantizeKV(
     GroupQueryAttentionData<T>& data,
     float scale) {
   assert(parameters.is_first_prompt);  // Only support first prompt for this function.
-  assert(parameters.kv_share_buffer);
+  assert(parameters.past_present_share_buffer);
 
   bool is_quantized = parameters.k_quant_type != KVQuantizationType::NONE;
   assert(is_quantized);
@@ -1131,7 +1131,7 @@ Status FlashAttentionWithQuantizeKV(
     GroupQueryAttentionParameters& parameters,
     GroupQueryAttentionData<T>& data,
     float scale) {
-  assert(parameters.kv_share_buffer);
+  assert(parameters.past_present_share_buffer);
 
   bool is_quantized = parameters.k_quant_type != KVQuantizationType::NONE;
   assert(is_quantized);
@@ -1190,8 +1190,8 @@ Status FlashAttentionWithQuantizeKV(
 
   // TODO: add code to quantize float key and value (after rotary) and save to present_key and present_value here.
 
-  void* present_key = reinterpret_cast<void*>(const_cast<T*>(data.present_key));
-  void* present_value = reinterpret_cast<void*>(const_cast<T*>(data.present_value));
+  void* present_key = data.present_key;
+  void* present_value = data.present_value;
   void* cos_cache = reinterpret_cast<void*>(const_cast<T*>(data.cos_cache));
   void* sin_cache = reinterpret_cast<void*>(const_cast<T*>(data.sin_cache));
   void* head_sink = reinterpret_cast<void*>(const_cast<T*>(data.head_sink));
@@ -1269,11 +1269,11 @@ Status EfficientAttention(
   const int head_size = parameters.head_size;
   AttentionQkvFormat past_kv_format = parameters.past_kv_format;
 
-  DEBUG_PRINTF("[GQA EfficientAttention] is_packed_qkv: %d, is_first_prompt: %d, is_subsequent_prompt: %d, kv_share_buffer: %d",
+  DEBUG_PRINTF("[GQA EfficientAttention] is_packed_qkv: %d, is_first_prompt: %d, is_subsequent_prompt: %d, past_present_share_buffer: %d",
                static_cast<int>(parameters.is_packed_qkv),
                static_cast<int>(parameters.is_first_prompt),
                static_cast<int>(parameters.is_subsequent_prompt),
-               static_cast<int>(parameters.kv_share_buffer));
+               static_cast<int>(parameters.past_present_share_buffer));
 
   const void* query;
   const void* key;
@@ -1341,7 +1341,7 @@ Status EfficientAttention(
     }
     query = reinterpret_cast<const void*>(q_buffer);
 
-    // For kv_share_buffer path, we use Fused RoPE in LaunchConcatKVInPlaceWithRoPE.
+    // For past_present_share_buffer path, we use Fused RoPE in LaunchConcatKVInPlaceWithRoPE.
     // For non-share-buffer path, we use Fused RoPE in LaunchConcatNewToPastKVHelper.
     // No explicit K rotation needed here - handled by fused kernels.
 
@@ -1360,7 +1360,7 @@ Status EfficientAttention(
     }
   }
 
-  if (parameters.kv_share_buffer) {
+  if (parameters.past_present_share_buffer) {
     // Concatenate new kv in place
     constexpr bool is_new_kv_bnsh_format = false;
 
@@ -1401,8 +1401,8 @@ Status EfficientAttention(
             parameters.sequence_length,
             k_dst,
             reinterpret_cast<const T*>(value),
-            data.present_key,
-            data.present_value,
+            reinterpret_cast<T*>(data.present_key),
+            reinterpret_cast<T*>(data.present_value),
             past_kv_format != AttentionQkvFormat::Q_K_V_BSNH,  // is_past_kv_bnsh_format
             is_new_kv_bnsh_format,
             stream,
