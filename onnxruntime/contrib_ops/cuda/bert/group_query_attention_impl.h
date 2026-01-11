@@ -80,26 +80,35 @@ struct GQABufferRequirements {
       // - rotary_buffer is NOT used (rotations go to unpacked_qkv_buffer)
       // - position_ids_buffer is NOT used (flash attention uses implicit position IDs)
 
+      bool is_quantized = params.k_quant_type != KVQuantizationType::NONE || params.v_quant_type != KVQuantizationType::NONE;
       if (params.is_packed_qkv) {
         // Need full Q+K+V for unpacking, UNLESS we use the fully fused path.
         // Fused path (Unpack+RoPE+Append) only stores rotated Q in unpacked_qkv_buffer.
         // K and V are written directly to present_key/value.
-        if (params.past_present_share_buffer && params.do_rotary && !disable_fused_kv) {
+        // NOTE: For quantized KV cache, we still need full Q+K+V in scratch for prompt because
+        // we can't write float K/V directly to quantized cache.
+        if (params.past_present_share_buffer && params.do_rotary && !disable_fused_kv && !is_quantized) {
           req.unpacked_qkv_bytes = elem_size * q_elements;
         } else {
           req.unpacked_qkv_bytes = elem_size * (q_elements + k_elements + v_elements);
         }
-      } else if (params.do_rotary) {
-        // Unpacked input with RoPE: need Q for rotation output.
-        // K is needed only if we use the optimized KV-append path (share_buffer && !first_prompt).
-        // Otherwise K-rotation is handled on-the-fly by kernels or not needed.
-        size_t bytes = elem_size * q_elements;
-        if (params.past_present_share_buffer && !params.is_first_prompt) {
-          bytes += elem_size * k_elements;
+      } else if (params.do_rotary || is_quantized) {
+        // Unpacked input with RoPE or Quantization:
+        // For quantization in the first prompt, we always need full Q+K+V in scratch
+        // to pass to standard Flash Attention kernels.
+        if (params.is_first_prompt && is_quantized) {
+          req.unpacked_qkv_bytes = elem_size * (q_elements + k_elements + v_elements);
+        } else if (params.do_rotary) {
+          // Unpacked input with RoPE: need Q for rotation output.
+          // K is needed if we use the optimized KV-append path (share_buffer && !first_prompt)
+          size_t bytes = elem_size * q_elements;
+          if (params.past_present_share_buffer && !params.is_first_prompt) {
+            bytes += elem_size * k_elements;
+          }
+          req.unpacked_qkv_bytes = bytes;
         }
-        req.unpacked_qkv_bytes = bytes;
       }
-      // Note: unpacked + no-RoPE case does NOT need unpacked_qkv_buffer
+      // Note: unpacked + no-RoPE case does NOT need unpacked_qkv_buffer (unless it is a quantized path)
 
     } else if (use_memory_efficient_attention) {
       // Memory Efficient Attention path:
@@ -178,15 +187,27 @@ Status LaunchDequantizeKV(cudaStream_t stream, T* dequantized_data,
                           const T_QUANT* quantized_data, const T_SCALE* scale,
                           const int* past_seq_lens, int batch_size, int num_heads,
                           int cache_sequence_length, int head_size, int bit_width,
-                          KVQuantizationType quant_type);
+                          KVQuantizationType quant_type,
+                          bool is_input_bsnh);
 
 template <typename T, typename T_QUANT, typename T_SCALE>
 Status LaunchQuantizeKV(cudaStream_t stream, T_QUANT* quantized_data,
                         const T* dequantized_data, const T_SCALE* scale,
                         const int* total_seq_lens, int batch_size, int num_heads,
-                        int cache_sequence_length, int head_size, int bit_width,
+                        int input_sequence_length, int cache_sequence_length, int head_size, int bit_width,
                         KVQuantizationType quant_type,
-                        bool is_input_bsnh = false);
+                        bool is_input_bsnh,
+                        bool is_output_bsnh);
+
+template <typename T, typename T_QUANT, typename T_SCALE>
+Status LaunchQuantizeAppendKV(cudaStream_t stream, T_QUANT* cache_data,
+                              const T* new_data, const T_SCALE* scale,
+                              const int* total_seq_lens, int batch_size, int num_heads,
+                              int max_seq_len, int head_size, int bit_width,
+                              int new_seq_len,
+                              KVQuantizationType quant_type,
+                              bool is_input_bsnh,
+                              bool is_output_bsnh);
 
 }  // namespace cuda
 }  // namespace contrib

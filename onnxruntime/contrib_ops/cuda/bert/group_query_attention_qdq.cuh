@@ -70,7 +70,8 @@ __global__ void DequantizeKernel(T* dequantized_data,
                                  int batch_size, int num_heads,
                                  int cache_sequence_length,
                                  int head_size, int bit_width,
-                                 KVQuantizationType quant_type) {
+                                 KVQuantizationType quant_type,
+                                 bool is_input_bsnh) {
   int64_t total_elements = static_cast<int64_t>(batch_size) * num_heads * cache_sequence_length * head_size;
   int elements_per_head_packed = (bit_width == 4) ? (head_size + 1) / 2 : head_size;
 
@@ -104,10 +105,17 @@ __global__ void DequantizeKernel(T* dequantized_data,
     float quantized_float;
     // The input quantized_data is indexed by the actual cache sequence length (cache_sequence_length = cache_sequence_length)
     // not the output sequence length.
-    int64_t input_idx = (static_cast<int64_t>(b) * num_heads * cache_sequence_length * elements_per_head_packed +
-                         static_cast<int64_t>(n) * cache_sequence_length * elements_per_head_packed +
-                         static_cast<int64_t>(s) * elements_per_head_packed +
-                         (bit_width == 4 ? h / 2 : h));
+    int64_t input_idx = static_cast<int64_t>(b) * num_heads * cache_sequence_length * elements_per_head_packed +
+                        static_cast<int64_t>(n) * cache_sequence_length * elements_per_head_packed +
+                        static_cast<int64_t>(s) * elements_per_head_packed +
+                        (bit_width == 4 ? h / 2 : h);
+
+    if (is_input_bsnh) {
+      input_idx = static_cast<int64_t>(b) * cache_sequence_length * num_heads * elements_per_head_packed +
+                  static_cast<int64_t>(s) * num_heads * elements_per_head_packed +
+                  static_cast<int64_t>(n) * elements_per_head_packed +
+                  (bit_width == 4 ? h / 2 : h);
+    }
 
     if (bit_width == 8) {
       quantized_float = static_cast<float>(
@@ -130,7 +138,8 @@ Status LaunchDequantizeKV(cudaStream_t stream, T* dequantized_data,
                           const int* past_seq_lens, int batch_size, int num_heads,
                           int cache_sequence_length,
                           int head_size, int bit_width,
-                          KVQuantizationType quant_type) {
+                          KVQuantizationType quant_type,
+                          bool is_input_bsnh) {
   if (cache_sequence_length == 0) return Status::OK();
 
   // Output buffer uses cache_sequence_length stride
@@ -140,7 +149,7 @@ Status LaunchDequantizeKV(cudaStream_t stream, T* dequantized_data,
   DequantizeKernel<T, T_QUANT, T_SCALE><<<blocks, threads_per_block, 0, stream>>>(
       dequantized_data, quantized_data, scale, past_seq_lens,
       batch_size, num_heads, cache_sequence_length,
-      head_size, bit_width, quant_type);
+      head_size, bit_width, quant_type, is_input_bsnh);
 
   return CUDA_CALL(cudaGetLastError());
 }
@@ -151,9 +160,11 @@ __global__ void QuantizeKernel(T_QUANT* quantized_data,
                                const T* dequantized_data, const T_SCALE* scale,
                                const int* total_seq_lens,
                                int total_packed_elements,
+                               int input_sequence_length,
                                int cache_sequence_length, int num_heads, int head_size,
                                int bit_width, KVQuantizationType quant_type,
-                               bool is_input_bsnh = false) {
+                               bool is_input_bsnh,
+                               bool is_output_bsnh) {
   int elements_per_head_packed = (bit_width == 4) ? (head_size + 1) / 2 : head_size;
 
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total_packed_elements;
@@ -169,13 +180,54 @@ __global__ void QuantizeKernel(T_QUANT* quantized_data,
     int total_valid_len_b = total_seq_lens[b];
     if (s >= total_valid_len_b) {
       if (bit_width == 8) {
-        reinterpret_cast<int8_t*>(quantized_data)[i] = 0;
+        int64_t out_idx = i;
+        if (is_output_bsnh) {
+          int64_t b_idx = b;
+          int64_t n_idx = n;
+          int64_t s_idx = s;
+          int64_t h_idx = i % elements_per_head_packed;
+          out_idx = b_idx * cache_sequence_length * num_heads * elements_per_head_packed +
+                    s_idx * num_heads * elements_per_head_packed +
+                    n_idx * elements_per_head_packed +
+                    h_idx;
+        }
+        reinterpret_cast<int8_t*>(quantized_data)[out_idx] = 0;
       } else {  // 4
         // With packed iteration, each thread handles one byte (2 values).
         // Since we are in the padding region, write a zero byte.
-        reinterpret_cast<uint8_t*>(quantized_data)[i] = (0 + 8) | ((0 + 8) << 4);
+        // For BNSH/BSNH output, we need to calculate correct index.
+        int64_t out_idx = i;
+        if (is_output_bsnh) {
+          int64_t b_idx = b;
+          int64_t n_idx = n;
+          int64_t s_idx = s;
+          int64_t h_idx = i % elements_per_head_packed;
+          out_idx = b_idx * cache_sequence_length * num_heads * elements_per_head_packed +
+                    s_idx * num_heads * elements_per_head_packed +
+                    n_idx * elements_per_head_packed +
+                    h_idx;
+        }
+
+        if (bit_width == 8) {
+          // Should not reach here given outer if
+          reinterpret_cast<int8_t*>(quantized_data)[out_idx] = 0;
+        } else {
+          reinterpret_cast<uint8_t*>(quantized_data)[out_idx] = (0 + 8) | ((0 + 8) << 4);
+        }
       }
       continue;
+    }
+
+    int64_t output_idx = i;
+    if (is_output_bsnh) {
+      int64_t b_idx = b;
+      int64_t n_idx = n;
+      int64_t s_idx = s;
+      int64_t h_idx = i % elements_per_head_packed;
+      output_idx = b_idx * cache_sequence_length * num_heads * elements_per_head_packed +
+                   s_idx * num_heads * elements_per_head_packed +
+                   n_idx * elements_per_head_packed +
+                   h_idx;
     }
 
     if (bit_width == 8) {
@@ -189,18 +241,18 @@ __global__ void QuantizeKernel(T_QUANT* quantized_data,
       }
 
       float inv_scale = (scale_val == 0.0f) ? 0.0f : 1.0f / scale_val;
-      int64_t flattened_input_idx = is_input_bsnh ? ((int64_t)b * cache_sequence_length * num_heads * head_size +
+      int64_t flattened_input_idx = is_input_bsnh ? ((int64_t)b * input_sequence_length * num_heads * head_size +
                                                      (int64_t)s * num_heads * head_size +
                                                      (int64_t)n * head_size +
                                                      h)
-                                                  : ((int64_t)b * num_heads * cache_sequence_length * head_size +
-                                                     (int64_t)n * cache_sequence_length * head_size +
+                                                  : ((int64_t)b * num_heads * input_sequence_length * head_size +
+                                                     (int64_t)n * input_sequence_length * head_size +
                                                      (int64_t)s * head_size +
                                                      h);
       float val_float = static_cast<float>(dequantized_data[flattened_input_idx]) * inv_scale;
 
       int32_t val_int32 = static_cast<int32_t>(rintf(val_float));
-      reinterpret_cast<int8_t*>(quantized_data)[i] =
+      reinterpret_cast<int8_t*>(quantized_data)[output_idx] =
           static_cast<int8_t>(max(-128, min(127, val_int32)));
     } else {  // 4
       int h0 = h_packed * 2;
@@ -215,12 +267,12 @@ __global__ void QuantizeKernel(T_QUANT* quantized_data,
       }
       float inv_scale0 = (scale0 == 0.0f) ? 0.0f : 1.0f / scale0;
 
-      int64_t input_idx0 = is_input_bsnh ? ((int64_t)b * cache_sequence_length * num_heads * head_size +
+      int64_t input_idx0 = is_input_bsnh ? ((int64_t)b * input_sequence_length * num_heads * head_size +
                                             (int64_t)s * num_heads * head_size +
                                             (int64_t)n * head_size +
                                             h0)
-                                         : ((int64_t)b * num_heads * cache_sequence_length * head_size +
-                                            (int64_t)n * cache_sequence_length * head_size +
+                                         : ((int64_t)b * num_heads * input_sequence_length * head_size +
+                                            (int64_t)n * input_sequence_length * head_size +
                                             (int64_t)s * head_size +
                                             h0);
       float val0 = static_cast<float>(dequantized_data[input_idx0]) * inv_scale0;
@@ -237,12 +289,12 @@ __global__ void QuantizeKernel(T_QUANT* quantized_data,
         }
         float inv_scale1 = (scale1 == 0.0f) ? 0.0f : 1.0f / scale1;
 
-        int64_t input_idx1 = is_input_bsnh ? ((int64_t)b * cache_sequence_length * num_heads * head_size +
+        int64_t input_idx1 = is_input_bsnh ? ((int64_t)b * input_sequence_length * num_heads * head_size +
                                               (int64_t)s * num_heads * head_size +
                                               (int64_t)n * head_size +
                                               h1)
-                                           : ((int64_t)b * num_heads * cache_sequence_length * head_size +
-                                              (int64_t)n * cache_sequence_length * head_size +
+                                           : ((int64_t)b * num_heads * input_sequence_length * head_size +
+                                              (int64_t)n * input_sequence_length * head_size +
                                               (int64_t)s * head_size +
                                               h1);
         float val1 = static_cast<float>(dequantized_data[input_idx1]) * inv_scale1;
@@ -255,7 +307,7 @@ __global__ void QuantizeKernel(T_QUANT* quantized_data,
       // Pack two 4-bit values into one byte with +8 bias to convert to unsigned [0,15]
       // Low nibble: q0 (even element), High nibble: q1 (odd element)
       uint8_t packed = ((q0 + 8) & 0x0F) | (((q1 + 8) & 0x0F) << 4);
-      reinterpret_cast<uint8_t*>(quantized_data)[i] = packed;
+      reinterpret_cast<uint8_t*>(quantized_data)[output_idx] = packed;
     }
   }
 }
@@ -273,7 +325,8 @@ __global__ void QuantizeAppendKernel(T_QUANT* cache_data,
                                      int new_seq_len,
                                      KVQuantizationType quant_type,
                                      int batch_size,
-                                     bool is_input_bsnh = false) {
+                                     bool is_input_bsnh,
+                                     bool is_output_bsnh) {
   int elements_per_head_packed = (bit_width == 4) ? (head_size + 1) / 2 : head_size;
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int total_elements = batch_size * num_heads * new_seq_len * elements_per_head_packed;
@@ -297,10 +350,16 @@ __global__ void QuantizeAppendKernel(T_QUANT* cache_data,
   // For safety, ensure past_len >= 0. In prompt phase, it's 0.
   if (past_len < 0) past_len = 0;
 
-  int64_t cache_offset = (int64_t)b * num_heads * max_seq_len * elements_per_head_packed +
-                         (int64_t)n * max_seq_len * elements_per_head_packed +
-                         (int64_t)(past_len + s) * elements_per_head_packed +
+  int64_t cache_offset = (int64_t)b * max_seq_len * num_heads * elements_per_head_packed +
+                         (int64_t)(past_len + s) * num_heads * elements_per_head_packed +
+                         (int64_t)n * elements_per_head_packed +
                          h_packed;
+  if (is_output_bsnh) {
+    cache_offset = (int64_t)b * max_seq_len * num_heads * elements_per_head_packed +
+                   (int64_t)(past_len + s) * num_heads * elements_per_head_packed +
+                   (int64_t)n * elements_per_head_packed +
+                   h_packed;
+  }
 
   if (bit_width == 8) {
     int h = h_packed;
@@ -374,9 +433,10 @@ Status LaunchQuantizeKV(cudaStream_t stream, T_QUANT* quantized_data,
                         const T* dequantized_data, const T_SCALE* scale,
                         const int* total_seq_lens,
                         int batch_size, int num_heads,
-                        int cache_sequence_length, int head_size, int bit_width,
+                        int input_sequence_length, int cache_sequence_length, int head_size, int bit_width,
                         KVQuantizationType quant_type,
-                        bool is_input_bsnh) {
+                        bool is_input_bsnh,
+                        bool is_output_bsnh) {
   assert(total_seq_lens != nullptr);
   if (cache_sequence_length == 0) return Status::OK();
 
@@ -388,7 +448,7 @@ Status LaunchQuantizeKV(cudaStream_t stream, T_QUANT* quantized_data,
 
   QuantizeKernel<T, T_QUANT, T_SCALE><<<blocks, threads_per_block, 0, stream>>>(
       quantized_data, dequantized_data, scale, total_seq_lens, total_packed_elements,
-      cache_sequence_length, num_heads, head_size, bit_width, quant_type, is_input_bsnh);
+      input_sequence_length, cache_sequence_length, num_heads, head_size, bit_width, quant_type, is_input_bsnh, is_output_bsnh);
 
   return CUDA_CALL(cudaGetLastError());
 }
@@ -400,45 +460,46 @@ Status LaunchQuantizeAppendKV(cudaStream_t stream, T_QUANT* cache_data,
                               int max_seq_len, int head_size, int bit_width,
                               int new_seq_len,
                               KVQuantizationType quant_type,
-                              bool is_input_bsnh = false) {
+                              bool is_input_bsnh,
+                              bool is_output_bsnh) {
   int elements_per_head_packed = (bit_width == 4) ? (head_size + 1) / 2 : head_size;
   int total_threads = batch_size * num_heads * new_seq_len * elements_per_head_packed;
   const int threads_per_block = 256;
   int blocks = (total_threads + threads_per_block - 1) / threads_per_block;
 
   QuantizeAppendKernel<T, T_QUANT, T_SCALE><<<blocks, threads_per_block, 0, stream>>>(
-      cache_data, new_data, scale, total_seq_lens, max_seq_len, num_heads, head_size, bit_width, new_seq_len, quant_type, batch_size, is_input_bsnh);
+      cache_data, new_data, scale, total_seq_lens, max_seq_len, num_heads, head_size, bit_width, new_seq_len, quant_type, batch_size, is_input_bsnh, is_output_bsnh);
 
   return CUDA_CALL(cudaGetLastError());
 }
 
 // Explicit instantiations for launchers
 template Status LaunchDequantizeKV<half, int8_t, half>(
-    cudaStream_t, half*, const int8_t*, const half*, const int*, int, int, int, int, int, KVQuantizationType);
+    cudaStream_t, half*, const int8_t*, const half*, const int*, int, int, int, int, int, KVQuantizationType, bool);
 template Status LaunchDequantizeKV<half, uint8_t, half>(
-    cudaStream_t, half*, const uint8_t*, const half*, const int*, int, int, int, int, int, KVQuantizationType);
+    cudaStream_t, half*, const uint8_t*, const half*, const int*, int, int, int, int, int, KVQuantizationType, bool);
 template Status LaunchDequantizeKV<BFloat16, int8_t, BFloat16>(
-    cudaStream_t, BFloat16*, const int8_t*, const BFloat16*, const int*, int, int, int, int, int, KVQuantizationType);
+    cudaStream_t, BFloat16*, const int8_t*, const BFloat16*, const int*, int, int, int, int, int, KVQuantizationType, bool);
 template Status LaunchDequantizeKV<BFloat16, uint8_t, BFloat16>(
-    cudaStream_t, BFloat16*, const uint8_t*, const BFloat16*, const int*, int, int, int, int, int, KVQuantizationType);
+    cudaStream_t, BFloat16*, const uint8_t*, const BFloat16*, const int*, int, int, int, int, int, KVQuantizationType, bool);
 
 template Status LaunchQuantizeKV<half, int8_t, half>(
-    cudaStream_t, int8_t*, const half*, const half*, const int*, int, int, int, int, int, KVQuantizationType, bool);
+    cudaStream_t, int8_t*, const half*, const half*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
 template Status LaunchQuantizeKV<half, uint8_t, half>(
-    cudaStream_t, uint8_t*, const half*, const half*, const int*, int, int, int, int, int, KVQuantizationType, bool);
+    cudaStream_t, uint8_t*, const half*, const half*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
 template Status LaunchQuantizeKV<BFloat16, int8_t, BFloat16>(
-    cudaStream_t, int8_t*, const BFloat16*, const BFloat16*, const int*, int, int, int, int, int, KVQuantizationType, bool);
+    cudaStream_t, int8_t*, const BFloat16*, const BFloat16*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
 template Status LaunchQuantizeKV<BFloat16, uint8_t, BFloat16>(
-    cudaStream_t, uint8_t*, const BFloat16*, const BFloat16*, const int*, int, int, int, int, int, KVQuantizationType, bool);
+    cudaStream_t, uint8_t*, const BFloat16*, const BFloat16*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
 
 template Status LaunchQuantizeAppendKV<half, int8_t, half>(
-    cudaStream_t, int8_t*, const half*, const half*, const int*, int, int, int, int, int, int, KVQuantizationType, bool);
+    cudaStream_t, int8_t*, const half*, const half*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
 template Status LaunchQuantizeAppendKV<half, uint8_t, half>(
-    cudaStream_t, uint8_t*, const half*, const half*, const int*, int, int, int, int, int, int, KVQuantizationType, bool);
+    cudaStream_t, uint8_t*, const half*, const half*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
 template Status LaunchQuantizeAppendKV<BFloat16, int8_t, BFloat16>(
-    cudaStream_t, int8_t*, const BFloat16*, const BFloat16*, const int*, int, int, int, int, int, int, KVQuantizationType, bool);
+    cudaStream_t, int8_t*, const BFloat16*, const BFloat16*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
 template Status LaunchQuantizeAppendKV<BFloat16, uint8_t, BFloat16>(
-    cudaStream_t, uint8_t*, const BFloat16*, const BFloat16*, const int*, int, int, int, int, int, int, KVQuantizationType, bool);
+    cudaStream_t, uint8_t*, const BFloat16*, const BFloat16*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
 
 }  // namespace cuda
 }  // namespace contrib

@@ -79,7 +79,10 @@ Status HandleDequantization(
 
   quant_data.is_k_quantized = params.k_quant_type != KVQuantizationType::NONE;
   if (quant_data.is_k_quantized) {
-    ORT_ENFORCE(past_key != nullptr && k_scale != nullptr, "past_key and k_scale must be provided for quantized KV cache.");
+    if (params.seqlen_past_kv_cache > 0) {
+      ORT_ENFORCE(past_key != nullptr, "past_key must be provided for quantized KV cache with past data.");
+    }
+    ORT_ENFORCE(k_scale != nullptr, "k_scale must be provided for quantized KV cache.");
 
     // Enforce shared buffer constraint
     if (params.seqlen_past_kv_cache > 0) {
@@ -96,19 +99,20 @@ Status HandleDequantization(
     data.past_key = data.present_key;
 
     if (params.seqlen_past_kv_cache > 0) {
+      bool is_input_bsnh = params.past_kv_format == AttentionQkvFormat::Q_K_V_BSNH;
       Status status;
       if (params.kv_cache_bit_width == 8) {
         status = LaunchDequantizeKV<CudaT, int8_t, CudaT>(
             stream, reinterpret_cast<CudaT*>(quant_data.dequantized_key_buffer.get()),
             static_cast<const int8_t*>(past_key->DataRaw()), quant_data.k_scale_ptr, data.past_seq_lens,
             params.batch_size, params.kv_num_heads, params.seqlen_present_kv_cache, params.head_size,
-            params.kv_cache_bit_width, params.k_quant_type);
+            params.kv_cache_bit_width, params.k_quant_type, is_input_bsnh);
       } else if (params.kv_cache_bit_width == 4) {
         status = LaunchDequantizeKV<CudaT, uint8_t, CudaT>(
             stream, reinterpret_cast<CudaT*>(quant_data.dequantized_key_buffer.get()),
             static_cast<const uint8_t*>(past_key->DataRaw()), quant_data.k_scale_ptr, data.past_seq_lens,
             params.batch_size, params.kv_num_heads, params.seqlen_present_kv_cache, params.head_size,
-            params.kv_cache_bit_width, params.k_quant_type);
+            params.kv_cache_bit_width, params.k_quant_type, is_input_bsnh);
       } else {
         return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Quantized KV cache requires kv_cache_bit_width to be 4 or 8.");
       }
@@ -122,7 +126,10 @@ Status HandleDequantization(
 
   quant_data.is_v_quantized = params.v_quant_type != KVQuantizationType::NONE;
   if (quant_data.is_v_quantized) {
-    ORT_ENFORCE(past_value != nullptr && v_scale != nullptr, "past_value and v_scale must be provided for quantized KV cache.");
+    if (params.seqlen_past_kv_cache > 0) {
+      ORT_ENFORCE(past_value != nullptr, "past_value must be provided for quantized KV cache with past data.");
+    }
+    ORT_ENFORCE(v_scale != nullptr, "v_scale must be provided for quantized KV cache.");
 
     // Enforce shared buffer constraint
     if (params.seqlen_past_kv_cache > 0) {
@@ -137,19 +144,20 @@ Status HandleDequantization(
     data.past_value = data.present_value;
 
     if (params.seqlen_past_kv_cache > 0) {
+      bool is_input_bsnh = params.past_kv_format == AttentionQkvFormat::Q_K_V_BSNH;
       Status status;
       if (params.kv_cache_bit_width == 8) {
         status = LaunchDequantizeKV<CudaT, int8_t, CudaT>(
             stream, reinterpret_cast<CudaT*>(quant_data.dequantized_value_buffer.get()),
             static_cast<const int8_t*>(past_value->DataRaw()), quant_data.v_scale_ptr, data.past_seq_lens,
             params.batch_size, params.kv_num_heads, params.seqlen_present_kv_cache, params.head_size,
-            params.kv_cache_bit_width, params.v_quant_type);
+            params.kv_cache_bit_width, params.v_quant_type, is_input_bsnh);
       } else if (params.kv_cache_bit_width == 4) {
         status = LaunchDequantizeKV<CudaT, uint8_t, CudaT>(
             stream, reinterpret_cast<CudaT*>(quant_data.dequantized_value_buffer.get()),
             static_cast<const uint8_t*>(past_value->DataRaw()), quant_data.v_scale_ptr, data.past_seq_lens,
             params.batch_size, params.kv_num_heads, params.seqlen_present_kv_cache, params.head_size,
-            params.kv_cache_bit_width, params.v_quant_type);
+            params.kv_cache_bit_width, params.v_quant_type, is_input_bsnh);
       } else {
         return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Quantized KV cache requires kv_cache_bit_width to be 4 or 8.");
       }
@@ -177,18 +185,19 @@ Status HandleRequantization(
   Tensor* present_value = context->Output<Tensor>(2);
   auto stream = static_cast<cudaStream_t>(context->GetComputeStream()->GetHandle());
 
+  bool is_output_bsnh = params.past_kv_format == AttentionQkvFormat::Q_K_V_BSNH;
   if (quant_data.is_k_quantized) {
     Status status;
     if (params.kv_cache_bit_width == 8) {
       status = LaunchQuantizeKV<CudaT, int8_t, CudaT>(
           stream, present_key->MutableData<int8_t>(), reinterpret_cast<const CudaT*>(data.present_key), quant_data.k_scale_ptr, data.total_seq_lens,
-          params.batch_size, params.kv_num_heads, params.seqlen_present_kv_cache, params.head_size,
-          params.kv_cache_bit_width, params.k_quant_type, false);
+          params.batch_size, params.kv_num_heads, params.seqlen_present_kv_cache, params.seqlen_present_kv_cache, params.head_size,
+          params.kv_cache_bit_width, params.k_quant_type, false, is_output_bsnh);
     } else if (params.kv_cache_bit_width == 4) {
       status = LaunchQuantizeKV<CudaT, uint8_t, CudaT>(
           stream, present_key->MutableData<uint8_t>(), reinterpret_cast<const CudaT*>(data.present_key), quant_data.k_scale_ptr, data.total_seq_lens,
-          params.batch_size, params.kv_num_heads, params.seqlen_present_kv_cache, params.head_size,
-          params.kv_cache_bit_width, params.k_quant_type, false);
+          params.batch_size, params.kv_num_heads, params.seqlen_present_kv_cache, params.seqlen_present_kv_cache, params.head_size,
+          params.kv_cache_bit_width, params.k_quant_type, false, is_output_bsnh);
     } else {
       return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Quantized KV cache requires kv_cache_bit_width to be 4 or 8.");
     }
@@ -200,13 +209,13 @@ Status HandleRequantization(
     if (params.kv_cache_bit_width == 8) {
       status = LaunchQuantizeKV<CudaT, int8_t, CudaT>(
           stream, present_value->MutableData<int8_t>(), reinterpret_cast<const CudaT*>(data.present_value), quant_data.v_scale_ptr, data.total_seq_lens,
-          params.batch_size, params.kv_num_heads, params.seqlen_present_kv_cache, params.head_size,
-          params.kv_cache_bit_width, params.v_quant_type, false);
+          params.batch_size, params.kv_num_heads, params.seqlen_present_kv_cache, params.seqlen_present_kv_cache, params.head_size,
+          params.kv_cache_bit_width, params.v_quant_type, false, is_output_bsnh);
     } else if (params.kv_cache_bit_width == 4) {
       status = LaunchQuantizeKV<CudaT, uint8_t, CudaT>(
           stream, present_value->MutableData<uint8_t>(), reinterpret_cast<const CudaT*>(data.present_value), quant_data.v_scale_ptr, data.total_seq_lens,
-          params.batch_size, params.kv_num_heads, params.seqlen_present_kv_cache, params.head_size,
-          params.kv_cache_bit_width, params.v_quant_type, false);
+          params.batch_size, params.kv_num_heads, params.seqlen_present_kv_cache, params.seqlen_present_kv_cache, params.head_size,
+          params.kv_cache_bit_width, params.v_quant_type, false, is_output_bsnh);
     } else {
       return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Quantized KV cache requires kv_cache_bit_width to be 4 or 8.");
     }
@@ -495,10 +504,10 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
   // This compares the final pointer values after quantization handling.
   parameters.past_present_share_buffer = (data.past_key == data.present_key);
 
-  bool use_quantized_kv = (parameters.k_quant_type != KVQuantizationType::NONE) || (parameters.v_quant_type != KVQuantizationType::NONE);
-
-  // Force fallback to dequantize past kv + GQA + quantize present kv.
-  bool use_dequantize_quantize_fallback = use_quantized_kv;
+  bool use_quantized_kv = (k_quant_type_ != KVQuantizationType::NONE) || (v_quant_type_ != KVQuantizationType::NONE);
+  // Fallback to dequantize past kv + GQA + quantize present kv for decoding paths.
+  // For the first prompt, we use the optimized FlashAttentionAndQuantizeKV path.
+  bool use_dequantize_quantize_fallback = use_quantized_kv && !parameters.is_first_prompt;
 
 #if USE_FLASH_ATTENTION
   bool use_flash_attention = !disable_flash_attention_ &&
@@ -511,6 +520,11 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
                                                                                   static_cast<int>(k_quant_type_),
                                                                                   static_cast<int>(v_quant_type_),
                                                                                   kv_cache_bit_width_);
+  if (!use_flash_attention) {
+    // We only implmented flash attention variant for quantized kv.
+    use_dequantize_quantize_fallback = true;
+  }
+
   data.use_flash_attention_fast_decode = use_flash_attention && !disable_flash_decode_ && !parameters.is_first_prompt && parameters.past_present_share_buffer;
   if (use_flash_attention) {
     data.use_flash_attention = true;
@@ -533,6 +547,7 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
   }
 #endif
 
+  // use_dequantize_quantize_fallback is already computed above.
   if (data.use_flash_attention_fast_decode && parameters.sequence_length == 1 && !use_dequantize_quantize_fallback) {
     // FlashDecoding Fast Path:
     // - Uses Flash Attention's internal KV append logic, so total_seq_lens and padded_seq_lens are not needed.
@@ -623,7 +638,7 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
 
   if (kernel_options_->AllowDebugInfo()) {
     AttentionKernelDebugInfo debug_info;
-    debug_info.use_flash_attention = use_flash_attention;
+    debug_info.use_flash_attention = data.use_flash_attention;
     debug_info.use_efficient_attention = data.use_memory_efficient_attention;
 
     debug_info.Print("GroupQueryAttention",
@@ -658,18 +673,22 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
     DUMP_TENSOR("k_scale", data.k_scale, 1, 1, 1, 1);
   }
 
-  // Dump Present Key (should contain past + new)
-  // Note: Dimensions might need adjustment for int4 to avoid dump crash if size mismatch
-  if (parameters.k_quant_type != KVQuantizationType::NONE) {
-    // Just dump raw bytes
-    if (parameters.kv_cache_bit_width == 4) {
-      DUMP_TENSOR("present_key_quant_packed", reinterpret_cast<const int8_t*>(data.present_key),
-                  parameters.batch_size, parameters.kv_num_heads, parameters.seqlen_present_kv_cache, parameters.head_size / 2);
-    } else {
-      DUMP_TENSOR("present_key_quant", reinterpret_cast<const int8_t*>(data.present_key),
-                  parameters.batch_size, parameters.kv_num_heads, parameters.seqlen_present_kv_cache, parameters.head_size);
-    }
-  }
+  // // Dump Present Key (should contain past + new)
+  // // Note: Dimensions might need adjustment for int4 to avoid dump crash if size mismatch
+  // if (parameters.k_quant_type != KVQuantizationType::NONE) {
+  //   // Just dump raw bytes
+  //   if (parameters.kv_cache_bit_width == 4) {
+  //      ORT_RETURN_IF_ERROR((LaunchQuantizeKV<T, int8_t, T>(
+  //         stream, reinterpret_cast<int8_t*>(data.present_key), unpacked_k, data.k_scale,
+  //         data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
+  //         head_size, 8, parameters.k_quant_type, false, past_bsnh)));
+  //   } else {
+  //     ORT_RETURN_IF_ERROR((LaunchQuantizeKV<T, uint8_t, T>(
+  //         stream, reinterpret_cast<uint8_t*>(data.present_key), unpacked_k, data.k_scale,
+  //         data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
+  //         head_size, 4, parameters.k_quant_type, false, past_bsnh)));
+  //   }
+  // }
 #endif
 
   cublasHandle_t cublas = GetCublasHandle(context);

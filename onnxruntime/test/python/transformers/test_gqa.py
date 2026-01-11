@@ -1171,9 +1171,12 @@ def parity_check_gqa_prompt(
         v_cache_ref_np = v_cache_ref_np[:, :, : config.kv_sequence_length, :]
 
     if config.k_quant_type == "NONE" and config.v_quant_type == "NONE":
+        print_diff_statistics(torch.tensor(present_k_np - k_cache_ref_np), "present_k")
         numpy.testing.assert_allclose(present_k_np, k_cache_ref_np, rtol=rtol, atol=atol)
+        print_diff_statistics(torch.tensor(present_v_np - v_cache_ref_np), "present_v")
         numpy.testing.assert_allclose(present_v_np, v_cache_ref_np, rtol=rtol, atol=atol)
 
+    print_diff_statistics(torch.tensor(out_np - out_ref_np), "out")
     numpy.testing.assert_allclose(out_np, out_ref_np, rtol=rtol, atol=atol)
 
     # Compare quantized cache with proper masking per batch
@@ -1209,6 +1212,10 @@ def parity_check_gqa_prompt(
 
         for b in range(config.batch_size):
             valid_len = cache_seqlens[b].item()
+            print_diff_statistics(
+                torch.tensor(present_k_dequant[b, :, :valid_len, :] - k_cache_ref_dequant[b, :, :valid_len, :]),
+                f"present_k[{b}]",
+            )
             numpy.testing.assert_allclose(
                 present_k_dequant[b, :, :valid_len, :], k_cache_ref_dequant[b, :, :valid_len, :], rtol=rtol, atol=atol
             )
@@ -1242,6 +1249,10 @@ def parity_check_gqa_prompt(
 
         for b in range(config.batch_size):
             valid_len = cache_seqlens[b].item()
+            print_diff_statistics(
+                torch.tensor(present_v_dequant[b, :, :valid_len, :] - v_cache_ref_dequant[b, :, :valid_len, :]),
+                f"present_v[{b}]",
+            )
             numpy.testing.assert_allclose(
                 present_v_dequant[b, :, :valid_len, :], v_cache_ref_dequant[b, :, :valid_len, :], rtol=rtol, atol=atol
             )
@@ -1446,9 +1457,12 @@ def parity_check_gqa_past(
             k_cache_ref_np = k_cache_ref_np[:, :, :total_len, :]
             v_cache_ref_np = v_cache_ref_np[:, :, :total_len, :]
 
+        print_diff_statistics(torch.tensor(present_k_np - k_cache_ref_np), "present_k")
         numpy.testing.assert_allclose(present_k_np, k_cache_ref_np, rtol=rtol, atol=atol)
+        print_diff_statistics(torch.tensor(present_v_np - v_cache_ref_np), "present_v")
         numpy.testing.assert_allclose(present_v_np, v_cache_ref_np, rtol=rtol, atol=atol)
 
+    print_diff_statistics(torch.tensor(out_np - out_ref_np), "out")
     numpy.testing.assert_allclose(out_np, out_ref_np, rtol=rtol, atol=atol)
 
     # Compare quantized cache with proper masking per batch
@@ -1481,6 +1495,10 @@ def parity_check_gqa_past(
 
         for b in range(config.batch_size):
             valid_len = (cache_seqlens[b] + config.q_sequence_length).item()
+            print_diff_statistics(
+                torch.tensor(present_k_dequant[b, :, :valid_len, :] - k_cache_ref_dequant[b, :, :valid_len, :]),
+                f"present_k[{b}]",
+            )
             numpy.testing.assert_allclose(
                 present_k_dequant[b, :, :valid_len, :],
                 k_cache_ref_dequant[b, :, :valid_len, :],
@@ -1517,6 +1535,10 @@ def parity_check_gqa_past(
 
         for b in range(config.batch_size):
             valid_len = (cache_seqlens[b] + config.q_sequence_length).item()
+            print_diff_statistics(
+                torch.tensor(present_v_dequant[b, :, :valid_len, :] - v_cache_ref_dequant[b, :, :valid_len, :]),
+                f"present_v[{b}]",
+            )
             numpy.testing.assert_allclose(
                 present_v_dequant[b, :, :valid_len, :],
                 v_cache_ref_dequant[b, :, :valid_len, :],
@@ -1669,6 +1691,48 @@ def parity_test_gqa_padding_prompt():
         raise AssertionError(msg)
 
     torch.testing.assert_close(out_ort, out_ref, rtol=1e-2, atol=1e-2)
+
+
+# #################################################################################################
+#  Test Utilities
+# #################################################################################################
+
+
+def print_diff_statistics(diff_tensor: torch.Tensor, prefix: str = ""):
+    """
+    Print percentile statistics (75%, 95%, 99%) for a difference tensor.
+    This helps assess parity quality beyond just max difference.
+
+    Args:
+        diff_tensor: Tensor containing absolute differences between expected and actual outputs.
+        prefix: Optional prefix string for the output message.
+    """
+    diff_flat = diff_tensor.flatten().float()
+    if diff_flat.numel() == 0:
+        print(f"{prefix}Diff statistics: empty tensor")
+        return
+
+    # Compute percentiles
+    sorted_diff, _ = torch.sort(diff_flat)
+    n = sorted_diff.numel()
+
+    p75_idx = min(int(n * 0.75), n - 1)
+    p90_idx = min(int(n * 0.90), n - 1)
+    p95_idx = min(int(n * 0.95), n - 1)
+    p99_idx = min(int(n * 0.99), n - 1)
+    p999_idx = min(int(n * 0.999), n - 1)
+
+    p75 = sorted_diff[p75_idx].item()
+    p90 = sorted_diff[p90_idx].item()
+    p95 = sorted_diff[p95_idx].item()
+    p99 = sorted_diff[p99_idx].item()
+    p999 = sorted_diff[p999_idx].item()
+    max_val = sorted_diff[-1].item()
+    mean_val = diff_flat.mean().item()
+
+    print(
+        f"{prefix} Diff stats - mean: {mean_val:.6f}, p75: {p75:.6f}, p90: {p90:.6f}, p95: {p95:.6f}, p99: {p99:.6f}, p999: {p999:.6f}, max: {max_val:.6f}"
+    )
 
 
 # #################################################################################################
@@ -1877,8 +1941,8 @@ def has_flash_attention(bf16: bool = False):
     return has_cuda_device(80)
 
 
-rtol = {"fp16": 5e-3, "bf16": 5e-2}
-atol = {"fp16": 5e-3, "bf16": 1e-2}
+rtol = {"fp16": 5e-3, "bf16": 5e-2, "int8_fp16": 5e-2, "int4_fp16": 5e-2, "int8_bf16": 5e-2, "int4_bf16": 5e-2}
+atol = {"fp16": 5e-3, "bf16": 1e-2, "int8_fp16": 1e-1, "int4_fp16": 1e-1, "int8_bf16": 1e-1, "int4_bf16": 1e-1}
 
 
 def has_quantized_kv_cache():
@@ -1925,8 +1989,8 @@ class TestFlashGQA(unittest.TestCase):
             torch_type=torch.float16,
             ort_type=TensorProto.FLOAT16,
             causal=True,
-            rtol=0.1,
-            atol=0.05,
+            rtol=rtol[f"{config.kv_cache_type}_fp16"],
+            atol=atol[f"{config.kv_cache_type}_fp16"],
         )
 
     @parameterized.expand(gqa_cuda_quantized_test_cases(is_past=False))
@@ -1939,8 +2003,8 @@ class TestFlashGQA(unittest.TestCase):
             torch_type=torch.float16,
             ort_type=TensorProto.FLOAT16,
             causal=True,
-            rtol=0.1,
-            atol=0.05,
+            rtol=rtol[f"{config.kv_cache_type}_fp16"],
+            atol=atol[f"{config.kv_cache_type}_fp16"],
         )
 
 

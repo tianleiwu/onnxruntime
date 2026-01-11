@@ -1086,7 +1086,6 @@ Status FlashAttention(
   return Status::OK();
 }
 
-#if 0  // still need to implement this
 // Use Flash Attention for float key and value, then quantize key/value to int4/int8 to save to k/v cache.
 template <typename T>
 Status FlashAttentionAndQuantizeKV(
@@ -1096,29 +1095,113 @@ Status FlashAttentionAndQuantizeKV(
     GroupQueryAttentionData<T>& data,
     float scale) {
   assert(parameters.is_first_prompt);  // Only support first prompt for this function.
-  assert(parameters.past_present_share_buffer);
+  // assert(parameters.past_present_share_buffer);
 
-  bool is_quantized = parameters.k_quant_type != KVQuantizationType::NONE;
+  bool is_quantized = parameters.k_quant_type != KVQuantizationType::NONE || parameters.v_quant_type != KVQuantizationType::NONE;
   assert(is_quantized);
+
+  const int max_threads_per_block = device_prop.maxThreadsPerBlock;
+  const int batch_size = parameters.batch_size;
+  const int sequence_length = parameters.sequence_length;
+  const int kv_num_heads = parameters.kv_num_heads;
+  const int num_heads = parameters.num_heads;
+  const int head_size = parameters.head_size;
 
   ORT_GQA_TRACE("FlashAttentionAndQuantizeKV");
 
-  // TODO: for the first prompt, there are two solutions:
-  // (1) Similar to FlashAttention, we do unpack qkv and apply rotary if needed, then call flash attention kernel
-  //     to compute the attention output. Then we quantize float key and value (after rotary) in temp buffers to int4/int8.
-  //     Note that float key and value shall be stored in temp buffers, not in present_key and present_value output.
-  //     In this solution, we may refactor FlashAttention function so that we need not write duplicated code.
-  //     In this mode, we call the float version of flash attention kernel (flash_fwd_kernel). It could be faster but need
-  //     more memory to store float key and value. It could have higher accuracy.
-  // (2) Quantize float key and value (after rotary) to present_key and present_value first, then call flash attention kernel
-  //     to compute the attention output. Then we quantize float key and value (after rotary) in temp buffers to int4/int8.
-  //     Note that float key and value shall be stored in temp buffers, not in present_key and present_value output.
-  //     In this mode, we call the int4/int8 version of flash attention kernel (flash_fwd_kvcache). It could be slower but
-  //     need less memory. The accuracy might not be as good as the float version.
+  bool past_bsnh = parameters.past_kv_format == AttentionQkvFormat::Q_K_V_BSNH;
 
-  // We will use solution 1 for prompt.
-  // TODO: use similar code like FlashAttention to compute float attention output
-  // TODO: add code to quantize float key and value (after rotary) and save to present_key and present_value.
+  // Allocate scratch space for unpacked/rotated Q, K, V within data.unpacked_qkv_buffer
+  T* unpacked_q = reinterpret_cast<T*>(data.unpacked_qkv_buffer);
+  size_t q_size = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size;
+  T* unpacked_k = unpacked_q + q_size;
+  size_t k_size = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size;
+  T* unpacked_v = unpacked_k + k_size;
+
+  // 1. Unpack QKV and Apply RoPE
+  const T* q_input = reinterpret_cast<const T*>(data.query);
+  const T* k_input = reinterpret_cast<const T*>(data.key);
+  const T* v_input = reinterpret_cast<const T*>(data.value);
+
+  if (parameters.is_packed_qkv) {
+    // Unpack to BSNH
+    ORT_RETURN_IF_ERROR((LaunchUnpackQKV<T, false>(q_input, unpacked_q, unpacked_k, unpacked_v, num_heads, kv_num_heads, head_size, sequence_length, batch_size, stream, max_threads_per_block)));
+    if constexpr (kTrackBufferUsage) {
+      UpdateUnpackedQkvMaxUsed(data, (q_size + 2 * k_size) * sizeof(T));
+    }
+  } else {
+    // Inputs are already BSNH, copy to scratch
+    cudaMemcpyAsync(unpacked_q, q_input, q_size * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(unpacked_k, k_input, k_size * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(unpacked_v, v_input, k_size * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+    if constexpr (kTrackBufferUsage) {
+      UpdateUnpackedQkvMaxUsed(data, (q_size + k_size + k_size) * sizeof(T));
+    }
+  }
+
+  if (parameters.do_rotary) {
+    // Rotate Q (BSNH)
+    ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel(
+        stream, unpacked_q, unpacked_q, nullptr, data.past_seq_lens, data.cos_cache, data.sin_cache,
+        batch_size, sequence_length, num_heads, head_size, parameters.rotary_dim,
+        parameters.max_sequence_length, 2, parameters.rotary_interleaved, max_threads_per_block, false));
+
+    // Rotate K (BSNH)
+    // TODO: Optimization - We can pass nullptr for past_seq_lens for the first prompt case.
+    ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel(
+        stream, unpacked_k, unpacked_k, nullptr, data.past_seq_lens, data.cos_cache, data.sin_cache,
+        batch_size, sequence_length, kv_num_heads, head_size, parameters.rotary_dim,
+        parameters.max_sequence_length, 2, parameters.rotary_interleaved, max_threads_per_block, false));
+  }
+
+  // 2. Run Float Flash Attention
+  bool is_causal = parameters.is_unidirectional;
+  bool is_bf16 = std::is_same<T, BFloat16>::value;
+
+  int local_window_size = parameters.local_window_size;
+  if (local_window_size > 0) {
+    local_window_size -= 1;  // Flash Attention expects (window_left - 1) for causal masking
+  }
+
+  ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd(
+      device_prop, stream, unpacked_q, unpacked_k, unpacked_v, data.output,
+      reinterpret_cast<void*>(data.softmax_lse),
+      batch_size, num_heads, kv_num_heads, head_size, sequence_length, sequence_length,
+      scale, parameters.softcap, is_causal, is_bf16, parameters.use_smooth_softmax,
+      parameters.num_splits,
+      reinterpret_cast<void*>(data.softmax_lse_accum),
+      reinterpret_cast<void*>(data.out_accum),
+      true,  // kv_bsnh = true (BSNH)
+      local_window_size));
+
+  // 3. Quantize K and V to present cache
+  if (parameters.k_quant_type != KVQuantizationType::NONE) {
+    if (parameters.kv_cache_bit_width == 8) {
+      ORT_RETURN_IF_ERROR((LaunchQuantizeKV<T, int8_t, T>(
+          stream, reinterpret_cast<int8_t*>(data.present_key), unpacked_k, data.k_scale,
+          data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
+          head_size, 8, parameters.k_quant_type, true, past_bsnh)));
+    } else {
+      ORT_RETURN_IF_ERROR((LaunchQuantizeKV<T, uint8_t, T>(
+          stream, reinterpret_cast<uint8_t*>(data.present_key), unpacked_k, data.k_scale,
+          data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
+          head_size, 4, parameters.k_quant_type, true, past_bsnh)));
+    }
+  }
+
+  if (parameters.v_quant_type != KVQuantizationType::NONE) {
+    if (parameters.kv_cache_bit_width == 8) {
+      ORT_RETURN_IF_ERROR((LaunchQuantizeKV<T, int8_t, T>(
+          stream, reinterpret_cast<int8_t*>(data.present_value), unpacked_v, data.v_scale,
+          data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
+          head_size, 8, parameters.v_quant_type, true, past_bsnh)));
+    } else {
+      ORT_RETURN_IF_ERROR((LaunchQuantizeKV<T, uint8_t, T>(
+          stream, reinterpret_cast<uint8_t*>(data.present_value), unpacked_v, data.v_scale,
+          data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
+          head_size, 4, parameters.v_quant_type, true, past_bsnh)));
+    }
+  }
 
   return Status::OK();
 }
@@ -1249,7 +1332,6 @@ Status FlashAttentionWithQuantizeKV(
   //     parameters.query_dynamic_quant));
   return Status::OK();
 }
-#endif
 #endif
 
 #if USE_MEMORY_EFFICIENT_ATTENTION
@@ -1495,13 +1577,15 @@ Status QkvToContext(
     GroupQueryAttentionData<T>& data) {
   auto stream = static_cast<cudaStream_t>(ort_stream->GetHandle());
   const float scale = parameters.scale == 0.0f ? 1.f / sqrt(static_cast<float>(parameters.head_size)) : parameters.scale;
-
 #if USE_FLASH_ATTENTION
   if (data.use_flash_attention_fast_decode) {
     return FlashDecoding(device_prop, stream, parameters, data, scale);
   }
 
   if (data.use_flash_attention) {
+    if (parameters.is_first_prompt && (parameters.k_quant_type != KVQuantizationType::NONE || parameters.v_quant_type != KVQuantizationType::NONE)) {
+      return FlashAttentionAndQuantizeKV(device_prop, stream, parameters, data, scale);
+    }
     return FlashAttention(device_prop, stream, parameters, data, scale);
   }
 #endif
