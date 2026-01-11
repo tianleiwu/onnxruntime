@@ -1901,8 +1901,6 @@ def gqa_cuda_past_test_cases(allow_head_sink: bool = True):
 def gqa_cuda_quantized_test_cases(is_past):
     base_cases = gqa_cuda_past_test_cases() if is_past else gqa_cuda_prompt_test_cases()
     for name, config in base_cases:
-        if config.packed:  # Quantization is not supported with packed QKV yet
-            continue
         for kv_type in ["int8", "int4"]:
             for quant_mode in ["PER_TENSOR", "PER_CHANNEL"]:
                 q_config = deepcopy(config)

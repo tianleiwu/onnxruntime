@@ -1207,7 +1207,6 @@ Status FlashAttentionAndQuantizeKV(
 }
 
 // Use Flash Attention with Quantized KV (for Subsequent Prompt or Decoding, need quantize k/v first then call int4/int8 version of flash attention kernel).
-template <typename T>
 Status FlashAttentionWithQuantizeKV(
     const cudaDeviceProp& device_prop,
     cudaStream_t stream,
@@ -1221,6 +1220,7 @@ Status FlashAttentionWithQuantizeKV(
 
   ORT_GQA_TRACE("FlashAttentionWithQuantizedKV");
 
+  const int max_threads_per_block = device_prop.maxThreadsPerBlock;
   const int batch_size = parameters.batch_size;
   const int sequence_length = parameters.sequence_length;
   const int kv_sequence_length = parameters.sequence_length;
@@ -1231,47 +1231,100 @@ Status FlashAttentionWithQuantizeKV(
   bool is_causal = parameters.is_unidirectional;
   bool is_bf16 = std::is_same<T, BFloat16>::value;
 
-  void* query = reinterpret_cast<void*>(const_cast<T*>(data.query));
-  void* key;
-  void* value;
+  // Buffers
+  T* unpacked_buffer = reinterpret_cast<T*>(data.unpacked_qkv_buffer);
+  size_t q_elements = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size;
+  size_t k_elements = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size;
 
-  if (!parameters.is_packed_qkv) {
-    key = reinterpret_cast<void*>(const_cast<T*>(data.key));
-    value = reinterpret_cast<void*>(const_cast<T*>(data.value));
+  void* query = nullptr;
+  void* key = nullptr;
+  void* value = nullptr;
+
+  if (parameters.is_packed_qkv) {
+    T* unpacked_q = unpacked_buffer;
+    T* unpacked_k = unpacked_buffer + q_elements;
+    T* unpacked_v = unpacked_buffer + q_elements + k_elements;
+
+    // Unpack
+    ORT_RETURN_IF_ERROR((LaunchUnpackQKV<T, false>(
+        reinterpret_cast<const T*>(data.query), unpacked_q, unpacked_k, unpacked_v,
+        num_heads, kv_num_heads, head_size, sequence_length, batch_size,
+        stream, max_threads_per_block)));
+
+    query = unpacked_q;
+    key = unpacked_k;
+    value = unpacked_v;
+
+    if constexpr (kTrackBufferUsage) {
+      UpdateUnpackedQkvMaxUsed(data, (q_elements + 2 * k_elements) * sizeof(T));
+    }
   } else {
-    const size_t key_offset = static_cast<size_t>(num_heads * head_size);
-    const size_t value_offset = static_cast<size_t>(kv_num_heads * head_size);
-    key = reinterpret_cast<T*>(query) + key_offset;
-    value = reinterpret_cast<T*>(key) + value_offset;
+    // Unpacked input
+    if (parameters.do_rotary) {
+      // Need buffers for Q and K rotation
+      // Assumes buffer is large enough (q_elements + k_elements)
+      query = unpacked_buffer;
+      key = unpacked_buffer + q_elements;
+    } else {
+      query = const_cast<void*>(reinterpret_cast<const void*>(data.query));
+      key = const_cast<void*>(reinterpret_cast<const void*>(data.key));
+    }
+    value = const_cast<void*>(reinterpret_cast<const void*>(data.value));
   }
 
-  // TODO: for the consequent prompt or decoding, since past_key and past_value are already quantized, we use the following solution:
-  // Quantize float new key and new value (after rotary) and append to present_key and present_value first, then call flash attention kernel
-  //     to compute the attention output. In this mode, we call the int4/int8 version of flash attention kernel (flash_fwd_kvcache).
-  // if (!parameters.is_packed_qkv) {
-  //   // Int8 flash attention kernel are able to perform on-the-fly quantization (see kEnableOnTheFlyNewKVQuantization).
-  //   // That has only slight performance benefit while make code complicated. So we still use the separate LaunchQuantAppend
-  //   // to make it consistent among int4, int8 and int8_quant cases.
-  //   if (parameters.kv_cache_bit_width == 4 || parameters.kv_cache_bit_width == 8) {
-  //     auto LaunchQuantAppend = [&](void* dst, const T* src, const T* scale, KVQuantizationType q_type) {
-  //       if (parameters.kv_cache_bit_width == 8) {
-  //         return LaunchQuantizeAppendKV<T, int8_t, T>(
-  //             stream, reinterpret_cast<int8_t*>(dst), src, scale,
-  //             data.total_seq_lens, batch_size, kv_num_heads,
-  //             parameters.seqlen_present_kv_cache, head_size, 8, sequence_length, q_type, true);
-  //       } else {
-  //         return LaunchQuantizeAppendKV<T, uint8_t, T>(
-  //             stream, reinterpret_cast<uint8_t*>(dst), src, scale,
-  //             data.total_seq_lens, batch_size, kv_num_heads,
-  //             parameters.seqlen_present_kv_cache, head_size, 4, sequence_length, q_type, true);
-  //       }
-  //     };
-  //     ORT_RETURN_IF_ERROR(LaunchQuantAppend(data.present_key, reinterpret_cast<const T*>(key), data.k_scale, parameters.k_quant_type));
-  //     ORT_RETURN_IF_ERROR(LaunchQuantAppend(data.present_value, reinterpret_cast<const T*>(value), data.v_scale, parameters.v_quant_type));
-  //   }
-  // }
+  const int64_t* position_ids = data.position_ids;
 
-  // TODO: add code to quantize float key and value (after rotary) and save to present_key and present_value here.
+  // RoPE
+  if (parameters.do_rotary) {
+    // Rotate Q
+    const T* q_src = parameters.is_packed_qkv ? reinterpret_cast<const T*>(query) : reinterpret_cast<const T*>(data.query);
+    T* q_dst = reinterpret_cast<T*>(query);
+
+    // Use position_ids if available (Format 1), else use past_seq_lens (Format 2)
+    int pos_format = (position_ids != nullptr) ? 1 : 2;
+    const int64_t* pos_ids_ptr = (position_ids != nullptr) ? position_ids : nullptr;
+    const int* past_seq_lens_ptr = (position_ids != nullptr) ? nullptr : data.past_seq_lens;
+
+    ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel(
+        stream, q_dst, q_src, pos_ids_ptr, past_seq_lens_ptr, data.cos_cache, data.sin_cache,
+        batch_size, sequence_length, num_heads, head_size, parameters.rotary_dim,
+        parameters.max_sequence_length, pos_format, parameters.rotary_interleaved, max_threads_per_block, false));
+
+    // Rotate K
+    const T* k_src = parameters.is_packed_qkv ? reinterpret_cast<const T*>(key) : reinterpret_cast<const T*>(data.key);
+    T* k_dst = reinterpret_cast<T*>(key);
+
+    ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel(
+        stream, k_dst, k_src, pos_ids_ptr, past_seq_lens_ptr, data.cos_cache, data.sin_cache,
+        batch_size, sequence_length, kv_num_heads, head_size, parameters.rotary_dim,
+        parameters.max_sequence_length, pos_format, parameters.rotary_interleaved, max_threads_per_block, false));
+
+    if constexpr (kTrackBufferUsage && !parameters.is_packed_qkv) {
+      UpdateUnpackedQkvMaxUsed(data, (q_elements + k_elements) * sizeof(T));
+    }
+  }
+
+  // Helper lambda for quantization append
+  auto LaunchQuantAppend = [&](void* dst, const T* src, const void* scale, KVQuantizationType q_type) {
+    if (parameters.kv_cache_bit_width == 8) {
+      return LaunchQuantizeAppendKV<T, int8_t, T>(
+          stream, reinterpret_cast<int8_t*>(dst), src, reinterpret_cast<const T*>(scale),
+          data.total_seq_lens, batch_size, kv_num_heads,
+          parameters.seqlen_present_kv_cache, head_size, 8, sequence_length, q_type, true, false);
+    } else {
+      return LaunchQuantizeAppendKV<T, uint8_t, T>(
+          stream, reinterpret_cast<uint8_t*>(dst), src, reinterpret_cast<const T*>(scale),
+          data.total_seq_lens, batch_size, kv_num_heads,
+          parameters.seqlen_present_kv_cache, head_size, 4, sequence_length, q_type, true, false);
+    }
+  };
+
+  if (parameters.k_quant_type != KVQuantizationType::NONE) {
+    ORT_RETURN_IF_ERROR(LaunchQuantAppend(data.present_key, reinterpret_cast<const T*>(key), data.k_scale, parameters.k_quant_type));
+  }
+  if (parameters.v_quant_type != KVQuantizationType::NONE) {
+    ORT_RETURN_IF_ERROR(LaunchQuantAppend(data.present_value, reinterpret_cast<const T*>(value), data.v_scale, parameters.v_quant_type));
+  }
 
   void* present_key = data.present_key;
   void* present_value = data.present_value;
@@ -1287,7 +1340,7 @@ Status FlashAttentionWithQuantizeKV(
   void* kernel_new_k = nullptr;
   void* kernel_new_v = nullptr;
 
-  // We've append the new tokens into present_key/value, so we pass total_seq_lens to the kernel.
+  // We've appended the new tokens into present_key/value, so we pass total_seq_lens to the kernel.
   void* seqlens_k = reinterpret_cast<void*>(data.total_seq_lens);
 
   ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd_kvcache(
@@ -1306,30 +1359,6 @@ Status FlashAttentionWithQuantizeKV(
       static_cast<int>(parameters.v_quant_type),
       parameters.kv_cache_bit_width,
       parameters.query_dynamic_quant));
-
-  // // We have already appended (and quantized if needed) the new tokens into present_key/value.
-  // // Pass nullptr for new_k/new_v to disable the kernel's internal Append_KV logic.
-  // // Pass new_k/new_v (key/value) to enable the kernel's internal Append_KV logic if quantization is needed.
-  // // We only enable this for INT8 as INT4 support is not yet added to the fused kernel.
-  // void* kernel_new_k = nullptr;
-  // void* kernel_new_v = nullptr;
-
-  // ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd_kvcache(
-  //     device_prop, stream, query, present_key, present_value,
-  //     kernel_new_k, kernel_new_v,
-  //     data.output, reinterpret_cast<void*>(data.softmax_lse), seqlens_k,
-  //     cos_cache, sin_cache, head_sink, /*block_table*/ nullptr, batch_size,
-  //     num_heads, kv_num_heads, head_size, sequence_length,
-  //     parameters.seqlen_present_kv_cache, kv_sequence_length,
-  //     parameters.rotary_dim, scale, parameters.softcap, is_causal, is_bf16,
-  //     parameters.use_smooth_softmax, past_bsnh, parameters.num_splits,
-  //     reinterpret_cast<void*>(data.softmax_lse_accum),
-  //     reinterpret_cast<void*>(data.out_accum), parameters.local_window_size - 1,
-  //     parameters.rotary_interleaved, parameters.is_packed_qkv, 0, 1, k_scale,
-  //     v_scale, static_cast<int>(parameters.k_quant_type),
-  //     static_cast<int>(parameters.v_quant_type),
-  //     parameters.kv_cache_bit_width,
-  //     parameters.query_dynamic_quant));
   return Status::OK();
 }
 #endif
@@ -1583,9 +1612,15 @@ Status QkvToContext(
   }
 
   if (data.use_flash_attention) {
-    if (parameters.is_first_prompt && (parameters.k_quant_type != KVQuantizationType::NONE || parameters.v_quant_type != KVQuantizationType::NONE)) {
-      return FlashAttentionAndQuantizeKV(device_prop, stream, parameters, data, scale);
+    if (parameters.k_quant_type != KVQuantizationType::NONE || parameters.v_quant_type != KVQuantizationType::NONE) {
+      assert(parameters.past_present_share_buffer);
+      if (parameters.is_first_prompt) {
+        return FlashAttentionAndQuantizeKV(device_prop, stream, parameters, data, scale);
+      } else {
+        return FlashAttentionWithQuantizeKV(device_prop, stream, parameters, data, scale);
+      }
     }
+
     return FlashAttention(device_prop, stream, parameters, data, scale);
   }
 #endif

@@ -505,9 +505,6 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
   parameters.past_present_share_buffer = (data.past_key == data.present_key);
 
   bool use_quantized_kv = (k_quant_type_ != KVQuantizationType::NONE) || (v_quant_type_ != KVQuantizationType::NONE);
-  // Fallback to dequantize past kv + GQA + quantize present kv for decoding paths.
-  // For the first prompt, we use the optimized FlashAttentionAndQuantizeKV path.
-  bool use_dequantize_quantize_fallback = use_quantized_kv && !parameters.is_first_prompt;
 
 #if USE_FLASH_ATTENTION
   bool use_flash_attention = !disable_flash_attention_ &&
@@ -520,10 +517,9 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
                                                                                   static_cast<int>(k_quant_type_),
                                                                                   static_cast<int>(v_quant_type_),
                                                                                   kv_cache_bit_width_);
-  if (!use_flash_attention) {
-    // We only implmented flash attention variant for quantized kv.
-    use_dequantize_quantize_fallback = true;
-  }
+  // Fallback to dequantize past kv + GQA + quantize present kv for decoding paths.
+  // For the first prompt, we use the optimized FlashAttentionAndQuantizeKV path.
+  bool use_dequantize_quantize_fallback = use_quantized_kv && use_flash_attention;
 
   data.use_flash_attention_fast_decode = use_flash_attention && !disable_flash_decode_ && !parameters.is_first_prompt && parameters.past_present_share_buffer;
   if (use_flash_attention) {
@@ -672,23 +668,6 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
     // Assuming scalar or small vector, dump first few elements
     DUMP_TENSOR("k_scale", data.k_scale, 1, 1, 1, 1);
   }
-
-  // // Dump Present Key (should contain past + new)
-  // // Note: Dimensions might need adjustment for int4 to avoid dump crash if size mismatch
-  // if (parameters.k_quant_type != KVQuantizationType::NONE) {
-  //   // Just dump raw bytes
-  //   if (parameters.kv_cache_bit_width == 4) {
-  //      ORT_RETURN_IF_ERROR((LaunchQuantizeKV<T, int8_t, T>(
-  //         stream, reinterpret_cast<int8_t*>(data.present_key), unpacked_k, data.k_scale,
-  //         data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
-  //         head_size, 8, parameters.k_quant_type, false, past_bsnh)));
-  //   } else {
-  //     ORT_RETURN_IF_ERROR((LaunchQuantizeKV<T, uint8_t, T>(
-  //         stream, reinterpret_cast<uint8_t*>(data.present_key), unpacked_k, data.k_scale,
-  //         data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
-  //         head_size, 4, parameters.k_quant_type, false, past_bsnh)));
-  //   }
-  // }
 #endif
 
   cublasHandle_t cublas = GetCublasHandle(context);
