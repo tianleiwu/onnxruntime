@@ -2,6 +2,9 @@
 // Licensed under the MIT License.
 
 #include <vector>
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include "core/providers/cuda/cuda_common.h"
 #include "core/platform/env_var_utils.h"
 #include "contrib_ops/cuda/bert/group_query_attention_impl.h"
@@ -517,14 +520,23 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
                                                                                   static_cast<int>(k_quant_type_),
                                                                                   static_cast<int>(v_quant_type_),
                                                                                   kv_cache_bit_width_);
-  // Fallback to dequantize past kv + GQA + quantize present kv for decoding paths.
-  // For the first prompt, we use the optimized FlashAttentionAndQuantizeKV path.
-  bool use_dequantize_quantize_fallback = use_quantized_kv && use_flash_attention;
+  // Fallback to dequantize past kv + GQA + quantize present kv for paths WITHOUT optimized kernels.
+  // For share_buffer=true cases, we have optimized paths:
+  //   - First prompt: FlashAttentionAndQuantizeKV
+  //   - Decoding: FlashAttentionWithQuantizeKV
+  // Fallback is only needed for non-share_buffer cases (which are rare for quantized KV).
+  bool use_dequantize_quantize_fallback = use_quantized_kv && !(use_flash_attention && parameters.past_present_share_buffer);
 
-  data.use_flash_attention_fast_decode = use_flash_attention && !disable_flash_decode_ && !parameters.is_first_prompt && parameters.past_present_share_buffer;
+  // Debug: Force fallback path via environment variable
+  const char* force_fallback_env = getenv("ORT_GQA_FORCE_FALLBACK");
+  if (force_fallback_env && atoi(force_fallback_env) > 0) {
+    use_dequantize_quantize_fallback = true;
+  }
+
+  data.use_flash_attention_fast_decode = use_flash_attention && !disable_flash_decode_ && !parameters.is_first_prompt && parameters.past_present_share_buffer && !use_quantized_kv;
   if (use_flash_attention) {
     data.use_flash_attention = true;
-    data.use_flash_attention_fast_decode = !disable_flash_decode_ && !parameters.is_first_prompt && parameters.past_present_share_buffer;
+    data.use_flash_attention_fast_decode = !disable_flash_decode_ && !parameters.is_first_prompt && parameters.past_present_share_buffer && !use_quantized_kv;
 
     // Allocate Flash specific buffers (Softmax LSE, Accum)
     size_t softmax_lse_bytes = onnxruntime::flash::get_softmax_lse_size(parameters.sequence_length, parameters.batch_size, parameters.num_heads);
@@ -570,6 +582,10 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
                                                  parameters.is_first_prompt,
                                                  cuda_stream,
                                                  device_prop.maxThreadsPerBlock));
+    // Debug: verify total_seq_lens buffer
+    int debug_total_seq_len = 0;
+    cudaMemcpy(&debug_total_seq_len, data.total_seq_lens, sizeof(int), cudaMemcpyDeviceToHost);
+    printf("[DEBUG] [GQA] After LaunchGetSequenceLengths: total_seq_lens[0]=%d, total_seq_lens_ptr=%p\\n", debug_total_seq_len, data.total_seq_lens);
   }
 
 #if USE_MEMORY_EFFICIENT_ATTENTION

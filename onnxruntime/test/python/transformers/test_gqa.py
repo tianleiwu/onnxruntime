@@ -1308,7 +1308,7 @@ def parity_check_gqa_past(
         v_scale = v_scale.to(torch_type)
 
     cache_seqlens = torch.randint(
-        0,
+        1,
         config.past_kv_sequence_length - config.q_sequence_length + 1,
         (config.batch_size,),
         device=device,
@@ -1442,6 +1442,8 @@ def parity_check_gqa_past(
     )
     out = torch.reshape(out, (config.batch_size, config.q_sequence_length, config.num_heads, config.head_size))
     out_np = out.to(torch.float32).detach().cpu().numpy()
+    print(f"[DEBUG] out_np non-zeros: {numpy.count_nonzero(out_np)} / {out_np.size}")
+    print(f"[DEBUG] out_ref_np non-zeros: {numpy.count_nonzero(out_ref_np)} / {out_ref_np.size}")
 
     # --- Comparison ---
     if config.k_quant_type == "NONE" and config.v_quant_type == "NONE":

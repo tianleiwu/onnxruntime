@@ -350,15 +350,23 @@ __global__ void QuantizeAppendKernel(T_QUANT* cache_data,
   // For safety, ensure past_len >= 0. In prompt phase, it's 0.
   if (past_len < 0) past_len = 0;
 
-  int64_t cache_offset = (int64_t)b * max_seq_len * num_heads * elements_per_head_packed +
-                         (int64_t)(past_len + s) * num_heads * elements_per_head_packed +
-                         (int64_t)n * elements_per_head_packed +
-                         h_packed;
+  int64_t cache_offset;
   if (is_output_bsnh) {
     cache_offset = (int64_t)b * max_seq_len * num_heads * elements_per_head_packed +
                    (int64_t)(past_len + s) * num_heads * elements_per_head_packed +
                    (int64_t)n * elements_per_head_packed +
                    h_packed;
+  } else {
+    cache_offset = (int64_t)b * num_heads * max_seq_len * elements_per_head_packed +
+                   (int64_t)n * max_seq_len * elements_per_head_packed +
+                   (int64_t)(past_len + s) * elements_per_head_packed +
+                   h_packed;
+  }
+
+  // Debug print for first few elements
+  if (idx == 0) {
+    printf("[QuantizeAppendKernel] batch=%d, past_len=%d, new_seq_len=%d, max_seq_len=%d, cache_offset=%lld, is_output_bsnh=%d\\n",
+           batch_size, past_len, new_seq_len, max_seq_len, (long long)cache_offset, (int)is_output_bsnh);
   }
 
   if (bit_width == 8) {

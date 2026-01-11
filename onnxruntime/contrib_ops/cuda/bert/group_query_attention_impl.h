@@ -101,11 +101,16 @@ struct GQABufferRequirements {
         } else if (params.do_rotary) {
           // Unpacked input with RoPE: need Q for rotation output.
           // K is needed if we use the optimized KV-append path (share_buffer && !first_prompt)
+          // or for quantized decoding path
           size_t bytes = elem_size * q_elements;
           if (params.past_present_share_buffer && !params.is_first_prompt) {
             bytes += elem_size * k_elements;
           }
           req.unpacked_qkv_bytes = bytes;
+        } else if (is_quantized && !params.is_first_prompt && params.past_present_share_buffer) {
+          // Unpacked + no-RoPE + quantized decoding: need Q+K buffers for FlashAttentionWithQuantizeKV
+          // Actually, if no rotary, we can use data.query and data.key directly, so no buffer needed
+          // This case is a no-op (buffer not needed)
         }
       }
       // Note: unpacked + no-RoPE case does NOT need unpacked_qkv_buffer (unless it is a quantized path)

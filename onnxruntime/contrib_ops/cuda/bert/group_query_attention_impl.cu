@@ -1207,6 +1207,7 @@ Status FlashAttentionAndQuantizeKV(
 }
 
 // Use Flash Attention with Quantized KV (for Subsequent Prompt or Decoding, need quantize k/v first then call int4/int8 version of flash attention kernel).
+template <typename T>
 Status FlashAttentionWithQuantizeKV(
     const cudaDeviceProp& device_prop,
     cudaStream_t stream,
@@ -1223,11 +1224,9 @@ Status FlashAttentionWithQuantizeKV(
   const int max_threads_per_block = device_prop.maxThreadsPerBlock;
   const int batch_size = parameters.batch_size;
   const int sequence_length = parameters.sequence_length;
-  const int kv_sequence_length = parameters.sequence_length;
   const int num_heads = parameters.num_heads;
   const int kv_num_heads = parameters.kv_num_heads;
   const int head_size = parameters.head_size;
-  AttentionQkvFormat past_kv_format = parameters.past_kv_format;
   bool is_causal = parameters.is_unidirectional;
   bool is_bf16 = std::is_same<T, BFloat16>::value;
 
@@ -1299,10 +1298,17 @@ Status FlashAttentionWithQuantizeKV(
         batch_size, sequence_length, kv_num_heads, head_size, parameters.rotary_dim,
         parameters.max_sequence_length, pos_format, parameters.rotary_interleaved, max_threads_per_block, false));
 
-    if constexpr (kTrackBufferUsage && !parameters.is_packed_qkv) {
-      UpdateUnpackedQkvMaxUsed(data, (q_elements + k_elements) * sizeof(T));
+    if constexpr (kTrackBufferUsage) {
+      if (!parameters.is_packed_qkv) {
+        UpdateUnpackedQkvMaxUsed(data, (q_elements + k_elements) * sizeof(T));
+      }
     }
   }
+
+  DEBUG_PRINTF("[FlashAttentionWithQuantizeKV] do_rotary=%d, query=%p, key=%p, value=%p, data.query=%p, data.key=%p, data.value=%p",
+               (int)parameters.do_rotary, query, key, value, (const void*)data.query, (const void*)data.key, (const void*)data.value);
+
+  bool past_bsnh = parameters.past_kv_format == AttentionQkvFormat::Q_K_V_BSNH;
 
   // Helper lambda for quantization append
   auto LaunchQuantAppend = [&](void* dst, const T* src, const void* scale, KVQuantizationType q_type) {
@@ -1310,12 +1316,12 @@ Status FlashAttentionWithQuantizeKV(
       return LaunchQuantizeAppendKV<T, int8_t, T>(
           stream, reinterpret_cast<int8_t*>(dst), src, reinterpret_cast<const T*>(scale),
           data.total_seq_lens, batch_size, kv_num_heads,
-          parameters.seqlen_present_kv_cache, head_size, 8, sequence_length, q_type, true, false);
+          parameters.seqlen_present_kv_cache, head_size, 8, sequence_length, q_type, true, past_bsnh);
     } else {
       return LaunchQuantizeAppendKV<T, uint8_t, T>(
           stream, reinterpret_cast<uint8_t*>(dst), src, reinterpret_cast<const T*>(scale),
           data.total_seq_lens, batch_size, kv_num_heads,
-          parameters.seqlen_present_kv_cache, head_size, 4, sequence_length, q_type, true, false);
+          parameters.seqlen_present_kv_cache, head_size, 4, sequence_length, q_type, true, past_bsnh);
     }
   };
 
@@ -1333,7 +1339,6 @@ Status FlashAttentionWithQuantizeKV(
   void* head_sink = reinterpret_cast<void*>(const_cast<T*>(data.head_sink));
   void* k_scale = const_cast<void*>(reinterpret_cast<const void*>(data.k_scale));
   void* v_scale = const_cast<void*>(reinterpret_cast<const void*>(data.v_scale));
-  bool past_bsnh = past_kv_format == AttentionQkvFormat::Q_K_V_BSNH;
 
   // We have already appended (and quantized if needed) the new tokens into present_key/value.
   // Pass nullptr for new_k/new_v to disable the kernel's internal Append_KV logic.
@@ -1343,18 +1348,28 @@ Status FlashAttentionWithQuantizeKV(
   // We've appended the new tokens into present_key/value, so we pass total_seq_lens to the kernel.
   void* seqlens_k = reinterpret_cast<void*>(data.total_seq_lens);
 
+  // We've already applied rotary externally, so don't let Flash Attention apply it again.
+  // Set rotary_dim=0 and pass nullptr for cos/sin to disable internal rotary.
+  int kernel_rotary_dim = 0;
+  void* kernel_cos_cache = nullptr;
+  void* kernel_sin_cache = nullptr;
+
+  DEBUG_PRINTF("[FlashAttentionWithQuantizeKV] query=%p, pk=%p, pv=%p, out=%p, seq_k=%p, batch=%d, nheads=%d, kv_nheads=%d, h_size=%d, seq_q=%d, seq_k_max=%d, seq_k_new=%d, past_bsnh=%d, rot_dim=%d, scale=%f, cap=%f, causal=%d, bf16=%d, pack=%d k_quant=%d, v_quant=%d, bit=%d",
+               query, present_key, present_value, data.output, seqlens_k, batch_size, num_heads, kv_num_heads, head_size, sequence_length, parameters.seqlen_present_kv_cache, sequence_length, (int)past_bsnh, kernel_rotary_dim, scale, parameters.softcap, (int)is_causal, (int)is_bf16, (int)parameters.is_packed_qkv, (int)parameters.k_quant_type, (int)parameters.v_quant_type, parameters.kv_cache_bit_width);
+
   ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd_kvcache(
       device_prop, stream, query, present_key, present_value,
       kernel_new_k, kernel_new_v,
       data.output, reinterpret_cast<void*>(data.softmax_lse), seqlens_k,
-      cos_cache, sin_cache, head_sink, /*block_table*/ nullptr, batch_size,
+      kernel_cos_cache, kernel_sin_cache, head_sink, /*block_table*/ nullptr, batch_size,
       num_heads, kv_num_heads, head_size, sequence_length,
-      parameters.seqlen_present_kv_cache, kv_sequence_length,
-      parameters.rotary_dim, scale, parameters.softcap, is_causal, is_bf16,
-      parameters.use_smooth_softmax, past_bsnh, parameters.num_splits,
+      parameters.seqlen_present_kv_cache, 0,
+      kernel_rotary_dim, scale, parameters.softcap, is_causal, is_bf16,
+      parameters.use_smooth_softmax, past_bsnh, 1,
       reinterpret_cast<void*>(data.softmax_lse_accum),
-      reinterpret_cast<void*>(data.out_accum), parameters.local_window_size - 1,
-      parameters.rotary_interleaved, parameters.is_packed_qkv, 0, 1, k_scale,
+      reinterpret_cast<void*>(data.out_accum),
+      parameters.local_window_size > 0 ? parameters.local_window_size - 1 : -1,
+      parameters.rotary_interleaved, false /* is_packed_qkv - we've already unpacked */, 0, 1, k_scale,
       v_scale, static_cast<int>(parameters.k_quant_type),
       static_cast<int>(parameters.v_quant_type),
       parameters.kv_cache_bit_width,
