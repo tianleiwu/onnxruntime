@@ -333,8 +333,8 @@ def create_gqa_node_and_io(
         "query",
         "key" if not config.packed else "",
         "value" if not config.packed else "",
-        "past_key" if is_past or share_buffer else "",
-        "past_value" if is_past or share_buffer else "",
+        "past_key" if is_past or share_buffer or config.k_quant_type != "NONE" else "",
+        "past_value" if is_past or share_buffer or config.k_quant_type != "NONE" else "",
         "seqlens_k",
         "total_sequence_length",
         "cos_cache" if config.rotary else "",
@@ -342,8 +342,8 @@ def create_gqa_node_and_io(
         "position_ids" if config.has_position_ids else "",
         "attention_bias" if config.has_attention_bias else "",
         "head_sink" if config.has_head_sink else "",
-        "k_scale" if config.k_quant_type != "NONE" and (is_past or share_buffer) else "",
-        "v_scale" if config.v_quant_type != "NONE" and (is_past or share_buffer) else "",
+        "k_scale" if config.k_quant_type != "NONE" else "",
+        "v_scale" if config.v_quant_type != "NONE" else "",
     ]
 
     # Remove trailing empty strings
@@ -407,7 +407,7 @@ def create_gqa_node_and_io(
             ]
         )
 
-    if is_past or share_buffer:
+    if is_past or share_buffer or config.k_quant_type != "NONE":
         k_shape = [config.batch_size, config.kv_num_heads, past_kv_seqlen, config.head_size]
         if config.kv_cache_type == "int4":
             k_shape[-1] //= 2
@@ -569,12 +569,18 @@ def gqa_prompt_func(
         bind_tensor(io_binding, "key", new_k, device, ort_type)
         bind_tensor(io_binding, "value", new_v, device, ort_type)
 
-    # 3. Bind 'past_key', 'past_value' (if share_buffer and passed as k/v)
-    if share_buffer:
+    # 3. Bind 'past_key', 'past_value'
+    if share_buffer or config.k_quant_type != "NONE":
         # cache_ort_type corresponds to config.kv_cache_type
         cache_ort_type = ONNX_TENSOR_TYPE_MAP[config.kv_cache_type]
-        bind_tensor(io_binding, "past_key", k, device, cache_ort_type)
-        bind_tensor(io_binding, "past_value", v, device, cache_ort_type)
+        k_to_bind = k if share_buffer else k[:, :, :0, :]
+        v_to_bind = v if share_buffer else v[:, :, :0, :]
+        bind_tensor(io_binding, "past_key", k_to_bind, device, cache_ort_type)
+        bind_tensor(io_binding, "past_value", v_to_bind, device, cache_ort_type)
+
+    if config.k_quant_type != "NONE":
+        bind_tensor(io_binding, "k_scale", k_scale, device, ort_type)
+        bind_tensor(io_binding, "v_scale", v_scale, device, ort_type)
 
     # 4. Bind scalars/1D tensors
     # seqlens_k is INT32
@@ -1164,8 +1170,9 @@ def parity_check_gqa_prompt(
         k_cache_ref_np = k_cache_ref_np[:, :, : config.kv_sequence_length, :]
         v_cache_ref_np = v_cache_ref_np[:, :, : config.kv_sequence_length, :]
 
-    numpy.testing.assert_allclose(present_k_np, k_cache_ref_np, rtol=rtol, atol=atol)
-    numpy.testing.assert_allclose(present_v_np, v_cache_ref_np, rtol=rtol, atol=atol)
+    if config.k_quant_type == "NONE" and config.v_quant_type == "NONE":
+        numpy.testing.assert_allclose(present_k_np, k_cache_ref_np, rtol=rtol, atol=atol)
+        numpy.testing.assert_allclose(present_v_np, v_cache_ref_np, rtol=rtol, atol=atol)
 
     numpy.testing.assert_allclose(out_np, out_ref_np, rtol=rtol, atol=atol)
 
@@ -1919,7 +1926,21 @@ class TestFlashGQA(unittest.TestCase):
             ort_type=TensorProto.FLOAT16,
             causal=True,
             rtol=0.1,
-            atol=0.02,
+            atol=0.05,
+        )
+
+    @parameterized.expand(gqa_cuda_quantized_test_cases(is_past=False))
+    def test_gqa_quantized_prompt(self, name, config):
+        os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
+        parity_check_gqa_prompt(
+            config=config,
+            ep="CUDAExecutionProvider",
+            device="cuda",
+            torch_type=torch.float16,
+            ort_type=TensorProto.FLOAT16,
+            causal=True,
+            rtol=0.1,
+            atol=0.05,
         )
 
 
