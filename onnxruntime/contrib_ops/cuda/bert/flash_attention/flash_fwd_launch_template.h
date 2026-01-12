@@ -380,11 +380,10 @@ void run_flash_int4_dequant_fwd(Flash_fwd_params& params, cudaStream_t stream) {
   BOOL_SWITCH(params.is_causal, Is_causal, [&] {
     BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
       EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
-        LOCAL_SWITCH((params.window_size_left >= 0 || params.window_size_right >= 0) && !Is_causal, Is_Local, [&] {
           SOFTCAP_SWITCH(params.softcap > 0.0, Is_softcap, [&] {
                BOOL_SWITCH(params.num_splits > 1, SplitConst, [&] {
                    BOOL_SWITCH(params.knew_ptr != nullptr, Append_KV_Const, [&] {
-                        auto kernel = &flash_fwd_int4_dequant_kernel<Kernel_traits, Is_causal, Is_Local && !Is_causal, false,
+                        auto kernel = &flash_fwd_int4_dequant_kernel<Kernel_traits, Is_causal, false, false,
                                                                  IsEvenMNConst && IsEvenKConst, IsEvenKConst, Is_softcap, SplitConst, Append_KV_Const, QUANT_TYPE>;
                         if (smem_size >= 48 * 1024) {
                           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_size));
@@ -393,7 +392,6 @@ void run_flash_int4_dequant_fwd(Flash_fwd_params& params, cudaStream_t stream) {
                    });
                });
           });
-        });
       });
     });
   });
@@ -436,19 +434,17 @@ void run_flash_int8_dequant_fwd(Flash_fwd_params& params, cudaStream_t stream) {
   BOOL_SWITCH(params.is_causal, Is_causal, [&] {
      BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
        EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
-         LOCAL_SWITCH((params.window_size_left >= 0 || params.window_size_right >= 0) && !Is_causal, Is_Local, [&] {
-           SOFTCAP_SWITCH(params.softcap > 0.0, Is_softcap, [&] {
-                BOOL_SWITCH(params.num_splits > 1, SplitConst, [&] {
-                    BOOL_SWITCH(params.knew_ptr != nullptr, Append_KV_Const, [&] {
-                         auto kernel = &flash_fwd_int8_dequant_kernel<Kernel_traits, Is_causal, Is_Local && !Is_causal, false,
-                                                                  IsEvenMNConst && IsEvenKConst, IsEvenKConst, Is_softcap, SplitConst, Append_KV_Const>;
-                         if (smem_size >= 48 * 1024) {
-                           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_size));
-                         }
-                         kernel<<<grid, Kernel_traits::kNThreads, static_cast<int>(smem_size), stream>>>(params);
-                    });
-                });
-           });
+         SOFTCAP_SWITCH(params.softcap > 0.0, Is_softcap, [&] {
+              BOOL_SWITCH(params.num_splits > 1, SplitConst, [&] {
+                  BOOL_SWITCH(params.knew_ptr != nullptr, Append_KV_Const, [&] {
+                       auto kernel = &flash_fwd_int8_dequant_kernel<Kernel_traits, Is_causal, false, false,
+                                                                IsEvenMNConst && IsEvenKConst, IsEvenKConst, Is_softcap, SplitConst, Append_KV_Const>;
+                       if (smem_size >= 48 * 1024) {
+                         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_size));
+                       }
+                       kernel<<<grid, Kernel_traits::kNThreads, static_cast<int>(smem_size), stream>>>(params);
+                  });
+              });
          });
        });
      });
