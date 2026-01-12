@@ -448,15 +448,15 @@ bool is_supported(const cudaDeviceProp& dprops, size_t head_size, size_t num_hea
   return (dprops.major >= 8) && (head_size % 8 == 0) && (head_size <= 256) && (num_heads % num_heads_k == 0);
 }
 
-bool is_supported_quantization(bool is_causal, size_t head_size, int k_quant_type, int v_quant_type, int kv_cache_bit_width) {
+bool is_supported_quantization(bool /*is_causal*/, size_t head_size, int k_quant_type, int v_quant_type, int kv_cache_bit_width) {
   if constexpr (kEnableFlashAttention4Bit) {
     return (k_quant_type == 0 && v_quant_type == 0) ||  // no quantization supported for all head sizes
-           (is_causal && head_size == 128 &&
+           (head_size == 128 &&
             ((k_quant_type == 1 && v_quant_type == 1 && kv_cache_bit_width == 8) ||
              (k_quant_type == 2 && v_quant_type == 2 && kv_cache_bit_width == 4)));
   } else {
     return (k_quant_type == 0 && v_quant_type == 0) ||  // no quantization supported for all head sizes
-           (is_causal && head_size == 128 && k_quant_type == 1 && v_quant_type == 1 && kv_cache_bit_width == 8);
+           (head_size == 128 && k_quant_type == 1 && v_quant_type == 1 && kv_cache_bit_width == 8);
   }
 }
 

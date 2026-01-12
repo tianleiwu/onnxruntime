@@ -111,23 +111,26 @@ struct Flash_dq_kernel_traits {
       SmemLayoutAtom{},
       Shape<Int<kBlockM>, Int<kHeadDim>>{}));
 
-  using SmemLayoutK = decltype(tile_to_shape(
-      SmemLayoutAtom{},
-      Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+  // Padded layout for K/V to avoid bank conflicts and ensure alignment
+  // For Int4, we store duplicated bytes, so we need kHeadDim bytes per row (same as Int8).
+  static constexpr int kSmemRowPaddingInt4 = 16;
+  static constexpr int kSmemRowStrideInt4 = kHeadDim + kSmemRowPaddingInt4;
 
-  using SmemLayoutV = SmemLayoutK;
+  using SmemLayoutKInt8 = decltype(make_layout(
+      Shape<Int<kBlockN>, Int<kHeadDim>>{},
+      Stride<Int<kSmemRowStrideInt4>, _1>{}));
 
-  // V transposed layout for P×V GEMM
-  using SmemLayoutVtransposed = decltype(composition(SmemLayoutV{}, make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
-  using SmemLayoutVtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
+  using SmemLayoutV = SmemLayoutKInt8;
 
-  // INT4 packed layout for K (INT4 pairs packed into INT8 bytes)
-  // Use swizzling to avoid bank conflicts when reading data for MMA
-  using SmemLayoutKInt8 = decltype(tile_to_shape(
-      composition(Swizzle<kSwizzle, 3, 3>{},
-                  Layout<Shape<_8, Int<kBlockKSmem>>,
-                         Stride<Int<kBlockKSmem>, _1>>{}),
-      Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+  // V transposed layout for P×V GEMM (swapped strides)
+  using SmemLayoutVtransposed = decltype(make_layout(
+      Shape<Int<kHeadDim>, Int<kBlockN>>{},
+      Stride<_1, Int<kSmemRowStrideInt4>>{}));
+
+  // Logical FP16 layout matching the physical shape (for dummy tensors)
+  using SmemLayoutK = decltype(make_layout(
+      Shape<Int<kBlockN>, Int<kHeadDim>>{},
+      Stride<Int<kSmemRowStrideInt4>, _1>{}));
 
   // Copy atoms
   using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
@@ -185,6 +188,11 @@ inline __device__ void compute_attn_1rowblock(
   using ElementInt32 = typename Kernel_traits::ElementInt32;
   using index_t = typename Kernel_traits::index_t;
 
+  const int tidx = threadIdx.x;
+  constexpr int kBlockM = Kernel_traits::kBlockM;
+  constexpr int kBlockN = Kernel_traits::kBlockN;
+  constexpr int kHeadDim = Kernel_traits::kHeadDim;
+
   // Use ElementO for output: accumulates if Split is true
   using ElementO = std::conditional_t<!Split, Element, ElementAccum>;
 
@@ -193,16 +201,21 @@ inline __device__ void compute_attn_1rowblock(
   Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)),
                           typename Kernel_traits::SmemLayoutQ{});
   // Int8/Int4 Shared Memory Buffers
-  Tensor sK = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + sizeof(Element) * size(sQ))),
+  // Note: Padding calc logic from Int8
+  constexpr int kSmemSizeQ = kBlockM * kHeadDim * sizeof(Element);
+  constexpr int kSmemSizeKInt4 = kBlockN * Kernel_traits::kSmemRowStrideInt4 * sizeof(ElementInt8);
+
+  Tensor sK = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ)),
                           typename Kernel_traits::SmemLayoutKInt8{});
-  Tensor sV = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + sizeof(Element) * size(sQ) + sizeof(ElementInt8) * size(sK))),
+  Tensor sV = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ + kSmemSizeKInt4)),
                           typename Kernel_traits::SmemLayoutV{});
 
-  const int tidx = threadIdx.x;
-
-  constexpr int kBlockM = Kernel_traits::kBlockM;
-  constexpr int kBlockN = Kernel_traits::kBlockN;
-  constexpr int kHeadDim = Kernel_traits::kHeadDim;
+  // Zero-initialize sK and sV physical memory once to prevent garbage in padding
+  const int total_kv_bytes = 2 * kBlockN * Kernel_traits::kSmemRowStrideInt4;
+  for (int i = tidx; i < total_kv_bytes; i += Kernel_traits::kNThreads) {
+    reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ)[i] = 0;
+  }
+  __syncthreads();
 
   const BlockInfo<!Is_even_MN> binfo(params, bidb);
 
@@ -257,7 +270,9 @@ inline __device__ void compute_attn_1rowblock(
   // Scale Tensors in Shared Memory
   // Place sKScale AFTER sV_int8 with PADDING to account for Swizzled Layout gaps
   // Offset = size(sQ)*2 (FP16) + size(sK)*1 + size(sK)*1 + 1024 (Padding)
-  Tensor sKScale = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + sizeof(Element) * size(sQ) + 2 * sizeof(ElementInt8) * size(sK) + 1024)),
+  // Place sKScale AFTER sV_int8 with PADDING
+  // Offset = sQ + sK + sV + Padding
+  Tensor sKScale = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ + 2 * kSmemSizeKInt4 + 1024)),
                                make_layout(Shape<Int<kHeadDim>>{}, Stride<_1>{}));
 
   // Place sVScale after sKScale
@@ -267,6 +282,13 @@ inline __device__ void compute_attn_1rowblock(
   // Define sO early (reusing Q memory) for Output Staging (FP16)
   Tensor sO = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)),
                           typename Kernel_traits::SmemLayoutO{});
+
+  // Define sP buffer (Reuse sK memory)
+  // sK size is kBlockN * 144 (approx 64 * 144 = 9216 bytes).
+  // sP needs kBlockM * kBlockN * 2 (approx 64 * 64 * 2 = 8192 bytes).
+  // Fits!
+  auto sP = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ)),
+                        make_layout(Shape<Int<kBlockM>, Int<kBlockN>>{}, Stride<Int<kBlockN>, _1>{}));
 
   // ============================================================================
   // Global Memory Indices & Offsets using BlockInfo
@@ -360,8 +382,9 @@ inline __device__ void compute_attn_1rowblock(
   Tensor tSrQ = thr_mma.partition_fragment_A(sQ);
 
   // Register fragments for K and V (FP16 structure for MMA)
-  Tensor sK_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + sizeof(Element) * size(sQ))),
-                                typename Kernel_traits::SmemLayoutK{});
+  // Register fragments for K and V (FP16 structure for MMA)
+  auto sK_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ)),
+                              typename Kernel_traits::SmemLayoutK{});
   Tensor tSrK = thr_mma.partition_fragment_B(sK_dummy);
 
   // Scale Partitioning (Broadcast along N)
@@ -372,9 +395,10 @@ inline __device__ void compute_attn_1rowblock(
   auto tSrKScale = thr_mma.partition_fragment_B(sKScale_broadcast);
 
   // For V, P@V. V matches K layout in structure (BlockN, HeadDim) via sV.
-  Tensor sV_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + sizeof(Element) * (size(sQ) + size(sK)))),
-                                typename Kernel_traits::SmemLayoutV{});
-  Tensor tOrVt = thr_mma.partition_fragment_B(sV_dummy);
+  // For V, P@V. V matches K layout in structure (BlockN, HeadDim) via sV.
+  auto sV_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ + kSmemSizeKInt4)),
+                              make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}));
+  auto tOrVt = thr_mma.partition_fragment_B(sV_dummy);
 
   // We also partition V-Scale using same pattern
   auto tSrVScale = thr_mma.partition_fragment_B(sVScale_broadcast);
@@ -422,8 +446,18 @@ inline __device__ void compute_attn_1rowblock(
   Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
 
   // K/V Int8 Copier
-  Tensor tSsK = smem_thr_copy_KInt8.partition_S(sK);
-  Tensor tSsV = smem_thr_copy_KInt8.partition_S(sV);
+  // We use the physical Int8 layout so that partitioning correctly accounts for padding.
+  auto sK_quant = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutKInt8{});
+  // Partition the physical Smem tensor for loading into registers
+  // Explicitly match logical shape (HeadDim, BlockN) for B-operand logic if needed?
+  // No, K is (BlockN, HeadDim).
+  auto tSsK = smem_thr_copy_KInt8.partition_S(sK_quant);
+
+  // V physical for partitioning (must be transposed shape (HeadDim, BlockN) for B operand)
+  // Use explicitly transposed layout
+  auto sV_quant_t = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
+  // Partition the physical Smem tensor for loading into registers
+  auto tSsV = smem_thr_copy_KInt8.partition_S(sV_quant_t);
 
   // ============================================================================
   // Main Attention Loop
@@ -514,14 +548,47 @@ inline __device__ void compute_attn_1rowblock(
       softmax.template softmax_rescale_o</*Is_first=*/false>(acc_s, acc_o, params.scale_softmax_log2);
     }
 
-    // 3. P @ V (Gemm Quant)
-    Tensor rP = flash::convert_type<Element>(acc_s);
-    Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma_PV>(rP.layout()));
+    // 3. P @ V (Using sP shared memory to avoid register layout issues)
+    // Convert acc_s (Float) to sP (Half/Element)
+    // Map acc_s fragments to sP indices
+    // Each thread in quad handles 2 rows and 2*MMA_N columns
+    auto acc_s_rowcol = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+    const int lane_id = tidx % 32;
+    const int warp_id = tidx / 32;
+
+#pragma unroll
+    for (int mi = 0; mi < size<0, 1>(acc_s_rowcol); ++mi) {
+      int r_base = warp_id * 16 + mi * 0 + (lane_id / 4);  // warp covers 16 rows, MMA_M=1
+#pragma unroll
+      for (int i = 0; i < size<0, 0>(acc_s_rowcol); ++i) {
+        int r = r_base + i * 8;
+#pragma unroll
+        for (int nj = 0; nj < size<1, 1>(acc_s_rowcol); ++nj) {
+          int c_base = (lane_id % 4) * 2 + nj * 8;
+#pragma unroll
+          for (int j = 0; j < size<1, 0>(acc_s_rowcol); ++j) {
+            int c = c_base + j;
+            if (r < kBlockM && c < kBlockN) {
+              sP(r, c) = static_cast<Element>(acc_s_rowcol(make_coord(i, mi), make_coord(j, nj)));
+            }
+          }
+        }
+      }
+    }
+    __syncthreads();
+
+    // Reload P from Smem as operand A for PV GEMM
+    auto smem_tiled_copy_P = make_tiled_copy_A(Copy_Atom<DefaultCopy, Element>{}, tiled_mma);
+    auto smem_thr_copy_P = smem_tiled_copy_P.get_thread_slice(tidx);
+    auto tOrP = tiled_mma.get_thread_slice(tidx).partition_fragment_A(sP);
+    auto tSrP = smem_thr_copy_P.retile_D(tOrP);
+    auto tSsP = smem_thr_copy_P.partition_S(sP);
+    cute::copy(smem_tiled_copy_P, tSsP, tSrP);
 
     if constexpr (QUANT_TYPE == 2) {
-      flash::gemm_quant_manual<true>(acc_o, tOrP, tOrVt, tSsV, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, tSrVScale);
+      flash::gemm_quant_manual<true>(acc_o, tSrP, tOrVt, tSsV, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, tSrVScale);
     } else {
-      flash::gemm_quant_manual<true>(acc_o, tOrP, tOrVt, tSsV, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, v_scale);
+      flash::gemm_quant_manual<true>(acc_o, tSrP, tOrVt, tSsV, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, v_scale);
     }
 
     __syncthreads();

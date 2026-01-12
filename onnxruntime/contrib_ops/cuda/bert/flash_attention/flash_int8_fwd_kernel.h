@@ -101,6 +101,8 @@ struct Flash_dq_kernel_traits {
       Layout<Shape<Int<kNWarps>, _1, _1>>,
       Tile<Int<16 * kNWarps>, _8, _16>>;  // N=8 matches MMA Atom N dimension
 
+  static constexpr int kNThreadsPerRow = 4;  // Each row of 16x8x16 atom is handled by 4 threads (for N=8 tile)
+
   // Shared memory layouts
   using SmemLayoutAtom = decltype(composition(Swizzle<kSwizzle, 3, 3>{},
                                               Layout<Shape<_8, Int<kBlockKSmem>>,
@@ -135,10 +137,16 @@ struct Flash_dq_kernel_traits {
       Shape<Int<kBlockN>, Int<kHeadDim>>{},
       Stride<Int<kSmemRowStrideInt8>, _1>{}));  // Padded row-major, 16-byte aligned rows
 
+  // V transposed layout for P×V GEMM
+  using SmemLayoutVInt8transposed = decltype(make_layout(
+      Shape<Int<kHeadDim>, Int<kBlockN>>{},
+      Stride<_1, Int<kSmemRowStrideInt8>>{}));
+
   // Copy atoms
   using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
   using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;  // For V transposition
   using SmemCopyAtomInt8 = Copy_Atom<SM75_U32x4_LDSM_N, ElementInt8>;
+  using SmemCopyAtomInt8Default = Copy_Atom<cute::DefaultCopy, ElementInt8>;
 
   static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
   static constexpr int kGmemThreadsPerRow = kBlockKSmem / kGmemElemsPerLoad;
@@ -168,7 +176,11 @@ struct Flash_dq_kernel_traits {
 
   using GmemTiledCopyO = decltype(make_tiled_copy(Copy_Atom<DefaultCopy, cute::uint128_t>{},
                                                   GmemLayoutAtom{},
-                                                  Layout<Shape<_1, _8>>{}));
+                                                  Layout<Shape<_1, _8>>{}));  // For Half
+
+  using GmemTiledCopyOaccum = decltype(make_tiled_copy(Copy_Atom<DefaultCopy, cute::uint128_t>{},
+                                                       GmemLayoutAtom{},
+                                                       Layout<Shape<_1, _4>>{}));  // For Float
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -262,14 +274,17 @@ inline __device__ void compute_attn_1rowblock(
   if (n_block_min >= n_block_max) {
     // We exit early and write 0 to gOaccum and -inf to gLSEaccum (if Split).
     if constexpr (Split) {
-      const index_t row_offset_oaccum = (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM) * params.d_rounded;
-      const index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
+      const index_t row_offset_oaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q * params.d_rounded;
+      const index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q;
 
-      Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO*>(params.oaccum_ptr) + row_offset_oaccum),
-                                   Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                                   make_stride(kHeadDim, _1{}));  // Stride is kHeadDim for accum buffer
-      Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.softmax_lseaccum_ptr) + row_offset_lseaccum),
-                                     Shape<Int<kBlockM>>{}, Stride<_1>{});
+      Tensor gOaccum_base = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO*>(params.oaccum_ptr) + row_offset_oaccum),
+                                        make_shape(params.seqlen_q, Int<kHeadDim>{}),
+                                        make_stride(kHeadDim, _1{}));
+      Tensor gOaccum = local_tile(gOaccum_base, Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
+
+      Tensor gLSEaccum_base = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.softmax_lseaccum_ptr) + row_offset_lseaccum),
+                                          make_shape(params.seqlen_q), Stride<_1>{});
+      Tensor gLSEaccum = local_tile(gLSEaccum_base, Shape<Int<kBlockM>>{}, make_coord(m_block));
 
       // Use GmemTiledCopyOaccum if available, otherwise reuse GmemTiledCopyO but adapt for ElementO type?
       // Actually, we can just use simple writes since this is initialization.
@@ -320,27 +335,48 @@ inline __device__ void compute_attn_1rowblock(
   Tensor sV = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ + kSmemSizeKInt8)),
                           typename Kernel_traits::SmemLayoutKInt8{});
 
-  // Define sO early (reusing Q memory) for Output Staging (FP16)
-  Tensor sO = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)),
+  // Zero-initialize sK and sV physical memory once to prevent garbage in padding
+  // (16-byte padding per row is used for 128-bit aligned cp.async and bank conflict avoidance)
+  const int total_kv_bytes = 2 * kBlockN * Kernel_traits::kSmemRowStrideInt8;
+  for (int i = tidx; i < total_kv_bytes; i += Kernel_traits::kNThreads) {
+    reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ)[i] = 0;
+  }
+  __syncthreads();
+
+  // Output Smem Layout (Row-Major for Vectorized Global Copy)
+  Tensor sO = make_tensor(make_smem_ptr(reinterpret_cast<ElementO*>(smem_)),
                           typename Kernel_traits::SmemLayoutO{});
 
   // Compute KV head index (for GQA)
   const int kv_head_idx = bidh / params.h_h_k_ratio;
 
   // Get scales
-  // For PER_TENSOR (1): use index 0. For PER_CHANNEL (2): use kv_head_idx.
+  // For PER_TENSOR (1): use index 0. For PER_CHANNEL (2): use head scale.
+  // Note: GQA typically uses one scale per KV head.
   const int scale_idx = (params.k_quant_type == 2) ? kv_head_idx : 0;
   const float k_scale = params.k_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.k_scale_ptr)[scale_idx]) : 1.0f;
   const float v_scale = params.v_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.v_scale_ptr)[scale_idx]) : 1.0f;
 
-  // ============================================================================
   // Global Memory Tensors
-  // ============================================================================
   Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<const Element*>(params.q_ptr) +
                                         binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
                           make_shape(binfo.actual_seqlen_q, params.h, params.d),
                           make_stride(params.q_row_stride, params.q_head_stride, _1{}));
   Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
+
+  // O and LSE accumulators
+  const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb);
+  const index_t row_offset_oaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q * params.d_rounded;
+  const index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q;
+
+  Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO*>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
+                          make_shape(binfo.actual_seqlen_q, Split ? Int<1>{} : params.h, params.d),
+                          make_stride(Split ? Int<kHeadDim>{} : params.o_row_stride, Split ? Int<0>{} : params.o_head_stride, _1{}));
+  Tensor gO = local_tile(mO(_, Split ? _0{} : bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
+
+  Tensor gLSEaccum_base = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + row_offset_lseaccum),
+                                      make_shape(binfo.actual_seqlen_q), Stride<_1>{});
+  Tensor gLSEaccum = local_tile(gLSEaccum_base, Shape<Int<kBlockM>>{}, make_coord(m_block));
 
   // K is INT8 in global memory
   const index_t k_base_offset = binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb) +
@@ -355,15 +391,6 @@ inline __device__ void compute_attn_1rowblock(
   Tensor mV_int8 = make_tensor(make_gmem_ptr(reinterpret_cast<const ElementInt8*>(params.v_ptr) + v_base_offset),
                                make_shape(binfo.actual_seqlen_k, params.d),
                                make_stride(params.v_row_stride, _1{}));
-
-  // Output Tensors (Split or Standard)
-  Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO*>(Split ? params.oaccum_ptr : params.o_ptr) +
-                                        (Split
-                                             ? (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM) * params.d_rounded
-                                             : binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb))),
-                          make_shape(binfo.actual_seqlen_q, params.h, params.d),
-                          make_stride(Split ? kHeadDim : params.o_row_stride, Split ? _0{} : params.o_head_stride, _1{}));
-  Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
 
   // ============================================================================
   // Copy Setup
@@ -398,29 +425,40 @@ inline __device__ void compute_attn_1rowblock(
 
   // Register fragments for K and V (FP16 structure for MMA)
   // tSrK must match the logical B-operand shape for QDQ: (HeadDim, BlockN) i.e. K^T
-  // We use dummy layout matching SmemLayoutK (BlockN, HeadDim) which is what TN MMA expects for B (K^T)
-  Tensor sK_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + sizeof(Element) * size(sQ))),
-                                typename Kernel_traits::SmemLayoutK{});
-  Tensor tSrK = thr_mma.partition_fragment_B(sK_dummy);
+  // We use dummy layout matching SmemLayoutK (BlockN, HeadDim) but pointing to the REAL data.
+  auto sK_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ)),
+                              typename Kernel_traits::SmemLayoutK{});
+  auto tSrK = thr_mma.partition_fragment_B(sK_dummy);
 
   // Smem-to-Register copy for Int8 K/V data:
   // - We use DefaultCopy (scalar/vector) instead of LDSM (SM75_U32x4_LDSM_N)
   // - LDSM loads 4 elements per instruction, but FP16 MMA B-fragment expects different sizing
   // - DefaultCopy is more flexible and handles the Int8->FP16 layout mapping correctly
   // - The data is dequantized in registers after loading (in gemm_quant_manual)
-  using SmemCopyAtomInt8Default = Copy_Atom<DefaultCopy, typename Kernel_traits::ElementInt8>;
+  using SmemCopyAtomInt8Default = typename Kernel_traits::SmemCopyAtomInt8Default;
   auto smem_tiled_copy_KInt8 = make_tiled_copy_B(SmemCopyAtomInt8Default{}, tiled_mma);
   auto smem_thr_copy_KInt8 = smem_tiled_copy_KInt8.get_thread_slice(tidx);
 
-  Tensor sV_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + sizeof(Element) * (size(sQ) + size(sK)))),
-                                typename Kernel_traits::SmemLayoutV{});
-  Tensor tOrVt = thr_mma.partition_fragment_B(sV_dummy);
+  // We use the physical Int8 layout so that partitioning correctly accounts for padding.
+  auto sK_quant = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutKInt8{});
+  // Partition the physical Smem tensor for loading into registers
+  auto tSsK = smem_thr_copy_KInt8.partition_S(make_tensor(sK_quant.data(), make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, Stride<_1, Int<Kernel_traits::kSmemRowStrideInt8>>{})));
 
-  Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
+  // V dummy for partitioning (must be transposed shape (HeadDim, BlockN) for B operand)
+  auto sV_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ + kSmemSizeKInt8)),
+                              make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}));
+  auto tOrVt = thr_mma.partition_fragment_B(sV_dummy);
+
+  // V physical for partitioning (must be transposed shape (HeadDim, BlockN) for B operand)
+  auto sV_quant_t = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVInt8transposed{});
+  // Partition the physical Smem tensor for loading into registers
+  auto tSsV = smem_thr_copy_KInt8.partition_S(sV_quant_t);
+
+  auto acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
   clear(acc_o);
 
   constexpr int kNRows = 2 * decltype(size<1>(acc_o))::value;
-  flash::Softmax<kNRows> softmax;
+  flash::Softmax<kNRows, Kernel_traits::kNThreadsPerRow> softmax;
 
   // ============================================================================
   // Load Q
@@ -440,12 +478,6 @@ inline __device__ void compute_attn_1rowblock(
 
   // K/V Int8 Copier
   // Note: we redefined smem_tiled_copy_KInt8 above using DefaultCopy
-  Tensor tSsK = smem_thr_copy_KInt8.partition_S(sK);
-  // We use direct tSsK (no transpose) because TN MMA expects B in (N, K) layout which is what sK provides.
-  // Tensor sK_transposed_view = make_tensor(sK.data(), make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, Stride<_1, Int<kHeadDim>>{}));
-  // Tensor tSsK_transposed = smem_thr_copy_KInt8.partition_S(sK_transposed_view);
-
-  Tensor tSsV = smem_thr_copy_KInt8.partition_S(sV);  // sV (64, 128) is fine for P@V?
   // For P@V: P(64, 128) @ V(128, 64)? No.
   // P is (BlockM, BlockN) (64, 64)? No.
   // P comes from acc_s.
@@ -504,14 +536,14 @@ inline __device__ void compute_attn_1rowblock(
         Element* vnew_base_ptr = reinterpret_cast<Element*>(params.vnew_ptr) + v_batch_head_offset;
 
         // [Scale Pointers]
-        const float* k_scale_base = reinterpret_cast<const float*>(params.k_scale_ptr);
-        const float* v_scale_base = reinterpret_cast<const float*>(params.v_scale_ptr);
+        const Element* k_scale_base = reinterpret_cast<const Element*>(params.k_scale_ptr);
+        const Element* v_scale_base = reinterpret_cast<const Element*>(params.v_scale_ptr);
 
         // Optimize scale access: if per-tensor, load once.
         float k_scale_val = 1.0f;
         float v_scale_val = 1.0f;
-        if (params.k_quant_type != 2 && params.k_scale_ptr) k_scale_val = k_scale_base[0];
-        if (params.v_quant_type != 2 && params.v_scale_ptr) v_scale_val = v_scale_base[0];
+        if (params.k_quant_type != 2 && params.k_scale_ptr) k_scale_val = static_cast<float>(k_scale_base[0]);
+        if (params.v_quant_type != 2 && params.v_scale_ptr) v_scale_val = static_cast<float>(v_scale_base[0]);
 
         // K Load + Quantize
         Tensor tKsK_dst = gmem_thr_copy_KInt8.partition_D(sK);
@@ -533,7 +565,7 @@ inline __device__ void compute_attn_1rowblock(
 
             float scale = k_scale_val;
             if (params.k_quant_type == 2) {  // Per-channel
-              scale = k_scale_base[bidh_kv * kHeadDim + h_idx];
+              scale = static_cast<float>(k_scale_base[bidh_kv * kHeadDim + h_idx]);
             }
 
             // Quantize: INT8 = FP16 * DivScale (or FP16 / Scale).
@@ -574,7 +606,7 @@ inline __device__ void compute_attn_1rowblock(
 
             float scale = v_scale_val;
             if (params.v_quant_type == 2) {  // Per-channel
-              scale = v_scale_base[bidh_kv * kHeadDim + h_idx];
+              scale = static_cast<float>(v_scale_base[bidh_kv * kHeadDim + h_idx]);
             }
 
             val_int8 = static_cast<int8_t>(static_cast<float>(val_fp16) / scale);
@@ -607,6 +639,9 @@ inline __device__ void compute_attn_1rowblock(
     // - Int8 K data is loaded into registers, dequantized to FP16, then used in MMA
     // - k_scale converts Int8 values back to original FP16 range
     flash::gemm_quant_manual<false>(acc_s, tSrQ, tSrK, tSsK, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, k_scale);
+    if (bidb == 0 && bidh == 0 && tidx == 0 && n_block == 0) {
+      printf("DEBUG: bidb=0 bidh=0 n_block=0 k_scale=%f v_scale=%f acc_s(0,0)=%f\n", k_scale, v_scale, (float)acc_s(0));
+    }
 
     // Masking
     constexpr int kNWarps = Kernel_traits::kNWarps;
@@ -632,15 +667,49 @@ inline __device__ void compute_attn_1rowblock(
       softmax.template softmax_rescale_o</*Is_first=*/false>(acc_s, acc_o, params.scale_softmax_log2);
     }
 
-    // 3. P @ V (Gemm Quant)
-    Tensor rP = flash::convert_type<Element>(acc_s);
-    Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma_PV>(rP.layout()));
+    // 3. P @ V (Using sP shared memory to avoid register layout issues)
+    // - Reuse sK memory for sP (attention probabilities)
+    // - sK is (BlockN, HeadDim) = (64, 128) -> plenty of space for sP (64, 64)
+    auto sP = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ)),
+                          make_layout(Shape<Int<kBlockM>, Int<kBlockN>>{}, Stride<Int<kBlockN>, _1>{}));
+
+    // Convert acc_s (Float) to sP (Half/Element)
+    auto acc_s_rowcol = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+    const int lane_id = tidx % 32;
+    const int warp_id = tidx / 32;
+    // Map acc_s fragments to sP indices
+    // Each thread in quad handles 2 rows and 2*MMA_N columns
+#pragma unroll
+    for (int mi = 0; mi < size<0, 1>(acc_s_rowcol); ++mi) {
+      int r_base = warp_id * 16 + mi * 0 + (lane_id / 4);  // warp covers 16 rows, MMA_M=1
+#pragma unroll
+      for (int i = 0; i < size<0, 0>(acc_s_rowcol); ++i) {
+        int r = r_base + i * 8;
+#pragma unroll
+        for (int nj = 0; nj < size<1, 1>(acc_s_rowcol); ++nj) {
+          int c_base = (lane_id % 4) * 2 + nj * 8;
+#pragma unroll
+          for (int j = 0; j < size<1, 0>(acc_s_rowcol); ++j) {
+            int c = c_base + j;
+            if (r < kBlockM && c < kBlockN) {
+              sP(r, c) = static_cast<Element>(acc_s_rowcol(make_coord(i, mi), make_coord(j, nj)));
+            }
+          }
+        }
+      }
+    }
+    __syncthreads();
+
+    // Reload P from Smem as operand A for PV GEMM
+    auto smem_tiled_copy_P = make_tiled_copy_A(Copy_Atom<DefaultCopy, Element>{}, tiled_mma);
+    auto smem_thr_copy_P = smem_tiled_copy_P.get_thread_slice(tidx);
+    auto tOrP = tiled_mma.get_thread_slice(tidx).partition_fragment_A(sP);
+    auto tSrP = smem_thr_copy_P.retile_D(tOrP);
+    auto tSsP = smem_thr_copy_P.partition_S(sP);
+    cute::copy(smem_tiled_copy_P, tSsP, tSrP);
 
     // P @ V using gemm_quant_manual:
-    // - P (softmax output) is already FP16, V is Int8 in shared memory
-    // - Int8 V data is dequantized to FP16 in registers during the GEMM
-    // - v_scale converts Int8 values back to original FP16 range
-    flash::gemm_quant_manual<false>(acc_o, tOrP, tOrVt, tSsV, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, v_scale);
+    flash::gemm_quant_manual<false>(acc_o, tSrP, tOrVt, tSsV, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, v_scale);
 
     __syncthreads();
   }  // End n_block loop
@@ -656,9 +725,9 @@ inline __device__ void compute_attn_1rowblock(
   Tensor lse = softmax.template normalize_softmax_lse<Split>(acc_o, params.scale_softmax, sink);
 
   // Store Reg -> Smem (use same approach as old kernel with retile_S)
-  Tensor rO = flash::convert_type<Element>(acc_o);
+  Tensor rO = flash::convert_type<ElementO>(acc_o);
 
-  using SmemCopyAtomO = Copy_Atom<DefaultCopy, Element>;
+  using SmemCopyAtomO = Copy_Atom<DefaultCopy, ElementO>;
   auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
   auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
   Tensor taccOrO = smem_thr_copy_O.retile_S(rO);   // ((Atom,AtomNum), MMA_M, MMA_N)
@@ -669,7 +738,8 @@ inline __device__ void compute_attn_1rowblock(
 
   // Copy Smem -> Global
   if constexpr (!Split) {
-    typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
+    using GmemTiledCopyO = typename Kernel_traits::GmemTiledCopyO;
+    GmemTiledCopyO gmem_tiled_copy_O;
     auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
     Tensor tOsO = gmem_thr_copy_O.partition_S(sO);
     Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
@@ -715,10 +785,6 @@ inline __device__ void compute_attn_1rowblock(
     // Local row index within the block (0..kBlockM-1)
     const int local_row_0 = warp * 16 + (lane / 4);
     const int local_row_1 = local_row_0 + 8;
-
-    const index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
-    Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.softmax_lseaccum_ptr) + row_offset_lseaccum),
-                                   Shape<Int<kBlockM>>{}, Stride<_1>{});
 
     // Only the first thread in the quad (Col 0) writes LSE
     if ((lane % 4) == 0) {

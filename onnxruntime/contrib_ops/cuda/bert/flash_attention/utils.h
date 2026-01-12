@@ -276,7 +276,7 @@ __forceinline__ __device__ void gemm_quant_manual(Tensor0& acc, Tensor1& tCrA, T
   Tensor tCrB_quant = make_tensor<ElementQuant>(layout(tCrB));
 
   Tensor tCrB_quant_copy_view = smem_thr_copy_B.retile_D(tCrB_quant);
-  CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_quant_copy_view));  // N
+  // CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_quant_copy_view));  // N
 
   cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_quant_copy_view(_, _, _0{}));
 

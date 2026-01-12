@@ -1303,9 +1303,10 @@ def parity_check_gqa_past(
     if v_scale is not None:
         v_scale = v_scale.to(torch_type)
 
+    # past cache sequence length is in [1, past_kv_sequence_length]
     cache_seqlens = torch.randint(
-        0,
-        config.past_kv_sequence_length - config.q_sequence_length + 1,
+        1,
+        config.past_kv_sequence_length + 1,
         (config.batch_size,),
         device=device,
         dtype=torch.long,
@@ -1381,8 +1382,32 @@ def parity_check_gqa_past(
     update_mask = torch.logical_and(
         cache_seqlens_expanded <= arange, arange < cache_seqlens_expanded + config.q_sequence_length
     )
-    k_cache_ref[update_mask] = rearrange(k_ro, "b s ... -> (b s) ...").to(k_cache_ref.dtype)
-    v_cache_ref[update_mask] = rearrange(new_v, "b s ... -> (b s) ...").to(v_cache_ref.dtype)
+
+    k_to_cache = k_ro
+    v_to_cache = new_v
+    if config.kv_cache_type != "none":
+        k_scale_bsnh = k_scale
+        v_scale_bsnh = v_scale
+        if config.k_quant_type == "PER_CHANNEL" and k_scale is not None:
+            k_scale_bsnh = k_scale.transpose(1, 2)  # (1, H, 1, D) -> (1, 1, H, D)
+        if config.v_quant_type == "PER_CHANNEL" and v_scale is not None:
+            v_scale_bsnh = v_scale.transpose(1, 2)  # (1, H, 1, D) -> (1, 1, H, D)
+
+        k_to_cache = dequantize_tensor(
+            quantize_tensor_with_scale(k_ro, k_scale_bsnh, config.k_quant_type, config.kv_cache_type),
+            k_scale_bsnh,
+            config.k_quant_type,
+            config.kv_cache_type,
+        ).to(torch_type)
+        v_to_cache = dequantize_tensor(
+            quantize_tensor_with_scale(new_v, v_scale_bsnh, config.v_quant_type, config.kv_cache_type),
+            v_scale_bsnh,
+            config.v_quant_type,
+            config.kv_cache_type,
+        ).to(torch_type)
+
+    k_cache_ref[update_mask] = rearrange(k_to_cache, "b s ... -> (b s) ...").to(k_cache_ref.dtype)
+    v_cache_ref[update_mask] = rearrange(v_to_cache, "b s ... -> (b s) ...").to(v_cache_ref.dtype)
     key_padding_mask = arange < cache_seqlens_expanded + config.q_sequence_length
 
     out_ref, _ = attention_ref(
@@ -1909,9 +1934,7 @@ def gqa_cuda_past_test_cases(allow_head_sink: bool = True, allow_local: bool = T
 
 
 def gqa_cuda_quantized_test_cases(is_past: bool):
-    base_cases = (
-        gqa_cuda_past_test_cases(allow_local=False) if is_past else gqa_cuda_prompt_test_cases(allow_local=False)
-    )
+    base_cases = gqa_cuda_past_test_cases(allow_local=True) if is_past else gqa_cuda_prompt_test_cases(allow_local=True)
     for name, config in base_cases:
         for kv_type in ["int8", "int4"]:
             for quant_mode in ["PER_TENSOR", "PER_CHANNEL"]:
