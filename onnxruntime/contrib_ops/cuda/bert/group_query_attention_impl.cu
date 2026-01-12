@@ -1158,10 +1158,7 @@ Status FlashAttentionAndQuantizeKV(
   bool is_causal = parameters.is_unidirectional;
   bool is_bf16 = std::is_same<T, BFloat16>::value;
 
-  int local_window_size = parameters.local_window_size;
-  if (local_window_size > 0) {
-    local_window_size -= 1;  // Flash Attention expects (window_left - 1) for causal masking
-  }
+  int local_window_size = parameters.local_window_size > 0 ? parameters.local_window_size - 1 : -1;
 
   ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd(
       device_prop, stream, unpacked_q, unpacked_k, unpacked_v, data.output,
@@ -1305,9 +1302,6 @@ Status FlashAttentionWithQuantizeKV(
     }
   }
 
-  DEBUG_PRINTF("[FlashAttentionWithQuantizeKV] do_rotary=%d, query=%p, key=%p, value=%p, data.query=%p, data.key=%p, data.value=%p",
-               (int)parameters.do_rotary, query, key, value, (const void*)data.query, (const void*)data.key, (const void*)data.value);
-
   bool past_bsnh = parameters.past_kv_format == AttentionQkvFormat::Q_K_V_BSNH;
 
   // Helper lambda for quantization append
@@ -1354,8 +1348,7 @@ Status FlashAttentionWithQuantizeKV(
   void* kernel_cos_cache = nullptr;
   void* kernel_sin_cache = nullptr;
 
-  DEBUG_PRINTF("[FlashAttentionWithQuantizeKV] query=%p, pk=%p, pv=%p, out=%p, seq_k=%p, batch=%d, nheads=%d, kv_nheads=%d, h_size=%d, seq_q=%d, seq_k_max=%d, seq_k_new=%d, past_bsnh=%d, rot_dim=%d, scale=%f, cap=%f, causal=%d, bf16=%d, pack=%d k_quant=%d, v_quant=%d, bit=%d",
-               query, present_key, present_value, data.output, seqlens_k, batch_size, num_heads, kv_num_heads, head_size, sequence_length, parameters.seqlen_present_kv_cache, sequence_length, (int)past_bsnh, kernel_rotary_dim, scale, parameters.softcap, (int)is_causal, (int)is_bf16, (int)parameters.is_packed_qkv, (int)parameters.k_quant_type, (int)parameters.v_quant_type, parameters.kv_cache_bit_width);
+  int local_window_size = parameters.local_window_size > 0 ? parameters.local_window_size - 1 : -1;
 
   ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd_kvcache(
       device_prop, stream, query, present_key, present_value,
@@ -1365,10 +1358,10 @@ Status FlashAttentionWithQuantizeKV(
       num_heads, kv_num_heads, head_size, sequence_length,
       parameters.seqlen_present_kv_cache, 0,
       kernel_rotary_dim, scale, parameters.softcap, is_causal, is_bf16,
-      parameters.use_smooth_softmax, past_bsnh, 1,
+      parameters.use_smooth_softmax, past_bsnh, parameters.num_splits,
       reinterpret_cast<void*>(data.softmax_lse_accum),
       reinterpret_cast<void*>(data.out_accum),
-      parameters.local_window_size > 0 ? parameters.local_window_size - 1 : -1,
+      local_window_size,
       parameters.rotary_interleaved, false /* is_packed_qkv - we've already unpacked */, 0, 1, k_scale,
       v_scale, static_cast<int>(parameters.k_quant_type),
       static_cast<int>(parameters.v_quant_type),

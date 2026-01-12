@@ -363,12 +363,6 @@ __global__ void QuantizeAppendKernel(T_QUANT* cache_data,
                    h_packed;
   }
 
-  // Debug print for first few elements
-  if (idx == 0) {
-    printf("[QuantizeAppendKernel] batch=%d, past_len=%d, new_seq_len=%d, max_seq_len=%d, cache_offset=%lld, is_output_bsnh=%d\\n",
-           batch_size, past_len, new_seq_len, max_seq_len, (long long)cache_offset, (int)is_output_bsnh);
-  }
-
   if (bit_width == 8) {
     int h = h_packed;
     int64_t src_idx = is_input_bsnh ? ((int64_t)b * new_seq_len * num_heads * head_size +

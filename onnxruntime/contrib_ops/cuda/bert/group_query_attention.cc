@@ -520,10 +520,11 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
                                                                                   static_cast<int>(k_quant_type_),
                                                                                   static_cast<int>(v_quant_type_),
                                                                                   kv_cache_bit_width_);
+
   // Fallback to dequantize past kv + GQA + quantize present kv for paths WITHOUT optimized kernels.
   // For share_buffer=true cases, we have optimized paths:
   //   - First prompt: FlashAttentionAndQuantizeKV
-  //   - Decoding: FlashAttentionWithQuantizeKV
+  //   - Decoding: FlashAttentionWithQuantizeKV (Only supports Rotary cases currently)
   // Fallback is only needed for non-share_buffer cases (which are rare for quantized KV).
   bool use_dequantize_quantize_fallback = use_quantized_kv && !(use_flash_attention && parameters.past_present_share_buffer);
 
@@ -533,11 +534,10 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
     use_dequantize_quantize_fallback = true;
   }
 
+  data.use_flash_attention = use_flash_attention;
   data.use_flash_attention_fast_decode = use_flash_attention && !disable_flash_decode_ && !parameters.is_first_prompt && parameters.past_present_share_buffer && !use_quantized_kv;
-  if (use_flash_attention) {
-    data.use_flash_attention = true;
-    data.use_flash_attention_fast_decode = !disable_flash_decode_ && !parameters.is_first_prompt && parameters.past_present_share_buffer && !use_quantized_kv;
 
+  if (use_flash_attention) {
     // Allocate Flash specific buffers (Softmax LSE, Accum)
     size_t softmax_lse_bytes = onnxruntime::flash::get_softmax_lse_size(parameters.sequence_length, parameters.batch_size, parameters.num_heads);
     auto [num_splits, softmax_lse_accum_bytes, out_accum_bytes] = onnxruntime::flash::get_num_splits_and_buffer_sizes(

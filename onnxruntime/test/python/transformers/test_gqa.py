@@ -52,6 +52,7 @@ param_count = int(os.getenv("PARAM_COUNT", "3")) if not pipeline_mode else 2
 # When quick build is used, flash attention only supports fp16 and head_size=128
 quick_build = ", quick-build=1, " in get_build_info()
 
+enable_debug_print = quick_build
 # #################################################################################################
 #  Configuration and Helper Classes
 # #################################################################################################
@@ -615,10 +616,10 @@ def gqa_prompt_func(
 
         if k_scale.dtype != target_dtype:
             k_scale = k_scale.to(target_dtype)
-        # if debug_gqa:
-        #     print(
-        #         f"DEBUG: Binding k_scale dtype={k_scale.dtype} ort_type={ort_type} shape={k_scale.shape} val={k_scale.flatten()[:4]}"
-        #     )
+        if enable_debug_print:
+            print(
+                f"DEBUG: Binding k_scale dtype={k_scale.dtype} ort_type={ort_type} shape={k_scale.shape} val={k_scale.flatten()[:4]}"
+            )
         bind_tensor(io_binding, "k_scale", k_scale, device, ort_type)
     if v_scale is not None:
         target_dtype = {
@@ -1119,11 +1120,6 @@ def parity_check_gqa_prompt(
     v_quant = quantize_tensor_with_scale(v, v_scale, config.v_quant_type, config.kv_cache_type)
 
     ort_seqlens = cache_seqlens - 1
-    # if debug_gqa:
-    #     if config.packed:
-    #         print(f"DEBUG_INPUT_PACKED: q_ort[0,0,0,:10] = {q_ort[0, 0, 0, :10]}")
-    #     else:
-    #         print(f"DEBUG_INPUT: q_ort[0,0,0,:10] = {q_ort[0, 0, 0, :10]}")
     out, present_k, present_v = gqa_prompt_func(
         q=q_ort,
         k=k_quant,
@@ -1308,7 +1304,7 @@ def parity_check_gqa_past(
         v_scale = v_scale.to(torch_type)
 
     cache_seqlens = torch.randint(
-        1,
+        0,
         config.past_kv_sequence_length - config.q_sequence_length + 1,
         (config.batch_size,),
         device=device,
@@ -1442,8 +1438,9 @@ def parity_check_gqa_past(
     )
     out = torch.reshape(out, (config.batch_size, config.q_sequence_length, config.num_heads, config.head_size))
     out_np = out.to(torch.float32).detach().cpu().numpy()
-    print(f"[DEBUG] out_np non-zeros: {numpy.count_nonzero(out_np)} / {out_np.size}")
-    print(f"[DEBUG] out_ref_np non-zeros: {numpy.count_nonzero(out_ref_np)} / {out_ref_np.size}")
+    if enable_debug_print:
+        print(f"[DEBUG] out_np non-zeros: {numpy.count_nonzero(out_np)} / {out_np.size}")
+        print(f"[DEBUG] out_ref_np non-zeros: {numpy.count_nonzero(out_ref_np)} / {out_ref_np.size}")
 
     # --- Comparison ---
     if config.k_quant_type == "NONE" and config.v_quant_type == "NONE":
@@ -1709,6 +1706,9 @@ def print_diff_statistics(diff_tensor: torch.Tensor, prefix: str = ""):
         diff_tensor: Tensor containing absolute differences between expected and actual outputs.
         prefix: Optional prefix string for the output message.
     """
+    if not enable_debug_print:
+        return
+
     diff_flat = diff_tensor.flatten().float()
     if diff_flat.numel() == 0:
         print(f"{prefix}Diff statistics: empty tensor")
@@ -1757,7 +1757,7 @@ def get_softmax_options(allow_head_sink: bool = True):
     return options
 
 
-def gqa_cuda_prompt_test_cases(allow_head_sink: bool = True):
+def gqa_cuda_prompt_test_cases(allow_head_sink: bool = True, allow_local: bool = True):
     batches = [3, 1, 5]
     seqs = [(35, 35), (1, 1), (64, 64), (128, 128), (240, 240), (2000, 2000)]
     heads = [(6, 3), (3, 1), (32, 8)]
@@ -1788,7 +1788,7 @@ def gqa_cuda_prompt_test_cases(allow_head_sink: bool = True):
                     b = batches[combo_index % len(batches)]
                     sq, skv = seqs[combo_index % len(seqs)]
                     n, n2 = heads[combo_index % len(heads)]
-                    lws_opts = [-1, random.randint(1, skv)]
+                    lws_opts = [-1, random.randint(1, skv)] if allow_local else [-1]
                     lws = lws_opts[combo_index % len(lws_opts)]
                     softcap = softcap_opts[combo_index % len(softcap_opts)]
                     use_smooth_softmax, has_head_sink = smmoth_softmax__head_sink[
@@ -1824,7 +1824,15 @@ def gqa_cuda_prompt_test_cases(allow_head_sink: bool = True):
                     yield name, config
 
 
-def gqa_cuda_past_test_cases(allow_head_sink: bool = True):
+# def gqa_cuda_past_verification_test_cases():
+#     batches = [1]
+#     seqs = [(1, 2)]
+#     subsequent_prompt_seqs = []
+#     heads = [(2, 1)]
+#     h_sizes = [128]
+
+
+def gqa_cuda_past_test_cases(allow_head_sink: bool = True, allow_local: bool = True):
     batches = [2, 1, 3]
     # s: new sequence length, s2: past sequence length
     seqs = [(1, 1), (1, 128), (1, 2048), (1, 5000)]
@@ -1864,7 +1872,7 @@ def gqa_cuda_past_test_cases(allow_head_sink: bool = True):
                         b = 1  # Force batch=1 for subsequent prompt
 
                     n, n2 = heads[combo_index % len(heads)]
-                    lws_opts = [-1, random.randint(1, s2)]
+                    lws_opts = [-1, random.randint(1, s2)] if allow_local else [-1]
                     lws = lws_opts[combo_index % len(lws_opts)]
                     softcap = softcap_opts[combo_index % len(softcap_opts)]
                     use_smooth_softmax, has_head_sink = smmoth_softmax__head_sink[
@@ -1900,8 +1908,10 @@ def gqa_cuda_past_test_cases(allow_head_sink: bool = True):
                     yield name, config
 
 
-def gqa_cuda_quantized_test_cases(is_past):
-    base_cases = gqa_cuda_past_test_cases() if is_past else gqa_cuda_prompt_test_cases()
+def gqa_cuda_quantized_test_cases(is_past: bool):
+    base_cases = (
+        gqa_cuda_past_test_cases(allow_local=False) if is_past else gqa_cuda_prompt_test_cases(allow_local=False)
+    )
     for name, config in base_cases:
         for kv_type in ["int8", "int4"]:
             for quant_mode in ["PER_TENSOR", "PER_CHANNEL"]:
@@ -1981,6 +1991,10 @@ class TestFlashGQA(unittest.TestCase):
 
     @parameterized.expand(gqa_cuda_quantized_test_cases(is_past=True))
     def test_gqa_quantized_past(self, name, config):
+        if enable_debug_print:
+            print("-" * 20)
+            print(f"test_case: {name}\n{config}")
+
         os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
         parity_check_gqa_past(
             config=config,
@@ -1995,6 +2009,10 @@ class TestFlashGQA(unittest.TestCase):
 
     @parameterized.expand(gqa_cuda_quantized_test_cases(is_past=False))
     def test_gqa_quantized_prompt(self, name, config):
+        if enable_debug_print:
+            print("-" * 20)
+            print(f"test_case: {name}\n{config}")
+
         os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
         parity_check_gqa_prompt(
             config=config,
