@@ -5,7 +5,7 @@
 # --------------------------------------------------------------------------
 
 """
-Parse nsys SQLite output to extract flash attention kernel timings.
+Parse nsys SQLite output to extract onnxruntime CUDA kernel timings.
 
 Usage:
   # First, profile with nsys:
@@ -38,12 +38,7 @@ def parse_nsys_sqlite(db_path: str, kernel_patterns: list[str] | None = None, sk
     """
     if kernel_patterns is None:
         kernel_patterns = [
-            "%flash%",
-            "%Flash%",
-            "%compute_attn%",
-            "%splitkv%",
-            "%dequant%",
-            "%Attention%",
+            "%onnxruntime%",
         ]
 
     conn = sqlite3.connect(db_path)
@@ -135,21 +130,38 @@ def list_all_kernels(db_path: str) -> list[str]:
         conn.close()
 
 
+def format_kernel_name(kernel_name: str) -> str:
+    prefix_list = [
+        "void onnxruntime::contrib::cuda::",
+        "void onnxruntime::",
+        "onnxruntime::contrib::cuda::",
+        "onnxruntime::",
+    ]
+    for prefix in prefix_list:
+        if kernel_name.startswith(prefix):
+            return kernel_name[len(prefix) :]
+    return kernel_name
+
+
 def format_table(results: list[dict], prefix: str) -> str:
     """Format results as a human-readable table."""
     if not results:
         return "No matching kernels found."
 
+    kernel_name_len_limit = 64
     lines = []
     lines.append(
-        f"{prefix}{'Kernel Name':<55} {'Total(ms)':>10} {'Calls':>8} {'Avg(us)':>10} {'Min(us)':>10} {'Max(us)':>10}"
+        f"{prefix}{'Kernel Name':<{kernel_name_len_limit}} {'Total(ms)':>10} {'Calls':>8} {'Avg(us)':>10} {'Min(us)':>10} {'Max(us)':>10}"
     )
-    lines.append("-" * 110)
+    lines.append("-" * 120)
 
     for r in results:
-        name = r["kernel_name"][:57] + "..." if len(r["kernel_name"]) > 60 else r["kernel_name"]
+        kernel_name = format_kernel_name(r["kernel_name"])
+        name = (
+            kernel_name[:kernel_name_len_limit] + "..." if len(kernel_name) > kernel_name_len_limit - 3 else kernel_name
+        )
         lines.append(
-            f"{name:<60} {r['total_ms']:>10.3f} {r['call_count']:>8d} {r['avg_us']:>10.2f} {r['min_us']:>10.2f} {r['max_us']:>10.2f}"
+            f"{name:<{kernel_name_len_limit}} {r['total_ms']:>10.3f} {r['call_count']:>8d} {r['avg_us']:>10.2f} {r['min_us']:>10.2f} {r['max_us']:>10.2f}"
         )
 
     return "\n".join(lines)
@@ -172,7 +184,7 @@ def main():
         epilog="""
 Examples:
   # Profile and parse:
-  nsys profile -o gqa --export=sqlite python profile_gqa.py --mode int8 --warmup 5 --repeat 10
+  nsys profile -o gqa --export=sqlite python profile_gqa.py --warmup 5 --repeat 10
   python parse_nsys.py gqa.sqlite
 
   # Skip warmup iterations (e.g., 5 warmup calls per kernel):

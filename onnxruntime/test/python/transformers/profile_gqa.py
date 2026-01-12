@@ -7,8 +7,6 @@
 Simple profiling script for GroupQueryAttention with quantized KV cache.
 
 Usage:
-  # Run directly to measure timing
-  conda activate py312
   cd /onnxruntime/test/python/transformers
   python profile_gqa.py
 
@@ -61,6 +59,7 @@ def create_gqa_config(
     num_heads: int = 32,
     kv_num_heads: int = 8,
     head_size: int = 128,
+    is_packed_qkv: bool = False,
     device: str = "cuda",
 ) -> GroupQueryAttentionConfig:
     """Create a GQA config based on the mode (fp16, int8, or int4)."""
@@ -93,7 +92,9 @@ def create_gqa_config(
         head_size=head_size,
         local_window_size=-1,
         do_rotary=True,
-        is_packed_qkv=False,
+        rotary_interleaved=False,
+        dtype=torch.float16 if mode == "fp16" else torch.bfloat16,
+        is_packed_qkv=is_packed_qkv,
         use_smooth_softmax=False,
         device=device,
         k_quant_type=k_quant_type,
@@ -127,6 +128,12 @@ def benchmark_gqa(config: GroupQueryAttentionConfig, warmup: int = 50, repeat: i
 
 def run_comparison(args):
     """Compare FP16/BF16 vs quantized performance."""
+    # Auto-adjust max_sequence_length to be at least total_sequence_length
+    total_sequence_length = args.past_sequence_length + args.sequence_length
+    if args.max_sequence_length < total_sequence_length:
+        args.max_sequence_length = total_sequence_length
+        print(f"Note: max_sequence_length auto-adjusted to {args.max_sequence_length}")
+
     print(f"\n{'=' * 70}")
     print("GQA Performance Comparison")
     print(f"{'=' * 70}")
@@ -148,6 +155,7 @@ def run_comparison(args):
             num_heads=args.num_heads,
             kv_num_heads=args.kv_num_heads,
             head_size=args.head_size,
+            is_packed_qkv=args.is_packed_qkv,
         )
         avg_ms = benchmark_gqa(config, warmup=args.warmup, repeat=args.repeat, mode=mode)
         results[mode] = avg_ms
@@ -177,6 +185,7 @@ def main():
     parser.add_argument("--head-size", type=int, default=128, help="Head dimension")
     parser.add_argument("--warmup", type=int, default=50, help="Warmup iterations")
     parser.add_argument("--repeat", type=int, default=100, help="Benchmark iterations")
+    parser.add_argument("--is-packed-qkv", action="store_true", help="Use packed QKV")
 
     args = parser.parse_args()
 
