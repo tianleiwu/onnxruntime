@@ -1095,10 +1095,8 @@ Status FlashAttentionAndQuantizeKV(
     GroupQueryAttentionData<T>& data,
     float scale) {
   assert(parameters.is_first_prompt);  // Only support first prompt for this function.
+  assert(parameters.k_quant_type != KVQuantizationType::NONE || parameters.v_quant_type != KVQuantizationType::NONE);
   // assert(parameters.past_present_share_buffer);
-
-  bool is_quantized = parameters.k_quant_type != KVQuantizationType::NONE || parameters.v_quant_type != KVQuantizationType::NONE;
-  assert(is_quantized);
 
   const int max_threads_per_block = device_prop.maxThreadsPerBlock;
   const int batch_size = parameters.batch_size;
@@ -1212,9 +1210,7 @@ Status FlashAttentionWithQuantizeKV(
     GroupQueryAttentionData<T>& data,
     float scale) {
   assert(parameters.past_present_share_buffer);
-
-  bool is_quantized = parameters.k_quant_type != KVQuantizationType::NONE;
-  assert(is_quantized);
+  assert(parameters.k_quant_type != KVQuantizationType::NONE);
 
   ORT_GQA_TRACE("FlashAttentionWithQuantizedKV");
 
