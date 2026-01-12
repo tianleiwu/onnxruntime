@@ -25,7 +25,8 @@
  * - K/V stored as packed INT4 (2 elements per byte)
  * - Each byte contains: [hi_nibble:4][lo_nibble:4]
  * - Logical view (duplicate layout) maps physical bytes to 2 logical elements
- * - Shared memory: [Q (FP16)] [K (INT8/INT4, swizzled)] [V (INT8/INT4, swizzled)]
+ * - Shared memory: [Q (FP16)] [K (INT8/INT4, padded)] [V (INT8/INT4, padded)] ... [sP (FP16, overlap with K)]
+ * - Padded layouts (16-byte padding) ensure 128-bit alignment and avoid bank conflicts.
  *
  * Performance Note:
  * - Scalar copy is slower than INT8's vectorized cp.async
@@ -286,7 +287,7 @@ inline __device__ void compute_attn_1rowblock(
   // Define sP buffer (Reuse sK memory)
   // sK size is kBlockN * 144 (approx 64 * 144 = 9216 bytes).
   // sP needs kBlockM * kBlockN * 2 (approx 64 * 64 * 2 = 8192 bytes).
-  // Fits!
+  // Fits safely.
   auto sP = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ)),
                         make_layout(Shape<Int<kBlockM>, Int<kBlockN>>{}, Stride<Int<kBlockN>, _1>{}));
 

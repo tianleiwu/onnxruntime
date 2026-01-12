@@ -514,12 +514,10 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
                              onnxruntime::flash::is_supported<T>(device_prop,
                                                                  parameters.head_size,
                                                                  parameters.num_heads,
-                                                                 parameters.kv_num_heads) &&
-                             onnxruntime::flash::is_supported_quantization<CudaT>(true /*is_causal*/,
-                                                                                  parameters.head_size,
-                                                                                  static_cast<int>(k_quant_type_),
-                                                                                  static_cast<int>(v_quant_type_),
-                                                                                  kv_cache_bit_width_);
+                                                                 parameters.kv_num_heads,
+                                                                 static_cast<int>(k_quant_type_),
+                                                                 static_cast<int>(v_quant_type_),
+                                                                 kv_cache_bit_width_);
 
   // Fallback to dequantize past kv + GQA + quantize present kv for paths WITHOUT optimized kernels.
   // For share_buffer=true cases, we have optimized paths:

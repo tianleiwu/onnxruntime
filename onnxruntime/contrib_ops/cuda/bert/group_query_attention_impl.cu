@@ -1357,7 +1357,7 @@ Status FlashAttentionWithQuantizeKV(
       kernel_cos_cache, kernel_sin_cache, head_sink, /*block_table*/ nullptr, batch_size,
       num_heads, kv_num_heads, head_size, sequence_length,
       parameters.seqlen_present_kv_cache, 0,
-      kernel_rotary_dim, scale, parameters.softcap, is_causal && (sequence_length > 1), is_bf16,
+      kernel_rotary_dim, scale, parameters.softcap, is_causal /*&& (sequence_length > 1)*/, is_bf16,
       parameters.use_smooth_softmax, past_bsnh, parameters.num_splits,
       reinterpret_cast<void*>(data.softmax_lse_accum),
       reinterpret_cast<void*>(data.out_accum),

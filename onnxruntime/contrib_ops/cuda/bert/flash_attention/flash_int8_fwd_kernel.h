@@ -16,14 +16,15 @@
  *
  * Key Features:
  * - 128-bit asynchronous global memory loads (cp.async) for K/V
- * - Padded shared memory layout for bank conflict avoidance
- * - Compatible with SM80+ (Ampere and newer GPUs)
- * - Supports causal masking, local attention, and softcap
+ *   - Padded shared memory layout for bank conflict avoidance (16-byte padding)
+ *   - Explicit sP shared memory buffer to avoid register layout issues in 2nd GEMM
+ *   - Compatible with SM80+ (Ampere and newer GPUs)
+ *   - Supports causal masking, local attention, and softcap
  *
  * Memory Layout:
  * - K/V stored as INT8 (1 byte per element)
- * - Row-major with padding for 128-bit alignment
- * - Shared memory: [Q (FP16)] [K (INT8, padded)] [V (INT8, padded)]
+ * - Row-major with padding for 128-bit alignment and bank conflict avoidance
+ * - Shared memory: [Q (FP16)] [K (INT8, padded)] [V (INT8, padded)] ... [sP (FP16, overlap with K)]
  *
  ******************************************************************************/
 #pragma once
@@ -639,9 +640,10 @@ inline __device__ void compute_attn_1rowblock(
     // - Int8 K data is loaded into registers, dequantized to FP16, then used in MMA
     // - k_scale converts Int8 values back to original FP16 range
     flash::gemm_quant_manual<false>(acc_s, tSrQ, tSrK, tSsK, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, k_scale);
-    if (bidb == 0 && bidh == 0 && tidx == 0 && n_block == 0) {
-      printf("DEBUG: bidb=0 bidh=0 n_block=0 k_scale=%f v_scale=%f acc_s(0,0)=%f\n", k_scale, v_scale, (float)acc_s(0));
-    }
+
+    // if (bidb == 0 && bidh == 0 && tidx == 0 && n_block == 0) {
+    //   printf("DEBUG: bidb=0 bidh=0 n_block=0 k_scale=%f v_scale=%f acc_s(0,0)=%f\n", k_scale, v_scale, (float)acc_s(0));
+    // }
 
     // Masking
     constexpr int kNWarps = Kernel_traits::kNWarps;
@@ -669,7 +671,9 @@ inline __device__ void compute_attn_1rowblock(
 
     // 3. P @ V (Using sP shared memory to avoid register layout issues)
     // - Reuse sK memory for sP (attention probabilities)
-    // - sK is (BlockN, HeadDim) = (64, 128) -> plenty of space for sP (64, 64)
+    // - sK is (BlockN, HeadDim + Pad) = (64, 144) -> ~9KB.
+    // - sP needs (BlockM, BlockN) = (64, 64) elements (FP16) -> 8KB.
+    // - Fits safely within sK's allocation.
     auto sP = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ)),
                           make_layout(Shape<Int<kBlockM>, Int<kBlockN>>{}, Stride<Int<kBlockN>, _1>{}));
 
