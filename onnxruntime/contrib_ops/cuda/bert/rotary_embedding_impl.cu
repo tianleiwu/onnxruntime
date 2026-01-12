@@ -38,15 +38,24 @@ __global__ void RotaryEmbeddingBSNH(T* output,                         // BxSxNx
 
   const int i = threadIdx.x;
 
-  if (i >= head_size) {
-    return;
-  }
+  extern __shared__ char smem_[];
+  T* smem = reinterpret_cast<T*>(smem_);
 
   const T* input_data = input + b * in_strides.x + s * in_strides.z + n * in_strides.y;
   T* output_data = output + b * out_strides.x + s * out_strides.z + n * out_strides.y;
 
+  // Load to shared memory for safe in-place update
+  if (i < head_size) {
+    smem[i] = input_data[i];
+  }
+  __syncthreads();
+
+  if (i >= head_size) {
+    return;
+  }
+
   if (i >= rotary_embedding_dim) {
-    output_data[i] = input_data[i];
+    output_data[i] = smem[i];
     return;
   }
 
@@ -79,7 +88,9 @@ __global__ void RotaryEmbeddingBSNH(T* output,                         // BxSxNx
     sign = (i < half_rotary_embedding_dim) ? -1 : 1;
     j = (i + half_rotary_embedding_dim) % rotary_embedding_dim;
   }
-  output_data[i] = input_data[i] * cos_data[cache_idx] + sign * input_data[j] * sin_data[cache_idx];
+
+  // Use values from shared memory
+  output_data[i] = smem[i] * cos_data[cache_idx] + sign * smem[j] * sin_data[cache_idx];
 }
 
 template <typename T>
@@ -137,9 +148,10 @@ Status LaunchRotaryEmbeddingKernel(cudaStream_t stream, T* output, const T* inpu
   const dim3 grid(sequence_length, batch_size, num_heads);
 
   assert(head_size <= max_threads_per_block);
-  RotaryEmbeddingBSNH<<<grid, block, 0, stream>>>(output, input, cos_cache, sin_cache, position_ids, past_sequence_lengths, sequence_length,
-                                                  num_heads, head_size, rotary_embedding_dim, position_ids_format,
-                                                  interleaved, in_strides, out_strides);
+  size_t smem_size = head_size * sizeof(T);
+  RotaryEmbeddingBSNH<<<grid, block, smem_size, stream>>>(output, input, cos_cache, sin_cache, position_ids, past_sequence_lengths, sequence_length,
+                                                          num_heads, head_size, rotary_embedding_dim, position_ids_format,
+                                                          interleaved, in_strides, out_strides);
 
   return CUDA_CALL(cudaGetLastError());
 }
