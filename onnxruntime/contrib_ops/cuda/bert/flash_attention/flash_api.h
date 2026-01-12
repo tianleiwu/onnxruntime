@@ -150,7 +150,7 @@ bool is_supported(const cudaDeviceProp& dprops, size_t head_size, size_t num_hea
   // In quick build mode, only fp16 flash attention is built
   constexpr bool is_bf16 = std::is_same<T, onnxruntime::BFloat16>::value;
   if (is_bf16) {
-    return false;
+    // return false;
   }
 
   if (head_size != 128) {

@@ -526,7 +526,7 @@ template <typename T, int Headdim, int kQuantBits>
 void run_mha_fwd_dequant_dispatch(Flash_fwd_params& params, cudaStream_t stream) {
   static_assert(Headdim == 128, "Dequant kernel currently only supports HeadDim=128");
   constexpr int kBlockM = 64;
-  constexpr int kBlockN = kQuantBits == 8 ? 64 : 32;
+  constexpr int kBlockN = 64;
   constexpr int kNWarps = 4;
 
   if constexpr (kQuantBits == 8) {

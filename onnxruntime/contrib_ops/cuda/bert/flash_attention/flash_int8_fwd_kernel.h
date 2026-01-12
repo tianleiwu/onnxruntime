@@ -339,8 +339,8 @@ inline __device__ void compute_attn_1rowblock(
   // Zero-initialize sK and sV physical memory once to prevent garbage in padding
   // (16-byte padding per row is used for 128-bit aligned cp.async and bank conflict avoidance)
   const int total_kv_bytes = 2 * kBlockN * Kernel_traits::kSmemRowStrideInt8;
-  for (int i = tidx; i < total_kv_bytes; i += Kernel_traits::kNThreads) {
-    reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ)[i] = 0;
+  for (int i = tidx; i < total_kv_bytes / 16; i += Kernel_traits::kNThreads) {
+    reinterpret_cast<uint4*>(smem_ + kSmemSizeQ)[i] = make_uint4(0, 0, 0, 0);
   }
   __syncthreads();
 
@@ -685,19 +685,18 @@ inline __device__ void compute_attn_1rowblock(
     // Each thread in quad handles 2 rows and 2*MMA_N columns
 #pragma unroll
     for (int mi = 0; mi < size<0, 1>(acc_s_rowcol); ++mi) {
-      int r_base = warp_id * 16 + mi * 0 + (lane_id / 4);  // warp covers 16 rows, MMA_M=1
+      int r_base = warp_id * 16 + (lane_id / 4);
 #pragma unroll
       for (int i = 0; i < size<0, 0>(acc_s_rowcol); ++i) {
         int r = r_base + i * 8;
 #pragma unroll
         for (int nj = 0; nj < size<1, 1>(acc_s_rowcol); ++nj) {
           int c_base = (lane_id % 4) * 2 + nj * 8;
-#pragma unroll
-          for (int j = 0; j < size<1, 0>(acc_s_rowcol); ++j) {
-            int c = c_base + j;
-            if (r < kBlockM && c < kBlockN) {
-              sP(r, c) = static_cast<Element>(acc_s_rowcol(make_coord(i, mi), make_coord(j, nj)));
-            }
+          if (r < kBlockM && c_base < kBlockN) {
+            __half2 vals_h2 = __halves2half2(
+                reinterpret_cast<half const&>(acc_s_rowcol(make_coord(i, mi), make_coord(0, nj))),
+                reinterpret_cast<half const&>(acc_s_rowcol(make_coord(i, mi), make_coord(1, nj))));
+            reinterpret_cast<__half2&>(sP(r, c_base)) = vals_h2;
           }
         }
       }

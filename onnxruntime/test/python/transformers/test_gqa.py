@@ -1969,8 +1969,8 @@ def has_cuda_device(min_capability: int = 80):
 
 
 def has_flash_attention(bf16: bool = False):
-    if bf16 and quick_build:
-        return False
+    # if bf16 and quick_build:
+    #     return False
     return has_cuda_device(80)
 
 

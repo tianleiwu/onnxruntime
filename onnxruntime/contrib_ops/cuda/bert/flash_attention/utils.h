@@ -288,9 +288,19 @@ __forceinline__ __device__ void gemm_quant_manual(Tensor0& acc, Tensor1& tCrA, T
 
   // For Scalar Scale (Per-Tensor)
   __half2 scale_h2_scalar;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  __nv_bfloat162 scale_bf16_2_scalar;
+#endif
   if constexpr (!Is_Scale_Tensor) {
-    const __half scale_h = __float2half(static_cast<float>(scale));
-    scale_h2_scalar = __half2half2(scale_h);
+    if constexpr (std::is_same_v<DQuantType, cutlass::half_t>) {
+      const __half scale_h = __float2half(static_cast<float>(scale));
+      scale_h2_scalar = __half2half2(scale_h);
+    } else if constexpr (std::is_same_v<DQuantType, cutlass::bfloat16_t>) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      const float s = static_cast<float>(scale);
+      scale_bf16_2_scalar = __floats2bfloat162_rn(s, s);
+#endif
+    }
   }
 
   // O5: Process tiles
@@ -365,17 +375,57 @@ __forceinline__ __device__ void gemm_quant_manual(Tensor0& acc, Tensor1& tCrA, T
                 static_cast<__half>(scale(j + 1, 0, qi)));
             result_h2 = __hmul2(vals_h2, scale_pair);
           } else {
-            // Per-tensor: broadcast single scale
-            __half scale_h = __float2half(static_cast<float>(scale));
-            __half2 scale_h2 = __half2half2(scale_h);
-            result_h2 = __hmul2(vals_h2, scale_h2);
+            // Per-tensor: broadcast single scale (hoisted)
+            result_h2 = __hmul2(vals_h2, scale_h2_scalar);
           }
 
           tCrB_frag(j) = result_h2.x;
           tCrB_frag(j + 1) = result_h2.y;
         }
+      } else if constexpr (std::is_same_v<DQuantType, cutlass::bfloat16_t>) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        // Vectorized BF16 path
+        CUTE_UNROLL
+        for (int j = 0; j < size(tCrB_frag); j += 2) {
+          int8_t v0 = tCrB_quant_frag(j);
+          int8_t v1 = tCrB_quant_frag(j + 1);
+
+          // Convert int8 -> float -> bfloat16
+          float f0 = static_cast<float>(v0);
+          float f1 = static_cast<float>(v1);
+          __nv_bfloat162 vals_bf16_2 = __floats2bfloat162_rn(f0, f1);
+          __nv_bfloat162 result_bf16_2;
+
+          if constexpr (Is_Scale_Tensor) {
+            float s0 = static_cast<float>(scale(j, 0, qi));
+            float s1 = static_cast<float>(scale(j + 1, 0, qi));
+            __nv_bfloat162 scale_pair = __floats2bfloat162_rn(s0, s1);
+            result_bf16_2 = __hmul2(vals_bf16_2, scale_pair);
+          } else {
+            // Per-tensor: broadcast single scale (hoisted)
+            result_bf16_2 = __hmul2(vals_bf16_2, scale_bf16_2_scalar);
+          }
+
+          __nv_bfloat16 low = __low2bfloat16(result_bf16_2);
+          __nv_bfloat16 high = __high2bfloat16(result_bf16_2);
+          tCrB_frag(j) = reinterpret_cast<cutlass::bfloat16_t&>(low);
+          tCrB_frag(j + 1) = reinterpret_cast<cutlass::bfloat16_t&>(high);
+        }
+#else
+        // Fallback for others
+        CUTE_UNROLL
+        for (int j = 0; j < size(tCrB_frag); ++j) {
+          float s;
+          if constexpr (Is_Scale_Tensor) {
+            s = static_cast<float>(scale(j, 0, qi));
+          } else {
+            s = static_cast<float>(scale);
+          }
+          tCrB_frag(j) = static_cast<DQuantType>(static_cast<float>(tCrB_quant_frag(j)) * s);
+        }
+#endif
       } else {
-        // Fallback for BF16 (scalar path)
+        // Fallback for others
         CUTE_UNROLL
         for (int j = 0; j < size(tCrB_frag); ++j) {
           auto val_q = tCrB_quant_frag(j);

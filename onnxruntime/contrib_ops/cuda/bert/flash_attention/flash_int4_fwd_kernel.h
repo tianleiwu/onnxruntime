@@ -520,9 +520,9 @@ inline __device__ void compute_attn_1rowblock(
     clear(acc_s);
 
     if constexpr (QUANT_TYPE == 2) {
-      flash::gemm_quant_manual<true>(acc_s, tSrQ, tSrK, tSsK, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, tSrKScale);
+      ::onnxruntime::flash::gemm_quant_manual<true>(acc_s, tSrQ, tSrK, tSsK, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, tSrKScale);
     } else {
-      flash::gemm_quant_manual<true>(acc_s, tSrQ, tSrK, tSsK, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, k_scale);
+      ::onnxruntime::flash::gemm_quant_manual<true>(acc_s, tSrQ, tSrK, tSsK, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, k_scale);
     }
 
     // Masking
@@ -587,9 +587,9 @@ inline __device__ void compute_attn_1rowblock(
     cute::copy(smem_tiled_copy_P, tSsP, tSrP);
 
     if constexpr (QUANT_TYPE == 2) {
-      flash::gemm_quant_manual<true>(acc_o, tSrP, tOrVt, tSsV, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, tSrVScale);
+      ::onnxruntime::flash::gemm_quant_manual<true>(acc_o, tSrP, tOrVt, tSsV, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, tSrVScale);
     } else {
-      flash::gemm_quant_manual<true>(acc_o, tSrP, tOrVt, tSsV, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, v_scale);
+      ::onnxruntime::flash::gemm_quant_manual<true>(acc_o, tSrP, tOrVt, tSsV, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, v_scale);
     }
 
     __syncthreads();
