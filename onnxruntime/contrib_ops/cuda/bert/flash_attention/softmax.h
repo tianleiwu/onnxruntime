@@ -36,25 +36,25 @@ __device__ __forceinline__ void thread_reduce_(Tensor<Engine0, Layout0> const& t
   }
 }
 
-template <typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Operator>
+template <int kNThreadsPerRow = 4, typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Operator>
 __device__ __forceinline__ void quad_allreduce_(Tensor<Engine0, Layout0>& dst, Tensor<Engine1, Layout1>& src, Operator& op) {
   CUTE_STATIC_ASSERT_V(size(dst) == size(src));
 #pragma unroll
   for (int i = 0; i < size(dst); i++) {
-    dst(i) = Allreduce<4>::run(src(i), op);
+    dst(i) = Allreduce<kNThreadsPerRow>::run(src(i), op);
   }
 }
 
-template <bool zero_init = true, typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Operator>
+template <int kNThreadsPerRow = 4, bool zero_init = true, typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Operator>
 __device__ __forceinline__ void reduce_(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1>& summary, Operator& op) {
   thread_reduce_<zero_init>(tensor, summary, op);
-  quad_allreduce_(summary, summary, op);
+  quad_allreduce_<kNThreadsPerRow>(summary, summary, op);
 }
 
-template <bool zero_init = true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+template <int kNThreadsPerRow = 4, bool zero_init = true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
 __device__ __forceinline__ void reduce_max(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1>& max) {
   MaxOp<float> max_op;
-  reduce_<zero_init>(tensor, max, max_op);
+  reduce_<kNThreadsPerRow, zero_init>(tensor, max, max_op);
 }
 
 template <bool zero_init = true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
@@ -94,7 +94,7 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0>& tenso
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int kNRows>
+template <int kNRows, int kNThreadsPerRow = 4>
 struct Softmax {
   using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
   TensorT row_max, row_sum;
@@ -106,14 +106,14 @@ struct Softmax {
     // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
     Tensor scores = make_tensor(acc_s.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_s.layout()));
     static_assert(decltype(size<0>(scores))::value == kNRows);
-    if (Is_first) {
-      FLASH_NAMESPACE::template reduce_max</*zero_init=*/true>(scores, row_max);
+    if constexpr (Is_first) {
+      FLASH_NAMESPACE::template reduce_max<kNThreadsPerRow, /*zero_init=*/true>(scores, row_max);
       FLASH_NAMESPACE::scale_apply_exp2(scores, row_max, softmax_scale_log2);
       FLASH_NAMESPACE::reduce_sum</*zero_init=*/true>(scores, row_sum);
     } else {
       Tensor scores_max_prev = make_fragment_like(row_max);
       cute::copy(row_max, scores_max_prev);
-      FLASH_NAMESPACE::template reduce_max</*zero_init=*/false>(scores, row_max);
+      FLASH_NAMESPACE::template reduce_max<kNThreadsPerRow, /*zero_init=*/false>(scores, row_max);
       // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
       Tensor acc_o_rowcol = make_tensor(acc_o.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_o.layout()));
       static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
@@ -141,7 +141,7 @@ struct Softmax {
                                                            float softmax_scale,
                                                            float sink) {  // IMPORTANT: sink is a pre-scaled logit
     SumOp<float> sum_op;
-    quad_allreduce_(row_sum, row_sum, sum_op);
+    quad_allreduce_<kNThreadsPerRow>(row_sum, row_sum, sum_op);
     TensorT lse = make_fragment_like(row_sum);
     Tensor acc_o_rowcol = make_tensor(acc_o.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_o.layout()));
     static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);

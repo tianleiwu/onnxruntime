@@ -40,14 +40,15 @@ limitations under the License.
 #include "contrib_ops/cuda/bert/cutlass_fmha/memory_efficient_attention.h"
 #include "contrib_ops/cuda/bert/flash_attention/flash_api.h"
 #include "contrib_ops/cuda/bert/group_query_attention_impl.h"
+#include "contrib_ops/cuda/bert/group_query_attention_qdq.cuh"
 #include "contrib_ops/cuda/bert/rotary_embedding_impl.h"
 #include "contrib_ops/cuda/bert/rotary_common.cuh"
 #include "contrib_ops/cuda/bert/transformer_common.h"
+#include "contrib_ops/cuda/utils/dump_cuda_tensor.h"
 #include "core/providers/cuda/cu_inc/common.cuh"
 #include "core/providers/cuda/cuda_common.h"
 #include "core/providers/cuda/shared_inc/cuda_call.h"
 #include "core/providers/cuda/shared_inc/fpgeneric.h"
-#include "contrib_ops/cuda/utils/dump_cuda_tensor.h"
 
 using namespace onnxruntime::cuda;
 
@@ -94,12 +95,12 @@ Status LaunchConcatNewToPastKVHelper(GroupQueryAttentionParameters& parameters,
                                  is_bsnh,
                                  data.past_seq_lens,
                                  data.total_seq_lens,
-                                 data.past_key,
-                                 data.past_value,
+                                 reinterpret_cast<const T*>(data.past_key),
+                                 reinterpret_cast<const T*>(data.past_value),
                                  reinterpret_cast<const T*>(new_key),
                                  reinterpret_cast<const T*>(new_value),
-                                 data.present_key,
-                                 data.present_value,
+                                 reinterpret_cast<T*>(data.present_key),
+                                 reinterpret_cast<T*>(data.present_value),
                                  stream,
                                  max_threads_per_block,
                                  past_only,
@@ -134,8 +135,8 @@ Status LaunchConcatKVInPlace(GroupQueryAttentionParameters& parameters,
                                parameters.sequence_length,
                                reinterpret_cast<const T*>(new_key),
                                reinterpret_cast<const T*>(new_value),
-                               data.present_key,
-                               data.present_value,
+                               reinterpret_cast<T*>(data.present_key),
+                               reinterpret_cast<T*>(data.present_value),
                                is_past_kv_bnsh_format,
                                is_new_kv_bnsh_format,
                                stream,
@@ -716,6 +717,15 @@ Status LaunchGetSequenceLengths(
   return CUDA_CALL(cudaGetLastError());
 }
 
+// Trace function for debugging
+#define ORT_GQA_TRACE(func_name)                                                                                           \
+  DEBUG_PRINTF("[GQA %s] is_packed_qkv: %d, is_first_prompt: %d, is_subsequent_prompt: %d, past_present_share_buffer: %d", \
+               func_name,                                                                                                  \
+               static_cast<int>(parameters.is_packed_qkv),                                                                 \
+               static_cast<int>(parameters.is_first_prompt),                                                               \
+               static_cast<int>(parameters.is_subsequent_prompt),                                                          \
+               static_cast<int>(parameters.past_present_share_buffer));
+
 ////////// Kernels (supports right padding but not left padding)
 
 #if USE_FLASH_ATTENTION
@@ -723,13 +733,15 @@ Status LaunchGetSequenceLengths(
 // Use flash attention for all workloads (rotary, kv append, attention, etc.). No extra kernel is used in this path.
 // Currently, only decoding or subsequent prompt can use this path. First prompt will not use this path.
 template <typename T>
-Status FlashAttentionDecoding(
+Status FlashDecoding(
     const cudaDeviceProp& device_prop,
     cudaStream_t stream,
     GroupQueryAttentionParameters& parameters,
     GroupQueryAttentionData<T>& data,
     float scale) {
-  assert(!parameters.is_first_prompt && parameters.kv_share_buffer);
+  assert(!parameters.is_first_prompt && parameters.past_present_share_buffer);
+
+  ORT_GQA_TRACE("FlashDecoding");
 
   const int batch_size = parameters.batch_size;
   const int sequence_length = parameters.sequence_length;
@@ -757,13 +769,16 @@ Status FlashAttentionDecoding(
 
   void* seqlens_k = reinterpret_cast<void*>(data.past_seq_lens);
 
-  void* present_key = reinterpret_cast<void*>(const_cast<T*>(data.present_key));
-  void* present_value = reinterpret_cast<void*>(const_cast<T*>(data.present_value));
+  void* present_key = data.present_key;
+  void* present_value = data.present_value;
   void* cos_cache = reinterpret_cast<void*>(const_cast<T*>(data.cos_cache));
   void* sin_cache = reinterpret_cast<void*>(const_cast<T*>(data.sin_cache));
   void* head_sink = reinterpret_cast<void*>(const_cast<T*>(data.head_sink));
 
   bool past_bsnh = past_kv_format == AttentionQkvFormat::Q_K_V_BSNH;
+
+  DEBUG_PRINTF("[FlashDecoding] key=%p, value=%p, present_key=%p, present_value=%p, seqlens_k=%p, is_packed_qkv=%d",
+               key, value, present_key, present_value, seqlens_k, static_cast<int>(parameters.is_packed_qkv));
 
   ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd_kvcache(
       device_prop, stream, query, present_key, present_value, key, value, data.output,
@@ -813,13 +828,8 @@ Status FlashAttention(
     value = reinterpret_cast<T*>(key) + value_offset;
   }
 
-#if DUMP_TENSOR_LEVEL > 0
-  printf("[GQA FlashAttention] is_packed_qkv: %d, is_first_prompt: %d, is_subsequent_prompt: %d, kv_share_buffer: %d\n",
-         static_cast<int>(parameters.is_packed_qkv),
-         static_cast<int>(parameters.is_first_prompt),
-         static_cast<int>(parameters.is_subsequent_prompt),
-         static_cast<int>(parameters.kv_share_buffer));
-#endif
+  ORT_GQA_TRACE("FlashAttention");
+
   DUMP_TENSOR_INIT();
 
   // Track whether we keep packed QKV for FA kernels
@@ -837,14 +847,14 @@ Status FlashAttention(
       T* unpacked_q = unpacked_buffer;
 
       // Check if we can use the fully fused path
-      if (parameters.kv_share_buffer && parameters.do_rotary && !data.disable_fused_kv) {
+      if (parameters.past_present_share_buffer && parameters.do_rotary && !data.disable_fused_kv) {
         // FULLY FUSED PATH: Unpack + RoPE Q + RoPE K + Append KV in single kernel
         // This eliminates 4 kernel launches!
         ORT_RETURN_IF_ERROR(LaunchUnpackQKVWithRoPEAndAppendKV<T>(
-            reinterpret_cast<const T*>(data.query),  // packed QKV
-            unpacked_q,                              // Q output buffer (rotated)
-            data.present_key,                        // K cache (direct write)
-            data.present_value,                      // V cache (direct write)
+            reinterpret_cast<const T*>(data.query),    // packed QKV
+            unpacked_q,                                // Q output buffer (rotated)
+            reinterpret_cast<T*>(data.present_key),    // K cache (direct write)
+            reinterpret_cast<T*>(data.present_value),  // V cache (direct write)
             num_heads,
             kv_num_heads,
             head_size,
@@ -866,9 +876,11 @@ Status FlashAttention(
         use_packed_for_fa = false;
         used_fused_packed_path = true;
 
-        // Track buffer usage: Only Q is stored in unpacked_qkv_buffer (fused path writes K/V to cache)
-        size_t q_bytes = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size * sizeof(T);
-        UpdateUnpackedQkvMaxUsed(data, q_bytes);
+        if constexpr (kTrackBufferUsage) {
+          // Track buffer usage: Only Q is stored in unpacked_qkv_buffer (fused path writes K/V to cache)
+          size_t q_bytes = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size * sizeof(T);
+          UpdateUnpackedQkvMaxUsed(data, q_bytes);
+        }
 
         // K and V are already in cache - no need to set key/value pointers
 
@@ -895,9 +907,11 @@ Status FlashAttention(
           use_packed_for_fa = false;
         }
 
-        // Track buffer usage: Q+K+V unpacked
-        size_t total_bytes = (q_size + 2 * k_size) * sizeof(T);
-        UpdateUnpackedQkvMaxUsed(data, total_bytes);
+        if constexpr (kTrackBufferUsage) {
+          // Track buffer usage: Q+K+V unpacked
+          size_t total_bytes = (q_size + 2 * k_size) * sizeof(T);
+          UpdateUnpackedQkvMaxUsed(data, total_bytes);
+        }
       }
     }
   }
@@ -951,12 +965,17 @@ Status FlashAttention(
         ));
     DUMP_TENSOR("Rotated Q", q_output_for_rope, batch_size, sequence_length, num_heads, head_size);
 
-    // Rotate K will be done later in fused kernel.
+    if constexpr (kTrackBufferUsage) {
+      size_t q_bytes = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size * sizeof(T);
+      UpdateUnpackedQkvMaxUsed(data, q_bytes);
+    }
+
+    // Explicit K Rotation will be done later in fused kernel.
   }
 
   // Skip KV append if we used the fully fused path (KV already in cache)
   if (!used_fused_packed_path) {
-    if (parameters.kv_share_buffer && !parameters.is_first_prompt) {
+    if (parameters.past_present_share_buffer && !parameters.is_first_prompt) {
       constexpr bool is_new_kv_bnsh_format = false;
       if (parameters.do_rotary) {
         // Explicit K Rotation (replacing internal RoPE in fused kernel)
@@ -995,8 +1014,8 @@ Status FlashAttention(
               sequence_length,
               k_dst,
               reinterpret_cast<const T*>(data.value),
-              data.present_key,
-              data.present_value,
+              reinterpret_cast<T*>(data.present_key),
+              reinterpret_cast<T*>(data.present_value),
               !past_bsnh,
               is_new_kv_bnsh_format,
               stream,
@@ -1008,10 +1027,12 @@ Status FlashAttention(
               parameters, data, k_dst, value, is_new_kv_bnsh_format, stream, max_threads_per_block));
         }
 
-        // Track buffer usage: Q + K rotated in unpacked_qkv_buffer
-        size_t k_elements = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size;
-        size_t total_bytes = (q_elements + k_elements) * sizeof(T);
-        UpdateUnpackedQkvMaxUsed(data, total_bytes);
+        if constexpr (kTrackBufferUsage) {
+          // Track buffer usage: Q + K rotated in unpacked_qkv_buffer
+          size_t k_elements = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size;
+          size_t total_bytes = (q_elements + k_elements) * sizeof(T);
+          UpdateUnpackedQkvMaxUsed(data, total_bytes);
+        }
       } else {
         // No RoPE - use original kernel
         ORT_RETURN_IF_ERROR(LaunchConcatKVInPlace(parameters, data, key, value, is_new_kv_bnsh_format, stream, max_threads_per_block));
@@ -1030,11 +1051,11 @@ Status FlashAttention(
 
   DUMP_TENSOR("Total Seq Lens", data.total_seq_lens, batch_size, 1);
   DUMP_TENSOR("Past Seq Lens", data.past_seq_lens, batch_size, 1);
-  DUMP_TENSOR("Present Key", data.present_key, batch_size, parameters.seqlen_present_kv_cache, kv_num_heads, head_size);
-  DUMP_TENSOR("Present Value", data.present_value, batch_size, parameters.seqlen_present_kv_cache, kv_num_heads, head_size);
+  // DUMP_TENSOR("Present Key", reinterpret_cast<const T*>(data.present_key), batch_size, parameters.seqlen_present_kv_cache, kv_num_heads, head_size);
+  // DUMP_TENSOR("Present Value", reinterpret_cast<const T*>(data.present_value), batch_size, parameters.seqlen_present_kv_cache, kv_num_heads, head_size);
 
-  void* present_key = reinterpret_cast<void*>(const_cast<T*>(data.present_key));
-  void* present_value = reinterpret_cast<void*>(const_cast<T*>(data.present_value));
+  void* present_key = data.present_key;
+  void* present_value = data.present_value;
 
   // Disable internal RoPE in Flash Attention (pass nullptr)
   void* cos_cache = nullptr;
@@ -1047,7 +1068,7 @@ Status FlashAttention(
   void* kernel_new_v = nullptr;
 
   // Use padded seq lens for first prompt since mha_fwd_kvcache assumes uniform seqlen_q.
-  // The causal mask offset (seqlen_k - seqlen_q) becomes negative when seqlen_k < seqlen_q, causing incorrect masking.
+  // In flash attention, the causal mask offset (seqlen_k - seqlen_q) becomes negative when seqlen_k < seqlen_q, causing incorrect masking.
   int* seq_lens = parameters.is_first_prompt ? data.padded_seq_lens : data.total_seq_lens;
 
   ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd_kvcache(
@@ -1063,6 +1084,286 @@ Status FlashAttention(
       reinterpret_cast<void*>(data.out_accum), parameters.local_window_size - 1,
       parameters.rotary_interleaved, use_packed_for_fa, 0, 1));
 
+  return Status::OK();
+}
+
+// Use Flash Attention for float key and value, then quantize key/value to int4/int8 to save to k/v cache.
+template <typename T>
+Status FlashAttentionAndQuantizeKV(
+    const cudaDeviceProp& device_prop,
+    cudaStream_t stream,
+    GroupQueryAttentionParameters& parameters,
+    GroupQueryAttentionData<T>& data,
+    float scale) {
+  assert(parameters.is_first_prompt);  // Only support first prompt for this function.
+  assert(parameters.k_quant_type != KVQuantizationType::NONE || parameters.v_quant_type != KVQuantizationType::NONE);
+  // assert(parameters.past_present_share_buffer);
+
+  const int max_threads_per_block = device_prop.maxThreadsPerBlock;
+  const int batch_size = parameters.batch_size;
+  const int sequence_length = parameters.sequence_length;
+  const int kv_num_heads = parameters.kv_num_heads;
+  const int num_heads = parameters.num_heads;
+  const int head_size = parameters.head_size;
+
+  ORT_GQA_TRACE("FlashAttentionAndQuantizeKV");
+
+  bool past_bsnh = parameters.past_kv_format == AttentionQkvFormat::Q_K_V_BSNH;
+
+  // Allocate scratch space for unpacked/rotated Q, K, V within data.unpacked_qkv_buffer
+  T* unpacked_q = reinterpret_cast<T*>(data.unpacked_qkv_buffer);
+  size_t q_size = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size;
+  T* unpacked_k = unpacked_q + q_size;
+  size_t k_size = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size;
+  T* unpacked_v = unpacked_k + k_size;
+
+  // 1. Unpack QKV and Apply RoPE
+  const T* q_input = reinterpret_cast<const T*>(data.query);
+  const T* k_input = reinterpret_cast<const T*>(data.key);
+  const T* v_input = reinterpret_cast<const T*>(data.value);
+
+  if (parameters.is_packed_qkv) {
+    // Unpack to BSNH
+    ORT_RETURN_IF_ERROR((LaunchUnpackQKV<T, false>(q_input, unpacked_q, unpacked_k, unpacked_v, num_heads, kv_num_heads, head_size, sequence_length, batch_size, stream, max_threads_per_block)));
+    if constexpr (kTrackBufferUsage) {
+      UpdateUnpackedQkvMaxUsed(data, (q_size + 2 * k_size) * sizeof(T));
+    }
+  } else {
+    // Inputs are already BSNH, copy to scratch
+    cudaMemcpyAsync(unpacked_q, q_input, q_size * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(unpacked_k, k_input, k_size * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(unpacked_v, v_input, k_size * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+    if constexpr (kTrackBufferUsage) {
+      UpdateUnpackedQkvMaxUsed(data, (q_size + k_size + k_size) * sizeof(T));
+    }
+  }
+
+  if (parameters.do_rotary) {
+    // Rotate Q (BSNH)
+    ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel(
+        stream, unpacked_q, unpacked_q, nullptr, data.past_seq_lens, data.cos_cache, data.sin_cache,
+        batch_size, sequence_length, num_heads, head_size, parameters.rotary_dim,
+        parameters.max_sequence_length, 2, parameters.rotary_interleaved, max_threads_per_block, false));
+
+    // Rotate K (BSNH)
+    // TODO: Optimization - We can pass nullptr for past_seq_lens for the first prompt case.
+    ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel(
+        stream, unpacked_k, unpacked_k, nullptr, data.past_seq_lens, data.cos_cache, data.sin_cache,
+        batch_size, sequence_length, kv_num_heads, head_size, parameters.rotary_dim,
+        parameters.max_sequence_length, 2, parameters.rotary_interleaved, max_threads_per_block, false));
+  }
+
+  // 2. Run Float Flash Attention
+  bool is_causal = parameters.is_unidirectional;
+  bool is_bf16 = std::is_same<T, BFloat16>::value;
+
+  int local_window_size = parameters.local_window_size > 0 ? parameters.local_window_size - 1 : -1;
+
+  ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd(
+      device_prop, stream, unpacked_q, unpacked_k, unpacked_v, data.output,
+      reinterpret_cast<void*>(data.softmax_lse),
+      batch_size, num_heads, kv_num_heads, head_size, sequence_length, sequence_length,
+      scale, parameters.softcap, is_causal, is_bf16, parameters.use_smooth_softmax,
+      parameters.num_splits,
+      reinterpret_cast<void*>(data.softmax_lse_accum),
+      reinterpret_cast<void*>(data.out_accum),
+      true,  // kv_bsnh = true (BSNH)
+      local_window_size));
+
+  // 3. Quantize K and V to present cache
+  if (parameters.k_quant_type != KVQuantizationType::NONE) {
+    if (parameters.kv_cache_bit_width == 8) {
+      ORT_RETURN_IF_ERROR((LaunchQuantizeKV<T, int8_t, T>(
+          stream, reinterpret_cast<int8_t*>(data.present_key), unpacked_k, data.k_scale,
+          data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
+          head_size, 8, parameters.k_quant_type, true, past_bsnh)));
+    } else {
+      ORT_RETURN_IF_ERROR((LaunchQuantizeKV<T, uint8_t, T>(
+          stream, reinterpret_cast<uint8_t*>(data.present_key), unpacked_k, data.k_scale,
+          data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
+          head_size, 4, parameters.k_quant_type, true, past_bsnh)));
+    }
+  }
+
+  if (parameters.v_quant_type != KVQuantizationType::NONE) {
+    if (parameters.kv_cache_bit_width == 8) {
+      ORT_RETURN_IF_ERROR((LaunchQuantizeKV<T, int8_t, T>(
+          stream, reinterpret_cast<int8_t*>(data.present_value), unpacked_v, data.v_scale,
+          data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
+          head_size, 8, parameters.v_quant_type, true, past_bsnh)));
+    } else {
+      ORT_RETURN_IF_ERROR((LaunchQuantizeKV<T, uint8_t, T>(
+          stream, reinterpret_cast<uint8_t*>(data.present_value), unpacked_v, data.v_scale,
+          data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
+          head_size, 4, parameters.v_quant_type, true, past_bsnh)));
+    }
+  }
+
+  return Status::OK();
+}
+
+// Use Flash Attention with Quantized KV (for Subsequent Prompt or Decoding, need quantize k/v first then call int4/int8 version of flash attention kernel).
+template <typename T>
+Status FlashAttentionWithQuantizeKV(
+    const cudaDeviceProp& device_prop,
+    cudaStream_t stream,
+    GroupQueryAttentionParameters& parameters,
+    GroupQueryAttentionData<T>& data,
+    float scale) {
+  assert(parameters.past_present_share_buffer);
+  assert(parameters.k_quant_type != KVQuantizationType::NONE);
+
+  ORT_GQA_TRACE("FlashAttentionWithQuantizedKV");
+
+  const int max_threads_per_block = device_prop.maxThreadsPerBlock;
+  const int batch_size = parameters.batch_size;
+  const int sequence_length = parameters.sequence_length;
+  const int num_heads = parameters.num_heads;
+  const int kv_num_heads = parameters.kv_num_heads;
+  const int head_size = parameters.head_size;
+  bool is_causal = parameters.is_unidirectional;
+  bool is_bf16 = std::is_same<T, BFloat16>::value;
+
+  // Buffers
+  T* unpacked_buffer = reinterpret_cast<T*>(data.unpacked_qkv_buffer);
+  size_t q_elements = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size;
+  size_t k_elements = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size;
+
+  void* query = nullptr;
+  void* key = nullptr;
+  void* value = nullptr;
+
+  if (parameters.is_packed_qkv) {
+    T* unpacked_q = unpacked_buffer;
+    T* unpacked_k = unpacked_buffer + q_elements;
+    T* unpacked_v = unpacked_buffer + q_elements + k_elements;
+
+    // Unpack
+    ORT_RETURN_IF_ERROR((LaunchUnpackQKV<T, false>(
+        reinterpret_cast<const T*>(data.query), unpacked_q, unpacked_k, unpacked_v,
+        num_heads, kv_num_heads, head_size, sequence_length, batch_size,
+        stream, max_threads_per_block)));
+
+    query = unpacked_q;
+    key = unpacked_k;
+    value = unpacked_v;
+
+    if constexpr (kTrackBufferUsage) {
+      UpdateUnpackedQkvMaxUsed(data, (q_elements + 2 * k_elements) * sizeof(T));
+    }
+  } else {
+    // Unpacked input
+    if (parameters.do_rotary) {
+      // Need buffers for Q and K rotation
+      // Assumes buffer is large enough (q_elements + k_elements)
+      query = unpacked_buffer;
+      key = unpacked_buffer + q_elements;
+    } else {
+      query = const_cast<void*>(reinterpret_cast<const void*>(data.query));
+      key = const_cast<void*>(reinterpret_cast<const void*>(data.key));
+    }
+    value = const_cast<void*>(reinterpret_cast<const void*>(data.value));
+  }
+
+  const int64_t* position_ids = data.position_ids;
+
+  // RoPE
+  if (parameters.do_rotary) {
+    // Rotate Q
+    const T* q_src = parameters.is_packed_qkv ? reinterpret_cast<const T*>(query) : reinterpret_cast<const T*>(data.query);
+    T* q_dst = reinterpret_cast<T*>(query);
+
+    // Use position_ids if available (Format 1), else use past_seq_lens (Format 2)
+    int pos_format = (position_ids != nullptr) ? 1 : 2;
+    const int64_t* pos_ids_ptr = (position_ids != nullptr) ? position_ids : nullptr;
+    const int* past_seq_lens_ptr = (position_ids != nullptr) ? nullptr : data.past_seq_lens;
+
+    ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel(
+        stream, q_dst, q_src, pos_ids_ptr, past_seq_lens_ptr, data.cos_cache, data.sin_cache,
+        batch_size, sequence_length, num_heads, head_size, parameters.rotary_dim,
+        parameters.max_sequence_length, pos_format, parameters.rotary_interleaved, max_threads_per_block, false));
+
+    // Rotate K
+    const T* k_src = parameters.is_packed_qkv ? reinterpret_cast<const T*>(key) : reinterpret_cast<const T*>(data.key);
+    T* k_dst = reinterpret_cast<T*>(key);
+
+    ORT_RETURN_IF_ERROR(LaunchRotaryEmbeddingKernel(
+        stream, k_dst, k_src, pos_ids_ptr, past_seq_lens_ptr, data.cos_cache, data.sin_cache,
+        batch_size, sequence_length, kv_num_heads, head_size, parameters.rotary_dim,
+        parameters.max_sequence_length, pos_format, parameters.rotary_interleaved, max_threads_per_block, false));
+
+    if constexpr (kTrackBufferUsage) {
+      if (!parameters.is_packed_qkv) {
+        UpdateUnpackedQkvMaxUsed(data, (q_elements + k_elements) * sizeof(T));
+      }
+    }
+  }
+
+  bool past_bsnh = parameters.past_kv_format == AttentionQkvFormat::Q_K_V_BSNH;
+
+  // Helper lambda for quantization append
+  auto LaunchQuantAppend = [&](void* dst, const T* src, const void* scale, KVQuantizationType q_type) {
+    if (parameters.kv_cache_bit_width == 8) {
+      return LaunchQuantizeAppendKV<T, int8_t, T>(
+          stream, reinterpret_cast<int8_t*>(dst), src, reinterpret_cast<const T*>(scale),
+          data.total_seq_lens, batch_size, kv_num_heads,
+          parameters.seqlen_present_kv_cache, head_size, 8, sequence_length, q_type, true, past_bsnh);
+    } else {
+      return LaunchQuantizeAppendKV<T, uint8_t, T>(
+          stream, reinterpret_cast<uint8_t*>(dst), src, reinterpret_cast<const T*>(scale),
+          data.total_seq_lens, batch_size, kv_num_heads,
+          parameters.seqlen_present_kv_cache, head_size, 4, sequence_length, q_type, true, past_bsnh);
+    }
+  };
+
+  if (parameters.k_quant_type != KVQuantizationType::NONE) {
+    ORT_RETURN_IF_ERROR(LaunchQuantAppend(data.present_key, reinterpret_cast<const T*>(key), data.k_scale, parameters.k_quant_type));
+  }
+  if (parameters.v_quant_type != KVQuantizationType::NONE) {
+    ORT_RETURN_IF_ERROR(LaunchQuantAppend(data.present_value, reinterpret_cast<const T*>(value), data.v_scale, parameters.v_quant_type));
+  }
+
+  void* present_key = data.present_key;
+  void* present_value = data.present_value;
+  void* cos_cache = reinterpret_cast<void*>(const_cast<T*>(data.cos_cache));
+  void* sin_cache = reinterpret_cast<void*>(const_cast<T*>(data.sin_cache));
+  void* head_sink = reinterpret_cast<void*>(const_cast<T*>(data.head_sink));
+  void* k_scale = const_cast<void*>(reinterpret_cast<const void*>(data.k_scale));
+  void* v_scale = const_cast<void*>(reinterpret_cast<const void*>(data.v_scale));
+
+  // We have already appended (and quantized if needed) the new tokens into present_key/value.
+  // Pass nullptr for new_k/new_v to disable the kernel's internal Append_KV logic.
+  void* kernel_new_k = nullptr;
+  void* kernel_new_v = nullptr;
+
+  // We've appended the new tokens into present_key/value, so we pass total_seq_lens to the kernel.
+  void* seqlens_k = reinterpret_cast<void*>(data.total_seq_lens);
+
+  // We've already applied rotary externally, so don't let Flash Attention apply it again.
+  // Set rotary_dim=0 and pass nullptr for cos/sin to disable internal rotary.
+  int kernel_rotary_dim = 0;
+  void* kernel_cos_cache = nullptr;
+  void* kernel_sin_cache = nullptr;
+
+  int local_window_size = parameters.local_window_size > 0 ? parameters.local_window_size - 1 : -1;
+
+  ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd_kvcache(
+      device_prop, stream, query, present_key, present_value,
+      kernel_new_k, kernel_new_v,
+      data.output, reinterpret_cast<void*>(data.softmax_lse), seqlens_k,
+      kernel_cos_cache, kernel_sin_cache, /*cache_batch_idx*/ nullptr, /*leftpad_k*/ nullptr, head_sink, /*block_table*/ nullptr, batch_size,
+      num_heads, kv_num_heads, head_size, sequence_length,
+      parameters.seqlen_present_kv_cache, 0,
+      kernel_rotary_dim, scale, parameters.softcap, is_causal /*&& (sequence_length > 1)*/, is_bf16,
+      parameters.use_smooth_softmax, past_bsnh, parameters.num_splits,
+      reinterpret_cast<void*>(data.softmax_lse_accum),
+      reinterpret_cast<void*>(data.out_accum),
+      local_window_size,
+      parameters.rotary_interleaved, false /* is_packed_qkv - we've already unpacked */, 0, 1, k_scale,
+      v_scale, static_cast<int>(parameters.k_quant_type),
+      static_cast<int>(parameters.v_quant_type),
+      parameters.kv_cache_bit_width,
+      parameters.query_dynamic_quant));
   return Status::OK();
 }
 #endif
@@ -1084,13 +1385,11 @@ Status EfficientAttention(
   const int head_size = parameters.head_size;
   AttentionQkvFormat past_kv_format = parameters.past_kv_format;
 
-#if DUMP_TENSOR_LEVEL > 0
-  printf("[GQA EfficientAttention] is_packed_qkv: %d, is_first_prompt: %d, is_subsequent_prompt: %d, kv_share_buffer: %d\n",
-         static_cast<int>(parameters.is_packed_qkv),
-         static_cast<int>(parameters.is_first_prompt),
-         static_cast<int>(parameters.is_subsequent_prompt),
-         static_cast<int>(parameters.kv_share_buffer));
-#endif
+  DEBUG_PRINTF("[GQA EfficientAttention] is_packed_qkv: %d, is_first_prompt: %d, is_subsequent_prompt: %d, past_present_share_buffer: %d",
+               static_cast<int>(parameters.is_packed_qkv),
+               static_cast<int>(parameters.is_first_prompt),
+               static_cast<int>(parameters.is_subsequent_prompt),
+               static_cast<int>(parameters.past_present_share_buffer));
 
   const void* query;
   const void* key;
@@ -1118,9 +1417,11 @@ Status EfficientAttention(
     key = reinterpret_cast<const void*>(k);
     value = reinterpret_cast<const void*>(v);
 
-    // Track buffer usage: Q+K+V unpacked
-    size_t total_bytes = (q_size + 2 * k_size) * sizeof(T);
-    UpdateUnpackedQkvMaxUsed(data, total_bytes);
+    if constexpr (kTrackBufferUsage) {
+      // Track buffer usage: Q+K+V unpacked
+      size_t total_bytes = (q_size + 2 * k_size) * sizeof(T);
+      UpdateUnpackedQkvMaxUsed(data, total_bytes);
+    }
   }
 
   const int64_t* position_ids = data.position_ids;
@@ -1156,24 +1457,26 @@ Status EfficientAttention(
     }
     query = reinterpret_cast<const void*>(q_buffer);
 
-    // For kv_share_buffer path, we use Fused RoPE in LaunchConcatKVInPlaceWithRoPE.
+    // For past_present_share_buffer path, we use Fused RoPE in LaunchConcatKVInPlaceWithRoPE.
     // For non-share-buffer path, we use Fused RoPE in LaunchConcatNewToPastKVHelper.
     // No explicit K rotation needed here - handled by fused kernels.
 
     // key remains pointing to original source for use in fused kernel below
 
-    // Track rotary buffer usage: Q rotated (K rotation is fused in KV append)
-    size_t q_bytes = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size * sizeof(T);
-    size_t k_bytes = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size * sizeof(T);
-    // Note: rotary_buffer layout is [Q_rotated, K_rotated] - no position_ids here
-    UpdateRotaryMaxUsed(data, q_bytes + k_bytes);
+    if constexpr (kTrackBufferUsage) {
+      // Track rotary buffer usage: Q rotated (K rotation is fused in KV append)
+      size_t q_bytes = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size * sizeof(T);
+      size_t k_bytes = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size * sizeof(T);
+      // Note: rotary_buffer layout is [Q_rotated, K_rotated] - no position_ids here
+      UpdateRotaryMaxUsed(data, q_bytes + k_bytes);
 
-    // Track position_ids_buffer usage
-    size_t pos_ids_bytes = static_cast<size_t>(batch_size) * sequence_length * sizeof(int64_t);
-    UpdatePositionIdsMaxUsed(data, pos_ids_bytes);
+      // Track position_ids_buffer usage
+      size_t pos_ids_bytes = static_cast<size_t>(batch_size) * sequence_length * sizeof(int64_t);
+      UpdatePositionIdsMaxUsed(data, pos_ids_bytes);
+    }
   }
 
-  if (parameters.kv_share_buffer) {
+  if (parameters.past_present_share_buffer) {
     // Concatenate new kv in place
     constexpr bool is_new_kv_bnsh_format = false;
 
@@ -1214,8 +1517,8 @@ Status EfficientAttention(
             parameters.sequence_length,
             k_dst,
             reinterpret_cast<const T*>(value),
-            data.present_key,
-            data.present_value,
+            reinterpret_cast<T*>(data.present_key),
+            reinterpret_cast<T*>(data.present_value),
             past_kv_format != AttentionQkvFormat::Q_K_V_BSNH,  // is_past_kv_bnsh_format
             is_new_kv_bnsh_format,
             stream,
@@ -1226,9 +1529,11 @@ Status EfficientAttention(
             parameters, data, k_dst, value, is_new_kv_bnsh_format, stream, max_threads_per_block));
       }
 
-      // Track rotary buffer usage: Q + K rotated (no position_ids in rotary_buffer)
-      size_t k_elements = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size;
-      UpdateRotaryMaxUsed(data, (q_elements + k_elements) * sizeof(T));
+      if constexpr (kTrackBufferUsage) {
+        // Track rotary buffer usage: Q + K rotated (no position_ids in rotary_buffer)
+        size_t k_elements = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size;
+        UpdateRotaryMaxUsed(data, (q_elements + k_elements) * sizeof(T));
+      }
     } else {
       // No RoPE - use original kernel
       ORT_RETURN_IF_ERROR(LaunchConcatKVInPlace(
@@ -1306,13 +1611,21 @@ Status QkvToContext(
     GroupQueryAttentionData<T>& data) {
   auto stream = static_cast<cudaStream_t>(ort_stream->GetHandle());
   const float scale = parameters.scale == 0.0f ? 1.f / sqrt(static_cast<float>(parameters.head_size)) : parameters.scale;
-
 #if USE_FLASH_ATTENTION
   if (data.use_flash_attention_fast_decode) {
-    return FlashAttentionDecoding(device_prop, stream, parameters, data, scale);
+    return FlashDecoding(device_prop, stream, parameters, data, scale);
   }
 
   if (data.use_flash_attention) {
+    if (parameters.k_quant_type != KVQuantizationType::NONE || parameters.v_quant_type != KVQuantizationType::NONE) {
+      assert(parameters.past_present_share_buffer);
+      if (parameters.is_first_prompt) {
+        return FlashAttentionAndQuantizeKV(device_prop, stream, parameters, data, scale);
+      } else {
+        return FlashAttentionWithQuantizeKV(device_prop, stream, parameters, data, scale);
+      }
+    }
+
     return FlashAttention(device_prop, stream, parameters, data, scale);
   }
 #endif

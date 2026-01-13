@@ -12,7 +12,8 @@ namespace flash {
 constexpr int TOTAL_DIM = 0;
 constexpr int H_DIM = 1;
 constexpr int D_DIM = 2;
-
+constexpr bool kEnableFlashAttention4Bit = true;
+constexpr bool kEnableOnTheFlyNewKVQuantization = false;
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct Qkv_params {
@@ -132,6 +133,16 @@ struct Flash_fwd_params : public Qkv_params {
 
   bool unpadded_lse = false;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
   const cudaDeviceProp* dprops = nullptr;
+  // Quantization params
+  void* __restrict__ k_scale_ptr = nullptr;
+  void* __restrict__ v_scale_ptr = nullptr;
+
+  // 0: NONE, 1: PER_TENSOR, 2: PER_CHANNEL
+  int k_quant_type = 0;
+  int v_quant_type = 0;
+
+  int kv_cache_bit_width = 0;
+  bool query_dynamic_quant = false;
   bool seqlenq_ngroups_swapped = false;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
 };
 
@@ -142,6 +153,9 @@ void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream);
 
 template <typename T, int Headdim, bool Is_causal>
 void run_mha_fwd_splitkv_dispatch(Flash_fwd_params& params, cudaStream_t stream);
+
+template <typename T, int Headdim, int kQuantBits>
+void run_mha_fwd_dequant_dispatch(Flash_fwd_params& params, cudaStream_t stream);
 
 }  // namespace flash
 }  // namespace onnxruntime

@@ -32,8 +32,13 @@ file(GLOB_RECURSE onnxruntime_cuda_contrib_ops_cu_srcs CONFIGURE_DEPENDS
 #     If new head dimensions are added or removed, update this list to match the supported set.
 if(onnxruntime_QUICK_BUILD)
   message(STATUS "Quick build mode enabled: Only building hdim128 fp16 flash attention kernels")
-  list(FILTER onnxruntime_cuda_contrib_ops_cu_srcs EXCLUDE REGEX "flash_fwd.*hdim(32|64|96|192|256)")
-  list(FILTER onnxruntime_cuda_contrib_ops_cu_srcs EXCLUDE REGEX "flash_fwd.*_bf16")
+  # Filter non-hdim128 kernels
+  list(FILTER onnxruntime_cuda_contrib_ops_cu_srcs EXCLUDE REGEX "flash_fwd.*hdim(32|64|96|160|192|224|256)")
+  # Filter all bfloat16 kernels (only keep fp16)
+  if (NOT onnxruntime_FLASH_BUILD)
+    list(FILTER onnxruntime_cuda_contrib_ops_cu_srcs EXCLUDE REGEX "flash_fwd.*_bf16")
+    list(FILTER onnxruntime_cuda_contrib_ops_cu_srcs EXCLUDE REGEX "flash_int.*_bf16")
+  endif()
 endif()
 
 file(GLOB_RECURSE onnxruntime_js_contrib_ops_cc_srcs CONFIGURE_DEPENDS

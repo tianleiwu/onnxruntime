@@ -4,7 +4,7 @@
 #pragma once
 
 /// @param COND       - a boolean expression to switch by
-/// @param CONST_NAME - a name given for the constexpr bool variable.
+/// @param CONST_NAME - a name given for the const bool variable.
 /// @param ...       - code to execute for true and false
 ///
 /// Usage:
@@ -14,33 +14,33 @@
 /// });
 /// ```
 
-#define BOOL_SWITCH(COND, CONST_NAME, ...)      \
-  [&] {                                         \
-    if (COND) {                                 \
-      constexpr static bool CONST_NAME = true;  \
-      return __VA_ARGS__();                     \
-    } else {                                    \
-      constexpr static bool CONST_NAME = false; \
-      return __VA_ARGS__();                     \
-    }                                           \
+#define BOOL_SWITCH(COND, CONST_NAME, ...) \
+  [&] {                                    \
+    if (COND) {                            \
+      const bool CONST_NAME = true;        \
+      return __VA_ARGS__();                \
+    } else {                               \
+      const bool CONST_NAME = false;       \
+      return __VA_ARGS__();                \
+    }                                      \
   }()
 
 #define FLASHATTENTION_DISABLE_ALIBI  // TEMP: Remove if we enable alibi
 #ifdef FLASHATTENTION_DISABLE_ALIBI
-#define ALIBI_SWITCH(COND, CONST_NAME, ...)   \
-  [&] {                                       \
-    constexpr static bool CONST_NAME = false; \
-    return __VA_ARGS__();                     \
+#define ALIBI_SWITCH(COND, CONST_NAME, ...) \
+  [&] {                                     \
+    const bool CONST_NAME = false;          \
+    return __VA_ARGS__();                   \
   }()
 #else
 #define ALIBI_SWITCH BOOL_SWITCH
 #endif
 
 #ifdef FLASHATTENTION_DISABLE_UNEVEN_K
-#define EVENK_SWITCH(COND, CONST_NAME, ...)  \
-  [&] {                                      \
-    constexpr static bool CONST_NAME = true; \
-    return __VA_ARGS__();                    \
+#define EVENK_SWITCH(COND, CONST_NAME, ...) \
+  [&] {                                     \
+    const bool CONST_NAME = true;           \
+    return __VA_ARGS__();                   \
   }()
 #else
 #define EVENK_SWITCH BOOL_SWITCH
@@ -49,7 +49,7 @@
 #ifdef FLASHATTENTION_DISABLE_SOFTCAP
 #define SOFTCAP_SWITCH(COND, CONST_NAME, ...) \
   [&] {                                       \
-    constexpr static bool CONST_NAME = false; \
+    const bool CONST_NAME = false;            \
     return __VA_ARGS__();                     \
   }()
 #else
@@ -57,16 +57,17 @@
 #endif
 
 #ifdef FLASHATTENTION_DISABLE_LOCAL
-#define LOCAL_SWITCH(COND, CONST_NAME, ...)   \
-  [&] {                                       \
-    constexpr static bool CONST_NAME = false; \
-    return __VA_ARGS__();                     \
+#define LOCAL_SWITCH(COND, CONST_NAME, ...) \
+  [&] {                                     \
+    const bool CONST_NAME = false;          \
+    return __VA_ARGS__();                   \
   }()
 #else
 #define LOCAL_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef ORT_QUICK_BUILD
+// ORT_QUICK_BUILD = 1 only builds fp16 kernels, ORT_QUICK_BUILD = 2 builds both fp16 and bf16 kernels.
+#if ORT_QUICK_BUILD == 1
 // Quick build mode: only fp16 kernels are compiled
 #define FP16_SWITCH(COND, ...)         \
   [&] {                                \
@@ -88,32 +89,32 @@
 
 #ifdef ORT_QUICK_BUILD
 // Quick build mode: only hdim128 kernels are compiled
-#define HEADDIM_SWITCH(HEADDIM, ...)     \
-  [&] {                                  \
-    constexpr static int kHeadDim = 128; \
-    return __VA_ARGS__();                \
+#define HEADDIM_SWITCH(HEADDIM, ...) \
+  [&] {                              \
+    const int kHeadDim = 128;        \
+    return __VA_ARGS__();            \
   }()
 #else
-#define HEADDIM_SWITCH(HEADDIM, ...)       \
-  [&] {                                    \
-    if (HEADDIM <= 32) {                   \
-      constexpr static int kHeadDim = 32;  \
-      return __VA_ARGS__();                \
-    } else if (HEADDIM <= 64) {            \
-      constexpr static int kHeadDim = 64;  \
-      return __VA_ARGS__();                \
-    } else if (HEADDIM <= 96) {            \
-      constexpr static int kHeadDim = 96;  \
-      return __VA_ARGS__();                \
-    } else if (HEADDIM <= 128) {           \
-      constexpr static int kHeadDim = 128; \
-      return __VA_ARGS__();                \
-    } else if (HEADDIM <= 192) {           \
-      constexpr static int kHeadDim = 192; \
-      return __VA_ARGS__();                \
-    } else if (HEADDIM <= 256) {           \
-      constexpr static int kHeadDim = 256; \
-      return __VA_ARGS__();                \
-    }                                      \
+#define HEADDIM_SWITCH(HEADDIM, ...) \
+  [&] {                              \
+    if (HEADDIM <= 32) {             \
+      const int kHeadDim = 32;       \
+      return __VA_ARGS__();          \
+    } else if (HEADDIM <= 64) {      \
+      const int kHeadDim = 64;       \
+      return __VA_ARGS__();          \
+    } else if (HEADDIM <= 96) {      \
+      const int kHeadDim = 96;       \
+      return __VA_ARGS__();          \
+    } else if (HEADDIM <= 128) {     \
+      const int kHeadDim = 128;      \
+      return __VA_ARGS__();          \
+    } else if (HEADDIM <= 192) {     \
+      const int kHeadDim = 192;      \
+      return __VA_ARGS__();          \
+    } else if (HEADDIM <= 256) {     \
+      const int kHeadDim = 256;      \
+      return __VA_ARGS__();          \
+    }                                \
   }()
 #endif

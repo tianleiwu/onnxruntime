@@ -151,11 +151,14 @@ struct GroupQueryAttentionData {
   const T* query = nullptr;
   const T* key = nullptr;
   const T* value = nullptr;
-  const T* past_key = nullptr;
-  const T* past_value = nullptr;
+  const void* past_key = nullptr;
+  const void* past_value = nullptr;
   const T* cos_cache = nullptr;
   const T* sin_cache = nullptr;
   const T* head_sink = nullptr;
+
+  const T* k_scale = nullptr;
+  const T* v_scale = nullptr;
 
   // Total sequence length for each batch. It has shape [batch_size].
   int* total_seq_lens = nullptr;
@@ -200,8 +203,8 @@ struct GroupQueryAttentionData {
 
   // Output Tensors
   T* output = nullptr;
-  T* present_key = nullptr;
-  T* present_value = nullptr;
+  void* present_key = nullptr;
+  void* present_value = nullptr;
 
   // Kernel Flags
   bool use_flash_attention = false;
