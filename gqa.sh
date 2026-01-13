@@ -111,7 +111,7 @@ if [ "$RUN_BUILD" = true ]; then
             --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF \
             --cmake_extra_defines onnxruntime_ENABLE_CUDA_EP_INTERNAL_TESTS=OFF \
             --cmake_extra_defines onnxruntime_USE_FPA_INTB_GEMM=OFF \
-            --cmake_extra_defines onnxruntime_QUICK_BUILD=ON
+            --cmake_extra_defines onnxruntime_FLASH_BUILD=ON \
 
     if [ $? -ne 0 ]; then
         echo "==== ❌ Build failed! Exiting. ===="

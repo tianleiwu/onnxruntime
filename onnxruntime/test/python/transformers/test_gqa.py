@@ -49,8 +49,11 @@ pipeline_mode = os.getenv("PIPELINE_MODE", "1") == "1"
 # Number of values per parameter (compared to pipeline mode)
 param_count = int(os.getenv("PARAM_COUNT", "3")) if not pipeline_mode else 2
 
-# When quick build is used, flash attention only supports fp16 and head_size=128
-quick_build = ", quick-build=1, " in get_build_info()
+# When quick build is used, flash attention only supports head_size=128
+quick_build = ", quick-build=" in get_build_info()
+
+# When quick build mode is 1, bf16 is excluded
+quick_build_exclude_bf16 = ", quick-build=1, " in get_build_info()
 
 enable_debug_print = quick_build
 # #################################################################################################
@@ -1969,8 +1972,8 @@ def has_cuda_device(min_capability: int = 80):
 
 
 def has_flash_attention(bf16: bool = False):
-    # if bf16 and quick_build:
-    #     return False
+    if bf16 and quick_build_exclude_bf16:
+        return False
     return has_cuda_device(80)
 
 

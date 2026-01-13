@@ -465,7 +465,6 @@ ncu-ui gqa_kernel.ncu-rep
 |----------|--------|-------------|
 | `PIPELINE_MODE` | `0`, `1` | Reduce tests for CI |
 | `PARAM_COUNT` | integer | Parameter variations |
-| `QUICK_BUILD` | `0`, `1` | Fast build testing (hdim128 only) |
 
 ### CUDA Configuration
 | Variable | Values | Description |
