@@ -23,6 +23,8 @@ import argparse
 import time
 
 import torch
+import onnxruntime
+print(f"DEBUG: onnxruntime location: {onnxruntime.__file__}")
 from test_sparse_attention import GroupQueryAttentionConfig, OrtGroupQueryAttention
 
 # Optional NVTX support for nsys range markers

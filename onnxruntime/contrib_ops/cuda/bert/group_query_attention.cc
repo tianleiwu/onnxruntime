@@ -533,15 +533,26 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
   }
 
   data.use_flash_attention = use_flash_attention;
-  data.use_flash_attention_fast_decode = use_flash_attention && !disable_flash_decode_ && !parameters.is_first_prompt && parameters.past_present_share_buffer && !use_quantized_kv;
+  data.use_flash_attention_fast_decode = use_flash_attention && !disable_flash_decode_ && !parameters.is_first_prompt && parameters.past_present_share_buffer && (!use_quantized_kv);
 
   if (use_flash_attention) {
     // Allocate Flash specific buffers (Softmax LSE, Accum)
     size_t softmax_lse_bytes = onnxruntime::flash::get_softmax_lse_size(parameters.sequence_length, parameters.batch_size, parameters.num_heads);
+
+    int num_heads_for_split = data.use_flash_attention_fast_decode ? parameters.kv_num_heads : parameters.num_heads;
     auto [num_splits, softmax_lse_accum_bytes, out_accum_bytes] = onnxruntime::flash::get_num_splits_and_buffer_sizes(
-        parameters.batch_size, parameters.sequence_length, parameters.total_sequence_length, parameters.num_heads,
+        parameters.batch_size, parameters.sequence_length, parameters.total_sequence_length, num_heads_for_split,
         parameters.head_size, device_prop.multiProcessorCount);
+
     parameters.num_splits = static_cast<int>(num_splits);
+
+    if (data.use_flash_attention_fast_decode && num_splits > 1) {
+      // The heuristic used kv_num_heads to maximize occupancy for the GQA-aware kernel.
+      // However, the LSE and Accum buffers must store results for ALL num_heads.
+      softmax_lse_accum_bytes = onnxruntime::flash::get_softmax_lse_accum_size(num_splits, parameters.batch_size, parameters.num_heads, parameters.sequence_length);
+      auto round_multiple = [](size_t x, size_t m) { return (x + m - 1) / m * m; };
+      out_accum_bytes = onnxruntime::flash::get_out_accum_size(num_splits, parameters.batch_size, parameters.num_heads, parameters.sequence_length, round_multiple(parameters.head_size, 32));
+    }
 
     softmax_lse_buffer = GetScratchBuffer<void>(softmax_lse_bytes, context->GetComputeStream());
     softmax_lse_accum_buffer = GetScratchBuffer<void>(softmax_lse_accum_bytes, context->GetComputeStream());

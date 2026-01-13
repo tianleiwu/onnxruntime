@@ -788,7 +788,11 @@ Status FlashDecoding(
       parameters.seqlen_present_kv_cache, kv_sequence_length, parameters.rotary_dim,
       scale, parameters.softcap, is_causal, is_bf16, parameters.use_smooth_softmax, past_bsnh, parameters.num_splits,
       reinterpret_cast<void*>(data.softmax_lse_accum), reinterpret_cast<void*>(data.out_accum),
-      parameters.local_window_size - 1, parameters.rotary_interleaved, parameters.is_packed_qkv));
+      parameters.local_window_size - 1, parameters.rotary_interleaved, parameters.is_packed_qkv,
+      0, 1, const_cast<void*>(reinterpret_cast<const void*>(data.k_scale)),
+      const_cast<void*>(reinterpret_cast<const void*>(data.v_scale)),
+      static_cast<int>(parameters.k_quant_type), static_cast<int>(parameters.v_quant_type),
+      parameters.kv_cache_bit_width, parameters.query_dynamic_quant));
 
   return Status::OK();
 }
@@ -1082,7 +1086,11 @@ Status FlashAttention(
       parameters.use_smooth_softmax, past_bsnh, parameters.num_splits,
       reinterpret_cast<void*>(data.softmax_lse_accum),
       reinterpret_cast<void*>(data.out_accum), parameters.local_window_size - 1,
-      parameters.rotary_interleaved, use_packed_for_fa, 0, 1));
+      parameters.rotary_interleaved, use_packed_for_fa, 0, 1,
+      const_cast<void*>(reinterpret_cast<const void*>(data.k_scale)),
+      const_cast<void*>(reinterpret_cast<const void*>(data.v_scale)),
+      static_cast<int>(parameters.k_quant_type), static_cast<int>(parameters.v_quant_type),
+      parameters.kv_cache_bit_width, parameters.query_dynamic_quant));
 
   return Status::OK();
 }
