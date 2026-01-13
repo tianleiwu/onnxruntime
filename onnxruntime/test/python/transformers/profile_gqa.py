@@ -62,23 +62,27 @@ def create_gqa_config(
     is_packed_qkv: bool = False,
     device: str = "cuda",
 ) -> GroupQueryAttentionConfig:
-    """Create a GQA config based on the mode (fp16, int8, or int4)."""
+    """Create a GQA config based on the mode."""
     if mode == "fp16":
         k_quant_type = "NONE"
         v_quant_type = "NONE"
         kv_cache_type = "float16"
+        dtype = torch.float16
     elif mode == "bf16":
         k_quant_type = "NONE"
         v_quant_type = "NONE"
         kv_cache_type = "bfloat16"
+        dtype = torch.bfloat16
     elif mode == "int8":
         k_quant_type = "PER_TENSOR"
         v_quant_type = "PER_TENSOR"
         kv_cache_type = "int8"
+        dtype = torch.float16
     elif mode == "int4":
         k_quant_type = "PER_CHANNEL"
         v_quant_type = "PER_CHANNEL"
         kv_cache_type = "int4"
+        dtype = torch.float16
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -93,7 +97,7 @@ def create_gqa_config(
         local_window_size=-1,
         do_rotary=True,
         rotary_interleaved=False,
-        dtype=torch.float16 if mode == "fp16" else torch.bfloat16,
+        dtype=dtype,
         is_packed_qkv=is_packed_qkv,
         use_smooth_softmax=False,
         device=device,
@@ -159,7 +163,7 @@ def run_comparison(args):
         )
         avg_ms = benchmark_gqa(config, warmup=args.warmup, repeat=args.repeat, mode=mode)
         results[mode] = avg_ms
-        print(f"  {mode.upper():6s}: {avg_ms:.4f} ms")
+        print(f"  {mode.upper():6s} (dtype={config.dtype}): {avg_ms:.4f} ms")
 
     # Print comparison if we have baseline
     baseline = "fp16" if "fp16" in results else ("bf16" if "bf16" in results else None)

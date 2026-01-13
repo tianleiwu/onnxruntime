@@ -204,5 +204,5 @@ if [ "$RUN_PROFILE" = true ]; then
     echo "==== 🚀 Running profile_gqa.sh... ===="
     # bash profile_gqa.sh --fp16
     # bash profile_gqa.sh --fp16 --int4 --int8_quant --qkv
-    bash profile_gqa.sh --int8 --int4 --qkv
+    bash profile_gqa.sh --int8 --qkv
 fi
