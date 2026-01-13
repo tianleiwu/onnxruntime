@@ -270,11 +270,12 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_int8_dequant_kernel, bool Is_causal, bool 
 #if defined(ARCH_SUPPORTS_FLASH)
   const int n_split_idx = Split ? blockIdx.y : 0;
   const int num_n_splits = Split ? gridDim.y : 1;
-  const int bidb = Split ? blockIdx.z / params.h : blockIdx.y;
-  const int bidh = Split ? blockIdx.z % params.h : blockIdx.z;
+  // GQA-aware: compute bidh_kv (KV head index) from grid.z
+  const int bidb = Split ? blockIdx.z / params.h_k : blockIdx.y;
+  const int bidh_kv = Split ? blockIdx.z % params.h_k : blockIdx.z;
 
   flash::int8::compute_attn_1rowblock<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(
-      params, bidb, bidh, blockIdx.x, n_split_idx, num_n_splits);
+      params, bidb, bidh_kv, blockIdx.x, n_split_idx, num_n_splits);
 #else
   FLASH_UNSUPPORTED_ARCH
 #endif
@@ -346,8 +347,11 @@ void run_flash_int8_dequant_fwd(Flash_fwd_params& params, cudaStream_t stream) {
       (Kernel_traits::kBlockN * Kernel_traits::kSmemRowStrideInt8 +   // K_int8 (padded stride)
        Kernel_traits::kBlockN * Kernel_traits::kSmemRowStrideInt8);   // V_int8 (padded stride)
 
-  const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
-  dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
+  // GQA-aware: tile along combined seqlen_q and head dimension.
+  // Each block handles a tile of (seqlen_q * h_h_k_ratio).
+  const int virtual_seqlen_q = params.seqlen_q * params.h_h_k_ratio;
+  const int num_m_block = (virtual_seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
+  dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h_k : params.h_k);
 
   const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr &&
                           params.seqlen_k % Kernel_traits::kBlockN == 0 &&

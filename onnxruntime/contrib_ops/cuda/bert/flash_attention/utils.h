@@ -639,9 +639,9 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
                                      Tensor<Engine3, Layout3> const& predicate_K, const int max_MN = 0) {
   CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
   CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
-  CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));  // MMA
-  CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D));  // MMA_M
-  CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));  // MMA_K
+  assert(size<0>(S) == size<0>(D));  // MMA
+  assert(size<1>(S) == size<1>(D));  // MMA_M
+  assert(size<2>(S) == size<2>(D));  // MMA_K
   // There's no case where !Clear_OOB_K && Clear_OOB_MN
   static_assert(!(Clear_OOB_MN && !Clear_OOB_K));
 #pragma unroll
@@ -672,9 +672,9 @@ __forceinline__ __device__ void copy_w_min_idx(Tensor<Engine0, Layout0> const& S
                                                const int max_MN = 0, const int min_MN = 0) {
   CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
   CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
-  CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));  // MMA
-  CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D));  // MMA_M
-  CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));  // MMA_K
+  assert(size<0>(S) == size<0>(D));  // MMA
+  assert(size<1>(S) == size<1>(D));  // MMA_M
+  assert(size<2>(S) == size<2>(D));  // MMA_K
 // if (threadIdx.x == 0 && blockIdx.z == 0) { printf("blockIdx.y = %d, max_MN = %d, min_MN = %d\n", blockIdx.y, max_MN, min_MN); }
 #pragma unroll
   for (int m = 0; m < size<1>(S); ++m) {
