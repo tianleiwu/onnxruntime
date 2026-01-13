@@ -238,7 +238,7 @@ __forceinline__ __device__ void dequant_scores(
 template <typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi,
           bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_1rowblock(
-    const Params& params, const int bidb, const int bidh_kv, const int m_block,
+    const Params& params, const int bidb, const int bidh, const int m_block,
     const int n_split_idx, const int num_n_splits) {
   using Element = typename Kernel_traits::Element;
   using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -259,48 +259,52 @@ inline __device__ void compute_attn_1rowblock(
 
   const BlockInfo<!Is_even_MN> binfo(params, bidb);
 
-  // GQA-aware: the total "rows" in the M dimension is (seqlen_q * h_h_k_ratio)
-  const int virtual_seqlen_q = binfo.actual_seqlen_q * params.h_h_k_ratio;
-
-  if (m_block * kBlockM >= virtual_seqlen_q) return;
+  if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
   // Compute n_block range for Split-K
   const int n_blocks_per_split = ((params.seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
-  // Note: For simplicity in GQA-aware blocking, we use the first Q head of the group for causal/local constraints.
-  // Since all Q rows in this block share the same K padding/masking, this is safe for decoding.
   const int n_block_min = !Is_local
                               ? n_split_idx * n_blocks_per_split
-                              : std::max(n_split_idx * n_blocks_per_split, (m_block * kBlockM / params.h_h_k_ratio + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
+                              : std::max(n_split_idx * n_blocks_per_split, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
   int n_block_max = std::min(cute::ceil_div(binfo.actual_seqlen_k, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
   if (Is_causal || Is_local) {
     n_block_max = std::min(n_block_max,
-                           cute::ceil_div((m_block + 1) * kBlockM / params.h_h_k_ratio + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
+                           cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
   }
 
   // Early Exit / Initialization for Empty Split Blocks
   if (n_block_min >= n_block_max) {
     // We exit early and write 0 to gOaccum and -inf to gLSEaccum (if Split).
     if constexpr (Split) {
-      // For Split-K initialization in GQA-aware mode, we need to handle all heads in the group.
-      // This part is complex; for now we rely on the fact that if one head group is empty, they all are for decoding.
-      // We initialize based on the flattened M-dimension.
-      const index_t row_offset_oaccum = ((n_split_idx * params.b + bidb) * params.h + bidh_kv * params.h_h_k_ratio) * params.seqlen_q * params.d_rounded;
-      const index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh_kv * params.h_h_k_ratio) * params.seqlen_q;
+      const index_t row_offset_oaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q * params.d_rounded;
+      const index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q;
 
       Tensor gOaccum_base = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO*>(params.oaccum_ptr) + row_offset_oaccum),
-                                        make_shape(params.seqlen_q * params.h_h_k_ratio, Int<kHeadDim>{}),
+                                        make_shape(params.seqlen_q, Int<kHeadDim>{}),
                                         make_stride(kHeadDim, _1{}));
       Tensor gOaccum = local_tile(gOaccum_base, Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
 
       Tensor gLSEaccum_base = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.softmax_lseaccum_ptr) + row_offset_lseaccum),
-                                          make_shape(params.seqlen_q * params.h_h_k_ratio), Stride<_1>{});
+                                          make_shape(params.seqlen_q), Stride<_1>{});
       Tensor gLSEaccum = local_tile(gLSEaccum_base, Shape<Int<kBlockM>>{}, make_coord(m_block));
 
+      // Use GmemTiledCopyOaccum if available, otherwise reuse GmemTiledCopyO but adapt for ElementO type?
+      // Actually, we can just use simple writes since this is initialization.
+      // Or reuse Kernel_traits definitions if suitable.
+      // Let's use simple per-thread loop for initialization to avoid complexity with TiledCopy types for now.
+      // Actually best is to use tiled copy.
+
+      // Output Smem Layout (Row-Major for Vectorized Global Copy)
+      // using SmemLayoutO = decltype(make_layout(Shape<Int<kBlockM>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{}));
+      // We can reuse that for gOaccum initialization.
+
+      // For efficiency, just use a basic loop.
       int total_elems = kBlockM * kHeadDim;
       for (int i = tidx; i < total_elems; i += Kernel_traits::kNThreads) {
         int row = i / kHeadDim;
         int col = i % kHeadDim;
-        if (m_block * kBlockM + row < virtual_seqlen_q) {
+        if (row < binfo.actual_seqlen_q - m_block * kBlockM) {
+          // Bounds check
           if (col < params.d) {
             gOaccum(row, col) = 0.0f;
           }
@@ -309,7 +313,7 @@ inline __device__ void compute_attn_1rowblock(
 
       // Init LSE
       for (int i = tidx; i < kBlockM; i += Kernel_traits::kNThreads) {
-        if (m_block * kBlockM + i < virtual_seqlen_q) {
+        if (i < binfo.actual_seqlen_q - m_block * kBlockM) {
           gLSEaccum(i) = -std::numeric_limits<ElementAccum>::infinity();
         }
       }
@@ -319,46 +323,62 @@ inline __device__ void compute_attn_1rowblock(
 
   // Layout: [sQ (FP16)] [sK (Int8, padded)] [sV (Int8, padded)]
   // ============================================================================
+  // Note: SmemLayoutKInt8 uses padded stride (kSmemRowStrideInt8 = 144 for HeadDim=128)
+  // size(layout) returns logical size (64 × 128 = 8192), not physical size (64 × 144 = 9216)
+  // We must use physical size for tensor placement to avoid overlap.
   constexpr int kSmemSizeQ = kBlockM * kHeadDim * sizeof(Element);
   constexpr int kSmemSizeKInt8 = kBlockN * Kernel_traits::kSmemRowStrideInt8 * sizeof(ElementInt8);
 
   Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)),
                           typename Kernel_traits::SmemLayoutQ{});
+  // sK: INT8 Layout with padding for 128-bit aligned cp.async
   Tensor sK = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ)),
                           typename Kernel_traits::SmemLayoutKInt8{});
   Tensor sV = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ + kSmemSizeKInt8)),
                           typename Kernel_traits::SmemLayoutKInt8{});
 
+  // Zero-initialize sK and sV physical memory once to prevent garbage in padding
+  // (16-byte padding per row is used for 128-bit aligned cp.async and bank conflict avoidance)
   const int total_kv_bytes = 2 * kBlockN * Kernel_traits::kSmemRowStrideInt8;
   for (int i = tidx; i < total_kv_bytes / 16; i += Kernel_traits::kNThreads) {
     reinterpret_cast<uint4*>(smem_ + kSmemSizeQ)[i] = make_uint4(0, 0, 0, 0);
   }
   __syncthreads();
 
+  // Output Smem Layout (Row-Major for Vectorized Global Copy)
   Tensor sO = make_tensor(make_smem_ptr(reinterpret_cast<ElementO*>(smem_)),
                           typename Kernel_traits::SmemLayoutO{});
 
-  // GQA-aware: kv_head_idx is bidh_kv directly.
-  const int kv_head_idx = bidh_kv;
+  // Compute KV head index (for GQA)
+  const int kv_head_idx = bidh / params.h_h_k_ratio;
 
   // Get scales
+  // For PER_TENSOR (1): use index 0. For PER_CHANNEL (2): use head scale.
+  // Note: GQA typically uses one scale per KV head.
   const int scale_idx = (params.k_quant_type == 2) ? kv_head_idx : 0;
   const float k_scale = params.k_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.k_scale_ptr)[scale_idx]) : 1.0f;
   const float v_scale = params.v_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.v_scale_ptr)[scale_idx]) : 1.0f;
 
-  // Global Memory Tensors: Use composed layouts to flatten hierarchy for GQA
-  // We combine Head (within group) and Seq into a single flattened M dimension "virtual_seqlen_q"
-  // but use the correct strides to map back to (head_in_group, actual_seq)
-  const int head_group_start = bidh_kv * params.h_h_k_ratio;
-  const Element* q_group_ptr = reinterpret_cast<const Element*>(params.q_ptr) + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb) + head_group_start * params.q_head_stride;
+  // Global Memory Tensors
+  Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<const Element*>(params.q_ptr) +
+                                        binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
+                          make_shape(binfo.actual_seqlen_q, params.h, params.d),
+                          make_stride(params.q_row_stride, params.q_head_stride, _1{}));
+  Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
 
-  // O and LSE accumulators: global base pointers
-  const index_t row_offset_o_base_gqa = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb) + (index_t)head_group_start * params.o_head_stride;
-  const index_t row_offset_oaccum_base_gqa = ((index_t)(n_split_idx * params.b + bidb) * params.h + head_group_start) * params.seqlen_q * params.d_rounded;
-  const index_t row_offset_lseaccum_base_gqa = ((index_t)(n_split_idx * params.b + bidb) * params.h + head_group_start) * params.seqlen_q;
+  // O and LSE accumulators
+  const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb);
+  const index_t row_offset_oaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q * params.d_rounded;
+  const index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q;
 
-  ElementO* o_ptr_base = reinterpret_cast<ElementO*>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum_base_gqa : row_offset_o_base_gqa);
-  ElementAccum* lse_ptr_base = reinterpret_cast<ElementAccum*>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + row_offset_lseaccum_base_gqa;
+  Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO*>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
+                          make_shape(binfo.actual_seqlen_q, Split ? Int<1>{} : params.h, params.d),
+                          make_stride(Split ? Int<kHeadDim>{} : params.o_row_stride, Split ? Int<0>{} : params.o_head_stride, _1{}));
+  Tensor gO = local_tile(mO(_, Split ? _0{} : bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
+
+  Tensor gLSEaccum_base = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + row_offset_lseaccum),
+                                      make_shape(binfo.actual_seqlen_q), Stride<_1>{});
+  Tensor gLSEaccum = local_tile(gLSEaccum_base, Shape<Int<kBlockM>>{}, make_coord(m_block));
 
   // K is INT8 in global memory
   const index_t k_base_offset = binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb) +
@@ -379,6 +399,19 @@ inline __device__ void compute_attn_1rowblock(
   // ============================================================================
   typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
   auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
+
+  Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ);
+  Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
+
+  Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));
+  Tensor tQcQ = gmem_thr_copy_QKV.partition_S(cQ);
+  Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
+  if (!Is_even_K) {
+#pragma unroll
+    for (int k = 0; k < size(tQpQ); ++k) {
+      tQpQ(k) = get<1>(tQcQ(0, 0, k)) < params.d;
+    }
+  }
 
   // Tiled Copy for K/V INT8 loading
   typename Kernel_traits::GmemTiledCopyKInt8 gmem_tiled_copy_KInt8;
@@ -430,19 +463,12 @@ inline __device__ void compute_attn_1rowblock(
   flash::Softmax<kNRows, Kernel_traits::kNThreadsPerRow> softmax;
 
   // ============================================================================
-  // Load Q manually from Global to Shared
-  for (int i = tidx; i < kBlockM * kHeadDim; i += Kernel_traits::kNThreads) {
-    int row = i / kHeadDim;
-    int col = i % kHeadDim;
-    int virtual_row = m_block * kBlockM + row;
-    if (virtual_row < virtual_seqlen_q) {
-      int h_rel = virtual_row % params.h_h_k_ratio;
-      int s_idx = virtual_row / params.h_h_k_ratio;
-      // In BSNH: [Batch, Seq, Head, Dim]
-      index_t offset = (index_t)s_idx * params.q_row_stride + (index_t)h_rel * params.q_head_stride + col;
-      sQ(row, col) = q_group_ptr[offset];
-    }
-  }
+  // Load Q
+  // ============================================================================
+  flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
+                                     binfo.actual_seqlen_q - m_block * kBlockM);
+  cute::cp_async_fence();
+  cute::cp_async_wait<0>();
   __syncthreads();
 
   // ============================================================================
@@ -505,6 +531,7 @@ inline __device__ void compute_attn_1rowblock(
         Tensor tKgK_write = gmem_thr_copy_KInt8.partition_S(gK_int8_write);  // Thread partition for Global Write
 
         // [New K/V Base Pointers] Hoist invariant offset calculation
+        const int bidh_kv = bidh / params.h_h_k_ratio;
         size_t k_batch_head_offset = (bidb * params.knew_batch_stride) + (bidh_kv * params.knew_head_stride);
         size_t v_batch_head_offset = (bidb * params.vnew_batch_stride) + (bidh_kv * params.vnew_head_stride);
         Element* knew_base_ptr = reinterpret_cast<Element*>(params.knew_ptr) + k_batch_head_offset;
@@ -619,13 +646,11 @@ inline __device__ void compute_attn_1rowblock(
     //   printf("DEBUG: bidb=0 bidh=0 n_block=0 k_scale=%f v_scale=%f acc_s(0,0)=%f\n", k_scale, v_scale, (float)acc_s(0));
     // }
 
-    // Masking: map virtual row back to original sequence row
+    // Masking
     constexpr int kNWarps = Kernel_traits::kNWarps;
     const int col_idx_offset = n_block * kBlockN;
-    // Map virtual row index (0..virtual_seqlen_q-1) to actual sequence index (0..actual_seqlen_q-1)
-    const int row_idx_offset = (m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4) / params.h_h_k_ratio;
-    const int warp_row_stride = (kNWarps * 16) / params.h_h_k_ratio;  // Approximation for masking
-
+    const int row_idx_offset = m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4;
+    const int warp_row_stride = kNWarps * 16;
     flash::Mask<Is_causal, Is_local, /*Has_alibi=*/false> mask(
         binfo.actual_seqlen_k, binfo.actual_seqlen_q,
         params.window_size_left, params.window_size_right);
@@ -698,53 +723,82 @@ inline __device__ void compute_attn_1rowblock(
   // ============================================================================
   // Normalize acc_o (full N=128)
   // Handle sink parameter correctly for smooth softmax (same as old kernel)
-  // For GQA efficiency, we use the first head of the group for sink if provided
-  const float sink = (params.head_sink_ptr)
-                         ? static_cast<float>(reinterpret_cast<const Element*>(params.head_sink_ptr)[head_group_start])
-                         : (params.smooth_softmax ? 0.0f : -flash::kInfinity);
+  float sink = (params.head_sink_ptr != nullptr)
+                   ? static_cast<float>(reinterpret_cast<const Element*>(params.head_sink_ptr)[bidh])
+                   : (params.smooth_softmax ? 0.0f : -flash::kInfinity);
   Tensor lse = softmax.template normalize_softmax_lse<Split>(acc_o, params.scale_softmax, sink);
 
-  // 1. Copy Reg -> Smem (Standard Flash method, safe)
-  Tensor tOrO = make_tensor(acc_o.data(), typename Kernel_traits::SmemLayoutO{});
-  Tensor tOsO_acc = tiled_mma.get_slice(tidx).partition_C(sO);
-  cute::copy(tOrO, tOsO_acc);
+  // Store Reg -> Smem (use same approach as old kernel with retile_S)
+  Tensor rO = flash::convert_type<ElementO>(acc_o);
+
+  using SmemCopyAtomO = Copy_Atom<DefaultCopy, ElementO>;
+  auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
+  auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
+  Tensor taccOrO = smem_thr_copy_O.retile_S(rO);   // ((Atom,AtomNum), MMA_M, MMA_N)
+  auto taccOsO = smem_thr_copy_O.partition_D(sO);  // ((Atom,AtomNum),PIPE_M,PIPE_N)
+
+  cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
   __syncthreads();
 
-  // 2. Copy Smem -> Gmem (Manual for GQA mapping)
-  for (int i = tidx; i < kBlockM * kHeadDim; i += Kernel_traits::kNThreads) {
-    int row = i / kHeadDim;
-    int col = i % kHeadDim;
-    int virtual_row = m_block * kBlockM + row;
-    if (virtual_row < virtual_seqlen_q) {
-      int h_rel = virtual_row % params.h_h_k_ratio;
-      int s_idx = virtual_row / params.h_h_k_ratio;
+  // Copy Smem -> Global
+  if constexpr (!Split) {
+    using GmemTiledCopyO = typename Kernel_traits::GmemTiledCopyO;
+    GmemTiledCopyO gmem_tiled_copy_O;
+    auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
+    Tensor tOsO = gmem_thr_copy_O.partition_S(sO);
+    Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
 
-      if (col < params.d) {
-        index_t offset;
-        if constexpr (Split) {
-          // Split (Oaccum): [splits, Batch, Head, Seq, Dim]. Seq is inner to Head.
-          offset = (index_t)h_rel * params.seqlen_q * params.d_rounded + (index_t)s_idx * params.d_rounded + col;
-        } else {
-          // Unsplit (BSNH): [Batch, Seq, Head, Dim]. Head is inner to Seq.
-          offset = (index_t)s_idx * params.o_row_stride + (index_t)h_rel * params.o_head_stride + col;
-        }
-        o_ptr_base[offset] = static_cast<ElementO>(sO(row, col));
+    Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));
+    Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOsO)));
+
+    flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+        gmem_tiled_copy_O, tOsO, tOgO,
+        tOcO, tOpO,
+        binfo.actual_seqlen_q - m_block * kBlockM);
+  } else {
+    // Split case: Write sO (Element/Half) to gO (ElementAccum/Float).
+    // We also need to write LSE.
+
+    // 1. Write O accum (sO -> gO)
+    // This is a manual copy from shared memory to global memory with type conversion.
+    // sO is [kBlockM, kHeadDim] in shared memory.
+    // gO is [kBlockM, kHeadDim] tile in global memory.
+    // We iterate through all elements this thread group is responsible for,
+    // but since it's just a raw copy loop, we can distribute work simply.
+
+    const int total_elems = kBlockM * kHeadDim;
+#pragma unroll
+    for (int i = tidx; i < total_elems; i += Kernel_traits::kNThreads) {
+      int r = i / kHeadDim;
+      int c = i % kHeadDim;
+      if (r < binfo.actual_seqlen_q - m_block * kBlockM) {
+        gO(r, c) = static_cast<ElementAccum>(sO(r, c));
       }
     }
-  }
 
-  // 3. Write LSE: use the thread-local `lse` register tensor
-  const int lane = tidx % 32;
-  const int warp = tidx / 32;
-  if (lane % 4 == 0) {
-    for (int mi = 0; mi < size<0>(lse); ++mi) {
-      int local_row = warp * 16 + (lane / 4) + mi * 8;
-      int virtual_row = m_block * kBlockM + local_row;
-      if (virtual_row < virtual_seqlen_q) {
-        int h_rel = virtual_row % params.h_h_k_ratio;
-        int s_idx = virtual_row / params.h_h_k_ratio;
-        index_t lse_offset = (index_t)h_rel * params.seqlen_q + s_idx;
-        lse_ptr_base[lse_offset] = lse(mi);
+    // 2. Write LSE accum
+    // Map LSE values (registers) to Global Rows manually for SM80_16x8x16 layout.
+    // acc_o structure for 16x8x16:
+    // Each warp handles 16 rows (MMA_M=1 for BlockM=64/4warps=16 rows per warp).
+    // Lanes 0-3 handle Row 0 and Row 8. (Cols 0-7).
+    // We rely on consistent layout for SM80.
+
+    const int lane = tidx % 32;
+    const int warp = tidx / 32;
+    // Local row index within the block (0..kBlockM-1)
+    const int local_row_0 = warp * 16 + (lane / 4);
+    const int local_row_1 = local_row_0 + 8;
+
+    // Only the first thread in the quad (Col 0) writes LSE
+    if ((lane % 4) == 0) {
+      // LSE[0] corresponds to local_row_0
+      if (local_row_0 < binfo.actual_seqlen_q - m_block * kBlockM) {
+        gLSEaccum(local_row_0) = lse(0);
+      }
+      // LSE[1] corresponds to local_row_1
+      if (local_row_1 < binfo.actual_seqlen_q - m_block * kBlockM) {
+        gLSEaccum(local_row_1) = lse(1);
       }
     }
   }
