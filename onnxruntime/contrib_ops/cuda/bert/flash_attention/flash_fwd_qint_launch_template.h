@@ -192,10 +192,16 @@ void run_flash_int8_decode_fwd(Flash_fwd_params& params, cudaStream_t stream) {
   dim3 grid_decode(1, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * num_heads_launch : num_heads_launch);
 
   // Calculate Smem Size (Physical size with padding)
-  constexpr int kSmemSizeQ = DecodeTraits::kBlockM * DecodeTraits::kHeadDim * sizeof(typename DecodeTraits::Element);
+  // Note: GQA kernel uses kSmemQRows = max(kNWarps*16, kBlockM) for Q storage
+  // and double-buffered K/V with kNumStages=2
+  constexpr int kSmemQRows = (DecodeTraits::kNWarps * 16 > DecodeTraits::kBlockM)
+                                 ? (DecodeTraits::kNWarps * 16)
+                                 : DecodeTraits::kBlockM;
+  constexpr int kSmemSizeQ = kSmemQRows * DecodeTraits::kHeadDim * sizeof(typename DecodeTraits::Element);
   constexpr int kSmemSizeKInt8 = DecodeTraits::kBlockN * DecodeTraits::kSmemRowStrideInt8 * sizeof(typename DecodeTraits::ElementInt8);
   constexpr int kSmemSizeVInt8 = kSmemSizeKInt8;
-  int smem_size_decode = kSmemSizeQ + kSmemSizeKInt8 + kSmemSizeVInt8;
+  constexpr int kNumStages = 2;  // Double-buffering for pipelining
+  int smem_size_decode = kSmemSizeQ + kNumStages * (kSmemSizeKInt8 + kSmemSizeVInt8);
 
   QUANT_CAUSAL_SWITCH(params.is_causal, Is_causal, [&] {
     BOOL_SWITCH(params.num_splits > 1, SplitConst, [&] {
@@ -392,7 +398,7 @@ void run_mha_fwd_dequant_dispatch(Flash_fwd_params& params, cudaStream_t stream)
           // N=128 improves memory bandwidth usage.
           // Warps=1 works with N=128 and M=16.
           // Note: Ensure sufficient splits are used to saturate GPU.
-          run_flash_int8_decode_fwd<flash::int8::Flash_dq_kernel_traits<Headdim, 16, 128, 1, T>>(params, stream);
+          run_flash_int8_decode_fwd<flash::int8::Flash_dq_kernel_traits<Headdim, 16, 128, 4, T>>(params, stream);
         } else {
           run_flash_int8_dequant_fwd<flash::int8::Flash_dq_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, T>>(params, stream);
         }

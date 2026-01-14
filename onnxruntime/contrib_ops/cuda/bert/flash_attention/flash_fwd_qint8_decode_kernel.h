@@ -51,6 +51,45 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// Vectorized Dequantization Helpers
+// Optimized for int8 KV cache with fp16/bf16 computation
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Dequantize 4 int8 values to 4 floats using vectorized operations
+// Input: 4 consecutive int8 values packed in an int (as bytes)
+// Output: 4 floats in an array
+__device__ __forceinline__ void dequant_int8x4_to_float4(
+    const int8_t* src, float* dst, float scale) {
+  // Load 4 int8s as a single 32-bit word
+  int32_t packed = *reinterpret_cast<const int32_t*>(src);
+
+  // Extract individual bytes using bit operations
+  int8_t v0 = static_cast<int8_t>(packed & 0xFF);
+  int8_t v1 = static_cast<int8_t>((packed >> 8) & 0xFF);
+  int8_t v2 = static_cast<int8_t>((packed >> 16) & 0xFF);
+  int8_t v3 = static_cast<int8_t>((packed >> 24) & 0xFF);
+
+  // Convert to float with scale
+  dst[0] = static_cast<float>(v0) * scale;
+  dst[1] = static_cast<float>(v1) * scale;
+  dst[2] = static_cast<float>(v2) * scale;
+  dst[3] = static_cast<float>(v3) * scale;
+}
+
+// Compute dot product of two float4 vectors
+__device__ __forceinline__ float dot4(const float* a, const float* b) {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+}
+
+// Accumulate: dst += scale * src (float4)
+__device__ __forceinline__ void fma4(float* dst, float scale, const float* src) {
+  dst[0] += scale * src[0];
+  dst[1] += scale * src[1];
+  dst[2] += scale * src[2];
+  dst[3] += scale * src[3];
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // Kernel Traits for Decode (Q=1)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -212,11 +251,15 @@ inline __device__ void compute_attn_decode(const Params& params) {
   // ============================================================================
   // Online Softmax State (per warp)
   // ============================================================================
-  float m_i = -INFINITY;           // Running max
-  float l_i = 0.0f;                // Running sum of exp
-  float acc_o[kHeadDim / 32 + 1];  // Output accumulator (distributed across lanes)
+  float m_i = -INFINITY;  // Running max
+  float l_i = 0.0f;       // Running sum of exp
+
+  // Output accumulator: each lane holds kElemsPerLane consecutive elements
+  // For HeadDim=128: lane 0 holds [0,1,2,3], lane 1 holds [4,5,6,7], etc.
+  constexpr int kElemsPerLane = kHeadDim / 32;  // 4 for HeadDim=128
+  float acc_o[kElemsPerLane];
 #pragma unroll
-  for (int i = 0; i < kHeadDim / 32 + 1; ++i) {
+  for (int i = 0; i < kElemsPerLane; ++i) {
     acc_o[i] = 0.0f;
   }
 
@@ -281,19 +324,32 @@ inline __device__ void compute_attn_decode(const Params& params) {
     __syncthreads();
 
     // --------------------------------------------------------------------
-    // Compute S = Q @ K^T (warp-level GEMV with dequant)
+    // Compute S = Q @ K^T (warp-level GEMV with vectorized dequant)
     // Each warp uses its own Q vector, shared K
-    // Result: scores[kBlockN] per warp
+    // OPTIMIZATION: Each lane handles 4 consecutive head dims per iteration
+    // HeadDim=128, 32 lanes → each lane covers 4 elements → 1 full pass
+    // Using vectorized int8x4 loads for K data
     // --------------------------------------------------------------------
     float scores[kBlockN];
-    // Removed #pragma unroll to reduce compile time (kBlockN can be 128)
+
+    // Pre-load Q values for this lane (kElemsPerLane elements per lane)
+    float q_local[kElemsPerLane];
+#pragma unroll
+    for (int i = 0; i < kElemsPerLane; ++i) {
+      q_local[i] = my_sQ[lane_id * kElemsPerLane + i];
+    }
+
+    // Process each K token
     for (int n = 0; n < kBlockN; ++n) {
       float score = 0.0f;
+      const ElementInt8* k_row = sK + n * kSmemRowStride;
+
+      // Vectorized dot product: process 4 elements at a time
 #pragma unroll
-      for (int d = lane_id; d < kHeadDim; d += 32) {
-        float q_val = static_cast<float>(my_sQ[d]);
-        float k_val = static_cast<float>(sK[n * kSmemRowStride + d]) * k_scale;
-        score += q_val * k_val;
+      for (int i = 0; i < kElemsPerLane; ++i) {
+        int d = lane_id * kElemsPerLane + i;
+        float k_val = static_cast<float>(k_row[d]) * k_scale;
+        score += q_local[i] * k_val;
       }
       scores[n] = warp_reduce_sum(score);
     }
@@ -334,7 +390,7 @@ inline __device__ void compute_attn_decode(const Params& params) {
 
 // Rescale existing O accumulator
 #pragma unroll
-    for (int i = 0; i < kHeadDim / 32 + 1; ++i) {
+    for (int i = 0; i < kElemsPerLane; ++i) {
       acc_o[i] *= rescale;
     }
     l_i *= rescale;
@@ -348,16 +404,19 @@ inline __device__ void compute_attn_decode(const Params& params) {
     m_i = m_new;
 
     // --------------------------------------------------------------------
-    // Accumulate O += P @ V (warp-level)
-    // Each lane accumulates part of the head dimension
+    // Accumulate O += P @ V (warp-level with vectorized access)
+    // OPTIMIZATION: Each lane handles 4 consecutive head dims (matches Q×K)
+    // acc_o[i] accumulates element (lane_id * 4 + i) of the output
     // --------------------------------------------------------------------
-    // Removed #pragma unroll to reduce compile time
     for (int n = 0; n < kBlockN; ++n) {
       float p_val = p[n];
+      const ElementInt8* v_row = sV + n * kSmemRowStride;
+
 #pragma unroll
-      for (int d = lane_id; d < kHeadDim; d += 32) {
-        float v_val = static_cast<float>(sV[n * kSmemRowStride + d]) * v_scale;
-        acc_o[d / 32] += p_val * v_val;
+      for (int i = 0; i < kElemsPerLane; ++i) {
+        int d = lane_id * kElemsPerLane + i;
+        float v_val = static_cast<float>(v_row[d]) * v_scale;
+        acc_o[i] += p_val * v_val;
       }
     }
 
@@ -379,8 +438,9 @@ inline __device__ void compute_attn_decode(const Params& params) {
   ElementO* o_ptr = reinterpret_cast<ElementO*>(Split ? params.oaccum_ptr : params.o_ptr) + o_offset;
 
 #pragma unroll
-  for (int d = lane_id; d < kHeadDim; d += 32) {
-    float val = acc_o[d / 32] * l_inv;
+  for (int i = 0; i < kElemsPerLane; ++i) {
+    int d = lane_id * kElemsPerLane + i;
+    float val = acc_o[i] * l_inv;
     if (d < params.d) {
       o_ptr[d] = static_cast<ElementO>(val);
     } else if (d < params.d_rounded) {

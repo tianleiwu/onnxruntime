@@ -818,19 +818,32 @@ inline __device__ void compute_attn_1rowblock_gqa(
     return;
   }
 
-  // Smem Setup
-  // Smem Setup
+  // Smem Setup (Double-buffered for K/V pipelining)
   constexpr int kSmemQRows = (kNWarps * 16 > kBlockM) ? (kNWarps * 16) : kBlockM;
   constexpr int kSmemSizeQ = kSmemQRows * kHeadDim * sizeof(Element);
   constexpr int kSmemSizeKInt8 = kBlockN * Kernel_traits::kSmemRowStrideInt8 * sizeof(ElementInt8);
+  constexpr int kSmemSizeVInt8 = kSmemSizeKInt8;
+  constexpr int kSmemSizeKVInt8 = kSmemSizeKInt8 + kSmemSizeVInt8;
+  constexpr int kNumStages = 2;  // Double-buffering
 
   using SmemLayoutQ_GQA = decltype(tile_to_shape(typename Kernel_traits::SmemLayoutAtom{}, Shape<Int<kSmemQRows>, Int<kHeadDim>>{}));
   Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)), SmemLayoutQ_GQA{});
-  Tensor sK = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ)), typename Kernel_traits::SmemLayoutKInt8{});
-  Tensor sV = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ + kSmemSizeKInt8)), typename Kernel_traits::SmemLayoutKInt8{});
 
-  // Zero-init Int8 padding
-  const int total_kv_bytes = 2 * kBlockN * Kernel_traits::kSmemRowStrideInt8;
+  // Double-buffered K/V: Stage 0 and Stage 1
+  char* stage0_base = smem_ + kSmemSizeQ;
+  char* stage1_base = smem_ + kSmemSizeQ + kSmemSizeKVInt8;
+
+  auto sK_0 = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(stage0_base)),
+                          typename Kernel_traits::SmemLayoutKInt8{});
+  auto sV_0 = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(stage0_base + kSmemSizeKInt8)),
+                          typename Kernel_traits::SmemLayoutKInt8{});
+  auto sK_1 = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(stage1_base)),
+                          typename Kernel_traits::SmemLayoutKInt8{});
+  auto sV_1 = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(stage1_base + kSmemSizeKInt8)),
+                          typename Kernel_traits::SmemLayoutKInt8{});
+
+  // Zero-init Int8 padding (both stages)
+  const int total_kv_bytes = kNumStages * kSmemSizeKVInt8;
   for (int i = tidx; i < total_kv_bytes / 16; i += Kernel_traits::kNThreads) {
     reinterpret_cast<uint4*>(smem_ + kSmemSizeQ)[i] = make_uint4(0, 0, 0, 0);
   }
@@ -875,24 +888,79 @@ inline __device__ void compute_attn_1rowblock_gqa(
   const float k_scale = params.k_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.k_scale_ptr)[(params.k_quant_type == 2) ? kv_head_idx : 0]) : 1.0f;
   const float v_scale = params.v_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.v_scale_ptr)[(params.k_quant_type == 2) ? kv_head_idx : 0]) : 1.0f;
 
+  // Global K/V base offsets
+  const index_t k_base = binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb) + kv_head_idx * params.k_head_stride;
+  const index_t v_base = binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb) + kv_head_idx * params.v_head_stride;
+
+  Tensor mK = make_tensor(make_gmem_ptr(reinterpret_cast<const ElementInt8*>(params.k_ptr) + k_base),
+                          make_shape(binfo.actual_seqlen_k, params.d), make_stride(params.k_row_stride, _1{}));
+  Tensor mV = make_tensor(make_gmem_ptr(reinterpret_cast<const ElementInt8*>(params.v_ptr) + v_base),
+                          make_shape(binfo.actual_seqlen_k, params.d), make_stride(params.v_row_stride, _1{}));
+
+  // Prepare predicates for K/V copy
+  Tensor cK = make_identity_tensor(make_shape(size<0>(sK_0), size<1>(sK_0)));
+  Tensor tKcK = gmem_thr_copy_KInt8.partition_D(cK);
+  auto tKsK_0 = gmem_thr_copy_KInt8.partition_D(sK_0);
+  Tensor tKpK = make_tensor<bool>(make_shape(size<2>(tKsK_0)));
+#pragma unroll
+  for (int k = 0; k < size(tKpK); ++k) tKpK(k) = get<1>(tKcK(0, 0, k)) < params.d;
+
+  // Helper lambdas for loading K/V tiles into each stage
+  auto load_kv_tile_stage0 = [&](int n_block) {
+    Tensor gK = local_tile(mK, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
+    Tensor gV = local_tile(mV, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
+    Tensor tKsK = gmem_thr_copy_KInt8.partition_D(sK_0);
+    Tensor tVsV = gmem_thr_copy_KInt8.partition_D(sV_0);
+    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KInt8, gmem_thr_copy_KInt8.partition_S(gK), tKsK, tKcK, tKpK, binfo.actual_seqlen_k - n_block * kBlockN);
+    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KInt8, gmem_thr_copy_KInt8.partition_S(gV), tVsV, tKcK, tKpK, binfo.actual_seqlen_k - n_block * kBlockN);
+  };
+
+  auto load_kv_tile_stage1 = [&](int n_block) {
+    Tensor gK = local_tile(mK, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
+    Tensor gV = local_tile(mV, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
+    Tensor tKsK = gmem_thr_copy_KInt8.partition_D(sK_1);
+    Tensor tVsV = gmem_thr_copy_KInt8.partition_D(sV_1);
+    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KInt8, gmem_thr_copy_KInt8.partition_S(gK), tKsK, tKcK, tKpK, binfo.actual_seqlen_k - n_block * kBlockN);
+    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KInt8, gmem_thr_copy_KInt8.partition_S(gV), tVsV, tKcK, tKpK, binfo.actual_seqlen_k - n_block * kBlockN);
+  };
+
+  // ============================================================================
+  // Main Loop with Double-Buffered Pipelining
+  // ============================================================================
+  // Pre-load first tile (stage 0)
+  int first_n_block = n_block_max - 1;
+  if (first_n_block >= n_block_min) {
+    load_kv_tile_stage0(first_n_block);
+    cute::cp_async_fence();
+  }
+
   bool is_first_block = true;
   for (int n_block = n_block_max - 1; n_block >= n_block_min; --n_block) {
-    // Load K/V
-    const index_t k_base = binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb) + kv_head_idx * params.k_head_stride;
-    const index_t v_base = binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb) + kv_head_idx * params.v_head_stride;
+    // Determine current and next stage
+    int cur_stage = (n_block_max - 1 - n_block) % kNumStages;
+    int next_n_block = n_block - 1;
 
-    Tensor gK = local_tile(make_tensor(make_gmem_ptr(reinterpret_cast<const ElementInt8*>(params.k_ptr) + k_base), make_shape(binfo.actual_seqlen_k, params.d), make_stride(params.k_row_stride, _1{})), Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
-    Tensor gV = local_tile(make_tensor(make_gmem_ptr(reinterpret_cast<const ElementInt8*>(params.v_ptr) + v_base), make_shape(binfo.actual_seqlen_k, params.d), make_stride(params.v_row_stride, _1{})), Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
+    // Issue async load for NEXT tile into NEXT stage buffer
+    if (next_n_block >= n_block_min) {
+      if ((cur_stage + 1) % kNumStages == 0) {
+        load_kv_tile_stage0(next_n_block);
+      } else {
+        load_kv_tile_stage1(next_n_block);
+      }
+      cute::cp_async_fence();
+    }
 
-    Tensor tKsK = gmem_thr_copy_KInt8.partition_D(sK);
-    Tensor tVsV = gmem_thr_copy_KInt8.partition_D(sV);
-
-    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KInt8, gmem_thr_copy_KInt8.partition_S(gK), tKsK, gmem_thr_copy_KInt8.partition_D(make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)))), make_tensor<bool>(make_shape(size<2>(tKsK))), binfo.actual_seqlen_k - n_block * kBlockN);
-    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KInt8, gmem_thr_copy_KInt8.partition_S(gV), tVsV, gmem_thr_copy_KInt8.partition_D(make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)))), make_tensor<bool>(make_shape(size<2>(tKsK))), binfo.actual_seqlen_k - n_block * kBlockN);
-
-    cute::cp_async_fence();
-    cute::cp_async_wait<0>();
+    // Wait for CURRENT tile (keep 1 async op in flight if there's a next tile)
+    if (next_n_block >= n_block_min) {
+      cute::cp_async_wait<1>();
+    } else {
+      cute::cp_async_wait<0>();
+    }
     __syncthreads();
+
+    // Select current stage's K/V buffers
+    auto& sK_cur = (cur_stage == 0) ? sK_0 : sK_1;
+    auto& sV_cur = (cur_stage == 0) ? sV_0 : sV_1;
 
     // Gemm Quant Q*K^T
     Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
@@ -903,15 +971,16 @@ inline __device__ void compute_attn_1rowblock_gqa(
     auto tSrQ = tiled_mma.get_thread_slice(tidx).partition_fragment_A(sQ);
     cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ);
 
-    // Manual GEMM
+    // Manual GEMM with current stage's K
     auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomInt8Default{}, tiled_mma);
-    auto sK_quant = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutKInt8{});
-    auto tSsK = smem_tiled_copy_K.get_thread_slice(tidx).partition_S(make_tensor(sK_quant.data(), make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, Stride<_1, Int<Kernel_traits::kSmemRowStrideInt8>>{})));
-    auto tSrK = tiled_mma.get_thread_slice(tidx).partition_fragment_B(make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ)), typename Kernel_traits::SmemLayoutK{}));
+    auto tSsK = smem_tiled_copy_K.get_thread_slice(tidx).partition_S(
+        make_tensor(sK_cur.data(), make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{},
+                                               Stride<_1, Int<Kernel_traits::kSmemRowStrideInt8>>{})));
+    auto tSrK = tiled_mma.get_thread_slice(tidx).partition_fragment_B(
+        make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ)), typename Kernel_traits::SmemLayoutK{}));
     flash::gemm_quant_manual<false>(acc_s, tSrQ, tSrK, tSsK, tiled_mma, smem_tiled_copy_K, smem_tiled_copy_K.get_thread_slice(tidx), k_scale);
 
-    // Masking Handled by implicit bounds check (or simple clip)
-    // Actually we need to mask out tokens beyond seqlen_k
+    // Masking
     if (n_block * kBlockN + kBlockN > binfo.actual_seqlen_k) {
       flash::Mask<false, false, false> mask(binfo.actual_seqlen_k, 0, 0, 0);
       mask.template apply_mask<false, false>(acc_s, n_block * kBlockN, 0, 0);
@@ -924,100 +993,98 @@ inline __device__ void compute_attn_1rowblock_gqa(
     else
       softmax.template softmax_rescale_o<false>(acc_s, acc_o, params.scale_softmax_log2);
 
-    if (tidx == 0) {
-      // P@V
-      // sP reuses sK shared memory. We must ensure all warps finished reading sK (in gemm_quant_manual)
-      // before any warp starts writing sP.
-      __syncthreads();
+    // P@V: sP reuses current stage's K buffer memory
+    __syncthreads();
 
-      auto sP = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ)), make_layout(Shape<Int<kSmemQRows>, Int<kBlockN>>{}, Stride<Int<kBlockN>, _1>{}));
-      // Acc_s to sP
-      auto acc_s_rowcol = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
-      const int lane_id = tidx % 32;
-      const int warp_id = tidx / 32;
-      for (int mi = 0; mi < size<0, 1>(acc_s_rowcol); ++mi) {
-        int r_base = warp_id * 16 + (lane_id / 4);
-        for (int i = 0; i < size<0, 0>(acc_s_rowcol); ++i) {
-          int r = r_base + i * 8;
-          for (int nj = 0; nj < size<1, 1>(acc_s_rowcol); ++nj) {
-            int c_base = (lane_id % 4) * 2 + nj * 8;
-            if (r < kBlockM && c_base < kBlockN) {
-              reinterpret_cast<__half2&>(sP(r, c_base)) = __halves2half2(static_cast<half>(acc_s_rowcol(make_coord(i, mi), make_coord(0, nj))), static_cast<half>(acc_s_rowcol(make_coord(i, mi), make_coord(1, nj))));
-            }
+    auto sP = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(sK_cur.data().get())),
+                          make_layout(Shape<Int<kSmemQRows>, Int<kBlockN>>{}, Stride<Int<kBlockN>, _1>{}));
+    // Acc_s to sP
+    auto acc_s_rowcol = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+    const int lane_id = tidx % 32;
+    const int warp_id = tidx / 32;
+    for (int mi = 0; mi < size<0, 1>(acc_s_rowcol); ++mi) {
+      int r_base = warp_id * 16 + (lane_id / 4);
+      for (int i = 0; i < size<0, 0>(acc_s_rowcol); ++i) {
+        int r = r_base + i * 8;
+        for (int nj = 0; nj < size<1, 1>(acc_s_rowcol); ++nj) {
+          int c_base = (lane_id % 4) * 2 + nj * 8;
+          if (r < kBlockM && c_base < kBlockN) {
+            reinterpret_cast<__half2&>(sP(r, c_base)) = __halves2half2(static_cast<half>(acc_s_rowcol(make_coord(i, mi), make_coord(0, nj))), static_cast<half>(acc_s_rowcol(make_coord(i, mi), make_coord(1, nj))));
           }
         }
       }
-      __syncthreads();
-
-      // P@V GEMM
-      auto smem_tiled_copy_P = make_tiled_copy_A(Copy_Atom<DefaultCopy, Element>{}, tiled_mma);
-      auto tOrP = tiled_mma.get_thread_slice(tidx).partition_fragment_A(sP);
-      auto tSsP = smem_tiled_copy_P.get_thread_slice(tidx).partition_S(sP);
-      cute::copy(smem_tiled_copy_P, tSsP, smem_tiled_copy_P.get_thread_slice(tidx).retile_D(tOrP));  // Retile?
-
-      auto sV_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ + kSmemSizeKInt8)), make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}));
-      auto tOrVt = tiled_mma.get_thread_slice(tidx).partition_fragment_B(sV_dummy);
-      auto sV_quant_t = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVInt8transposed{});
-      auto tSsV = smem_tiled_copy_K.get_thread_slice(tidx).partition_S(sV_quant_t);
-
-      flash::gemm_quant_manual<false>(acc_o, tOrP, tOrVt, tSsV, tiled_mma, smem_tiled_copy_K, smem_tiled_copy_K.get_thread_slice(tidx), v_scale);
-
-      __syncthreads();
-      is_first_block = false;
     }
-
-    // Epilogue: Output
-    float sink = (params.head_sink_ptr != nullptr) ? static_cast<float>(reinterpret_cast<const Element*>(params.head_sink_ptr)[kv_head_idx]) : (params.smooth_softmax ? 0.0f : -flash::kInfinity);
-    Tensor lse = softmax.template normalize_softmax_lse<Split>(acc_o, params.scale_softmax, sink);
-
-    Tensor rO = flash::convert_type<ElementO>(acc_o);
-    Tensor sO = make_tensor(make_smem_ptr(reinterpret_cast<ElementO*>(smem_)), make_layout(Shape<Int<kSmemQRows>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{}));
-    using SmemCopyAtomO = Copy_Atom<DefaultCopy, ElementO>;
-    auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
-    cute::copy(smem_tiled_copy_O, smem_tiled_copy_O.get_thread_slice(tidx).retile_S(rO), smem_tiled_copy_O.get_thread_slice(tidx).partition_D(sO));
     __syncthreads();
 
-    // Write Out Each Head
-    for (int i = 0; i < num_q_heads_per_kv; ++i) {
-      int row = (i % kNWarps) * 16 + (i / kNWarps);
-      int bidh = q_head_start + i;
+    // P@V GEMM with current stage's V
+    auto smem_tiled_copy_P = make_tiled_copy_A(Copy_Atom<DefaultCopy, Element>{}, tiled_mma);
+    auto tOrP = tiled_mma.get_thread_slice(tidx).partition_fragment_A(sP);
+    auto tSsP = smem_tiled_copy_P.get_thread_slice(tidx).partition_S(sP);
+    cute::copy(smem_tiled_copy_P, tSsP, smem_tiled_copy_P.get_thread_slice(tidx).retile_D(tOrP));
 
-      // Only Row 'row' matters
-      // Manual write to Global
-      const int total_elems = kHeadDim;
-      for (int j = tidx; j < total_elems; j += Kernel_traits::kNThreads) {
-        ElementO val = sO(row, j);
-        // Global Pointer
-        // gOaccum or gO
-        if constexpr (Split) {
-          const index_t row_offset_oaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q * params.d_rounded;
-          ElementO* gOaccum_ptr = reinterpret_cast<ElementO*>(params.oaccum_ptr) + row_offset_oaccum;
-          gOaccum_ptr[j] = val;
-        } else {
-          const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb) + bidh * params.o_head_stride;
-          ElementO* gO_ptr = reinterpret_cast<ElementO*>(params.o_ptr) + row_offset_o;
-          gO_ptr[j] = val;
-        }
+    auto sV_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(sV_cur.data().get())),
+                                make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}));
+    auto tOrVt = tiled_mma.get_thread_slice(tidx).partition_fragment_B(sV_dummy);
+    auto sV_quant_t = make_tensor(sV_cur.data(), typename Kernel_traits::SmemLayoutVInt8transposed{});
+    auto tSsV = smem_tiled_copy_K.get_thread_slice(tidx).partition_S(sV_quant_t);
+
+    flash::gemm_quant_manual<false>(acc_o, tOrP, tOrVt, tSsV, tiled_mma, smem_tiled_copy_K, smem_tiled_copy_K.get_thread_slice(tidx), v_scale);
+
+    __syncthreads();
+    is_first_block = false;
+  }
+
+  // Epilogue: Output
+  float sink = (params.head_sink_ptr != nullptr) ? static_cast<float>(reinterpret_cast<const Element*>(params.head_sink_ptr)[kv_head_idx]) : (params.smooth_softmax ? 0.0f : -flash::kInfinity);
+  Tensor lse = softmax.template normalize_softmax_lse<Split>(acc_o, params.scale_softmax, sink);
+
+  Tensor rO = flash::convert_type<ElementO>(acc_o);
+  Tensor sO = make_tensor(make_smem_ptr(reinterpret_cast<ElementO*>(smem_)), make_layout(Shape<Int<kSmemQRows>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{}));
+  using SmemCopyAtomO = Copy_Atom<DefaultCopy, ElementO>;
+  auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
+  cute::copy(smem_tiled_copy_O, smem_tiled_copy_O.get_thread_slice(tidx).retile_S(rO), smem_tiled_copy_O.get_thread_slice(tidx).partition_D(sO));
+  __syncthreads();
+
+  // Write Out Each Head
+  for (int i = 0; i < num_q_heads_per_kv; ++i) {
+    int row = (i % kNWarps) * 16 + (i / kNWarps);
+    int bidh = q_head_start + i;
+
+    // Only Row 'row' matters
+    // Manual write to Global
+    const int total_elems = kHeadDim;
+    for (int j = tidx; j < total_elems; j += Kernel_traits::kNThreads) {
+      ElementO val = sO(row, j);
+      // Global Pointer
+      // gOaccum or gO
+      if constexpr (Split) {
+        const index_t row_offset_oaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q * params.d_rounded;
+        ElementO* gOaccum_ptr = reinterpret_cast<ElementO*>(params.oaccum_ptr) + row_offset_oaccum;
+        gOaccum_ptr[j] = val;
+      } else {
+        const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb) + bidh * params.o_head_stride;
+        ElementO* gO_ptr = reinterpret_cast<ElementO*>(params.o_ptr) + row_offset_o;
+        gO_ptr[j] = val;
       }
+    }
 
-      // Write LSE
-      const int lane = tidx % 32;
-      const int warp = tidx / 32;
-      // LSE is distributed. lse(0) -> row (warp*16 + lane/4).
-      // Match row.
-      if ((lane % 4) == 0) {
-        int local_row = warp * 16 + (lane / 4);
-        if (local_row == row) {
-          index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q;
-          ElementAccum* lse_ptr = reinterpret_cast<ElementAccum*>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + row_offset_lseaccum;
-          lse_ptr[0] = lse(0);
-        }
-        local_row += 8;
-        if (local_row == row) {
-          index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q;
-          ElementAccum* lse_ptr = reinterpret_cast<ElementAccum*>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + row_offset_lseaccum;
-          lse_ptr[0] = lse(1);
-        }
+    // Write LSE
+    const int lane = tidx % 32;
+    const int warp = tidx / 32;
+    // LSE is distributed. lse(0) -> row (warp*16 + lane/4).
+    // Match row.
+    if ((lane % 4) == 0) {
+      int local_row = warp * 16 + (lane / 4);
+      if (local_row == row) {
+        index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q;
+        ElementAccum* lse_ptr = reinterpret_cast<ElementAccum*>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + row_offset_lseaccum;
+        lse_ptr[0] = lse(0);
+      }
+      local_row += 8;
+      if (local_row == row) {
+        index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q;
+        ElementAccum* lse_ptr = reinterpret_cast<ElementAccum*>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + row_offset_lseaccum;
+        lse_ptr[0] = lse(1);
       }
     }
   }

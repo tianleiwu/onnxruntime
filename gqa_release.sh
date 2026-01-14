@@ -32,7 +32,11 @@ fi
 pip install cmake ninja packaging numpy nvtx
 
 LD_LIBRARY_PATH=/usr/lib64/openmpi/lib:/home/tlwu/anaconda3/envs/py312/lib:/home/tlwu/cudnn9.8/lib64:/home/tlwu/cudnn9.8/lib
-# 
+
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+
+#
 # Parse arguments
 RUN_BUILD=false
 RUN_INSTALL=false
