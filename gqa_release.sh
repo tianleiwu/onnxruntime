@@ -5,7 +5,7 @@
 # Options:
 #   --build           Run build.sh
 #   --quick           Configure quick build/test (flash attention hdim128 only and exclude bf16, sets onnxruntime_QUICK_BUILD=ON)
-#   --quick_build     A combination of --quick and --build
+#   --flash_build     A combination of --quick and --build
 #   --clean           Clean build directory (rm -rf build)
 #   --clean_gqa       Clean GQA build artifacts
 #   --clean_flash     Clean flash attention build artifacts
@@ -24,10 +24,7 @@ pip install cmake ninja packaging numpy nvtx
 LD_LIBRARY_PATH=/usr/lib64/openmpi/lib:/home/tlwu/anaconda3/envs/py312/lib:/home/tlwu/cudnn9.8/lib64:/home/tlwu/cudnn9.8/lib
 
 # Parse arguments
-QUICK_BUILD_FLAG=""
-QUICK_BUILD_ENV=""
 RUN_BUILD=false
-USE_QUICK_BUILD=false
 RUN_INSTALL=false
 RUN_TEST=false
 RUN_BENCHMARK=false
@@ -36,6 +33,7 @@ ENABLE_DUMP="OFF"
 RUN_TEST_CASE=false
 TEST_CASE=""
 BUILD_TYPE="Release"
+BUILD_FLAG=""
 
 while [[ "$#" -gt 0 ]]; do
     case $1 in
@@ -43,18 +41,17 @@ while [[ "$#" -gt 0 ]]; do
             RUN_BUILD=true
             echo "==== 🚀 Build run enabled ===="
             ;;
-        --quick)
-            USE_QUICK_BUILD=true
-            QUICK_BUILD_FLAG="--cmake_extra_defines onnxruntime_QUICK_BUILD=ON"
-            QUICK_BUILD_ENV="QUICK_BUILD=1"
-            echo "==== 🚀 Quick build mode enabled (flash attention hdim128 only and exclude bf16) ===="
-            ;;
         --quick_build)
             RUN_BUILD=true
-            USE_QUICK_BUILD=true
-            QUICK_BUILD_FLAG="--cmake_extra_defines onnxruntime_QUICK_BUILD=ON"
-            QUICK_BUILD_ENV="QUICK_BUILD=1"
+            BUILD_FLAG="--cmake_extra_defines onnxruntime_QUICK_BUILD=ON"
+            rm -f build/cuda/$BUILD_TYPE/CMakeFiles/onnxruntime_providers_cuda.dir/home/tlwu/onnxruntime/onnxruntime/contrib_ops/cuda/bert/flash_attention/flash_fwd_q*
             echo "==== 🚀 Quick build mode enabled (flash attention hdim128 only and exclude bf16) ===="
+            ;;
+        --flash_build)
+            RUN_BUILD=true
+            BUILD_FLAG="--cmake_extra_defines onnxruntime_FLASH_BUILD=ON"
+            rm -f build/cuda/$BUILD_TYPE/CMakeFiles/onnxruntime_providers_cuda.dir/home/tlwu/onnxruntime/onnxruntime/contrib_ops/cuda/bert/flash_attention/flash_fwd_q*
+            echo "==== 🚀 Flash build mode enabled (flash attention hdim128 only and include bf16) ===="
             ;;
         --clean)
             echo "==== 🧹 Cleaning all build artifacts... ===="
@@ -111,9 +108,6 @@ set -o pipefail
 
 
 if [ "$RUN_BUILD" = true ]; then
-    if [ "$USE_QUICK_BUILD" = true ]; then
-        rm -f build/cuda/$BUILD_TYPE/CMakeFiles/onnxruntime_providers_cuda.dir/home/tlwu/onnxruntime/onnxruntime/contrib_ops/cuda/bert/flash_attention/flash_int*_fwd_*
-    fi
     start_build=$(date +%s)
 
     sh build.sh --config $BUILD_TYPE  --build_dir build/cuda --parallel  --use_cuda \
@@ -128,7 +122,7 @@ if [ "$RUN_BUILD" = true ]; then
             --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES=90 \
             --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF onnxruntime_ENABLE_CUDA_EP_INTERNAL_TESTS=OFF \
             --cmake_extra_defines onnxruntime_USE_FPA_INTB_GEMM=OFF \
-            $QUICK_BUILD_FLAG
+            $BUILD_FLAG
 
     if [ $? -ne 0 ]; then
         echo "==== ❌ Build failed! Exiting. ===="
@@ -176,7 +170,7 @@ esac
 cd onnxruntime/test/python/transformers
 
 if [ "$RUN_TEST" = true ]; then
-    env $QUICK_BUILD_ENV python test_gqa.py
+    python test_gqa.py
     test_exit_code=$?
     if [ $test_exit_code -ne 0 ]; then
         echo "==== ❌ test_gqa.py failed with exit code $test_exit_code! Exiting. ===="

@@ -24,9 +24,10 @@
 
 #include "contrib_ops/cuda/bert/flash_attention/flash.h"
 #include "contrib_ops/cuda/bert/flash_attention/block_info.h"
+#include "contrib_ops/cuda/bert/flash_attention/namespace_config.h"
 
-namespace onnxruntime {
-namespace flash {
+namespace FLASH_NAMESPACE {
+using namespace cute;
 namespace decode_int8 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -263,6 +264,17 @@ inline __device__ void compute_attn_decode(const Params& params) {
         const int v_row_stride_vecs = params.v_row_stride / kVecSize;
         int v_global_offset = (k_start + row) * v_row_stride_vecs + col_vec;
         sV_vec[smem_offset] = v_ptr_vec[v_global_offset];
+      } else {
+        // Zero-initialize tail to avoid NaN propagation (0 * NaN = NaN)
+        int smem_offset = row * kSmemStrideVecs + col_vec;
+        // int4 zero is {0,0,0,0} -> integer 0
+        ::int4 zero;
+        zero.x = 0;
+        zero.y = 0;
+        zero.z = 0;
+        zero.w = 0;
+        sK_vec[smem_offset] = zero;
+        sV_vec[smem_offset] = zero;
       }
     }
 
@@ -274,7 +286,7 @@ inline __device__ void compute_attn_decode(const Params& params) {
     // Result: scores[kBlockN] per warp
     // --------------------------------------------------------------------
     float scores[kBlockN];
-#pragma unroll
+    // Removed #pragma unroll to reduce compile time (kBlockN can be 128)
     for (int n = 0; n < kBlockN; ++n) {
       float score = 0.0f;
 #pragma unroll
@@ -286,15 +298,13 @@ inline __device__ void compute_attn_decode(const Params& params) {
       scores[n] = warp_reduce_sum(score);
     }
 
-// Apply scaling
-#pragma unroll
+    // Apply scaling
     for (int n = 0; n < kBlockN; ++n) {
       scores[n] *= params.scale_softmax;
     }
 
     // Causal masking (for decode, typically not needed since Q_row=0)
     if constexpr (Is_causal) {
-#pragma unroll
       for (int n = 0; n < kBlockN; ++n) {
         if (k_start + n > binfo.actual_seqlen_k - 1) {
           scores[n] = -INFINITY;
@@ -302,8 +312,7 @@ inline __device__ void compute_attn_decode(const Params& params) {
       }
     }
 
-// Out-of-bounds masking
-#pragma unroll
+    // Out-of-bounds masking
     for (int n = 0; n < kBlockN; ++n) {
       if (n >= k_len) {
         scores[n] = -INFINITY;
@@ -315,7 +324,6 @@ inline __device__ void compute_attn_decode(const Params& params) {
     // --------------------------------------------------------------------
     // Find max in this block
     float m_block = -INFINITY;
-#pragma unroll
     for (int n = 0; n < kBlockN; ++n) {
       m_block = fmaxf(m_block, scores[n]);
     }
@@ -333,18 +341,17 @@ inline __device__ void compute_attn_decode(const Params& params) {
 
     // Compute exp(s - m_new) and update sum
     float p[kBlockN];
-#pragma unroll
     for (int n = 0; n < kBlockN; ++n) {
       p[n] = expf(scores[n] - m_new);
       l_i += p[n];
     }
     m_i = m_new;
 
-// --------------------------------------------------------------------
-// Accumulate O += P @ V (warp-level)
-// Each lane accumulates part of the head dimension
-// --------------------------------------------------------------------
-#pragma unroll
+    // --------------------------------------------------------------------
+    // Accumulate O += P @ V (warp-level)
+    // Each lane accumulates part of the head dimension
+    // --------------------------------------------------------------------
+    // Removed #pragma unroll to reduce compile time
     for (int n = 0; n < kBlockN; ++n) {
       float p_val = p[n];
 #pragma unroll
@@ -394,5 +401,4 @@ inline __device__ void compute_attn_decode(const Params& params) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace decode_int8
-}  // namespace flash
-}  // namespace onnxruntime
+}  // namespace FLASH_NAMESPACE

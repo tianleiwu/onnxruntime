@@ -44,12 +44,12 @@
 #include "contrib_ops/cuda/bert/flash_attention/utils.h"
 #include "contrib_ops/cuda/bert/flash_attention/softmax.h"
 #include "contrib_ops/cuda/bert/flash_attention/mask.h"
+#include "contrib_ops/cuda/bert/flash_attention/namespace_config.h"
 
 // Set to 1 to enable debug prints for this kernel
 #define FLASH_INT8_QUANT_DEBUG 0
 
-namespace onnxruntime {
-namespace flash {
+namespace FLASH_NAMESPACE {
 using namespace cute;
 namespace int8_mma {
 
@@ -652,8 +652,7 @@ __global__ void flash_fwd_int8_quant_kernel(const Params params) {
   }
   int8_mma::compute_attn_1rowblock<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, std::max(1, params.num_splits));
 }
-}  // namespace flash
-}  // namespace onnxruntime
+}  // namespace FLASH_NAMESPACE
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop

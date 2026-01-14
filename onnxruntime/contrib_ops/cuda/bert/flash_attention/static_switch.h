@@ -66,6 +66,17 @@
 #define LOCAL_SWITCH BOOL_SWITCH
 #endif
 
+#define FLASHATTENTION_ASSUME_QUANT_CAUSAL  // GQA assumes causal is true, so we only build causal kernels for quantization.
+#ifdef FLASHATTENTION_ASSUME_QUANT_CAUSAL
+#define QUANT_CAUSAL_SWITCH(COND, CONST_NAME, ...) \
+  [&] {                                            \
+    const bool CONST_NAME = true;                  \
+    return __VA_ARGS__();                          \
+  }()
+#else
+#define QUANT_CAUSAL_SWITCH BOOL_SWITCH
+#endif
+
 // ORT_QUICK_BUILD = 1 only builds fp16 kernels, ORT_QUICK_BUILD = 2 builds both fp16 and bf16 kernels.
 #if ORT_QUICK_BUILD == 1
 // Quick build mode: only fp16 kernels are compiled

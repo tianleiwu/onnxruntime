@@ -62,9 +62,9 @@
 #include "contrib_ops/cuda/bert/flash_attention/utils.h"
 #include "contrib_ops/cuda/bert/flash_attention/softmax.h"
 #include "contrib_ops/cuda/bert/flash_attention/mask.h"
+#include "contrib_ops/cuda/bert/flash_attention/namespace_config.h"
 
-namespace onnxruntime {
-namespace flash {
+namespace FLASH_NAMESPACE {
 using namespace cute;
 namespace int4 {
 
@@ -665,8 +665,7 @@ inline __device__ void compute_attn_1rowblock(
 }
 
 }  // namespace int4
-}  // namespace flash
-}  // namespace onnxruntime
+}  // namespace FLASH_NAMESPACE
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
