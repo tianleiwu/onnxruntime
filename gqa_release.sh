@@ -15,14 +15,24 @@
 #   --profile         Run profiling with nsys
 #
 
-source $(conda info --base)/etc/profile.d/conda.sh
-
-conda activate py312
+if [ -d "/home/tlwu/anaconda3/envs/py312/lib" ]; then
+    source $(conda info --base)/etc/profile.d/conda.sh
+    conda activate py312
+    CUDA_VERSION=12.8
+    CUDA_HOME=/home/tlwu/cuda12.8
+    CUDNN_HOME=/home/tlwu/cudnn9.8
+    LD_LIBRARY_PATH="/usr/lib64/openmpi/lib:/home/tlwu/anaconda3/envs/py312/lib:/home/tlwu/cudnn9.8/lib64:/home/tlwu/cudnn9.8/lib"
+else
+    CUDA_VERSION=13.0
+    CUDA_HOME=/usr/local/cuda-13.0
+    CUDNN_HOME=/home/tlwu/cudnn9.14_cuda13/cudnn-linux-x86_64-9.14.0.64_cuda13-archive
+    LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:/home/tlwu/cudnn9.14_cuda13/cudnn-linux-x86_64-9.14.0.64_cuda13-archive/lib:/usr/local/cuda-13.0/lib64:/home/tlwu/cudnn9.14_cuda13/cudnn-linux-x86_64-9.14.0.64_cuda13-archive/lib
+fi
 
 pip install cmake ninja packaging numpy nvtx
 
 LD_LIBRARY_PATH=/usr/lib64/openmpi/lib:/home/tlwu/anaconda3/envs/py312/lib:/home/tlwu/cudnn9.8/lib64:/home/tlwu/cudnn9.8/lib
-
+# 
 # Parse arguments
 RUN_BUILD=false
 RUN_INSTALL=false
@@ -111,15 +121,14 @@ if [ "$RUN_BUILD" = true ]; then
     start_build=$(date +%s)
 
     sh build.sh --config $BUILD_TYPE  --build_dir build/cuda --parallel  --use_cuda \
-            --cuda_version 12.8 --cuda_home  /home/tlwu/cuda12.8/  \
-            --cudnn_home /home/tlwu/cudnn9.8/ \
+            --cuda_version $CUDA_VERSION --cuda_home $CUDA_HOME --cudnn_home $CUDNN_HOME \
             --build_wheel --skip_tests \
             --cmake_generator Ninja \
             --enable_cuda_nhwc_ops \
             --use_binskim_compliant_compile_flags \
             --cmake_extra_defines onnxruntime_DEBUG_NODE_INPUTS_OUTPUTS=OFF \
             --cmake_extra_defines onnxruntime_DUMP_TENSOR=$ENABLE_DUMP \
-            --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES=90 \
+            --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES=native \
             --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF onnxruntime_ENABLE_CUDA_EP_INTERNAL_TESTS=OFF \
             --cmake_extra_defines onnxruntime_USE_FPA_INTB_GEMM=OFF \
             $BUILD_FLAG

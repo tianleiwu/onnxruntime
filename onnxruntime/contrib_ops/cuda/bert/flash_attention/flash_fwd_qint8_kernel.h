@@ -80,6 +80,10 @@ struct Flash_dq_kernel_traits {
   static constexpr int kBlockN = kBlockN_;
   static constexpr int kHeadDim = kHeadDim_;
 
+  // Double-buffering (pipelining) configuration
+  // kNumStages=2: Use two K/V buffers to overlap memory loads with compute
+  static constexpr int kNumStages = 2;
+
   static_assert(kHeadDim % 32 == 0, "kHeadDim must be multiple of 32");
 
   static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
@@ -321,25 +325,39 @@ inline __device__ void compute_attn_1rowblock(
     return;
   }
 
-  // Layout: [sQ (FP16)] [sK (Int8, padded)] [sV (Int8, padded)]
+  // Layout: [sQ (FP16)] [sK[0] (Int8, padded)] [sV[0] (Int8, padded)] [sK[1] (Int8, padded)] [sV[1] (Int8, padded)]
   // ============================================================================
+  // Double-buffering: kNumStages=2 for overlapping memory loads with compute
   // Note: SmemLayoutKInt8 uses padded stride (kSmemRowStrideInt8 = 144 for HeadDim=128)
   // size(layout) returns logical size (64 × 128 = 8192), not physical size (64 × 144 = 9216)
   // We must use physical size for tensor placement to avoid overlap.
   constexpr int kSmemSizeQ = kBlockM * kHeadDim * sizeof(Element);
   constexpr int kSmemSizeKInt8 = kBlockN * Kernel_traits::kSmemRowStrideInt8 * sizeof(ElementInt8);
+  constexpr int kSmemSizeVInt8 = kBlockN * Kernel_traits::kSmemRowStrideInt8 * sizeof(ElementInt8);
+  constexpr int kSmemSizeKVInt8 = kSmemSizeKInt8 + kSmemSizeVInt8;  // One K+V pair
+  constexpr int kNumStages = Kernel_traits::kNumStages;
 
   Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)),
                           typename Kernel_traits::SmemLayoutQ{});
-  // sK: INT8 Layout with padding for 128-bit aligned cp.async
-  Tensor sK = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ)),
+
+  // Double-buffered K/V tensors: explicit declarations for each stage
+  // Stage 0: smem_ + kSmemSizeQ
+  // Stage 1: smem_ + kSmemSizeQ + kSmemSizeKVInt8
+  char* stage0_base = smem_ + kSmemSizeQ;
+  char* stage1_base = smem_ + kSmemSizeQ + kSmemSizeKVInt8;
+
+  auto sK_0 = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(stage0_base)),
                           typename Kernel_traits::SmemLayoutKInt8{});
-  Tensor sV = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(smem_ + kSmemSizeQ + kSmemSizeKInt8)),
+  auto sV_0 = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(stage0_base + kSmemSizeKInt8)),
+                          typename Kernel_traits::SmemLayoutKInt8{});
+  auto sK_1 = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(stage1_base)),
+                          typename Kernel_traits::SmemLayoutKInt8{});
+  auto sV_1 = make_tensor(make_smem_ptr(reinterpret_cast<ElementInt8*>(stage1_base + kSmemSizeKInt8)),
                           typename Kernel_traits::SmemLayoutKInt8{});
 
-  // Zero-initialize sK and sV physical memory once to prevent garbage in padding
+  // Zero-initialize all K/V buffers to prevent garbage in padding
   // (16-byte padding per row is used for 128-bit aligned cp.async and bank conflict avoidance)
-  const int total_kv_bytes = 2 * kBlockN * Kernel_traits::kSmemRowStrideInt8;
+  const int total_kv_bytes = kNumStages * kSmemSizeKVInt8;
   for (int i = tidx; i < total_kv_bytes / 16; i += Kernel_traits::kNThreads) {
     reinterpret_cast<uint4*>(smem_ + kSmemSizeQ)[i] = make_uint4(0, 0, 0, 0);
   }
@@ -428,7 +446,8 @@ inline __device__ void compute_attn_1rowblock(
   // Register fragments for K and V (FP16 structure for MMA)
   // tSrK must match the logical B-operand shape for QDQ: (HeadDim, BlockN) i.e. K^T
   // We use dummy layout matching SmemLayoutK (BlockN, HeadDim) but pointing to the REAL data.
-  auto sK_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ)),
+  // For double-buffering, we create the dummy tensor pointing to stage 0's K buffer.
+  auto sK_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(sK_0.data().get())),
                               typename Kernel_traits::SmemLayoutK{});
   auto tSrK = thr_mma.partition_fragment_B(sK_dummy);
 
@@ -441,20 +460,11 @@ inline __device__ void compute_attn_1rowblock(
   auto smem_tiled_copy_KInt8 = make_tiled_copy_B(SmemCopyAtomInt8Default{}, tiled_mma);
   auto smem_thr_copy_KInt8 = smem_tiled_copy_KInt8.get_thread_slice(tidx);
 
-  // We use the physical Int8 layout so that partitioning correctly accounts for padding.
-  auto sK_quant = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutKInt8{});
-  // Partition the physical Smem tensor for loading into registers
-  auto tSsK = smem_thr_copy_KInt8.partition_S(make_tensor(sK_quant.data(), make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, Stride<_1, Int<Kernel_traits::kSmemRowStrideInt8>>{})));
-
   // V dummy for partitioning (must be transposed shape (HeadDim, BlockN) for B operand)
-  auto sV_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ + kSmemSizeKInt8)),
+  // For double-buffering, we point to stage 0's V buffer.
+  auto sV_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(sV_0.data().get())),
                               make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}));
   auto tOrVt = thr_mma.partition_fragment_B(sV_dummy);
-
-  // V physical for partitioning (must be transposed shape (HeadDim, BlockN) for B operand)
-  auto sV_quant_t = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVInt8transposed{});
-  // Partition the physical Smem tensor for loading into registers
-  auto tSsV = smem_thr_copy_KInt8.partition_S(sV_quant_t);
 
   auto acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
   clear(acc_o);
@@ -495,142 +505,93 @@ inline __device__ void compute_attn_1rowblock(
   // tSsV partitions sV. Correct.
 
   // ============================================================================
-  // Main Attention Loop
+  // Main Attention Loop (Double-Buffered for Pipelining)
   // ============================================================================
-  bool is_first_block = true;
-  for (int n_block = n_block_max - 1; n_block >= n_block_min; --n_block) {
-    // 1. Load K / V (INT8) from Global to Smem (INT8)
+  // Double-buffering strategy:
+  // - Use kNumStages=2 K/V buffers to overlap memory loads with compute
+  // - Pre-load first tile before entering main loop
+  // - In each iteration: issue async load for next tile, then compute on current tile
+  // - Use cp_async_wait<1> instead of cp_async_wait<0> to keep one load in flight
+
+  // Prepare predicates for K/V copy (shared across all iterations)
+  Tensor cK = make_identity_tensor(make_shape(size<0>(sK_0), size<1>(sK_0)));
+  Tensor tKcK = gmem_thr_copy_KInt8.partition_D(cK);
+  auto tKsK_int8_0 = gmem_thr_copy_KInt8.partition_D(sK_0);
+  Tensor tKpK = make_tensor<bool>(make_shape(size<2>(tKsK_int8_0)));
+  if (!Is_even_K) {
+#pragma unroll
+    for (int k = 0; k < size(tKpK); ++k) tKpK(k) = get<1>(tKcK(0, 0, k)) < params.d;
+  }
+
+  // Helper lambda to load K/V tile into specified stage buffer (stage 0 or 1)
+  auto load_kv_tile_stage0 = [&](int n_block) {
+    if (n_block < n_block_min) return;
     Tensor gK_int8 = local_tile(mK_int8, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
     Tensor gV_int8 = local_tile(mV_int8, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
-
     Tensor tKgK_int8 = gmem_thr_copy_KInt8.partition_S(gK_int8);
-    Tensor tKsK_int8 = gmem_thr_copy_KInt8.partition_D(sK);
+    Tensor tKsK_int8 = gmem_thr_copy_KInt8.partition_D(sK_0);
     Tensor tVgV_int8 = gmem_thr_copy_KInt8.partition_S(gV_int8);
-    Tensor tVsV_int8 = gmem_thr_copy_KInt8.partition_D(sV);
+    Tensor tVsV_int8 = gmem_thr_copy_KInt8.partition_D(sV_0);
+    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KInt8, tKgK_int8, tKsK_int8, tKcK, tKpK, binfo.actual_seqlen_k - n_block * kBlockN);
+    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KInt8, tVgV_int8, tVsV_int8, tKcK, tKpK, binfo.actual_seqlen_k - n_block * kBlockN);
+  };
 
-    // Prepare predicates for K/V copy
-    Tensor cK = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));
-    Tensor tKcK = gmem_thr_copy_KInt8.partition_D(cK);
-    Tensor tKpK = make_tensor<bool>(make_shape(size<2>(tKsK_int8)));
-    if (!Is_even_K) {
-#pragma unroll
-      for (int k = 0; k < size(tKpK); ++k) tKpK(k) = get<1>(tKcK(0, 0, k)) < params.d;
-    }
+  auto load_kv_tile_stage1 = [&](int n_block) {
+    if (n_block < n_block_min) return;
+    Tensor gK_int8 = local_tile(mK_int8, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
+    Tensor gV_int8 = local_tile(mV_int8, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
+    Tensor tKgK_int8 = gmem_thr_copy_KInt8.partition_S(gK_int8);
+    Tensor tKsK_int8 = gmem_thr_copy_KInt8.partition_D(sK_1);
+    Tensor tVgV_int8 = gmem_thr_copy_KInt8.partition_S(gV_int8);
+    Tensor tVsV_int8 = gmem_thr_copy_KInt8.partition_D(sV_1);
+    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KInt8, tKgK_int8, tKsK_int8, tKcK, tKpK, binfo.actual_seqlen_k - n_block * kBlockN);
+    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KInt8, tVgV_int8, tVsV_int8, tKcK, tKpK, binfo.actual_seqlen_k - n_block * kBlockN);
+  };
 
-    bool is_knew_block = false;
-    if constexpr (kEnableOnTheFlyNewKVQuantization) {
-      // Check if we are in the 'New K' territory (appended data)
-      // For now we assume knew is appended at the very end
-      is_knew_block = (params.knew_ptr != nullptr) && (n_block * kBlockN >= binfo.seqlen_k_cache);
-      if (is_knew_block) {
-        // [Write-Back Setup] Define Write Tensor for K (Global INT8 Cache)
-        Tensor mK_int8_write = make_tensor(make_gmem_ptr(reinterpret_cast<ElementInt8*>(params.k_ptr) + k_base_offset),
-                                           make_shape(binfo.actual_seqlen_k, params.d),
-                                           make_stride(params.k_row_stride, _1{}));
-        Tensor gK_int8_write = local_tile(mK_int8_write, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
-        Tensor tKgK_write = gmem_thr_copy_KInt8.partition_S(gK_int8_write);  // Thread partition for Global Write
-
-        // [New K/V Base Pointers] Hoist invariant offset calculation
-        const int bidh_kv = bidh / params.h_h_k_ratio;
-        size_t k_batch_head_offset = (bidb * params.knew_batch_stride) + (bidh_kv * params.knew_head_stride);
-        size_t v_batch_head_offset = (bidb * params.vnew_batch_stride) + (bidh_kv * params.vnew_head_stride);
-        Element* knew_base_ptr = reinterpret_cast<Element*>(params.knew_ptr) + k_batch_head_offset;
-        Element* vnew_base_ptr = reinterpret_cast<Element*>(params.vnew_ptr) + v_batch_head_offset;
-
-        // [Scale Pointers]
-        const Element* k_scale_base = reinterpret_cast<const Element*>(params.k_scale_ptr);
-        const Element* v_scale_base = reinterpret_cast<const Element*>(params.v_scale_ptr);
-
-        // Optimize scale access: if per-tensor, load once.
-        float k_scale_val = 1.0f;
-        float v_scale_val = 1.0f;
-        if (params.k_quant_type != 2 && params.k_scale_ptr) k_scale_val = static_cast<float>(k_scale_base[0]);
-        if (params.v_quant_type != 2 && params.v_scale_ptr) v_scale_val = static_cast<float>(v_scale_base[0]);
-
-        // K Load + Quantize
-        Tensor tKsK_dst = gmem_thr_copy_KInt8.partition_D(sK);
-        int start_row = n_block * kBlockN;
-
-#pragma unroll
-        for (int i = 0; i < size(tKsK_dst); ++i) {
-          auto coord = tKcK(i);
-          int row_in_block = get<0>(coord);
-          int h_idx = get<1>(coord);
-          int global_k_row = start_row + row_in_block;
-
-          ElementInt8 val_int8 = 0;
-          if (global_k_row >= binfo.seqlen_k_cache && global_k_row < binfo.actual_seqlen_k) {
-            int knew_relative_row = global_k_row - binfo.seqlen_k_cache;
-
-            // Optimized load
-            Element val_fp16 = knew_base_ptr[knew_relative_row * params.knew_row_stride + h_idx];
-
-            float scale = k_scale_val;
-            if (params.k_quant_type == 2) {  // Per-channel
-              scale = static_cast<float>(k_scale_base[bidh_kv * kHeadDim + h_idx]);
-            }
-
-            // Quantize: INT8 = FP16 * DivScale (or FP16 / Scale).
-            val_int8 = static_cast<int8_t>(static_cast<float>(val_fp16) / scale);
-
-            // [Write-Back] Store to Global INT8 Cache
-            // tKgK_write(i) corresponds to the same global element as the one we just quantized
-            if (i < size(tKgK_write)) {
-              tKgK_write(i) = val_int8;
-            }
-          }
-          tKsK_dst(i) = val_int8;
-        }
-
-        // [Write-Back Setup] Define Write Tensor for V (Global INT8 Cache)
-        Tensor mV_int8_write = make_tensor(make_gmem_ptr(reinterpret_cast<ElementInt8*>(params.v_ptr) + v_base_offset),
-                                           make_shape(binfo.actual_seqlen_k, params.d),
-                                           make_stride(params.v_row_stride, _1{}));
-        Tensor gV_int8_write = local_tile(mV_int8_write, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(n_block, 0));
-        Tensor tVgV_write = gmem_thr_copy_KInt8.partition_S(gV_int8_write);
-
-        // V Load + Quantize
-        Tensor tVsV_dst = gmem_thr_copy_KInt8.partition_D(sV);
-
-#pragma unroll
-        for (int i = 0; i < size(tVsV_dst); ++i) {
-          auto coord = tKcK(i);  // Use same coordinates as K for simplicity if layout matches
-          int row_in_block = get<0>(coord);
-          int h_idx = get<1>(coord);
-          int global_v_row = start_row + row_in_block;
-
-          ElementInt8 val_int8 = 0;
-          if (global_v_row >= binfo.seqlen_k_cache && global_v_row < binfo.actual_seqlen_k) {
-            int knew_relative_row = global_v_row - binfo.seqlen_k_cache;
-
-            // Optimized load
-            Element val_fp16 = vnew_base_ptr[knew_relative_row * params.vnew_row_stride + h_idx];
-
-            float scale = v_scale_val;
-            if (params.v_quant_type == 2) {  // Per-channel
-              scale = static_cast<float>(v_scale_base[bidh_kv * kHeadDim + h_idx]);
-            }
-
-            val_int8 = static_cast<int8_t>(static_cast<float>(val_fp16) / scale);
-
-            // [Write-Back] Store to Global INT8 Cache
-            if (i < size(tVgV_write)) {
-              tVgV_write(i) = val_int8;
-            }
-          }
-          tVsV_dst(i) = val_int8;
-        }
-      }
-    }
-
-    if (!is_knew_block) {
-      flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KInt8, tKgK_int8, tKsK_int8, tKcK, tKpK, binfo.actual_seqlen_k - n_block * kBlockN);
-      flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KInt8, tVgV_int8, tVsV_int8, tKcK, tKpK, binfo.actual_seqlen_k - n_block * kBlockN);
-    }
-
+  // Pre-load first tile (stage 0)
+  int first_n_block = n_block_max - 1;
+  if (first_n_block >= n_block_min) {
+    load_kv_tile_stage0(first_n_block);
     cute::cp_async_fence();
-    cute::cp_async_wait<0>();
+  }
+
+  bool is_first_block = true;
+  for (int n_block = n_block_max - 1; n_block >= n_block_min; --n_block) {
+    // Determine current and next stage indices
+    int cur_stage = (n_block_max - 1 - n_block) % kNumStages;
+    int next_stage = (cur_stage + 1) % kNumStages;
+    int next_n_block = n_block - 1;
+
+    // Issue async load for NEXT tile into NEXT stage buffer (if there is a next tile)
+    if (next_n_block >= n_block_min) {
+      if (next_stage == 0) {
+        load_kv_tile_stage0(next_n_block);
+      } else {
+        load_kv_tile_stage1(next_n_block);
+      }
+      cute::cp_async_fence();
+    }
+
+    // Wait for CURRENT tile to be ready (allow 1 async op in flight if there's a next tile)
+    if (next_n_block >= n_block_min) {
+      cute::cp_async_wait<1>();  // Wait for current tile, keep next tile loading
+    } else {
+      cute::cp_async_wait<0>();  // Last iteration, wait for all
+    }
     __syncthreads();
+
+    // Select current stage's K/V buffers
+    auto& sK_cur = (cur_stage == 0) ? sK_0 : sK_1;
+    auto& sV_cur = (cur_stage == 0) ? sV_0 : sV_1;
+
+    // Create tSsK for current stage (K transposed for B operand)
+    auto tSsK = smem_thr_copy_KInt8.partition_S(
+        make_tensor(sK_cur.data(), make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{},
+                                               Stride<_1, Int<Kernel_traits::kSmemRowStrideInt8>>{})));
+
+    // Create tSsV for current stage (V transposed for B operand)
+    auto tSsV = smem_thr_copy_KInt8.partition_S(
+        make_tensor(sV_cur.data(), typename Kernel_traits::SmemLayoutVInt8transposed{}));
 
     // 2. Q @ K^T (Gemm Quant)
     Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
@@ -642,15 +603,11 @@ inline __device__ void compute_attn_1rowblock(
     // - k_scale converts Int8 values back to original FP16 range
     flash::gemm_quant_manual<false>(acc_s, tSrQ, tSrK, tSsK, tiled_mma, smem_tiled_copy_KInt8, smem_thr_copy_KInt8, k_scale);
 
-    // if (bidb == 0 && bidh == 0 && tidx == 0 && n_block == 0) {
-    //   printf("DEBUG: bidb=0 bidh=0 n_block=0 k_scale=%f v_scale=%f acc_s(0,0)=%f\n", k_scale, v_scale, (float)acc_s(0));
-    // }
-
     // Masking
-    constexpr int kNWarps = Kernel_traits::kNWarps;
+    constexpr int kNWarps_ = Kernel_traits::kNWarps;
     const int col_idx_offset = n_block * kBlockN;
     const int row_idx_offset = m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4;
-    const int warp_row_stride = kNWarps * 16;
+    const int warp_row_stride = kNWarps_ * 16;
     flash::Mask<Is_causal, Is_local, /*Has_alibi=*/false> mask(
         binfo.actual_seqlen_k, binfo.actual_seqlen_q,
         params.window_size_left, params.window_size_right);
@@ -671,11 +628,12 @@ inline __device__ void compute_attn_1rowblock(
     }
 
     // 3. P @ V (Using sP shared memory to avoid register layout issues)
-    // - Reuse sK memory for sP (attention probabilities)
+    // - sP reuses the current stage's K buffer memory (sK[cur_stage])
+    // - This is safe because we finished reading K in the Q×K^T GEMM above
     // - sK is (BlockN, HeadDim + Pad) = (64, 144) -> ~9KB.
     // - sP needs (BlockM, BlockN) = (64, 64) elements (FP16) -> 8KB.
     // - Fits safely within sK's allocation.
-    auto sP = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ)),
+    auto sP = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(sK_cur.data().get())),
                           make_layout(Shape<Int<kBlockM>, Int<kBlockN>>{}, Stride<Int<kBlockN>, _1>{}));
 
     // Convert acc_s (Float) to sP (Half/Element)

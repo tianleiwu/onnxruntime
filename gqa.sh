@@ -107,7 +107,7 @@ if [ "$RUN_BUILD" = true ]; then
             --use_binskim_compliant_compile_flags \
             --cmake_extra_defines onnxruntime_DEBUG_NODE_INPUTS_OUTPUTS=ON \
             --cmake_extra_defines onnxruntime_DUMP_TENSOR=ON \
-            --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES=90 \
+            --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES=native \
             --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF \
             --cmake_extra_defines onnxruntime_ENABLE_CUDA_EP_INTERNAL_TESTS=OFF \
             --cmake_extra_defines onnxruntime_USE_FPA_INTB_GEMM=OFF \

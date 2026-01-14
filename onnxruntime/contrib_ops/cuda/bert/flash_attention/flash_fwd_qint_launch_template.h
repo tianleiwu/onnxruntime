@@ -253,12 +253,14 @@ void run_flash_int8_decode_fwd(Flash_fwd_params& params, cudaStream_t stream) {
 template <typename Kernel_traits>
 void run_flash_int8_dequant_fwd(Flash_fwd_params& params, cudaStream_t stream) {
   assert(params.knew_ptr == nullptr);
-  // Smem layout: [sQ (FP16)] [sK (Int8, padded)] [sV (Int8, padded)]
+  // Smem layout: [sQ (FP16)] [sK (Int8, padded) x kNumStages] [sV (Int8, padded) x kNumStages]
   // Note: INT8 K/V buffers use kSmemRowStrideInt8 (144 for HeadDim=128) instead of kHeadDim (128)
   // to ensure 128-bit alignment for cp.async and avoid bank conflicts.
+  // kNumStages=2 for double-buffering: allows overlapping memory loads with compute.
   constexpr size_t smem_size = sizeof(typename Kernel_traits::Element) *
                                    (Kernel_traits::kBlockM * Kernel_traits::kHeadDim) +  // Q (FP16, no padding)
                                sizeof(typename Kernel_traits::ElementInt8) *
+                                   Kernel_traits::kNumStages *                                    // Double-buffering factor
                                    (Kernel_traits::kBlockN * Kernel_traits::kSmemRowStrideInt8 +  // K_int8 (padded stride)
                                     Kernel_traits::kBlockN * Kernel_traits::kSmemRowStrideInt8);  // V_int8 (padded stride)
 
