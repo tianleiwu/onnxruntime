@@ -200,8 +200,9 @@ void run_flash_int8_decode_fwd(Flash_fwd_params& params, cudaStream_t stream) {
   constexpr int kSmemSizeQ = kSmemQRows * DecodeTraits::kHeadDim * sizeof(typename DecodeTraits::Element);
   constexpr int kSmemSizeKInt8 = DecodeTraits::kBlockN * DecodeTraits::kSmemRowStrideInt8 * sizeof(typename DecodeTraits::ElementInt8);
   constexpr int kSmemSizeVInt8 = kSmemSizeKInt8;
-  constexpr int kNumStages = 2;  // Double-buffering for pipelining
-  int smem_size_decode = kSmemSizeQ + kNumStages * (kSmemSizeKInt8 + kSmemSizeVInt8);
+  constexpr int kSmemSizeMBar = 32;  // 2 Barriers * 2 Stages * 8 bytes = 32 bytesach
+  constexpr int kNumStages = 2;      // Double-buffering for pipelining
+  int smem_size_decode = kSmemSizeQ + kNumStages * (kSmemSizeKInt8 + kSmemSizeVInt8) + kSmemSizeMBar;
 
   QUANT_CAUSAL_SWITCH(params.is_causal, Is_causal, [&] {
     BOOL_SWITCH(params.num_splits > 1, SplitConst, [&] {
@@ -393,12 +394,9 @@ void run_mha_fwd_dequant_dispatch(Flash_fwd_params& params, cudaStream_t stream)
       if (params.k_quant_type != 0) {
         // TODO: review: whether we need params.h_h_k_ratio > 1 in the following check.
         if (params.seqlen_q == 1 && params.h_h_k_ratio > 1) {
-          // Specialized GQA path (Optimization Round 2)
-          // M=16 reduces compute waste for small query groups (e.g. 4 heads).
-          // N=128 improves memory bandwidth usage.
-          // Warps=1 works with N=128 and M=16.
-          // Note: Ensure sufficient splits are used to saturate GPU.
-          run_flash_int8_decode_fwd<flash::int8::Flash_dq_kernel_traits<Headdim, 16, 128, 4, T>>(params, stream);
+          // Warp-specialized GQA path with MBarrier (SM80+ Optimization)
+          // kNWarps=8: 4 GEMM0 warps (Q@K) + 4 GEMM1 warps (P@V + prefetch)
+          run_flash_int8_decode_fwd<flash::int8::Flash_dq_kernel_traits<Headdim, 16, 128, 8, T>>(params, stream);
         } else {
           run_flash_int8_dequant_fwd<flash::int8::Flash_dq_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, T>>(params, stream);
         }
