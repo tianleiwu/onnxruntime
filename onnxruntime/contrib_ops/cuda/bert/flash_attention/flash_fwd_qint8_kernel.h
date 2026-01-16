@@ -1211,8 +1211,8 @@ inline __device__ void compute_attn_1rowblock_gqa(
 // But validates compute structure.
 #pragma unroll
       for (int i = 0; i < size(tOrP); ++i) {
-        // Cast to __half for CUDA math, then back to Element type
-        tOrP(i) = static_cast<Element>(hexp(static_cast<__half>(tOrP(i))));
+        // Cast to float for math to preserve range (especially for BF16)
+        tOrP(i) = static_cast<Element>(expf(static_cast<float>(tOrP(i))));
       }
 
       // Compute P @ V

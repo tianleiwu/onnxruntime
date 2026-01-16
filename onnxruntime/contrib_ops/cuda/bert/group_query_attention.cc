@@ -13,6 +13,7 @@
 #include "core/platform/env_var_utils.h"
 #include "contrib_ops/cuda/bert/cutlass_fmha/memory_efficient_attention.h"
 #include "contrib_ops/cuda/bert/flash_attention/flash_api.h"
+#include "contrib_ops/cuda/bert/xqa/xqa_loader.h"
 #include "contrib_ops/cuda/utils/dump_cuda_tensor.h"
 #include "contrib_ops/cpu/utils/debug_macros.h"
 
@@ -281,6 +282,8 @@ GroupQueryAttention<T>::GroupQueryAttention(const OpKernelInfo& info)
 
   query_dynamic_quant_ = ParseEnvironmentVariableWithDefault<int>("ORT_FLASH_ATTENTION_QUERY_DYNAMIC_QUANT", 0) != 0;
 
+  enable_xqa_ = std::is_same_v<T, MLFloat16> && ParseEnvironmentVariableWithDefault<int>("ORT_ENABLE_XQA", 0) != 0;
+
   kernel_options_ = this->GetAttentionKernelOptions();
 
   disable_flash_attention_ = sizeof(T) != 2 || !kernel_options_->UseFlashAttention();
@@ -509,8 +512,49 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
 
   bool use_quantized_kv = (k_quant_type_ != KVQuantizationType::NONE) || (v_quant_type_ != KVQuantizationType::NONE);
 
+  // Allocate XQA scratch if needed (only for Flash Decoding path)
+  IAllocatorUniquePtr<void> xqa_scratch_buffer;
+  if (enable_xqa_) {
+    data.use_xqa = !parameters.is_first_prompt &&
+                   parameters.sequence_length == 1 &&
+                   parameters.past_present_share_buffer &&
+                   (!use_quantized_kv) &&
+                   parameters.softcap == 0.0f &&
+                   !parameters.use_smooth_softmax &&
+                   parameters.local_window_size == -1 &&
+                   !parameters.is_packed_qkv;  // XQA now supports all group sizes with proper M_TILESIZE
+
+    if (data.use_xqa) {
+      size_t xqa_scratch_bytes = onnxruntime::contrib::cuda::GetXQAScratchSize(
+          GetDeviceProp(),
+          parameters.batch_size,
+          parameters.num_heads,
+          parameters.kv_num_heads,
+          parameters.seqlen_present_kv_cache);
+      if (xqa_scratch_bytes > 0) {
+        // Calculate additional scratch needed for manual RoPE/Append in ExtremeDecoding
+
+        if (parameters.do_rotary) {
+          // 1. Q_rotated buffer: B * N * H * sizeof(T) (if rotary)
+          // 2. K_rotated buffer: B * Nk * H * sizeof(T) (if rotary)
+          size_t element_size = sizeof(CudaT);
+          size_t q_bytes = parameters.batch_size * parameters.num_heads * parameters.head_size * element_size;
+          size_t k_bytes = parameters.batch_size * parameters.kv_num_heads * parameters.head_size * element_size;
+          q_bytes = (q_bytes + 255) / 256 * 256;
+          k_bytes = (k_bytes + 255) / 256 * 256;
+          xqa_scratch_bytes += q_bytes + k_bytes;
+        }
+
+        xqa_scratch_buffer = this->GetScratchBuffer<void>(xqa_scratch_bytes, context->GetComputeStream());
+        data.scratch = xqa_scratch_buffer.get();
+        data.scratch_bytes = xqa_scratch_bytes;
+      }
+    }
+  }
+
 #if USE_FLASH_ATTENTION
-  bool use_flash_attention = !disable_flash_attention_ &&
+  bool use_flash_attention = !data.use_xqa &&
+                             !disable_flash_attention_ &&
                              onnxruntime::flash::is_supported<T>(device_prop,
                                                                  parameters.head_size,
                                                                  parameters.num_heads,
@@ -608,7 +652,7 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
   }
 
 #if USE_MEMORY_EFFICIENT_ATTENTION
-  if (!data.use_flash_attention) {
+  if (!data.use_xqa && !data.use_flash_attention) {
     // Fall back to memory efficient attention.
     int sm = (device_prop.major * 10) + device_prop.minor;
     bool use_memory_efficient_attention =
@@ -642,6 +686,7 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
   // This ensures allocation logic stays in sync with kernel usage
   auto buffer_req = GQABufferRequirements::Compute<T>(
       parameters,
+      data.use_xqa,
       data.use_flash_attention,
       data.use_flash_attention_fast_decode,
       data.use_memory_efficient_attention,

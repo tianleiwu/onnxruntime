@@ -37,6 +37,8 @@ class GroupQueryAttention final : public CudaKernel {
   bool disable_flash_decode_;
   bool disable_fused_kv_;
 
+  bool enable_xqa_;
+
   KVQuantizationType k_quant_type_;
   KVQuantizationType v_quant_type_;
   int kv_cache_bit_width_;

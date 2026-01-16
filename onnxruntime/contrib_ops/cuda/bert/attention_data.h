@@ -210,7 +210,12 @@ struct GroupQueryAttentionData {
   bool use_flash_attention = false;
   bool use_memory_efficient_attention = false;
   bool use_flash_attention_fast_decode = false;
+  bool use_xqa = false;
   bool disable_fused_kv = false;
+
+  // Scratch buffer for XQA (and future kernels)
+  void* scratch = nullptr;
+  size_t scratch_bytes = 0;
 };
 
 template <typename T>

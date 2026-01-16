@@ -49,6 +49,7 @@ struct GQABufferRequirements {
   template <typename T>
   static GQABufferRequirements Compute(
       const GroupQueryAttentionParameters& params,
+      bool use_xqa,
       bool use_flash_attention,
       bool use_flash_attention_fast_decode,
       bool use_memory_efficient_attention,
@@ -63,7 +64,7 @@ struct GQABufferRequirements {
     const size_t head_size = static_cast<size_t>(params.head_size);
 
     // Fast decode path: Flash Attention handles everything internally
-    if (use_flash_attention_fast_decode) {
+    if (use_xqa || use_flash_attention_fast_decode) {
       return req;  // All zeros - no scratch buffers needed
     }
 

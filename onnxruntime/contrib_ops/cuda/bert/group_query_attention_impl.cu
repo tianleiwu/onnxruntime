@@ -40,6 +40,7 @@ limitations under the License.
 #include "contrib_ops/cuda/bert/cutlass_fmha/memory_efficient_attention.h"
 #include "contrib_ops/cuda/bert/flash_attention/flash_api.h"
 #include "contrib_ops/cuda/bert/group_query_attention_impl.h"
+#include "contrib_ops/cuda/bert/xqa/xqa_loader.h"
 #include "contrib_ops/cuda/bert/group_query_attention_qdq.cuh"
 #include "contrib_ops/cuda/bert/rotary_embedding_impl.h"
 #include "contrib_ops/cuda/bert/rotary_common.cuh"
@@ -49,6 +50,7 @@ limitations under the License.
 #include "core/providers/cuda/cuda_common.h"
 #include "core/providers/cuda/shared_inc/cuda_call.h"
 #include "core/providers/cuda/shared_inc/fpgeneric.h"
+#include <math_constants.h>
 
 using namespace onnxruntime::cuda;
 
@@ -727,6 +729,190 @@ Status LaunchGetSequenceLengths(
                static_cast<int>(parameters.past_present_share_buffer));
 
 ////////// Kernels (supports right padding but not left padding)
+// Use flash attention for all workloads (rotary, kv append, attention, etc.). No extra kernel is used in this path.
+// Currently, only decoding or subsequent prompt can use this path. First prompt will not use this path.
+template <typename T>
+Status ExtremeDecoding(
+    const cudaDeviceProp& device_prop,
+    cudaStream_t stream,
+    GroupQueryAttentionParameters& parameters,
+    GroupQueryAttentionData<T>& data,
+    float scale) {
+  ORT_GQA_TRACE("ExtremeDecoding");
+
+  const int batch_size = parameters.batch_size;
+  const int sequence_length = parameters.sequence_length;
+  // const int kv_sequence_length = parameters.sequence_length;
+  const int num_heads = parameters.num_heads;
+  const int kv_num_heads = parameters.kv_num_heads;
+  const int head_size = parameters.head_size;
+  AttentionQkvFormat past_kv_format = parameters.past_kv_format;
+  // bool is_causal = parameters.is_unidirectional;
+  // bool is_bf16 = std::is_same<T, BFloat16>::value;
+
+  void* query = reinterpret_cast<void*>(const_cast<T*>(data.query));
+  void* key;
+  void* value;
+
+  if (!parameters.is_packed_qkv) {
+    key = reinterpret_cast<void*>(const_cast<T*>(data.key));
+    value = reinterpret_cast<void*>(const_cast<T*>(data.value));
+  } else {
+    const size_t key_offset = static_cast<size_t>(num_heads * head_size);
+    const size_t value_offset = static_cast<size_t>(kv_num_heads * head_size);
+    key = reinterpret_cast<T*>(query) + key_offset;
+    value = reinterpret_cast<T*>(key) + value_offset;
+  }
+
+  void* seqlens_k = reinterpret_cast<void*>(data.total_seq_lens);
+
+  void* present_key = data.present_key;
+  void* present_value = data.present_value;
+  void* cos_cache = reinterpret_cast<void*>(const_cast<T*>(data.cos_cache));
+  void* sin_cache = reinterpret_cast<void*>(const_cast<T*>(data.sin_cache));
+  void* head_sink = reinterpret_cast<void*>(const_cast<T*>(data.head_sink));
+
+  bool past_bsnh = past_kv_format == AttentionQkvFormat::Q_K_V_BSNH;
+
+  using CudaT = typename ToCudaType<T>::MappedType;
+
+  // Scratch buffer is allocated in GroupQueryAttention::ComputeInternal and passed via data
+  // Partition scratch: [Q_rot][K_rot][XQA_scratch]
+  char* scratch_ptr = static_cast<char*>(data.scratch);
+  size_t element_size = sizeof(CudaT);
+  size_t q_bytes = batch_size * num_heads * parameters.head_size * element_size;
+  size_t k_bytes = batch_size * kv_num_heads * parameters.head_size * element_size;
+  // size_t seq_bytes = batch_size * sizeof(int);
+
+  q_bytes = (q_bytes + 255) / 256 * 256;
+  k_bytes = (k_bytes + 255) / 256 * 256;
+  // seq_bytes = (seq_bytes + 255) / 256 * 256;
+
+  void* q_rot_ptr = nullptr;
+  void* k_rot_ptr = nullptr;
+  // int* seq_len_ptr = nullptr;
+
+  // Setup extra scratch pointers
+  if (parameters.do_rotary) {
+    q_rot_ptr = scratch_ptr;
+    scratch_ptr += q_bytes;
+    k_rot_ptr = scratch_ptr;
+    scratch_ptr += k_bytes;
+  }
+  // seq_len_ptr = reinterpret_cast<int*>(scratch_ptr);5
+  // scratch_ptr += seq_bytes;
+
+  // Determine workspace size for XQA
+  size_t used_bytes = scratch_ptr - static_cast<char*>(data.scratch);
+  size_t xqa_workspace_size = (data.scratch_bytes > used_bytes) ? (data.scratch_bytes - used_bytes) : 0;
+  void* xqa_workspace = scratch_ptr;
+
+  // 1. Prepare Q (Rotate if needed)
+  const void* q_final = query;
+  if (parameters.do_rotary) {
+    // Rotate Q
+    ORT_RETURN_IF_ERROR(onnxruntime::contrib::cuda::LaunchRotaryEmbeddingKernel<CudaT>(
+        stream, static_cast<CudaT*>(q_rot_ptr), static_cast<const CudaT*>(query),
+        data.position_ids, data.past_seq_lens,
+        static_cast<const CudaT*>(data.cos_cache), static_cast<const CudaT*>(data.sin_cache),
+        batch_size, sequence_length, num_heads, parameters.head_size, parameters.rotary_dim,
+        parameters.seqlen_present_kv_cache, /*pos_ids_format*/ 2, parameters.rotary_interleaved,
+        device_prop.maxThreadsPerBlock, /*bsnh*/ true));
+    q_final = q_rot_ptr;
+  }
+
+  // 2. Prepare K to append (Rotate if needed)
+  const void* k_to_append = key;
+  if (parameters.do_rotary) {
+    // Rotate K
+    ORT_RETURN_IF_ERROR(onnxruntime::contrib::cuda::LaunchRotaryEmbeddingKernel<CudaT>(
+        stream, static_cast<CudaT*>(k_rot_ptr), static_cast<const CudaT*>(key),
+        data.position_ids, data.past_seq_lens,
+        static_cast<const CudaT*>(data.cos_cache), static_cast<const CudaT*>(data.sin_cache),
+        batch_size, sequence_length, kv_num_heads, parameters.head_size, parameters.rotary_dim,
+        parameters.seqlen_present_kv_cache, /*pos_ids_format*/ 2, parameters.rotary_interleaved,
+        device_prop.maxThreadsPerBlock, /*bsnh*/ true));
+    k_to_append = k_rot_ptr;
+  }
+
+  // 3. Append K and V to Cache
+  // Use LaunchStridedCopy. Cache is BxNxMxH. Append at offset 'past_seq_lens'.
+  // Strides for cache (BNSH):
+  // B stride: N * M * H
+  // N stride: M * H
+  // S stride: H
+  // H stride: 1
+  size_t M = parameters.seqlen_present_kv_cache;
+  size_t H = parameters.head_size;
+  size_t N_kv = kv_num_heads;
+
+  LongLong4 cache_strides;
+  if (parameters.past_kv_format == AttentionQkvFormat::Q_K_V_BNSH) {
+    // BNSH
+    cache_strides.x = N_kv * M * H;
+    cache_strides.y = M * H;
+    cache_strides.z = H;
+    cache_strides.w = 1;
+  } else {
+    // BSNH
+    cache_strides.x = M * N_kv * H;
+    cache_strides.y = H;
+    cache_strides.z = N_kv * H;
+    cache_strides.w = 1;
+  }
+
+  LongLong4 input_strides;  // BxNx1xH
+  input_strides.x = N_kv * H;
+  input_strides.y = H;
+  input_strides.z = H;  // doesn't matter for S=1
+  input_strides.w = 1;
+
+  int4 shape = {batch_size, static_cast<int>(N_kv), 1, static_cast<int>(H)};
+
+  // Append K
+  ORT_RETURN_IF_ERROR(onnxruntime::contrib::cuda::LaunchStridedCopy<CudaT>(
+      stream,
+      static_cast<const CudaT*>(k_to_append),
+      shape, input_strides, nullptr,
+      static_cast<CudaT*>(present_key),
+      cache_strides, data.past_seq_lens,  // Offset by past_seq_lens
+      device_prop.maxThreadsPerBlock));
+
+  // Append V (V is not rotated)
+  ORT_RETURN_IF_ERROR(onnxruntime::contrib::cuda::LaunchStridedCopy<CudaT>(
+      stream,
+      static_cast<const CudaT*>(value),
+      shape, input_strides, nullptr,
+      static_cast<CudaT*>(present_value),
+      cache_strides, data.past_seq_lens,
+      device_prop.maxThreadsPerBlock));
+
+  // 5. Launch XQA
+  Status status = onnxruntime::contrib::cuda::LaunchXQAKernel<CudaT>(
+      device_prop,
+      stream,
+      q_final,
+      present_key,
+      present_value,
+      data.output,
+      batch_size,
+      num_heads,
+      kv_num_heads,
+      parameters.head_size,
+      sequence_length,                     // actual_seq_len (1)
+      parameters.seqlen_present_kv_cache,  // max_seq_len (Capacity)
+      scale,
+      past_bsnh,
+      data.total_seq_lens,
+      nullptr,  // kv_cache_scale (null for FP16)
+      0,        // kv_quant_type (0 = FP16)
+      xqa_workspace,
+      xqa_workspace_size);
+
+  // If XQA launch fails, debugging info
+
+  return status;
+}
 
 #if USE_FLASH_ATTENTION
 
@@ -1619,6 +1805,10 @@ Status QkvToContext(
     GroupQueryAttentionData<T>& data) {
   auto stream = static_cast<cudaStream_t>(ort_stream->GetHandle());
   const float scale = parameters.scale == 0.0f ? 1.f / sqrt(static_cast<float>(parameters.head_size)) : parameters.scale;
+  if (data.use_xqa) {
+    return ExtremeDecoding(device_prop, stream, parameters, data, scale);
+  }
+
 #if USE_FLASH_ATTENTION
   if (data.use_flash_attention_fast_decode) {
     return FlashDecoding(device_prop, stream, parameters, data, scale);

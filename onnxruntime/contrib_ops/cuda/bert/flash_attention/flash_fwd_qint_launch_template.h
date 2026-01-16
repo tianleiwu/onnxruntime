@@ -180,10 +180,6 @@ template <typename Kernel_traits>
 void run_flash_int8_decode_fwd(Flash_fwd_params& params, cudaStream_t stream) {
   assert(params.seqlen_q == 1 && params.h_h_k_ratio > 1);
 
-  // Specialized Decode Kernel Dispatch (Q=1)
-  // Use the new optimized INT8 kernel (flash_int8_fwd_kernel.h)
-  // This kernel uses standard grid (one block per Q-head), not GQA-aware blocking yet.
-
   using DecodeTraits = Kernel_traits;
 
   // Grid: (num_m_block, splits, b*h) or (num_m_block, splits, b*h_k) for GQA
@@ -206,13 +202,8 @@ void run_flash_int8_decode_fwd(Flash_fwd_params& params, cudaStream_t stream) {
 
   QUANT_CAUSAL_SWITCH(params.is_causal, Is_causal, [&] {
     BOOL_SWITCH(params.num_splits > 1, SplitConst, [&] {
-      // Assume no alibi, standard local/softcap/etc for now within BOOL_SWITCH if needed.
-      // For simplicity, hardcode some for decoding or match the existing BOOL_SWITCH structure.
-      // run_flash_fwd_splitkv_kernel uses: Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV
-
       bool Is_even_K = params.d == DecodeTraits::kHeadDim;
       bool Is_softcap = params.softcap > 0.0;
-      // Is_local, Has_alibi, Append_KV unused. Is_even_MN = false.
 
       EVENK_SWITCH(Is_even_K, IsEvenKConst, [&] {
         SOFTCAP_SWITCH(Is_softcap, IsSoftcapConst, [&] {
@@ -225,36 +216,6 @@ void run_flash_int8_decode_fwd(Flash_fwd_params& params, cudaStream_t stream) {
       });
     });
   });
-
-  // if (params.num_splits > 1) {
-  //   constexpr static int kBlockM = Kernel_traits::kHeadDim % 128 == 0 ? 4 : (Kernel_traits::kHeadDim % 64 == 0 ? 8 : 16);
-  //   dim3 grid_combine((params.b * params.h * params.seqlen_q + kBlockM - 1) / kBlockM);
-  //   const bool is_even_K = params.d == DecodeTraits::kHeadDim;
-
-  //   // Combine kernel requires kNThreads == 128. If DecodeTraits uses fewer threads (e.g. GQA optimization), switch traits.
-  //   using CombineTraits = typename std::conditional<
-  //       DecodeTraits::kNThreads == 128,
-  //       DecodeTraits,
-  //       flash::int8::Flash_dq_kernel_traits<DecodeTraits::kHeadDim, 64, 64, 4, typename DecodeTraits::Element>>::type;
-
-  //   EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
-  //     int split_combine_num = params.num_splits;
-  //     if (split_combine_num <= 2)
-  //       flash_fwd_splitkv_combine_kernel<CombineTraits, kBlockM, 1, IsEvenKConst><<<grid_combine, CombineTraits::kNThreads, 0, stream>>>(params);
-  //     else if (split_combine_num <= 4)
-  //       flash_fwd_splitkv_combine_kernel<CombineTraits, kBlockM, 2, IsEvenKConst><<<grid_combine, CombineTraits::kNThreads, 0, stream>>>(params);
-  //     else if (split_combine_num <= 8)
-  //       flash_fwd_splitkv_combine_kernel<CombineTraits, kBlockM, 3, IsEvenKConst><<<grid_combine, CombineTraits::kNThreads, 0, stream>>>(params);
-  //     else if (split_combine_num <= 16)
-  //       flash_fwd_splitkv_combine_kernel<CombineTraits, kBlockM, 4, IsEvenKConst><<<grid_combine, CombineTraits::kNThreads, 0, stream>>>(params);
-  //     else if (split_combine_num <= 32)
-  //       flash_fwd_splitkv_combine_kernel<CombineTraits, kBlockM, 5, IsEvenKConst><<<grid_combine, CombineTraits::kNThreads, 0, stream>>>(params);
-  //     else if (split_combine_num <= 64)
-  //       flash_fwd_splitkv_combine_kernel<CombineTraits, kBlockM, 6, IsEvenKConst><<<grid_combine, CombineTraits::kNThreads, 0, stream>>>(params);
-  //     else if (split_combine_num <= 128)
-  //       flash_fwd_splitkv_combine_kernel<CombineTraits, kBlockM, 7, IsEvenKConst><<<grid_combine, CombineTraits::kNThreads, 0, stream>>>(params);
-  //   });
-  // }
 }
 
 template <typename Kernel_traits>

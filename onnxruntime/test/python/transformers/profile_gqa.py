@@ -60,6 +60,7 @@ def create_gqa_config(
     kv_num_heads: int = 8,
     head_size: int = 128,
     is_packed_qkv: bool = False,
+    do_rotary: bool = True,
     device: str = "cuda",
 ) -> GroupQueryAttentionConfig:
     """Create a GQA config based on the mode."""
@@ -95,7 +96,7 @@ def create_gqa_config(
         kv_num_heads=kv_num_heads,
         head_size=head_size,
         local_window_size=-1,
-        do_rotary=True,
+        do_rotary=do_rotary,
         rotary_interleaved=False,
         dtype=dtype,
         is_packed_qkv=is_packed_qkv,
@@ -160,6 +161,7 @@ def run_comparison(args):
             kv_num_heads=args.kv_num_heads,
             head_size=args.head_size,
             is_packed_qkv=args.is_packed_qkv,
+            do_rotary=not args.no_rotary,
         )
         avg_ms = benchmark_gqa(config, warmup=args.warmup, repeat=args.repeat, mode=mode)
         results[mode] = avg_ms
@@ -190,6 +192,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=50, help="Warmup iterations")
     parser.add_argument("--repeat", type=int, default=100, help="Benchmark iterations")
     parser.add_argument("--is-packed-qkv", action="store_true", help="Use packed QKV")
+
+    parser.add_argument("--no-rotary", action="store_true", help="Disable rotary embeddings")
 
     args = parser.parse_args()
 
