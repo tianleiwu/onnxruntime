@@ -157,8 +157,8 @@ struct GroupQueryAttentionData {
   const T* sin_cache = nullptr;
   const T* head_sink = nullptr;
 
-  const T* k_scale = nullptr;
-  const T* v_scale = nullptr;
+  const float* k_scale = nullptr;
+  const float* v_scale = nullptr;
 
   // Total sequence length for each batch. It has shape [batch_size].
   int* total_seq_lens = nullptr;

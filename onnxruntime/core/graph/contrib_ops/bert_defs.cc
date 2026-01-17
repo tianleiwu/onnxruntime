@@ -1147,12 +1147,13 @@ It also supports optional float8, int8, int4 or int2 quantization for the KV cac
 The past and present KV cache tensors are expected in a BNSH format: `(batch_size, num_heads, cache_sequence_length, head_size)`, where `cache_sequence_length` is the length of the cached key/value sequences, or the maximum sequence length when past and present buffer sharing is used.
 
 **Quantization:**
-When quantization is enabled, `past_key` and `past_value` inputs must be of type `float8e4m3fn`, `float8e5m2`, `uint8`, `int8` or `int4`. The corresponding `k_scale` and `v_scale` tensors must be provided.
-The operator will output `present_key` and `present_value` in same format as the `past_key` and `past_value`, and `present_k_scale` and `present_v_scale` will contain updated scales if dynamic quantization is used.
-k_scale and present_k_scale will share buffer when past and present buffer sharing is used, same for v_scale and present_v_scale.
-The shapes of the k_scale, v_scale, present_k_scale and present_v_scale tensors shall be broadcastable to present_key shape.
+When quantization is enabled, `past_key` and `past_value` inputs can be of type `float8e4m3fn`, `uint8` or `int8`. The corresponding `k_scale` and `v_scale` tensors must be provided.
+The operator will output `present_key` and `present_value` in same format as the `past_key` and `past_value`.
 
 For 4-bit or 2-bit quantization, the data type can be uint8. Each byte contains two 4-bit or four 2-bit quantized values. The bit width of quantized KV cache can be set using `kv_cache_bit_width` attribute.
+
+The shapes of the k_scale, v_scale tensors shall be broadcastable to present_key shape.
+The data type of k_scale and v_scale can be float32 for per-tensor quantization, or same as input type for per-channel quantization.
 
 **Quantization Modes (`k_quant_type`, `v_quant_type` attributes):**
 - **"NONE"**: No quantization.
@@ -1194,8 +1195,8 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
               "Output values of QK matrix multiplication before (1) or after (2) softmax normalization. Default value is 0 (don't output).",
               AttributeProto::INT,
               static_cast<int64_t>(QKOutputType::NO_OUTPUT))
-        .Attr("k_quant_type", "Quantization type for K cache. One of 'NONE', 'PER_TENSOR', 'PER_CHANNEL', 'PER_TOKEN'.", AttributeProto::STRING, std::string("NONE"))
-        .Attr("v_quant_type", "Quantization type for V cache. One of 'NONE', 'PER_TENSOR', 'PER_CHANNEL', 'PER_TOKEN'.", AttributeProto::STRING, std::string("NONE"))
+        .Attr("k_quant_type", "Quantization type for K cache. One of 'NONE', 'PER_TENSOR', 'PER_CHANNEL'.", AttributeProto::STRING, std::string("NONE"))
+        .Attr("v_quant_type", "Quantization type for V cache. One of 'NONE', 'PER_TENSOR', 'PER_CHANNEL'.", AttributeProto::STRING, std::string("NONE"))
         .Attr("kv_cache_bit_width", "Bit width of quantized KV cache when its data type is uint8. Supported values are 4 and 2.", AttributeProto::INT, OPTIONAL_VALUE)
         .Input(0,
                "query",
@@ -1259,8 +1260,8 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
                "1D tensor with shape (num_heads). Each head has a smooth factor adding to the denominator of softmax.",
                "T",
                OpSchema::Optional)
-        .Input(12, "k_scale", "Scale tensor for past_key.", "T", OpSchema::Optional)
-        .Input(13, "v_scale", "Scale tensor for past_value.", "T", OpSchema::Optional)
+        .Input(12, "k_scale", "Scale tensor for past_key.", "T_KV_SCALE", OpSchema::Optional)
+        .Input(13, "v_scale", "Scale tensor for past_value.", "T_KV_SCALE", OpSchema::Optional)
         .Output(0,
                 "output",
                 "3D output tensor with shape (batch_size, sequence_length, hidden_size)",
@@ -1283,7 +1284,8 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
                 "T",
                 OpSchema::Optional)
         .TypeConstraint("T", {"tensor(float16)", "tensor(bfloat16)", "tensor(float)"}, "Constrain input and output to float tensors.")
-        .TypeConstraint("T_CACHE", {"tensor(float)", "tensor(float16)", "tensor(bfloat16)", "tensor(uint8)", "tensor(int8)", "tensor(float8e4m3fn)", "tensor(float8e5m2)"}, "Constrain KV cache types.")
+        .TypeConstraint("T_CACHE", {"tensor(float)", "tensor(float16)", "tensor(bfloat16)", "tensor(uint8)", "tensor(int8)", "tensor(float8e4m3fn)"}, "Constrain KV cache types.")
+        .TypeConstraint("T_KV_SCALE", {"tensor(float)"}, "Constrain KV cache scale types.")
         .TypeConstraint("M", {"tensor(int32)"}, "Constrain mask to int tensor.")
         .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
           // The 'output_qk' is an optional output at index 3.

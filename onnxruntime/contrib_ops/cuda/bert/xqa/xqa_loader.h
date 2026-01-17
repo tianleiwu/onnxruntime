@@ -30,7 +30,7 @@ Status LaunchXQAKernel(
     const float scale,
     const bool is_bsnh,           // Layout of KV cache
     const int* seq_lens,          // Array of sequence lengths [BatchSize]
-    const float* kv_cache_scale,  // Scale for INT8/FP8 dequantization (nullptr for FP16/BF16)
+    const float* kv_cache_scale,  // KV cache dequant scale (nullptr for FP16/BF16, per-tensor float for INT8)
     const int kv_quant_type,      // 0=FP16/BF16, 1=INT8, 2=FP8
     void* workspace = nullptr,    // Scratch memory
     size_t workspace_size = 0     // Size of scratch memory

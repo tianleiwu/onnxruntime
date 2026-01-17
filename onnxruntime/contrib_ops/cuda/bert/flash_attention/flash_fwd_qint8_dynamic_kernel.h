@@ -316,10 +316,17 @@ inline __device__ void compute_attn_1rowblock(
                           make_stride(Split ? kHeadDim : params.o_row_stride, Split ? _0{} : params.o_head_stride, _1{}));
   Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
 
-  // Scales - use 0 for per-tensor (k_quant_type==1), kv_head_idx for per-channel (k_quant_type==2)
-  const int scale_idx = (params.k_quant_type == 2) ? kv_head_idx : 0;
-  const float k_scale_global = params.k_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.k_scale_ptr)[scale_idx]) : 1.0f;
-  const float v_scale_global = params.v_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.v_scale_ptr)[scale_idx]) : 1.0f;
+  // Scales: both PER_TENSOR (1) and PER_CHANNEL (2) use float*
+  const float k_scale_global = params.k_scale_ptr
+                                   ? (params.k_quant_type == 1
+                                          ? reinterpret_cast<const float*>(params.k_scale_ptr)[0]
+                                          : reinterpret_cast<const float*>(params.k_scale_ptr)[kv_head_idx])
+                                   : 1.0f;
+  const float v_scale_global = params.v_scale_ptr
+                                   ? (params.v_quant_type == 1
+                                          ? reinterpret_cast<const float*>(params.v_scale_ptr)[0]
+                                          : reinterpret_cast<const float*>(params.v_scale_ptr)[kv_head_idx])
+                                   : 1.0f;
 
   // 1. Load Q (FP16)
   typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;

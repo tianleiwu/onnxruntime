@@ -476,32 +476,32 @@ Status LaunchQuantizeAppendKV(cudaStream_t stream, T_QUANT* cache_data,
 }
 
 // Explicit instantiations for launchers
-template Status LaunchDequantizeKV<half, int8_t, half>(
-    cudaStream_t, half*, const int8_t*, const half*, const int*, int, int, int, int, int, KVQuantizationType, bool);
-template Status LaunchDequantizeKV<half, uint8_t, half>(
-    cudaStream_t, half*, const uint8_t*, const half*, const int*, int, int, int, int, int, KVQuantizationType, bool);
-template Status LaunchDequantizeKV<BFloat16, int8_t, BFloat16>(
-    cudaStream_t, BFloat16*, const int8_t*, const BFloat16*, const int*, int, int, int, int, int, KVQuantizationType, bool);
-template Status LaunchDequantizeKV<BFloat16, uint8_t, BFloat16>(
-    cudaStream_t, BFloat16*, const uint8_t*, const BFloat16*, const int*, int, int, int, int, int, KVQuantizationType, bool);
+template Status LaunchDequantizeKV<half, int8_t, float>(
+    cudaStream_t, half*, const int8_t*, const float*, const int*, int, int, int, int, int, KVQuantizationType, bool);
+template Status LaunchDequantizeKV<half, uint8_t, float>(
+    cudaStream_t, half*, const uint8_t*, const float*, const int*, int, int, int, int, int, KVQuantizationType, bool);
+template Status LaunchDequantizeKV<BFloat16, int8_t, float>(
+    cudaStream_t, BFloat16*, const int8_t*, const float*, const int*, int, int, int, int, int, KVQuantizationType, bool);
+template Status LaunchDequantizeKV<BFloat16, uint8_t, float>(
+    cudaStream_t, BFloat16*, const uint8_t*, const float*, const int*, int, int, int, int, int, KVQuantizationType, bool);
 
-template Status LaunchQuantizeKV<half, int8_t, half>(
-    cudaStream_t, int8_t*, const half*, const half*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
-template Status LaunchQuantizeKV<half, uint8_t, half>(
-    cudaStream_t, uint8_t*, const half*, const half*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
-template Status LaunchQuantizeKV<BFloat16, int8_t, BFloat16>(
-    cudaStream_t, int8_t*, const BFloat16*, const BFloat16*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
-template Status LaunchQuantizeKV<BFloat16, uint8_t, BFloat16>(
-    cudaStream_t, uint8_t*, const BFloat16*, const BFloat16*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
+template Status LaunchQuantizeKV<half, int8_t, float>(
+    cudaStream_t, int8_t*, const half*, const float*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
+template Status LaunchQuantizeKV<half, uint8_t, float>(
+    cudaStream_t, uint8_t*, const half*, const float*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
+template Status LaunchQuantizeKV<BFloat16, int8_t, float>(
+    cudaStream_t, int8_t*, const BFloat16*, const float*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
+template Status LaunchQuantizeKV<BFloat16, uint8_t, float>(
+    cudaStream_t, uint8_t*, const BFloat16*, const float*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
 
-template Status LaunchQuantizeAppendKV<half, int8_t, half>(
-    cudaStream_t, int8_t*, const half*, const half*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
-template Status LaunchQuantizeAppendKV<half, uint8_t, half>(
-    cudaStream_t, uint8_t*, const half*, const half*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
-template Status LaunchQuantizeAppendKV<BFloat16, int8_t, BFloat16>(
-    cudaStream_t, int8_t*, const BFloat16*, const BFloat16*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
-template Status LaunchQuantizeAppendKV<BFloat16, uint8_t, BFloat16>(
-    cudaStream_t, uint8_t*, const BFloat16*, const BFloat16*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
+template Status LaunchQuantizeAppendKV<half, int8_t, float>(
+    cudaStream_t, int8_t*, const half*, const float*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
+template Status LaunchQuantizeAppendKV<half, uint8_t, float>(
+    cudaStream_t, uint8_t*, const half*, const float*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
+template Status LaunchQuantizeAppendKV<BFloat16, int8_t, float>(
+    cudaStream_t, int8_t*, const BFloat16*, const float*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
+template Status LaunchQuantizeAppendKV<BFloat16, uint8_t, float>(
+    cudaStream_t, uint8_t*, const BFloat16*, const float*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
 
 }  // namespace cuda
 }  // namespace contrib

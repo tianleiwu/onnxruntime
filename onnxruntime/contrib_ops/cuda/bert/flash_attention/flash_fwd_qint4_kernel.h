@@ -269,17 +269,16 @@ inline __device__ void compute_attn_1rowblock(
   // mK/mV moved to after offsets calculation
 
   // Scales in Smem (for Per-Channel quantization)
-  // Allocated after sV. Size: HeadDim elements (Half)
+  // Use float type to preserve precision (avoid fp16/bf16 round-trip loss)
   // Scale Tensors in Shared Memory
   // Place sKScale AFTER sV_int8 with PADDING to account for Swizzled Layout gaps
-  // Offset = size(sQ)*2 (FP16) + size(sK)*1 + size(sK)*1 + 1024 (Padding)
-  // Place sKScale AFTER sV_int8 with PADDING
   // Offset = sQ + sK + sV + Padding
-  Tensor sKScale = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_ + kSmemSizeQ + 2 * kSmemSizeKInt4 + 1024)),
+  using ElementScale = float;
+  Tensor sKScale = make_tensor(make_smem_ptr(reinterpret_cast<ElementScale*>(smem_ + kSmemSizeQ + 2 * kSmemSizeKInt4 + 1024)),
                                make_layout(Shape<Int<kHeadDim>>{}, Stride<_1>{}));
 
-  // Place sVScale after sKScale
-  Tensor sVScale = make_tensor(sKScale.data() + size(sKScale),
+  // Place sVScale after sKScale (accounting for float size)
+  Tensor sVScale = make_tensor(make_smem_ptr(reinterpret_cast<ElementScale*>(smem_ + kSmemSizeQ + 2 * kSmemSizeKInt4 + 1024 + kHeadDim * sizeof(ElementScale))),
                                make_layout(Shape<Int<kHeadDim>>{}, Stride<_1>{}));
 
   // Define sO early (reusing Q memory) for Output Staging (FP16)
@@ -306,13 +305,13 @@ inline __device__ void compute_attn_1rowblock(
 
   // Get scalar scales (for Per-Tensor or Per-Channel as scalar)
   const int scale_idx = (QUANT_TYPE == 2) ? kv_head_idx : 0;
-  const float k_scale = params.k_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.k_scale_ptr)[scale_idx]) : 1.0f;
-  const float v_scale = params.v_scale_ptr ? static_cast<float>(reinterpret_cast<const Element*>(params.v_scale_ptr)[scale_idx]) : 1.0f;
+  const float k_scale = params.k_scale_ptr ? reinterpret_cast<const float*>(params.k_scale_ptr)[scale_idx] : 1.0f;
+  const float v_scale = params.v_scale_ptr ? reinterpret_cast<const float*>(params.v_scale_ptr)[scale_idx] : 1.0f;
 
   // Global Scale Tensors (for Per-Channel)
-  auto gKScale = make_tensor(make_gmem_ptr(reinterpret_cast<const Element*>(params.k_scale_ptr) + kv_head_idx * params.d),
+  auto gKScale = make_tensor(make_gmem_ptr(reinterpret_cast<const float*>(params.k_scale_ptr) + kv_head_idx * params.d),
                              make_layout(Shape<Int<kHeadDim>>{}, Stride<_1>{}));
-  auto gVScale = make_tensor(make_gmem_ptr(reinterpret_cast<const Element*>(params.v_scale_ptr) + kv_head_idx * params.d),
+  auto gVScale = make_tensor(make_gmem_ptr(reinterpret_cast<const float*>(params.v_scale_ptr) + kv_head_idx * params.d),
                              make_layout(Shape<Int<kHeadDim>>{}, Stride<_1>{}));
 
   // ============================================================================
@@ -434,7 +433,7 @@ inline __device__ void compute_attn_1rowblock(
     int num_elems = kHeadDim;
     for (int i = tidx; i < num_elems; i += Kernel_traits::kNThreads) {
       if (i < params.d) {
-        sKScale(i) = gKScale(i);
+        sKScale(i) = gKScale(i);  // Store as float directly, no precision loss
         sVScale(i) = gVScale(i);
       }
     }

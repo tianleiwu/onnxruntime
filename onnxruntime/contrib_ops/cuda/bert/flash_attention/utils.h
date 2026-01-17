@@ -328,6 +328,7 @@ __forceinline__ __device__ void gemm_quant_manual(Tensor0& acc, Tensor1& tCrA, T
       // Each iteration processes 2 logical elements (which share the same packed byte)
 
       if constexpr (std::is_same_v<DQuantType, cutlass::half_t>) {
+        // FP16 Path: Multiply in float for precision, then convert to half2
         CUTE_UNROLL
         for (int j = 0; j < size(tCrB_frag); j += 2) {
           // Read packed byte (only need one since they are duplicated)
@@ -335,30 +336,32 @@ __forceinline__ __device__ void gemm_quant_manual(Tensor0& acc, Tensor1& tCrA, T
 
           int32_t v0, v1;
           // bfe.s32 extracts bits and sign-extends them in 1 cycle
-          // operand 0: dest
-          // operand 1: source
-          // operand 2: start bit
-          // operand 3: bit width
           asm("bfe.s32 %0, %1, 0, 4;" : "=r"(v0) : "r"(ub));
           asm("bfe.s32 %0, %1, 4, 4;" : "=r"(v1) : "r"(ub));
 
-          __half2 vals_h2 = __halves2half2(__int2half_rn(v0), __int2half_rn(v1));
-          __half2 result_h2;
-
+          // Multiply in float for precision
+          float s0, s1;
           if constexpr (Is_Scale_Tensor) {
-            __half2 scale_pair = __halves2half2(
-                static_cast<__half>(scale(j, 0, qi)),
-                static_cast<__half>(scale(j + 1, 0, qi)));
-            result_h2 = __hmul2(vals_h2, scale_pair);
+            s0 = static_cast<float>(scale(j, 0, qi));
+            s1 = static_cast<float>(scale(j + 1, 0, qi));
           } else {
-            result_h2 = __hmul2(vals_h2, scale_h2_scalar);
+            s0 = static_cast<float>(scale);
+            s1 = s0;
           }
+          float f0 = static_cast<float>(v0) * s0;
+          float f1 = static_cast<float>(v1) * s1;
+
+          // Convert float2 to half2 using fused instruction
+          uint32_t result_bits;
+          asm volatile("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(result_bits) : "f"(f1), "f"(f0));
+          __half2 result_h2 = reinterpret_cast<__half2&>(result_bits);
 
           tCrB_frag(j) = result_h2.x;
           tCrB_frag(j + 1) = result_h2.y;
         }
       } else if constexpr (std::is_same_v<DQuantType, cutlass::bfloat16_t>) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        // BF16 Path: Multiply in float for precision, then convert to bfloat162
         CUTE_UNROLL
         for (int j = 0; j < size(tCrB_frag); j += 2) {
           uint32_t ub = static_cast<uint32_t>((uint8_t)tCrB_quant_frag(j));
@@ -367,20 +370,22 @@ __forceinline__ __device__ void gemm_quant_manual(Tensor0& acc, Tensor1& tCrA, T
           asm("bfe.s32 %0, %1, 0, 4;" : "=r"(v0) : "r"(ub));
           asm("bfe.s32 %0, %1, 4, 4;" : "=r"(v1) : "r"(ub));
 
-          // Convert int8 -> float -> bfloat16
-          float f0 = static_cast<float>(v0);
-          float f1 = static_cast<float>(v1);
-          __nv_bfloat162 vals_bf16_2 = __floats2bfloat162_rn(f0, f1);
-          __nv_bfloat162 result_bf16_2;
-
+          // Multiply in float for precision
+          float s0, s1;
           if constexpr (Is_Scale_Tensor) {
-            float s0 = static_cast<float>(scale(j, 0, qi));
-            float s1 = static_cast<float>(scale(j + 1, 0, qi));
-            __nv_bfloat162 scale_pair = __floats2bfloat162_rn(s0, s1);
-            result_bf16_2 = __hmul2(vals_bf16_2, scale_pair);
+            s0 = static_cast<float>(scale(j, 0, qi));
+            s1 = static_cast<float>(scale(j + 1, 0, qi));
           } else {
-            result_bf16_2 = __hmul2(vals_bf16_2, scale_bf16_2_scalar);
+            s0 = static_cast<float>(scale);
+            s1 = s0;
           }
+          float f0 = static_cast<float>(v0) * s0;
+          float f1 = static_cast<float>(v1) * s1;
+
+          // Convert float2 to bfloat162 using fused instruction
+          uint32_t result_bits;
+          asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(result_bits) : "f"(f1), "f"(f0));
+          __nv_bfloat162 result_bf16_2 = reinterpret_cast<__nv_bfloat162&>(result_bits);
 
           __nv_bfloat16 low = __low2bfloat16(result_bf16_2);
           __nv_bfloat16 high = __high2bfloat16(result_bf16_2);
@@ -435,52 +440,56 @@ __forceinline__ __device__ void gemm_quant_manual(Tensor0& acc, Tensor1& tCrA, T
       // Int8 Path: 1-to-1 mapping
       // Optimization: Vectorized dequantization using __half2 for 2x throughput
       if constexpr (std::is_same_v<DQuantType, cutlass::half_t>) {
-        // Vectorized FP16 path for BOTH per-tensor and per-channel
+        // FP16 Path: Multiply in float for precision, then convert to half2
         CUTE_UNROLL
         for (int j = 0; j < size(tCrB_frag); j += 2) {
           int8_t v0 = tCrB_quant_frag(j);
           int8_t v1 = tCrB_quant_frag(j + 1);
 
-          __half2 vals_h2 = __halves2half2(__int2half_rn(v0), __int2half_rn(v1));
-          __half2 result_h2;
-
+          // Multiply in float for precision
+          float s0, s1;
           if constexpr (Is_Scale_Tensor) {
-            // Per-channel: load 2 different scales
-            __half2 scale_pair = __halves2half2(
-                static_cast<__half>(scale(j, 0, qi)),
-                static_cast<__half>(scale(j + 1, 0, qi)));
-            result_h2 = __hmul2(vals_h2, scale_pair);
+            s0 = static_cast<float>(scale(j, 0, qi));
+            s1 = static_cast<float>(scale(j + 1, 0, qi));
           } else {
-            // Per-tensor: broadcast single scale (hoisted)
-            result_h2 = __hmul2(vals_h2, scale_h2_scalar);
+            s0 = static_cast<float>(scale);
+            s1 = s0;
           }
+          float f0 = static_cast<float>(v0) * s0;
+          float f1 = static_cast<float>(v1) * s1;
+
+          // Convert float2 to half2 using fused instruction
+          uint32_t result_bits;
+          asm volatile("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(result_bits) : "f"(f1), "f"(f0));
+          __half2 result_h2 = reinterpret_cast<__half2&>(result_bits);
 
           tCrB_frag(j) = result_h2.x;
           tCrB_frag(j + 1) = result_h2.y;
         }
       } else if constexpr (std::is_same_v<DQuantType, cutlass::bfloat16_t>) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-        // Vectorized BF16 path
+        // BF16 Path: Multiply in float for precision, then convert to bfloat162
         CUTE_UNROLL
         for (int j = 0; j < size(tCrB_frag); j += 2) {
           int8_t v0 = tCrB_quant_frag(j);
           int8_t v1 = tCrB_quant_frag(j + 1);
 
-          // Convert int8 -> float -> bfloat16
-          float f0 = static_cast<float>(v0);
-          float f1 = static_cast<float>(v1);
-          __nv_bfloat162 vals_bf16_2 = __floats2bfloat162_rn(f0, f1);
-          __nv_bfloat162 result_bf16_2;
-
+          // Multiply in float for precision
+          float s0, s1;
           if constexpr (Is_Scale_Tensor) {
-            float s0 = static_cast<float>(scale(j, 0, qi));
-            float s1 = static_cast<float>(scale(j + 1, 0, qi));
-            __nv_bfloat162 scale_pair = __floats2bfloat162_rn(s0, s1);
-            result_bf16_2 = __hmul2(vals_bf16_2, scale_pair);
+            s0 = static_cast<float>(scale(j, 0, qi));
+            s1 = static_cast<float>(scale(j + 1, 0, qi));
           } else {
-            // Per-tensor: broadcast single scale (hoisted)
-            result_bf16_2 = __hmul2(vals_bf16_2, scale_bf16_2_scalar);
+            s0 = static_cast<float>(scale);
+            s1 = s0;
           }
+          float f0 = static_cast<float>(v0) * s0;
+          float f1 = static_cast<float>(v1) * s1;
+
+          // Convert float2 to bfloat162 using fused instruction
+          uint32_t result_bits;
+          asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(result_bits) : "f"(f1), "f"(f0));
+          __nv_bfloat162 result_bf16_2 = reinterpret_cast<__nv_bfloat162&>(result_bits);
 
           __nv_bfloat16 low = __low2bfloat16(result_bf16_2);
           __nv_bfloat16 high = __high2bfloat16(result_bf16_2);

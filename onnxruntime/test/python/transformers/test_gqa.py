@@ -71,6 +71,14 @@ ONNX_TENSOR_TYPE_MAP = {
     "int4": TensorProto.UINT8,
 }
 
+TORCH_DTYPE_TO_ONNX_MAP = {
+    torch.float32: TensorProto.FLOAT,
+    torch.float16: TensorProto.FLOAT16,
+    torch.bfloat16: TensorProto.BFLOAT16,
+    torch.int32: TensorProto.INT32,
+    torch.int8: TensorProto.INT8,
+}
+
 TORCH_DTYPE_MAP = {
     "float32": torch.float32,
     "float16": torch.float16,
@@ -108,6 +116,7 @@ class GQAConfig:
     has_head_sink: bool = False
     kv_cache_type: str = ""
     share_buffer: bool = True
+    share_kv_scale: bool = False
 
     has_position_ids: bool = False
     has_attention_bias: bool = False
@@ -124,9 +133,10 @@ class GQAConfig:
 
 
 def get_q_range(q_type_str):
-    if q_type_str == "int8":
+    q_type_str = str(q_type_str)
+    if q_type_str.endswith("int8"):
         return -128, 127
-    if q_type_str == "int4":
+    if q_type_str.endswith("int4"):
         return -8, 7
     raise ValueError(f"Unsupported quantization type for range: {q_type_str}")
 
@@ -183,7 +193,8 @@ def dequantize_tensor(quantized_tensor, scale, quant_type, q_type_str):
         scale = scale.to(quantized_tensor.device)
 
     unpacked_tensor = quantized_tensor
-    if q_type_str == "int4":
+    q_type_str_s = str(q_type_str)
+    if q_type_str_s.endswith("int4"):
         unpacked_tensor = unpack_int4(quantized_tensor)
 
     return unpacked_tensor.to(torch.float32) * scale
@@ -197,10 +208,12 @@ def quantize_tensor_with_scale(tensor_float, scale, quant_type, q_type_str):
     qmin, qmax = get_q_range(q_type_str)
     quantized = torch.clamp(torch.round(tensor_float / scale), qmin, qmax)
 
-    if q_type_str == "int4":
+    q_type_str_s = str(q_type_str)
+    if q_type_str_s.endswith("int4"):
         quantized = pack_int4(quantized.to(torch.int8))
     else:
-        quantized = quantized.to(TORCH_DTYPE_MAP[q_type_str])
+        target_dtype = q_type_str if isinstance(q_type_str, torch.dtype) else TORCH_DTYPE_MAP[q_type_str]
+        quantized = quantized.to(target_dtype)
     return quantized
 
 
@@ -328,9 +341,10 @@ def create_gqa_node_and_io(
     # Ensure kv_cache_bit_width is set correctly based on cache type if not provided
     bit_width = config.kv_cache_bit_width
     if bit_width == 0:
-        if config.kv_cache_type == "int4":
+        kv_cache_type_s = str(config.kv_cache_type)
+        if kv_cache_type_s.endswith("int4"):
             bit_width = 4
-        elif config.kv_cache_type == "int8":
+        elif kv_cache_type_s.endswith("int8"):
             bit_width = 8
 
     inputs = [
@@ -347,7 +361,9 @@ def create_gqa_node_and_io(
         "attention_bias" if config.has_attention_bias else "",
         "head_sink" if config.has_head_sink else "",
         "k_scale" if config.k_quant_type != "NONE" else "",
-        "v_scale" if config.v_quant_type != "NONE" else "",
+        "k_scale"
+        if config.share_kv_scale and config.k_quant_type != "NONE"
+        else ("v_scale" if config.v_quant_type != "NONE" else ""),
     ]
 
     # Remove trailing empty strings
@@ -393,7 +409,10 @@ def create_gqa_node_and_io(
         helper.make_tensor_value_info("total_sequence_length", TensorProto.INT32, [1]),
     ]
 
-    cache_ort_type = ONNX_TENSOR_TYPE_MAP[config.kv_cache_type]
+    if isinstance(config.kv_cache_type, torch.dtype):
+        cache_ort_type = TORCH_DTYPE_TO_ONNX_MAP[config.kv_cache_type]
+    else:
+        cache_ort_type = ONNX_TENSOR_TYPE_MAP[config.kv_cache_type]
 
     if not config.packed:
         graph_input.extend(
@@ -422,9 +441,10 @@ def create_gqa_node_and_io(
             ]
         )
         if config.k_quant_type != "NONE":
-            graph_input.append(helper.make_tensor_value_info("k_scale", ort_type, None))
-        if config.v_quant_type != "NONE":
-            graph_input.append(helper.make_tensor_value_info("v_scale", ort_type, None))
+            # Scales are always float32
+            graph_input.append(helper.make_tensor_value_info("k_scale", TensorProto.FLOAT, None))
+        if config.v_quant_type != "NONE" and not config.share_kv_scale:
+            graph_input.append(helper.make_tensor_value_info("v_scale", TensorProto.FLOAT, None))
 
     if config.rotary:
         rotary_dim = (math.floor(config.head_size / 16) * 16) // 2
@@ -576,15 +596,16 @@ def gqa_prompt_func(
     # 3. Bind 'past_key', 'past_value'
     if share_buffer or config.k_quant_type != "NONE":
         # cache_ort_type corresponds to config.kv_cache_type
-        cache_ort_type = ONNX_TENSOR_TYPE_MAP[config.kv_cache_type]
+        if isinstance(config.kv_cache_type, torch.dtype):
+            cache_ort_type = TORCH_DTYPE_TO_ONNX_MAP[config.kv_cache_type]
+        else:
+            cache_ort_type = ONNX_TENSOR_TYPE_MAP[config.kv_cache_type]
         k_to_bind = k if share_buffer else k[:, :, :0, :]
         v_to_bind = v if share_buffer else v[:, :, :0, :]
         bind_tensor(io_binding, "past_key", k_to_bind, device, cache_ort_type)
         bind_tensor(io_binding, "past_value", v_to_bind, device, cache_ort_type)
 
-    if config.k_quant_type != "NONE":
-        bind_tensor(io_binding, "k_scale", k_scale, device, ort_type)
-        bind_tensor(io_binding, "v_scale", v_scale, device, ort_type)
+    # Scales are bound below in section 6
 
     # 4. Bind scalars/1D tensors
     # seqlens_k is INT32
@@ -611,29 +632,21 @@ def gqa_prompt_func(
 
     # 6. Quantization scales
     if k_scale is not None:
-        target_dtype = {
-            TensorProto.FLOAT: torch.float32,
-            TensorProto.FLOAT16: torch.float16,
-            TensorProto.BFLOAT16: torch.bfloat16,
-        }.get(ort_type, torch.float32)
+        k_scale_ort_type = TensorProto.FLOAT
+        if k_scale.dtype != torch.float32:
+            k_scale = k_scale.to(torch.float32)
 
-        if k_scale.dtype != target_dtype:
-            k_scale = k_scale.to(target_dtype)
         if enable_debug_print:
             print(
-                f"DEBUG: Binding k_scale dtype={k_scale.dtype} ort_type={ort_type} shape={k_scale.shape} val={k_scale.flatten()[:4]}"
+                f"DEBUG: Binding k_scale dtype={k_scale.dtype} ort_type={k_scale_ort_type} shape={k_scale.shape} val={k_scale.flatten()[:4]}"
             )
-        bind_tensor(io_binding, "k_scale", k_scale, device, ort_type)
+        bind_tensor(io_binding, "k_scale", k_scale, device, k_scale_ort_type)
     if v_scale is not None:
-        target_dtype = {
-            TensorProto.FLOAT: torch.float32,
-            TensorProto.FLOAT16: torch.float16,
-            TensorProto.BFLOAT16: torch.bfloat16,
-        }.get(ort_type, torch.float32)
-
-        if v_scale.dtype != target_dtype:
-            v_scale = v_scale.to(target_dtype)
-        bind_tensor(io_binding, "v_scale", v_scale, device, ort_type)
+        v_scale_ort_type = TensorProto.FLOAT
+        if v_scale.dtype != torch.float32:
+            v_scale = v_scale.to(torch.float32)
+        if not config.share_kv_scale:
+            bind_tensor(io_binding, "v_scale", v_scale, device, v_scale_ort_type)
 
     # 7. Bind Outputs
     # output shape calculation
@@ -669,8 +682,16 @@ def gqa_prompt_func(
     else:
         cache_dtype = out_dtype
         cache_ort_type = ort_type
-        if config.kv_cache_type in ONNX_TENSOR_TYPE_MAP:
-            cache_ort_type = ONNX_TENSOR_TYPE_MAP[config.kv_cache_type]
+        if isinstance(config.kv_cache_type, torch.dtype):
+            is_valid_type = config.kv_cache_type in TORCH_DTYPE_TO_ONNX_MAP
+        else:
+            is_valid_type = config.kv_cache_type in ONNX_TENSOR_TYPE_MAP
+
+        if is_valid_type:
+            if isinstance(config.kv_cache_type, torch.dtype):
+                cache_ort_type = TORCH_DTYPE_TO_ONNX_MAP[config.kv_cache_type]
+            else:
+                cache_ort_type = ONNX_TENSOR_TYPE_MAP[config.kv_cache_type]
 
     if share_buffer:
         # We bind output to the input buffer 'k' / 'v' (in-place update)
@@ -743,7 +764,10 @@ def gqa_past_func(
     # 3. Bind 'past_key', 'past_value'
     # These are required inputs for past_func
     # cache_ort_type corresponds to config.kv_cache_type
-    cache_ort_type = ONNX_TENSOR_TYPE_MAP[config.kv_cache_type]
+    if isinstance(config.kv_cache_type, torch.dtype):
+        cache_ort_type = TORCH_DTYPE_TO_ONNX_MAP[config.kv_cache_type]
+    else:
+        cache_ort_type = ONNX_TENSOR_TYPE_MAP[config.kv_cache_type]
 
     if share_buffer:
         # If sharing buffer, we bind 'past_key' to the large buffer 'k'
@@ -781,25 +805,17 @@ def gqa_past_func(
 
     # 6. Quantization
     if k_scale is not None:
-        target_dtype = {
-            TensorProto.FLOAT: torch.float32,
-            TensorProto.FLOAT16: torch.float16,
-            TensorProto.BFLOAT16: torch.bfloat16,
-        }.get(ort_type, torch.float32)
-
-        if k_scale.dtype != target_dtype:
-            k_scale = k_scale.to(target_dtype)
-        bind_tensor(io_binding, "k_scale", k_scale, device, ort_type)
+        k_scale_ort_type = TensorProto.FLOAT
+        if k_scale.dtype != torch.float32:
+            k_scale = k_scale.to(torch.float32)
+        bind_tensor(io_binding, "k_scale", k_scale, device, k_scale_ort_type)
     if v_scale is not None:
-        target_dtype = {
-            TensorProto.FLOAT: torch.float32,
-            TensorProto.FLOAT16: torch.float16,
-            TensorProto.BFLOAT16: torch.bfloat16,
-        }.get(ort_type, torch.float32)
-
-        if v_scale.dtype != target_dtype:
-            v_scale = v_scale.to(target_dtype)
-        bind_tensor(io_binding, "v_scale", v_scale, device, ort_type)
+        # Per-tensor uses float32 scale, per-channel uses T type
+        v_scale_ort_type = TensorProto.FLOAT
+        if v_scale.dtype != torch.float32:
+            v_scale = v_scale.to(torch.float32)
+        if not config.share_kv_scale:
+            bind_tensor(io_binding, "v_scale", v_scale, device, v_scale_ort_type)
 
     # 7. Outputs
     # output shape calculation
@@ -833,8 +849,16 @@ def gqa_past_func(
     else:
         cache_dtype = out_dtype
         cache_ort_type = ort_type
-        if config.kv_cache_type in ONNX_TENSOR_TYPE_MAP:
-            cache_ort_type = ONNX_TENSOR_TYPE_MAP[config.kv_cache_type]
+        if isinstance(config.kv_cache_type, torch.dtype):
+            is_valid_type = config.kv_cache_type in TORCH_DTYPE_TO_ONNX_MAP
+        else:
+            is_valid_type = config.kv_cache_type in ONNX_TENSOR_TYPE_MAP
+
+        if is_valid_type:
+            if isinstance(config.kv_cache_type, torch.dtype):
+                cache_ort_type = TORCH_DTYPE_TO_ONNX_MAP[config.kv_cache_type]
+            else:
+                cache_ort_type = ONNX_TENSOR_TYPE_MAP[config.kv_cache_type]
 
     if share_buffer:
         # In-place update to k/v buffers
@@ -972,6 +996,7 @@ def get_static_scale(config: GQAConfig, device, torch_type, std):
     )
     calibration_data_v = torch.randn_like(calibration_data_k) * std
 
+    # TODO: handle config.share_kv_scale here.
     k_scale = compute_scale(calibration_data_k, config.k_quant_type, config.kv_cache_type)
     v_scale = compute_scale(calibration_data_v, config.v_quant_type, config.kv_cache_type)
     return k_scale, v_scale
@@ -1323,6 +1348,11 @@ def parity_check_gqa_past(
         k_scale = k_scale.to(torch_type)
     if v_scale is not None:
         v_scale = v_scale.to(torch_type)
+
+    if config.share_kv_scale:
+        joint_scale = torch.max(k_scale, v_scale)
+        k_scale = joint_scale
+        v_scale = joint_scale
 
     # past cache sequence length is in [1, past_kv_sequence_length]
     cache_seqlens = torch.randint(
@@ -1975,18 +2005,28 @@ def gqa_cuda_quantized_test_cases(is_past: bool):
     for name, config in base_cases:
         for kv_type in ["int8", "int4"]:
             for quant_mode in ["PER_TENSOR", "PER_CHANNEL"]:
-                q_config = deepcopy(config)
-                q_config.k_quant_type = quant_mode
-                q_config.v_quant_type = quant_mode
-                q_config.kv_cache_type = kv_type
-                if kv_type == "int4":
-                    if q_config.head_size % 2 != 0:
-                        continue
-                    q_config.kv_cache_bit_width = 4
-                elif kv_type == "int8":
-                    q_config.kv_cache_bit_width = 8
-                q_name = f"{name}_quant_{kv_type}_{quant_mode}"
-                yield q_name, q_config
+                share_scales_options = [False]
+                if quant_mode == "PER_TENSOR" and kv_type == "int8":
+                    share_scales_options = [False, True]
+
+                for share_scales in share_scales_options:
+                    q_config = deepcopy(config)
+                    q_config.k_quant_type = quant_mode
+                    q_config.v_quant_type = quant_mode
+                    q_config.kv_cache_type = kv_type
+                    q_config.share_kv_scale = share_scales
+
+                    if kv_type == "int4":
+                        if q_config.head_size % 2 != 0:
+                            continue
+                        q_config.kv_cache_bit_width = 4
+                    elif kv_type == "int8":
+                        q_config.kv_cache_bit_width = 8
+
+                    q_name = f"{name}_quant_{kv_type}_{quant_mode}"
+                    if share_scales:
+                        q_name += "_shared"
+                    yield q_name, q_config
 
 
 # #################################################################################################
@@ -2361,6 +2401,47 @@ class TestFusedKernelParity(unittest.TestCase):
 
         # Clean up
         del os.environ["ORT_DISABLE_FLASH_DECODE"]
+
+    def test_xqa_quantized_parity(self):
+        """Test XQA per-tensor INT8 quantized parity."""
+        os.environ["ORT_ENABLE_XQA"] = "1"
+
+        # Decoding config (seq_len=1, share_buffer=True)
+        # Testing different group sizes and query types
+        for torch_type, ort_type in [(torch.float16, TensorProto.FLOAT16), (torch.bfloat16, TensorProto.BFLOAT16)]:
+            for group_size in [8, 16, 32]:
+                kv_num_heads = 4
+                num_heads = kv_num_heads * group_size
+                config = GQAConfig(
+                    batch_size=2,
+                    q_sequence_length=1,
+                    kv_sequence_length=1,
+                    num_heads=num_heads,
+                    kv_num_heads=kv_num_heads,
+                    head_size=128,
+                    past_kv_sequence_length=128,
+                    buffer_sequence_length=256,
+                    rotary=False,
+                    packed=False,
+                    share_buffer=True,
+                    k_quant_type="PER_TENSOR",
+                    v_quant_type="PER_TENSOR",
+                    kv_cache_type=torch.int8,
+                    share_kv_scale=True,
+                )
+
+                parity_check_gqa_past(
+                    config=config,
+                    ep="CUDAExecutionProvider",
+                    device="cuda",
+                    torch_type=torch_type,
+                    ort_type=ort_type,
+                    causal=True,
+                    rtol=rtol["bf16"] if torch_type == torch.bfloat16 else rtol["fp16"],
+                    atol=atol["bf16"] if torch_type == torch.bfloat16 else atol["fp16"],
+                )
+
+        del os.environ["ORT_ENABLE_XQA"]
 
 
 if __name__ == "__main__":

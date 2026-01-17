@@ -34,8 +34,7 @@ namespace contrib {
 namespace cuda {
 
 // ============================================================================
-// BF16 KV Cache Instantiations (CACHE_ELEM_ENUM=0)
-// Each group_size maps to appropriate M_TILESIZE
+// BF16 KV Cache Instantiations
 // ============================================================================
 
 #define NAMESPACE_NAME grp1_bf16
@@ -86,40 +85,26 @@ namespace cuda {
 #undef GRP_SIZE
 #undef M_TILESIZE
 
-// ============================================================================
-// INT8 KV Cache Instantiations for BF16 (CACHE_ELEM_ENUM=1)
-// ============================================================================
-
-#undef CACHE_ELEM_ENUM
-#define CACHE_ELEM_ENUM 1
-
-#define NAMESPACE_NAME grp8_bf16_int8
-#define GRP_SIZE 8
-#define M_TILESIZE 8
-#include "xqa_impl_gen.cuh"
-#undef NAMESPACE_NAME
-#undef GRP_SIZE
-#undef M_TILESIZE
-
-#define NAMESPACE_NAME grp16_bf16_int8
-#define GRP_SIZE 16
-#define M_TILESIZE 16
-#include "xqa_impl_gen.cuh"
-#undef NAMESPACE_NAME
-#undef GRP_SIZE
-#undef M_TILESIZE
-
-#define NAMESPACE_NAME grp32_bf16_int8
-#define GRP_SIZE 32
-#define M_TILESIZE 32
-#include "xqa_impl_gen.cuh"
-#undef NAMESPACE_NAME
-#undef GRP_SIZE
-#undef M_TILESIZE
-
-// Reset CACHE_ELEM_ENUM to default
-#undef CACHE_ELEM_ENUM
-#define CACHE_ELEM_ENUM 0
+// Extern declarations for INT8 kernels with BF16 query (implemented in xqa_loader_bf16_int8.cu)
+Status LaunchXQAIn8KernelBF16(
+    const cudaDeviceProp& device_prop,
+    cudaStream_t stream,
+    const void* query,
+    const void* key_cache,
+    const void* value_cache,
+    void* output,
+    const int batch_size,
+    const int num_heads,
+    const int kv_num_heads,
+    const int head_size,
+    const int actual_seq_len,
+    const int max_seq_len,
+    const float scale,
+    const bool is_bsnh,
+    const int* seq_lens,
+    const float* kv_cache_scale,
+    void* workspace,
+    size_t workspace_size);
 
 // ============================================================================
 // Specialization for BFloat16
@@ -146,44 +131,31 @@ Status LaunchXQAKernel<BFloat16>(
     const int kv_quant_type,
     void* workspace,
     size_t workspace_size) {
-
   if (head_size != 128) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "XQA only supports head_size=128.");
   }
 
-  int group_size = num_heads / kv_num_heads;
-
-  // Dispatch based on kv_quant_type and group_size
+  // Dispatch to INT8 path if requested
   if (kv_quant_type == 1) {
-    // INT8 KV Cache path
-    switch (group_size) {
-      case 8:
-        return grp8_bf16_int8::Launch<BFloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
-      case 16:
-        return grp16_bf16_int8::Launch<BFloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
-      case 32:
-        return grp32_bf16_int8::Launch<BFloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
-      default:
-        return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "XQA INT8 supports group_size 8, 16, 32. Input has ", group_size);
-    }
-  } else {
-    // BF16 KV Cache path (default)
-    switch (group_size) {
-      case 1:
-        return grp1_bf16::Launch<BFloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
-      case 2:
-        return grp2_bf16::Launch<BFloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
-      case 4:
-        return grp4_bf16::Launch<BFloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
-      case 8:
-        return grp8_bf16::Launch<BFloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
-      case 16:
-        return grp16_bf16::Launch<BFloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
-      case 32:
-        return grp32_bf16::Launch<BFloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
-      default:
-        return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "XQA supports group_size 1, 2, 4, 8, 16, 32. Input has ", group_size);
-    }
+    return LaunchXQAIn8KernelBF16(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
+  }
+
+  int group_size = num_heads / kv_num_heads;
+  switch (group_size) {
+    case 1:
+      return grp1_bf16::Launch<BFloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
+    case 2:
+      return grp2_bf16::Launch<BFloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
+    case 4:
+      return grp4_bf16::Launch<BFloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
+    case 8:
+      return grp8_bf16::Launch<BFloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
+    case 16:
+      return grp16_bf16::Launch<BFloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
+    case 32:
+      return grp32_bf16::Launch<BFloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
+    default:
+      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "XQA supports group_size 1, 2, 4, 8, 16, 32. Input has ", group_size);
   }
 }
 

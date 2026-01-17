@@ -185,13 +185,16 @@ inline __device__ void compute_attn_decode(const Params& params) {
   ElementInt8* sK = reinterpret_cast<ElementInt8*>(smem_ + Kernel_traits::kSmemSizeQ);
   ElementInt8* sV = sK + kBlockN * kSmemRowStride;
 
-  // Get scales
-  const int scale_idx = (params.k_quant_type == 2) ? kv_head_idx : 0;
+  // Get scales: both PER_TENSOR (1) and PER_CHANNEL (2) use float*
   const float k_scale = params.k_scale_ptr
-                            ? static_cast<float>(reinterpret_cast<const Element*>(params.k_scale_ptr)[scale_idx])
+                            ? (params.k_quant_type == 1
+                                   ? reinterpret_cast<const float*>(params.k_scale_ptr)[0]
+                                   : reinterpret_cast<const float*>(params.k_scale_ptr)[kv_head_idx])
                             : 1.0f;
   const float v_scale = params.v_scale_ptr
-                            ? static_cast<float>(reinterpret_cast<const Element*>(params.v_scale_ptr)[scale_idx])
+                            ? (params.v_quant_type == 1
+                                   ? reinterpret_cast<const float*>(params.v_scale_ptr)[0]
+                                   : reinterpret_cast<const float*>(params.v_scale_ptr)[kv_head_idx])
                             : 1.0f;
 
   // ============================================================================

@@ -16,7 +16,7 @@ namespace NAMESPACE_NAME {
 
 #undef HEAD_GRP_SIZE
 
-size_t GetScratchSize(
+inline size_t GetScratchSize(
     const cudaDeviceProp& device_prop,
     int batch_size,
     int kv_num_heads,
@@ -35,9 +35,8 @@ size_t GetScratchSize(
   return roundUp<size_t>(semaphore_size, 128) + scratch_size;
 }
 
-// Launcher wrapper for this specialization
 template <typename T>
-Status Launch(
+inline Status Launch(
     const cudaDeviceProp& device_prop,
     cudaStream_t stream,
     const void* query,
@@ -75,14 +74,7 @@ Status Launch(
     semaphores = reinterpret_cast<uint32_t*>(workspace);
     scratch = reinterpret_cast<char*>(workspace) + padded_sem_size;
 
-    // Initialize semaphores to 0?
-    // mha_impl.cuh seems to use atomicInc. It expects initialized?
-    // Usually caller initializes? Or kernel?
-    // launchMHA does NOT initialize semaphores.
-    // We should initialize semaphores if needed.
-    // Wait, standard MHA usually initializes semaphores in a separate kernel or assumes 0?
-    // I'll check if launchMHA initializes.
-    // If not, I should cudaMemsetAsync here.
+    // Initialize semaphores to 0
     cudaMemsetAsync(semaphores, 0, semaphore_size, stream);
   }
 
