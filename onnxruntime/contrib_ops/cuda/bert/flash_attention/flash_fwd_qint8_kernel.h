@@ -351,6 +351,7 @@ inline __device__ void compute_attn_1rowblock(
   }
 
   // Early Exit / Initialization for Empty Split Blocks
+
   if (n_block_min >= n_block_max) {
     // We exit early and write 0 to gOaccum and -inf to gLSEaccum (if Split).
     if constexpr (Split) {
@@ -445,8 +446,6 @@ inline __device__ void compute_attn_1rowblock(
   const int kv_head_idx = bidh / params.h_h_k_ratio;
 
   // Get scales
-  // For PER_TENSOR (1): scale is float*, use index 0.
-  // For PER_CHANNEL (2): scale is Element*, use head scale.
   const float k_scale = params.k_scale_ptr
                             ? (params.k_quant_type == 1
                                    ? reinterpret_cast<const float*>(params.k_scale_ptr)[0]
@@ -568,6 +567,11 @@ inline __device__ void compute_attn_1rowblock(
   auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
   auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
   Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
+
+  // FIX: Copy Q from shared memory to register fragments
+  // This was missing, causing tSrQ to contain uninitialized/zero values
+  Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+  cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
 
   // K/V Int8 Copier
   // Note: we redefined smem_tiled_copy_KInt8 above using DefaultCopy
@@ -733,9 +737,10 @@ inline __device__ void compute_attn_1rowblock(
         for (int nj = 0; nj < size<1, 1>(acc_s_rowcol); ++nj) {
           int c_base = (lane_id % 4) * 2 + nj * 8;
           if (r < kBlockM && c_base < kBlockN) {
-            __half2 vals_h2 = __halves2half2(
-                reinterpret_cast<half const&>(acc_s_rowcol(make_coord(i, mi), make_coord(0, nj))),
-                reinterpret_cast<half const&>(acc_s_rowcol(make_coord(i, mi), make_coord(1, nj))));
+            // Fix: Use static_cast to properly convert float to half, not reinterpret_cast
+            float val0 = acc_s_rowcol(make_coord(i, mi), make_coord(0, nj));
+            float val1 = acc_s_rowcol(make_coord(i, mi), make_coord(1, nj));
+            __half2 vals_h2 = __halves2half2(__float2half(val0), __float2half(val1));
             reinterpret_cast<__half2&>(sP(r, c_base)) = vals_h2;
           }
         }
@@ -775,9 +780,37 @@ inline __device__ void compute_attn_1rowblock(
   auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
   Tensor taccOrO = smem_thr_copy_O.retile_S(rO);   // ((Atom,AtomNum), MMA_M, MMA_N)
   auto taccOsO = smem_thr_copy_O.partition_D(sO);  // ((Atom,AtomNum),PIPE_M,PIPE_N)
-
   cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
   __syncthreads();
+
+  // if (bidb == 0 && bidh == 0 && tidx == 0) {
+  //   // Check sO
+  //   float so_val = static_cast<float>(sO(0, 0));
+  //   // Check sQ (FP16)
+  //   float sq_val = static_cast<float>(sQ(0));
+  //   // Check sK (Int8) - Need to access stage0_base
+  //   // sK_0 is Tensor over stage0_base.
+  //   // sK_0 is (BlockN, HeadDim) or (HeadDim, BlockN)? Traits says SmemLayoutK
+  //   // SmemLayoutAtom 8x64.
+  //   // Just check first byte.
+  //   // reinterpret_cast<int8_t*>(stage0_base)[0]
+  //   int8_t sk_val = reinterpret_cast<int8_t*>(smem_ + kSmemSizeQ)[0];
+
+  //   printf("DEBUG 1ROW: tidx=0 sO(0,0)=%f sQ(0)=%f sK(0)=%d k_scale=%f v_scale=%f\n",
+  //          so_val, sq_val, (int)sk_val, k_scale, v_scale);
+
+  //   // Also check if binfo seqlen is reasonable
+  //   printf("DEBUG 1ROW: actual_seqlen_q=%d actual_seqlen_k=%d seqlen_q=%d seqlen_k=%d\n",
+  //          binfo.actual_seqlen_q, binfo.actual_seqlen_k, params.seqlen_q, params.seqlen_k);
+
+  //   // Check acc_o if possible (hard because it's in registers of specific threads).
+  // }
+  // if (bidb == 0 && bidh == 0 && tidx == 128) {
+  //   // Check a register value
+  //   // printf("DEBUG 1ROW: tidx=128 acc_o(0)=%f\n", static_cast<float>(acc_o(0)));
+  //   // rO is converted type.
+  //   printf("DEBUG 1ROW: tidx=128 rO(0)=%f\n", static_cast<float>(rO(0)));
+  // }
 
   // Copy Smem -> Global
   if constexpr (!Split) {
@@ -976,8 +1009,8 @@ inline __device__ void compute_attn_1rowblock_gqa(
     int h_in_grp = i / kHeadDim;
     int col = i % kHeadDim;
     int bidh = q_head_start + h_in_grp;
-    // Map head to row: Warp i handles Row i*16. Head h -> Warp (h%4). Row = (h%4)*16 + (h/4).
-    int target_row = (h_in_grp % kNWarps) * 16 + (h_in_grp / kNWarps);
+    // Map head to row: Warp i handles Row i (simple mapping for GQA decode)
+    int target_row = h_in_grp;
 
     if (col < params.d) {
       const Element* q_ptr = reinterpret_cast<const Element*>(params.q_ptr) + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb) + bidh * params.q_head_stride;
@@ -991,7 +1024,8 @@ inline __device__ void compute_attn_1rowblock_gqa(
   __syncthreads();
 
   // MMA Setup
-  typename Kernel_traits::TiledMma_PV tiled_mma;
+  using TiledMma = std::conditional_t<Split, typename Kernel_traits::TiledMma_Specialized, typename Kernel_traits::TiledMma_PV>;
+  TiledMma tiled_mma;
   auto acc_o = partition_fragment_C(tiled_mma, Shape<Int<kSmemQRows>, Int<kHeadDim>>{});
   clear(acc_o);
 
@@ -1162,9 +1196,11 @@ inline __device__ void compute_attn_1rowblock_gqa(
             int c_base = (lane % 4) * 2 + nj * 8;
             if (r < kBlockM && c_base < kBlockN) {
               // Cast float scores to half and write to sP
-              reinterpret_cast<__half2&>(sP(r, c_base)) = __halves2half2(
+              __half2 val_h2 = __halves2half2(
                   static_cast<half>(acc_s_rowcol(make_coord(i, mi), make_coord(0, nj))),
                   static_cast<half>(acc_s_rowcol(make_coord(i, mi), make_coord(1, nj))));
+
+              reinterpret_cast<__half2&>(sP(r, c_base)) = val_h2;
             }
           }
         }
@@ -1207,30 +1243,7 @@ inline __device__ void compute_attn_1rowblock_gqa(
       // 3. Compute P @ V
       auto& sV_cur = (cur_stage == 0) ? sV_0 : sV_1;
 
-      // Load S from sP (alias sK_cur)
-      auto sP = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(
-                                (cur_stage == 0) ? sK_0.data().get() : sK_1.data().get())),
-                            make_layout(Shape<Int<kSmemQRows>, Int<kBlockN>>{}, Stride<Int<kBlockN>, _1>{}));
-
-      auto smem_tiled_copy_P = make_tiled_copy_A(Copy_Atom<DefaultCopy, Element>{}, tiled_mma_spec);
-      auto tOrP = thread_mma_spec.partition_fragment_A(sP);
-      auto tSsP = smem_tiled_copy_P.get_thread_slice(tidx % (Kernel_traits::kNThreads / 2)).partition_S(sP);
-      cute::copy(smem_tiled_copy_P, tSsP, smem_tiled_copy_P.get_thread_slice(tidx % (Kernel_traits::kNThreads / 2)).retile_D(tOrP));
-
-// == LOCAL SOFTMAX (Approx) ==
-// tOrP contains fragment of S (FP16/FP32).
-// Apply exp locally.
-// Note: `tOrP` is a Tuple of Registers.
-// Iterate and exp.
-// Note: This ignores global Max subtraction, so numeric overflow likely if S is large.
-// But validates compute structure.
-#pragma unroll
-      for (int i = 0; i < size(tOrP); ++i) {
-        // Cast to float for math to preserve range (especially for BF16)
-        tOrP(i) = static_cast<Element>(expf(static_cast<float>(tOrP(i))));
-      }
-
-      // Compute P @ V
+      // Common P@V inputs setup (Gemm B)
       auto sV_dummy = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(sV_cur.data().get())),
                                   make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}));
       auto tOrVt = thread_mma_spec.partition_fragment_B(sV_dummy);
@@ -1239,10 +1252,72 @@ inline __device__ void compute_attn_1rowblock_gqa(
       auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomInt8Default{}, tiled_mma_spec);
       auto tSsV = smem_tiled_copy_K.get_thread_slice(tidx % (Kernel_traits::kNThreads / 2)).partition_S(sV_quant_t);
 
-      flash::gemm_quant_manual<false>(acc_o, tOrP, tOrVt, tSsV, tiled_mma_spec, smem_tiled_copy_K, smem_tiled_copy_K.get_thread_slice(tidx % (Kernel_traits::kNThreads / 2)), v_scale);
+      if constexpr (Split) {
+        // 1. Recover acc_s (Fragments) from sP (SMEM)
+        // Invert GEMM0 writer loop to load sP back to acc_s (Fragment C)
+        // Note: Must use kSmemQRows to match acc_o shape and Softmax expectations
+        Tensor acc_s = partition_fragment_C(tiled_mma_spec, Shape<Int<kSmemQRows>, Int<kBlockN>>{});
 
-      // 4. Signal V Done (Buffer Free for GEMM0 reuse)
-      // We must ensure Load is completely done before signaling?
+        auto sP_reader = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(
+                                         (cur_stage == 0) ? sK_0.data().get() : sK_1.data().get())),
+                                     make_layout(Shape<Int<kSmemQRows>, Int<kBlockN>>{}, Stride<Int<kBlockN>, _1>{}));
+
+        auto acc_s_rowcol = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        const int lane = tidx % 32;
+        const int warp = (tidx % (Kernel_traits::kNThreads / 2)) / 32;
+
+        for (int mi = 0; mi < size<0, 1>(acc_s_rowcol); ++mi) {
+          int r_base = warp * 16 + (lane / 4);
+          for (int i = 0; i < size<0, 0>(acc_s_rowcol); ++i) {
+            int r = r_base + i * 4;
+            for (int nj = 0; nj < size<1, 1>(acc_s_rowcol); ++nj) {
+              int c_base = (lane % 4) * 2 + nj * 8;
+              if (r < kBlockM && c_base < kBlockN) {
+                __half2 val_h2 = reinterpret_cast<__half2&>(sP_reader(r, c_base));
+                acc_s_rowcol(make_coord(i, mi), make_coord(0, nj)) = static_cast<float>(val_h2.x);
+                acc_s_rowcol(make_coord(i, mi), make_coord(1, nj)) = static_cast<float>(val_h2.y);
+              } else {
+                acc_s_rowcol(make_coord(i, mi), make_coord(0, nj)) = -INFINITY;
+                acc_s_rowcol(make_coord(i, mi), make_coord(1, nj)) = -INFINITY;
+              }
+            }
+          }
+        }
+
+        // 2. Apply Softmax Rescaling (Updates Max, Sum, Rescales acc_o, Computes P)
+        if (n_block == n_block_max - 1) {
+          softmax.template softmax_rescale_o</*Is_first=*/true, /*Check_inf=*/true>(acc_s, acc_o, params.scale_softmax_log2);
+        } else {
+          softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/true>(acc_s, acc_o, params.scale_softmax_log2);
+        }
+
+        // 3. Convert P (acc_s, float) to tOrP (Fragment A, Element/Half)
+        Tensor rP = flash::convert_type<Element>(acc_s);
+        Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma_Specialized>(rP.layout()));
+
+        // 4. Compute P @ V
+        flash::gemm_quant_manual<false>(acc_o, tOrP, tOrVt, tSsV, tiled_mma_spec, smem_tiled_copy_K, smem_tiled_copy_K.get_thread_slice(tidx % (Kernel_traits::kNThreads / 2)), v_scale);
+      } else {
+        // Original Approx Softmax Logic (Unchanged for Split=false compilation)
+        // Load S from sP (alias sK_cur)
+        auto sP = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(
+                                  (cur_stage == 0) ? sK_0.data().get() : sK_1.data().get())),
+                              make_layout(Shape<Int<kSmemQRows>, Int<kBlockN>>{}, Stride<Int<kBlockN>, _1>{}));
+
+        auto smem_tiled_copy_P = make_tiled_copy_A(Copy_Atom<DefaultCopy, Element>{}, tiled_mma_spec);
+        auto tOrP = thread_mma_spec.partition_fragment_A(sP);
+        auto tSsP = smem_tiled_copy_P.get_thread_slice(tidx % (Kernel_traits::kNThreads / 2)).partition_S(sP);
+        cute::copy(smem_tiled_copy_P, tSsP, smem_tiled_copy_P.get_thread_slice(tidx % (Kernel_traits::kNThreads / 2)).retile_D(tOrP));
+
+// == LOCAL SOFTMAX (Approx) ==
+#pragma unroll
+        for (int i = 0; i < size(tOrP); ++i) {
+          tOrP(i) = static_cast<Element>(expf(static_cast<float>(tOrP(i))));
+        }
+
+        // Compute P @ V
+        flash::gemm_quant_manual<false>(acc_o, tOrP, tOrVt, tSsV, tiled_mma_spec, smem_tiled_copy_K, smem_tiled_copy_K.get_thread_slice(tidx % (Kernel_traits::kNThreads / 2)), v_scale);
+      }
       // No, GEMM0 needs the BUFFER to be free.
       // We finished using sK (as sP).
       // We issued load for Next K into Next Buffer.
@@ -1288,43 +1363,41 @@ inline __device__ void compute_attn_1rowblock_gqa(
       // BUT, GEMM1 issues Load(N-1) into Buffer(N-1).
       // We are in Loop N.
       // Buffer(N-1) is "Next".
-      // We signal "Buffer N Done".
       // Correct.
+
       mbar_arrive(&mbar_v_done_ptr[cur_stage]);
     }
 
     // Toggle phase bit for the used barrier
     mbar_phase[cur_stage] ^= 1;
   }
+  // if (tidx == 128 && m_block == 0 && bidb == 0 && kv_head_idx == 0) printf("[DEBUG INT8 GQA LOOP END] tidx=%d warp_role=%d\n", tidx, warp_role);
 
   // Epilogue: Only GEMM1 has valid acc_o?
-  // Yes. GEMM0 should just exit or write 0?
-  // Current code writes based on acc_o.
-  // If GEMM0 has 0 in acc_o, and we write out...
-  // We need to sync/reduce or only let GEMM1 write.
-
   if (warp_role == 0) return;  // GEMM0 exits early
 
   // Epilogue: Output
+
   float sink = (params.head_sink_ptr != nullptr) ? static_cast<float>(reinterpret_cast<const Element*>(params.head_sink_ptr)[kv_head_idx]) : (params.smooth_softmax ? 0.0f : -flash::kInfinity);
   Tensor lse = softmax.template normalize_softmax_lse<Split>(acc_o, params.scale_softmax, sink);
 
   Tensor rO = flash::convert_type<ElementO>(acc_o);
   Tensor sO = make_tensor(make_smem_ptr(reinterpret_cast<ElementO*>(smem_)), make_layout(Shape<Int<kSmemQRows>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{}));
   using SmemCopyAtomO = Copy_Atom<DefaultCopy, ElementO>;
-  auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
-  cute::copy(smem_tiled_copy_O, smem_tiled_copy_O.get_thread_slice(tidx).retile_S(rO), smem_tiled_copy_O.get_thread_slice(tidx).partition_D(sO));
-  __syncthreads();
+  auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma_spec);
+  auto thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx % (Kernel_traits::kNThreads / 2));
+  cute::copy(smem_tiled_copy_O, thr_copy_O.retile_S(rO), thr_copy_O.partition_D(sO));
 
   // Write Out Each Head
   for (int i = 0; i < num_q_heads_per_kv; ++i) {
-    int row = (i % kNWarps) * 16 + (i / kNWarps);
+    int row = i;  // Map head i directly to row i
     int bidh = q_head_start + i;
 
     // Only Row 'row' matters
     // Manual write to Global
     const int total_elems = kHeadDim;
-    for (int j = tidx; j < total_elems; j += Kernel_traits::kNThreads) {
+    const int writer_tidx = tidx - (kWarpsPerRole * 32);  // Adjust for writer role offset
+    for (int j = writer_tidx; j < total_elems; j += (kWarpsPerRole * 32)) {
       ElementO val = sO(row, j);
       // Global Pointer
       // gOaccum or gO
@@ -1341,7 +1414,7 @@ inline __device__ void compute_attn_1rowblock_gqa(
 
     // Write LSE
     const int lane = tidx % 32;
-    const int warp = tidx / 32;
+    const int warp = (tidx / 32) - kWarpsPerRole;  // Adjust for writer role offset
     // LSE is distributed. lse(0) -> row (warp*16 + lane/4).
     // Match row.
     if ((lane % 4) == 0) {

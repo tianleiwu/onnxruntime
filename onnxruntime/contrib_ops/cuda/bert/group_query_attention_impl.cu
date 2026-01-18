@@ -1496,31 +1496,17 @@ Status FlashAttentionWithQuantizeKV(
   bool past_bsnh = parameters.past_kv_format == AttentionQkvFormat::Q_K_V_BSNH;
 
   // Helper lambda for quantization append
-  auto LaunchQuantAppend = [&](void* dst, const T* src, const void* scale, KVQuantizationType q_type) {
-    if (q_type == KVQuantizationType::PER_TENSOR) {
-      if (parameters.kv_cache_bit_width == 8) {
-        return LaunchQuantizeAppendKV<T, int8_t, float>(
-            stream, reinterpret_cast<int8_t*>(dst), src, reinterpret_cast<const float*>(scale),
-            data.total_seq_lens, batch_size, kv_num_heads,
-            parameters.seqlen_present_kv_cache, head_size, 8, sequence_length, q_type, true, past_bsnh);
-      } else {
-        return LaunchQuantizeAppendKV<T, uint8_t, float>(
-            stream, reinterpret_cast<uint8_t*>(dst), src, reinterpret_cast<const float*>(scale),
-            data.total_seq_lens, batch_size, kv_num_heads,
-            parameters.seqlen_present_kv_cache, head_size, 4, sequence_length, q_type, true, past_bsnh);
-      }
+  auto LaunchQuantAppend = [&](void* dst, const T* src, const float* scale, KVQuantizationType q_type) {
+    if (parameters.kv_cache_bit_width == 8) {
+      return LaunchQuantizeAppendKV<T, int8_t, float>(
+          stream, reinterpret_cast<int8_t*>(dst), src, scale,
+          data.total_seq_lens, batch_size, kv_num_heads,
+          parameters.seqlen_present_kv_cache, head_size, 8, sequence_length, q_type, true, past_bsnh);
     } else {
-      if (parameters.kv_cache_bit_width == 8) {
-        return LaunchQuantizeAppendKV<T, int8_t, T>(
-            stream, reinterpret_cast<int8_t*>(dst), src, reinterpret_cast<const T*>(scale),
-            data.total_seq_lens, batch_size, kv_num_heads,
-            parameters.seqlen_present_kv_cache, head_size, 8, sequence_length, q_type, true, past_bsnh);
-      } else {
-        return LaunchQuantizeAppendKV<T, uint8_t, T>(
-            stream, reinterpret_cast<uint8_t*>(dst), src, reinterpret_cast<const T*>(scale),
-            data.total_seq_lens, batch_size, kv_num_heads,
-            parameters.seqlen_present_kv_cache, head_size, 4, sequence_length, q_type, true, past_bsnh);
-      }
+      return LaunchQuantizeAppendKV<T, uint8_t, float>(
+          stream, reinterpret_cast<uint8_t*>(dst), src, scale,
+          data.total_seq_lens, batch_size, kv_num_heads,
+          parameters.seqlen_present_kv_cache, head_size, 4, sequence_length, q_type, true, past_bsnh);
     }
   };
 

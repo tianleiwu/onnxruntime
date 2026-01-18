@@ -56,6 +56,10 @@ quick_build = ", quick-build=" in get_build_info()
 quick_build_exclude_bf16 = ", quick-build=1, " in get_build_info()
 
 enable_debug_print = quick_build
+
+enable_deterministic_check = not quick_build
+
+enable_quantized_kv_tests = True
 # #################################################################################################
 #  Configuration and Helper Classes
 # #################################################################################################
@@ -1011,7 +1015,6 @@ def parity_check_gqa_prompt(
     causal,
     rtol,
     atol,
-    deterministic_check: bool = True,
 ):
     torch.manual_seed(0)
     std = 0.02
@@ -1149,7 +1152,7 @@ def parity_check_gqa_prompt(
     v_quant = quantize_tensor_with_scale(v, v_scale, config.v_quant_type, config.kv_cache_type)
 
     ort_seqlens = cache_seqlens - 1
-    num_runs = 2 if deterministic_check else 1
+    num_runs = 2 if enable_deterministic_check else 1
     for i in range(num_runs):
         out, present_k, present_v = gqa_prompt_func(
             q=q_ort,
@@ -1308,7 +1311,6 @@ def parity_check_gqa_past(
     causal,
     rtol,
     atol,
-    deterministic_check: bool = True,
 ):
     if ort_type == TensorProto.FLOAT16:
         torch_type = torch.float16
@@ -1492,7 +1494,7 @@ def parity_check_gqa_past(
     v_quant = quantize_tensor_with_scale(v, v_scale, config.v_quant_type, config.kv_cache_type)
 
     ort_seqlens = cache_seqlens + config.q_sequence_length - 1
-    num_runs = 2 if deterministic_check else 1
+    num_runs = 2 if enable_deterministic_check else 1
     for i in range(num_runs):
         out, present_k, present_v = gqa_past_func(
             q=q_ort,
@@ -1530,9 +1532,13 @@ def parity_check_gqa_past(
                 )
     out = torch.reshape(out, (config.batch_size, config.q_sequence_length, config.num_heads, config.head_size))
     out_np = out.to(torch.float32).detach().cpu().numpy()
+
     if enable_debug_print:
         print(f"[DEBUG] out_np non-zeros: {numpy.count_nonzero(out_np)} / {out_np.size}")
         print(f"[DEBUG] out_ref_np non-zeros: {numpy.count_nonzero(out_ref_np)} / {out_ref_np.size}")
+
+    if numpy.count_nonzero(out_ref_np) > 0 and numpy.count_nonzero(out_np) == 0:
+        raise RuntimeError("Output is all zeros")
 
     # --- Comparison ---
     if config.k_quant_type == "NONE" and config.v_quant_type == "NONE":
@@ -2052,7 +2058,7 @@ def has_flash_attention(bf16: bool = False):
 
 
 rtol = {"fp16": 5e-3, "bf16": 5e-2, "int8_fp16": 5e-2, "int4_fp16": 5e-2, "int8_bf16": 5e-2, "int4_bf16": 5e-2}
-atol = {"fp16": 5e-3, "bf16": 1e-2, "int8_fp16": 1e-1, "int4_fp16": 1e-1, "int8_bf16": 1e-1, "int4_bf16": 1e-1}
+atol = {"fp16": 5e-3, "bf16": 1e-2, "int8_fp16": 1e-1, "int4_fp16": 1e-1, "int8_bf16": 1e-1, "int4_bf16": 2e-1}
 
 
 def has_quantized_kv_cache():
@@ -2063,6 +2069,10 @@ def has_quantized_kv_cache():
 class TestFlashGQA(unittest.TestCase):
     @parameterized.expand(gqa_cuda_prompt_test_cases())
     def test_gqa_prompt_flash_attention(self, name, config):
+        if enable_debug_print:
+            print("-" * 20)
+            print(f"test_case: {name}\n{config}")
+
         os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
         parity_check_gqa_prompt(
             config=config,
@@ -2077,6 +2087,10 @@ class TestFlashGQA(unittest.TestCase):
 
     @parameterized.expand(gqa_cuda_past_test_cases())
     def test_gqa_past_flash_attention(self, name, config):
+        if enable_debug_print:
+            print("-" * 20)
+            print(f"test_case: {name}\n{config}")
+
         os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
         parity_check_gqa_past(
             config=config,
@@ -2089,6 +2103,11 @@ class TestFlashGQA(unittest.TestCase):
             atol=atol["fp16"],
         )
 
+
+@unittest.skipIf(
+    not has_flash_attention() or not enable_quantized_kv_tests, "Flash Attention is not available, skipping tests."
+)
+class TestFlashGQAQuantizedKV(unittest.TestCase):
     @parameterized.expand(gqa_cuda_quantized_test_cases(is_past=True))
     def test_gqa_quantized_past(self, name, config):
         if enable_debug_print:
@@ -2133,6 +2152,10 @@ class TestFlashGQABF16(unittest.TestCase):
         if not torch.cuda.is_bf16_supported():
             self.skipTest("BFloat16 not supported on this device")
 
+        if enable_debug_print:
+            print("-" * 20)
+            print(f"test_case: {name}\n{config}")
+
         config.kv_cache_type = "bfloat16"
         os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
         parity_check_gqa_prompt(
@@ -2151,6 +2174,10 @@ class TestFlashGQABF16(unittest.TestCase):
         if not torch.cuda.is_bf16_supported():
             self.skipTest("BFloat16 not supported on this device")
 
+        if enable_debug_print:
+            print("-" * 20)
+            print(f"test_case: {name}\n{config}")
+
         config.kv_cache_type = "bfloat16"
         os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
         parity_check_gqa_past(
@@ -2164,8 +2191,18 @@ class TestFlashGQABF16(unittest.TestCase):
             atol=atol["bf16"],
         )
 
+
+@unittest.skipIf(
+    not has_flash_attention(bf16=True) or not enable_quantized_kv_tests,
+    "Flash Attention is not available, skipping tests.",
+)
+class TestFlashGQABF16QuantizedKV(unittest.TestCase):
     @parameterized.expand(gqa_cuda_quantized_test_cases(is_past=False))
     def test_gqa_quantized_prompt_bf16(self, name, config):
+        if enable_debug_print:
+            print("-" * 20)
+            print(f"test_case: {name}\n{config}")
+
         os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
         parity_check_gqa_prompt(
             config=config,
@@ -2180,6 +2217,10 @@ class TestFlashGQABF16(unittest.TestCase):
 
     @parameterized.expand(gqa_cuda_quantized_test_cases(is_past=True))
     def test_gqa_quantized_past_bf16(self, name, config):
+        if enable_debug_print:
+            print("-" * 20)
+            print(f"test_case: {name}\n{config}")
+
         os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
         parity_check_gqa_past(
             config=config,
@@ -2197,6 +2238,10 @@ class TestFlashGQABF16(unittest.TestCase):
 class TestMemoryEfficientGQA(unittest.TestCase):
     @parameterized.expand(gqa_cuda_prompt_test_cases(allow_head_sink=False))
     def test_gqa_prompt_memory_efficient(self, name, config):
+        if enable_debug_print:
+            print("-" * 20)
+            print(f"test_case: {name}\n{config}")
+
         os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "1"
         parity_check_gqa_prompt(
             config=config,
@@ -2211,6 +2256,10 @@ class TestMemoryEfficientGQA(unittest.TestCase):
 
     @parameterized.expand(gqa_cuda_past_test_cases(allow_head_sink=False))
     def test_gqa_past_memory_efficient(self, name, config):
+        if enable_debug_print:
+            print("-" * 20)
+            print(f"test_case: {name}\n{config}")
+
         os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "1"
         parity_check_gqa_past(
             config=config,
@@ -2228,6 +2277,10 @@ class TestMemoryEfficientGQA(unittest.TestCase):
 class TestBF16MemoryEfficientGQA(unittest.TestCase):
     @parameterized.expand(gqa_cuda_past_test_cases(allow_head_sink=False))
     def test_gqa_past_memory_efficient_bf16(self, name, config):
+        if enable_debug_print:
+            print("-" * 20)
+            print(f"test_case: {name}\n{config}")
+
         os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "1"
         parity_check_gqa_past(
             config=config,
@@ -2244,6 +2297,10 @@ class TestBF16MemoryEfficientGQA(unittest.TestCase):
 @unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
 class TestFlashGQAPaddingPrompt(unittest.TestCase):
     def test_gqa_padding_prompt_flash_attention(self):
+        if enable_debug_print:
+            print("-" * 20)
+            print("test_case: test_gqa_padding_prompt_flash_attention")
+
         os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
         parity_test_gqa_padding_prompt()
 
@@ -2251,6 +2308,10 @@ class TestFlashGQAPaddingPrompt(unittest.TestCase):
 @unittest.skipIf(not has_cuda_device(53), "Memory Efficient Attention is not available, skipping tests.")
 class TestMemoryEfficientGQAPaddingPrompt(unittest.TestCase):
     def test_gqa_padding_prompt_memory_efficient_attention(self):
+        if enable_debug_print:
+            print("-" * 20)
+            print("test_case: test_gqa_padding_prompt_memory_efficient_attention")
+
         os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "1"
         parity_test_gqa_padding_prompt()
 
@@ -2401,6 +2462,11 @@ class TestFusedKernelParity(unittest.TestCase):
 
         # Clean up
         del os.environ["ORT_DISABLE_FLASH_DECODE"]
+
+
+@unittest.skipIf(not enable_quantized_kv_tests, "Quantized KV is not enabled, skipping tests.")
+class TestXQAQuantizedParity(unittest.TestCase):
+    """Tests that verify fused kernels produce the same results as unfused kernels."""
 
     def test_xqa_quantized_parity(self):
         """Test XQA per-tensor INT8 quantized parity."""

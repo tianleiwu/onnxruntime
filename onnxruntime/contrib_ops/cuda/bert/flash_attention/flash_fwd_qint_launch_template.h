@@ -15,6 +15,7 @@
 #include "contrib_ops/cuda/bert/flash_attention/utils.h"
 
 #define ALLOW_FLASH_FWD_QINT_DYNAMIC 0
+#define ALLOW_FLASH_FWD_QINT_DECODE 0
 
 #include "contrib_ops/cuda/bert/flash_attention/namespace_config.h"
 #include "contrib_ops/cuda/bert/flash_attention/static_switch.h"
@@ -22,7 +23,9 @@
 #include "contrib_ops/cuda/bert/flash_attention/flash_fwd_kernel.h"
 #include "contrib_ops/cuda/bert/flash_attention/flash_fwd_qint4_kernel.h"
 #include "contrib_ops/cuda/bert/flash_attention/flash_fwd_qint8_kernel.h"
+#if ALLOW_FLASH_FWD_QINT_DECODE
 #include "contrib_ops/cuda/bert/flash_attention/flash_fwd_qint8_decode_kernel.h"
+#endif
 #if ALLOW_FLASH_FWD_QINT_DYNAMIC
 #include "contrib_ops/cuda/bert/flash_attention/flash_fwd_qint8_dynamic_kernel.h"
 #endif
@@ -216,6 +219,36 @@ void run_flash_int8_decode_fwd(Flash_fwd_params& params, cudaStream_t stream) {
       });
     });
   });
+
+  if (params.num_splits > 1) {
+    constexpr static int kBlockM = Kernel_traits::kHeadDim % 128 == 0 ? 4 : (Kernel_traits::kHeadDim % 64 == 0 ? 8 : 16);
+    dim3 grid_combine((params.b * params.h * params.seqlen_q + kBlockM - 1) / kBlockM);
+
+    // Combine kernel requires kNThreads == 128.
+    using CombineTraits = typename std::conditional<
+        Kernel_traits::kNThreads == 128,
+        Kernel_traits,
+        flash::int8::Flash_dq_kernel_traits<Kernel_traits::kHeadDim, 64, 64, 4, typename Kernel_traits::Element>>::type;
+
+    const bool is_even_K = params.d == Kernel_traits::kHeadDim;
+    EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
+      int split_combine_num = params.num_splits;
+      if (split_combine_num <= 2)
+        flash_fwd_splitkv_combine_kernel<CombineTraits, kBlockM, 1, IsEvenKConst><<<grid_combine, CombineTraits::kNThreads, 0, stream>>>(params);
+      else if (split_combine_num <= 4)
+        flash_fwd_splitkv_combine_kernel<CombineTraits, kBlockM, 2, IsEvenKConst><<<grid_combine, CombineTraits::kNThreads, 0, stream>>>(params);
+      else if (split_combine_num <= 8)
+        flash_fwd_splitkv_combine_kernel<CombineTraits, kBlockM, 3, IsEvenKConst><<<grid_combine, CombineTraits::kNThreads, 0, stream>>>(params);
+      else if (split_combine_num <= 16)
+        flash_fwd_splitkv_combine_kernel<CombineTraits, kBlockM, 4, IsEvenKConst><<<grid_combine, CombineTraits::kNThreads, 0, stream>>>(params);
+      else if (split_combine_num <= 32)
+        flash_fwd_splitkv_combine_kernel<CombineTraits, kBlockM, 5, IsEvenKConst><<<grid_combine, CombineTraits::kNThreads, 0, stream>>>(params);
+      else if (split_combine_num <= 64)
+        flash_fwd_splitkv_combine_kernel<CombineTraits, kBlockM, 6, IsEvenKConst><<<grid_combine, CombineTraits::kNThreads, 0, stream>>>(params);
+      else if (split_combine_num <= 128)
+        flash_fwd_splitkv_combine_kernel<CombineTraits, kBlockM, 7, IsEvenKConst><<<grid_combine, CombineTraits::kNThreads, 0, stream>>>(params);
+    });
+  }
 }
 
 template <typename Kernel_traits>
@@ -353,13 +386,43 @@ void run_mha_fwd_dequant_dispatch(Flash_fwd_params& params, cudaStream_t stream)
 #endif
 
       if (params.k_quant_type != 0) {
+        // Fix for decoding with generic kernel:
+        // When seqlen_q == 1 and seqlen_k > 1, we are in decoding phase (attending to past history).
+        // The generic compute_attn_1rowblock kernel with Is_causal=true assumes Q and K are aligned at index 0,
+        // so row 0 only attends to col 0, masking out the entire history.
+        // For decoding, Q (at current step) should attend to all valid K (past + current).
+        // Since params.seqlen_k (or cu_seqlens_k) represents the valid KV length, we can simply disable
+        // causal masking to allow full attention to 0..actual_seqlen_k.
+        bool is_causal_effective = params.is_causal;
+        if (params.seqlen_q == 1 && params.seqlen_k > 1 && is_causal_effective) {
+          is_causal_effective = false;
+        }
+
         // TODO: review: whether we need params.h_h_k_ratio > 1 in the following check.
         if (params.seqlen_q == 1 && params.h_h_k_ratio > 1) {
           // Warp-specialized GQA path with MBarrier (SM80+ Optimization)
           // kNWarps=8: 4 GEMM0 warps (Q@K) + 4 GEMM1 warps (P@V + prefetch)
+          // Note: This kernel might handle causal implicitly or we should also pass is_causal_effective.
+          // The generic kernel fallback definitely needs it off.
+          // Let's use is_causal_effective for consistency, although GQA kernel might be smart enough.
+          // Actually GQA kernel (decode_kernel) assumes inference mode.
+          // But we pass params.is_causal to it.
+          // If we change it here, it applies to both.
+          // Let's modify params copy or pass explicitly?
+          // run_flash_int8_decode_fwd takes params by ref.
+          // We can temporarily toggle it? Or just pass modified boolean if we changed the signature?
+          // Logic usually uses params.is_causal inside.
+
+          // We can modify params.is_causal locally if we are careful.
+          bool original_causal = params.is_causal;
+          params.is_causal = is_causal_effective;
           run_flash_int8_decode_fwd<flash::int8::Flash_dq_kernel_traits<Headdim, 16, 128, 8, T>>(params, stream);
+          params.is_causal = original_causal;
         } else {
+          bool original_causal = params.is_causal;
+          params.is_causal = is_causal_effective;
           run_flash_int8_dequant_fwd<flash::int8::Flash_dq_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, T>>(params, stream);
+          params.is_causal = original_causal;
         }
       }
     }
@@ -367,10 +430,9 @@ void run_mha_fwd_dequant_dispatch(Flash_fwd_params& params, cudaStream_t stream)
 
   if constexpr (kEnableFlashAttention4Bit) {
     if (params.kv_cache_bit_width == 4) {
-      // if (params.k_quant_type == 1) {
-      //   run_flash_int4_dequant_fwd<flash::int4::Flash_dq_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, T>, 1>(params, stream);
-      // } else
-      if (params.k_quant_type == 2) {
+      if (params.k_quant_type == 1) {
+        run_flash_int4_dequant_fwd<flash::int4::Flash_dq_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, T>, 1>(params, stream);
+      } else if (params.k_quant_type == 2) {
         run_flash_int4_dequant_fwd<flash::int4::Flash_dq_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, T>, 2>(params, stream);
       }
     }

@@ -547,6 +547,7 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
                                k_quant_type_ == KVQuantizationType::PER_TENSOR &&
                                v_quant_type_ == KVQuantizationType::PER_TENSOR &&
                                data.k_scale == data.v_scale &&  // XQA requires k_scale and v_scale to be the same. Here requires k_scale and v_scale are same tensor.
+                               parameters.head_size == 128 &&
                                (group_size == 8 || group_size == 16 || group_size == 32));
 
     data.use_xqa = !parameters.is_first_prompt &&
@@ -679,10 +680,10 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
                                                  parameters.is_first_prompt,
                                                  cuda_stream,
                                                  device_prop.maxThreadsPerBlock));
-    // Debug: verify total_seq_lens buffer
-    int debug_total_seq_len = 0;
-    cudaMemcpy(&debug_total_seq_len, data.total_seq_lens, sizeof(int), cudaMemcpyDeviceToHost);
-    DEBUG_PRINTF("[GQA] After LaunchGetSequenceLengths: total_seq_lens[0]=%d, total_seq_lens_ptr=%p", debug_total_seq_len, data.total_seq_lens);
+    DUMP_TENSOR_INIT();
+    DUMP_TENSOR("total_seq_lens", data.total_seq_lens, parameters.batch_size, 1);
+    DUMP_TENSOR("past_seq_lens", data.past_seq_lens, parameters.batch_size, 1);
+    DUMP_TENSOR("padded_seq_lens", data.padded_seq_lens, parameters.batch_size, 1);
   }
 
 #if USE_MEMORY_EFFICIENT_ATTENTION

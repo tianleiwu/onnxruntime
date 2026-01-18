@@ -334,10 +334,11 @@ __forceinline__ __device__ void gemm_quant_manual(Tensor0& acc, Tensor1& tCrA, T
           // Read packed byte (only need one since they are duplicated)
           uint32_t ub = static_cast<uint32_t>((uint8_t)tCrB_quant_frag(j));
 
-          int32_t v0, v1;
-          // bfe.s32 extracts bits and sign-extends them in 1 cycle
-          asm("bfe.s32 %0, %1, 0, 4;" : "=r"(v0) : "r"(ub));
-          asm("bfe.s32 %0, %1, 4, 4;" : "=r"(v1) : "r"(ub));
+          uint32_t uv0, uv1;
+          asm("bfe.u32 %0, %1, 0, 4;" : "=r"(uv0) : "r"(ub));
+          asm("bfe.u32 %0, %1, 4, 4;" : "=r"(uv1) : "r"(ub));
+          int32_t v0 = static_cast<int32_t>(uv0) - 8;
+          int32_t v1 = static_cast<int32_t>(uv1) - 8;
 
           // Multiply in float for precision
           float s0, s1;
@@ -366,9 +367,11 @@ __forceinline__ __device__ void gemm_quant_manual(Tensor0& acc, Tensor1& tCrA, T
         for (int j = 0; j < size(tCrB_frag); j += 2) {
           uint32_t ub = static_cast<uint32_t>((uint8_t)tCrB_quant_frag(j));
 
-          int32_t v0, v1;
-          asm("bfe.s32 %0, %1, 0, 4;" : "=r"(v0) : "r"(ub));
-          asm("bfe.s32 %0, %1, 4, 4;" : "=r"(v1) : "r"(ub));
+          uint32_t uv0, uv1;
+          asm("bfe.u32 %0, %1, 0, 4;" : "=r"(uv0) : "r"(ub));
+          asm("bfe.u32 %0, %1, 4, 4;" : "=r"(uv1) : "r"(ub));
+          int32_t v0 = static_cast<int32_t>(uv0) - 8;
+          int32_t v1 = static_cast<int32_t>(uv1) - 8;
 
           // Multiply in float for precision
           float s0, s1;

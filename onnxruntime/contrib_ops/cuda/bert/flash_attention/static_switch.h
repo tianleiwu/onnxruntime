@@ -66,7 +66,8 @@
 #define LOCAL_SWITCH BOOL_SWITCH
 #endif
 
-#define FLASHATTENTION_ASSUME_QUANT_CAUSAL  // GQA assumes causal is true, so we only build causal kernels for quantization.
+// Disabled to allow runtime causal flag for decoding (seqlen_q=1) to work correctly.
+// #define FLASHATTENTION_ASSUME_QUANT_CAUSAL  // GQA assumes causal is true, so we only build causal kernels for quantization.
 #ifdef FLASHATTENTION_ASSUME_QUANT_CAUSAL
 #define QUANT_CAUSAL_SWITCH(COND, CONST_NAME, ...) \
   [&] {                                            \

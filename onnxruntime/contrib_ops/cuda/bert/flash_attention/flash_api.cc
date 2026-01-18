@@ -433,13 +433,13 @@ bool is_supported(const cudaDeviceProp& dprops, size_t head_size, size_t num_hea
     return (dprops.major >= 8) && (head_size % 8 == 0) && (head_size <= 256) && (num_heads % num_heads_k == 0);
   }
 
-  if ((dprops.major >= 8) && (head_size == 128) && (num_heads % num_heads_k == 0) && (k_quant_type == v_quant_type)) {
-    if constexpr (kEnableFlashAttention4Bit) {
-      return (k_quant_type == 1 && kv_cache_bit_width == 8) || (k_quant_type == 2 && kv_cache_bit_width == 4);
-    } else {
-      return (k_quant_type == 1 && kv_cache_bit_width == 8);
-    }
-  }
+  // if ((dprops.major >= 8) && (head_size == 128) && (num_heads % num_heads_k == 0) && (k_quant_type == v_quant_type)) {
+  //   if constexpr (kEnableFlashAttention4Bit) {
+  //     return (k_quant_type == 1 && kv_cache_bit_width == 8) || (k_quant_type == 2 && kv_cache_bit_width == 4);
+  //   } else {
+  //     return (k_quant_type == 1 && kv_cache_bit_width == 8);
+  //   }
+  // }
 
   return false;
 }
@@ -496,7 +496,6 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
   const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
   const bool paged_KV = block_table != nullptr;
 
-  // In kv-cache case, seqlen_k_max as kv sequence length
   Flash_fwd_params params;
   set_params_fprop(params,
                    batch_size,
@@ -618,6 +617,7 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
   params.k_quant_type = k_quant_type;
   params.v_quant_type = v_quant_type;
   params.kv_cache_bit_width = kv_cache_bit_width;
+
   params.query_dynamic_quant = query_dynamic_quant;
 
   // Only split kernel supports appending to KV cache

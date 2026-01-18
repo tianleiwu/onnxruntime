@@ -438,6 +438,10 @@ inline __device__ void compute_attn_1rowblock(
       }
     }
     __syncthreads();
+
+    // Load scales from smem broadcast to register fragments
+    cute::copy(sKScale_broadcast, tSrKScale);
+    cute::copy(sVScale_broadcast, tSrVScale);
   }
 
   // ============================================================================
