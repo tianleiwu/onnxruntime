@@ -428,7 +428,7 @@ Status mha_varlen_fwd(const cudaDeviceProp& dprops,
 // }
 
 bool is_supported(const cudaDeviceProp& dprops, size_t head_size, size_t num_heads, size_t num_heads_k,
-                  int k_quant_type, int v_quant_type, int kv_cache_bit_width) {
+                  int k_quant_type, int v_quant_type, int /*kv_cache_bit_width*/) {
   if (k_quant_type == 0 && v_quant_type == 0) {
     return (dprops.major >= 8) && (head_size % 8 == 0) && (head_size <= 256) && (num_heads % num_heads_k == 0);
   }
