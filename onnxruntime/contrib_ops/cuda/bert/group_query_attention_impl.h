@@ -46,6 +46,7 @@ struct GQABufferRequirements {
   template <typename T>
   static GQABufferRequirements Compute(
       const GroupQueryAttentionParameters& params,
+      bool use_xqa,
       bool use_flash_attention,
       bool use_flash_attention_fast_decode,
       bool use_memory_efficient_attention) {
@@ -65,6 +66,15 @@ struct GQABufferRequirements {
     const size_t q_elements = batch_size * seq_len * num_heads * head_size;
     const size_t k_elements = batch_size * seq_len * kv_num_heads * head_size;
     const size_t v_elements = k_elements;
+
+    if (use_xqa) {
+      if (params.do_rotary || params.is_packed_qkv) {
+        // XQA need scratch for rotated/unpacked Q.
+        // RoPE K is written directly to cache by the fused kernel.
+        req.qkv_buffer_bytes = elem_size * q_elements;
+      }
+      return req;
+    }
 
     if (use_flash_attention) {
       // Flash Attention path:
@@ -118,6 +128,19 @@ Status LaunchUnpackRoPEAppendKV(
     const int* past_seq_lens, const T* cos_cache, const T* sin_cache,
     const int rotary_dim, const int64_t* position_ids, const bool interleaved,
     const bool is_cache_bnsh, cudaStream_t stream, const int max_threads_per_block);
+
+
+template <typename T>
+Status LaunchUnpackRoPEQuantizeAppend(
+    const T* packed_qkv, const T* query, const T* key, const T* value,
+    T* unpacked_q, void* k_cache, void* v_cache,
+    const float* k_scale, const float* v_scale,
+    const int num_heads, const int kv_num_heads, const int head_size,
+    const int sequence_length, const int batch_size, const int max_seqlen,
+    const int* past_seq_lens, const T* cos_cache, const T* sin_cache,
+    const int rotary_dim, const int64_t* position_ids, const bool interleaved,
+    const bool is_cache_bnsh, const KVQuantizationType k_quant_type,
+    const int bit_width, cudaStream_t stream, const int max_threads_per_block);
 
 }  // namespace cuda
 }  // namespace contrib

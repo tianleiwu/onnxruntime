@@ -168,17 +168,17 @@ Status LaunchStridedCopy(cudaStream_t stream,
       max_threads_per_block);
 }
 
-template Status LaunchStridedCopy<float>(
-    cudaStream_t stream,
-    const float* in, int4 in_shape, LongLong4 in_strides,
-    float* out, LongLong4 out_strides,
-    int max_threads_per_block);
+// template Status LaunchStridedCopy<float>(
+//     cudaStream_t stream,
+//     const float* in, int4 in_shape, LongLong4 in_strides,
+//     float* out, LongLong4 out_strides,
+//     int max_threads_per_block);
 
-template Status LaunchStridedCopy<half>(
-    cudaStream_t stream,
-    const half* in, int4 in_shape, LongLong4 in_strides,
-    half* out, LongLong4 out_strides,
-    int max_threads_per_block);
+// template Status LaunchStridedCopy<half>(
+//     cudaStream_t stream,
+//     const half* in, int4 in_shape, LongLong4 in_strides,
+//     half* out, LongLong4 out_strides,
+//     int max_threads_per_block);
 
 }  // namespace cuda
 }  // namespace contrib

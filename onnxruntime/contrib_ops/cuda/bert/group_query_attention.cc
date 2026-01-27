@@ -4,14 +4,17 @@
 #include <vector>
 #include <algorithm>
 #include "core/providers/cuda/cuda_common.h"
+#include "core/providers/cuda/cuda_type_conversion.h"
 #include "core/platform/env_var_utils.h"
 #include "contrib_ops/cuda/bert/group_query_attention_impl.h"
 #include "contrib_ops/cuda/bert/group_query_attention.h"
 #include "contrib_ops/cpu/bert/group_query_attention_helper.h"
 #include "contrib_ops/cuda/bert/cutlass_fmha/memory_efficient_attention.h"
 #include "contrib_ops/cuda/bert/flash_attention/flash_api.h"
+#include "contrib_ops/cuda/bert/xqa/xqa_loader.h"
 #include "contrib_ops/cuda/utils/dump_cuda_tensor.h"
 #include "contrib_ops/cpu/utils/debug_macros.h"
+
 
 using namespace onnxruntime::cuda;
 using namespace ::onnxruntime::common;
@@ -21,23 +24,44 @@ namespace onnxruntime {
 namespace contrib {
 namespace cuda {
 
-#define REGISTER_KERNEL_TYPED(T)                                         \
-  ONNX_OPERATOR_TYPED_KERNEL_EX(                                         \
-      GroupQueryAttention,                                               \
-      kMSDomain,                                                         \
-      1,                                                                 \
-      T,                                                                 \
-      kCudaExecutionProvider,                                            \
-      (*KernelDefBuilder::Create())                                      \
-          .TypeConstraint("T", DataTypeImpl::GetTensorType<T>())         \
-          .TypeConstraint("M", {DataTypeImpl::GetTensorType<int32_t>()}) \
-          .MayInplace(3, 1)                                              \
-          .MayInplace(4, 2)                                              \
-          .InputMemoryType(OrtMemTypeCPUInput, 6),                       \
-      GroupQueryAttention<T>);
+namespace {
+// Map string attribute to quantization type enum
+KVQuantizationType StringToKVQuantizationType(const std::string& s) {
+  if (s == "NONE") {
+    return KVQuantizationType::NONE;
+  }
+  if (s == "PER_TENSOR") {
+    return KVQuantizationType::PER_TENSOR;
+  }
 
-REGISTER_KERNEL_TYPED(MLFloat16)
-REGISTER_KERNEL_TYPED(BFloat16)
+  if (s == "PER_CHANNEL") {
+    return KVQuantizationType::PER_CHANNEL;
+  }
+  return KVQuantizationType::NONE;
+}
+}  // namespace
+
+#define REGISTER_KERNEL_TYPED(T, U)                                                   \
+  ONNX_OPERATOR_TYPED_KERNEL_EX(                                                      \
+      GroupQueryAttention,                                                            \
+      kMSDomain,                                                                      \
+      1,                                                                              \
+      T##_##U,                                                                        \
+      kCudaExecutionProvider,                                                         \
+      (*KernelDefBuilder::Create())                                                   \
+          .TypeConstraint("T", DataTypeImpl::GetTensorType<T>())                      \
+          .TypeConstraint("T_CACHE", DataTypeImpl::GetTensorType<U>())                \
+          .TypeConstraint("T_KV_SCALE", DataTypeImpl::GetTensorType<float>())         \
+          .TypeConstraint("M", {DataTypeImpl::GetTensorType<int32_t>()})              \
+          .MayInplace(3, 1)                        /* past_key and present_key */     \
+          .MayInplace(4, 2)                        /* past_value and present_value */ \
+          .InputMemoryType(OrtMemTypeCPUInput, 6), /* total_sequence_length */        \
+      GroupQueryAttention<T, U>);
+
+REGISTER_KERNEL_TYPED(MLFloat16, MLFloat16)
+REGISTER_KERNEL_TYPED(BFloat16, BFloat16)
+REGISTER_KERNEL_TYPED(MLFloat16, INT8)
+
 
 constexpr const char* kDisableFlashDecode = "ORT_DISABLE_FLASH_DECODE";
 
@@ -51,8 +75,8 @@ constexpr const char* kDisableFlashDecode = "ORT_DISABLE_FLASH_DECODE";
 // - Quantized KV Cache (Int8/Int4) via GroupQueryAttentionData
 // - Flash Attention and Memory Efficient Attention backends
 //
-template <typename T>
-GroupQueryAttention<T>::GroupQueryAttention(const OpKernelInfo& info)
+template <typename T, typename U>
+GroupQueryAttention<T, U>::GroupQueryAttention(const OpKernelInfo& info)
     : CudaKernel(info) {
   int64_t num_heads = 0;
   int64_t kv_num_heads = 0;
@@ -68,6 +92,11 @@ GroupQueryAttention<T>::GroupQueryAttention(const OpKernelInfo& info)
   scale_ = info.GetAttrOrDefault<float>("scale", 0.0f);
   softcap_ = info.GetAttrOrDefault<float>("softcap", 0.0f);
   use_smooth_softmax_ = info.GetAttrOrDefault<int64_t>("smooth_softmax", 0) == 1;
+
+  k_quant_type_ = StringToKVQuantizationType(info.GetAttrOrDefault<std::string>("k_quant_type", "NONE"));
+  v_quant_type_ = StringToKVQuantizationType(info.GetAttrOrDefault<std::string>("v_quant_type", "NONE"));
+
+  enable_xqa_ = std::is_same_v<T, MLFloat16> && ParseEnvironmentVariableWithDefault<int>("ORT_ENABLE_XQA", 0) != 0;
 
   kernel_options_ = this->GetAttentionKernelOptions();
 
@@ -99,8 +128,8 @@ GroupQueryAttention<T>::GroupQueryAttention(const OpKernelInfo& info)
 // 9. position_ids      (Tensor) - Position indices for RoPE
 // 10. attention_bias   (Tensor) - Not supported in this kernel
 // 11. head_sink        (Tensor) - Attention sink for GPT-OSS
-template <typename T>
-Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
+template <typename T, typename U>
+GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) const {
   const Tensor* query = context->Input<Tensor>(0);
   const Tensor* key = context->Input<Tensor>(1);
   const Tensor* value = context->Input<Tensor>(2);
@@ -119,6 +148,40 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
   const Tensor* position_ids = context->Input<Tensor>(9);
   const Tensor* attention_bias = context->Input<Tensor>(10);
   const Tensor* head_sink = context->Input<Tensor>(11);
+  const Tensor* k_scale = context->Input<Tensor>(12);
+  const Tensor* v_scale = context->Input<Tensor>(13);
+
+
+  if (k_quant_type_ != KVQuantizationType::NONE) {
+    ORT_ENFORCE(k_quant_type_ == KVQuantizationType::PER_TENSOR);
+
+    if (k_scale == nullptr) {
+      return ORT_MAKE_STATUS(
+          ONNXRUNTIME, INVALID_ARGUMENT,
+          "k_scale must be provided when k_quant_type is not NONE");
+    }
+
+    if (k_scale->DataType() != DataTypeImpl::GetType<float>()) {
+      return ORT_MAKE_STATUS(
+          ONNXRUNTIME, INVALID_ARGUMENT,
+          "k_scale must be float tensor");
+    }
+  }
+
+  if (v_quant_type_ != KVQuantizationType::NONE) {
+    ORT_ENFORCE(v_quant_type_ == KVQuantizationType::PER_TENSOR);
+
+    if (v_scale == nullptr) {
+      return ORT_MAKE_STATUS(
+          ONNXRUNTIME, INVALID_ARGUMENT,
+          "v_scale must be provided when v_quant_type is not NONE");
+    }
+    if (v_scale->DataType() != DataTypeImpl::GetType<float>()) {
+      return ORT_MAKE_STATUS(
+          ONNXRUNTIME, INVALID_ARGUMENT,
+          "v_scale must be float tensor");
+    }
+  }
 
   if (attention_bias != nullptr) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
@@ -127,8 +190,10 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
 
   auto& device_prop = GetDeviceProp();
   GroupQueryAttentionParameters parameters;
-  typedef typename ToCudaType<T>::MappedType CudaT;
-  GroupQueryAttentionData<CudaT> data;
+
+  typedef typename onnxruntime::cuda::OrtToCudaType<T>::type CudaT;
+  typedef typename onnxruntime::cuda::OrtToCudaType<U>::type CudaU;
+  GroupQueryAttentionData<CudaT, CudaU> data;
 
   ORT_RETURN_IF_ERROR(group_query_attention_helper::CheckInputs(query,
                                                                 key,
@@ -155,6 +220,8 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
   parameters.use_smooth_softmax = use_smooth_softmax_ || head_sink != nullptr;
   parameters.zeros_count = kZerosCount;
   parameters.zero_ptr = zeros_.get();
+  parameters.k_quant_type = k_quant_type_;
+  parameters.v_quant_type = v_quant_type_;
   parameters.do_rotary = do_rotary_;
   parameters.rotary_interleaved = rotary_interleaved_;
 
@@ -203,17 +270,84 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
   data.value = value == nullptr ? nullptr : reinterpret_cast<const CudaT*>(value->Data<T>());
 
   // Handle Past/Present pointers
-  data.past_key = (past_key == nullptr) ? nullptr : reinterpret_cast<const CudaT*>(past_key->Data<T>());
-  data.present_key = reinterpret_cast<CudaT*>(context->Output<Tensor>(1)->MutableData<T>());
-  data.past_value = (past_value == nullptr) ? nullptr : reinterpret_cast<const CudaT*>(past_value->Data<T>());
-  data.present_value = reinterpret_cast<CudaT*>(context->Output<Tensor>(2)->MutableData<T>());
+  data.k_scale = k_scale == nullptr ? nullptr : reinterpret_cast<const float*>(k_scale->DataRaw());
+  data.v_scale = v_scale == nullptr ? nullptr : reinterpret_cast<const float*>(v_scale->DataRaw());
+
+  data.past_key = (past_key == nullptr) ? nullptr : reinterpret_cast<const CudaU*>(past_key->Data<U>());
+  data.past_value = (past_value == nullptr) ? nullptr : reinterpret_cast<const CudaU*>(past_value->Data<U>());
+
+  data.present_key = reinterpret_cast<CudaU*>(context->Output<Tensor>(1)->MutableData<U>());
+  data.present_value = reinterpret_cast<CudaU*>(context->Output<Tensor>(2)->MutableData<U>());
+
+  // Compute past_present_share_buffer early since it's needed for flash attention path selection.
+  // This compares the final pointer values after quantization handling.
+  parameters.past_present_share_buffer = (data.past_key == data.present_key);
+
+  bool is_inputs_quantized = (k_quant_type_ != KVQuantizationType::NONE) || (v_quant_type_ != KVQuantizationType::NONE);
+
+  // Allocate XQA scratch if needed (only for Flash Decoding path)
+  IAllocatorUniquePtr<void> xqa_scratch_buffer;
+  if (enable_xqa_) {
+    int group_size = parameters.num_heads / parameters.kv_num_heads;
+    bool is_int8_quantized_supported = (k_quant_type_ == KVQuantizationType::PER_TENSOR &&
+                                        v_quant_type_ == KVQuantizationType::PER_TENSOR &&
+                                        data.k_scale == data.v_scale &&  // XQA requires k_scale and v_scale to be the same. Here requires k_scale and v_scale are same tensor.
+                                        (parameters.head_size == 128 || parameters.head_size == 64) &&
+                                        (group_size == 8 || group_size == 16 || group_size == 32));
+
+    bool is_non_quantized_supported = !is_inputs_quantized &&
+                                      (parameters.head_size == 128 || parameters.head_size == 64) &&
+                                      (64 % group_size == 0);
+
+    data.use_xqa = !parameters.is_first_prompt &&
+                   parameters.sequence_length == 1 &&
+                   parameters.past_present_share_buffer &&
+                   (is_non_quantized_supported || is_int8_quantized_supported) &&
+                   parameters.softcap == 0.0f &&
+                   !parameters.use_smooth_softmax &&
+                   parameters.local_window_size == -1;
+
+    if (data.use_xqa) {
+      size_t xqa_scratch_bytes = onnxruntime::contrib::cuda::GetXQAScratchSize(
+          GetDeviceProp(),
+          parameters.batch_size,
+          parameters.num_heads,
+          parameters.kv_num_heads,
+          parameters.seqlen_present_kv_cache);
+      if (xqa_scratch_bytes > 0) {
+        // Calculate additional scratch needed for manual RoPE/Append in ExtremeDecoding
+
+        if (parameters.do_rotary) {
+          // 1. Q_rotated buffer: B * N * H * sizeof(T) (if rotary)
+          // 2. K_rotated buffer: B * Nk * H * sizeof(T) (if rotary)
+          size_t element_size = sizeof(CudaT);
+          size_t q_bytes = parameters.batch_size * parameters.num_heads * parameters.head_size * element_size;
+          size_t k_bytes = parameters.batch_size * parameters.kv_num_heads * parameters.head_size * element_size;
+          q_bytes = (q_bytes + 255) / 256 * 256;
+          k_bytes = (k_bytes + 255) / 256 * 256;
+          xqa_scratch_bytes += q_bytes + k_bytes;
+        }
+
+        xqa_scratch_buffer = this->GetScratchBuffer<void>(xqa_scratch_bytes, context->GetComputeStream());
+        data.xqa_buffer = xqa_scratch_buffer.get();
+        data.xqa_buffer_bytes = xqa_scratch_bytes;
+      }
+    }
+  }
+
+  // Check if Fused Flash Attention (consuming quantized KV directly) is supported.
+  bool is_fused_flash_supported = parameters.is_first_prompt && parameters.past_present_share_buffer;
+  if (is_inputs_quantized && !data.use_xqa && !is_fused_flash_supported && !parameters.is_first_prompt) {
+    ORT_THROW("Fallback to Dequantize -> GQA -> Quantize is not supported for first prompt");
+  }
 
   // Compute past_present_share_buffer early since it's needed for flash attention path selection.
   // This compares the final pointer values after quantization handling.
   parameters.past_present_share_buffer = (data.past_key == data.present_key);
 
 #if USE_FLASH_ATTENTION
-  bool use_flash_attention = !disable_flash_attention_ &&
+  bool use_flash_attention = !data.use_xqa &&
+                             !disable_flash_attention_ &&
                              onnxruntime::flash::is_supported<T>(device_prop,
                                                                  parameters.head_size,
                                                                  parameters.num_heads,
@@ -244,6 +378,16 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
     softmax_lse_buffer = GetScratchBuffer<void>(softmax_lse_bytes, context->GetComputeStream());
     softmax_lse_accum_buffer = GetScratchBuffer<void>(softmax_lse_accum_bytes, context->GetComputeStream());
     out_accum_buffer = GetScratchBuffer<void>(out_accum_bytes, context->GetComputeStream());
+
+    auto cuda_stream = static_cast<cudaStream_t>(context->GetComputeStream()->GetHandle());
+    if (softmax_lse_accum_bytes > 0) {
+      // Initialize to 0 is fine because Flash kernel will write -inf to it if needed.
+      // However, the standard Flash kernel often doesn't zero it globally.
+      CUDA_RETURN_IF_ERROR(cudaMemsetAsync(softmax_lse_accum_buffer.get(), 0, softmax_lse_accum_bytes, cuda_stream));
+    }
+    if (out_accum_bytes > 0) {
+      CUDA_RETURN_IF_ERROR(cudaMemsetAsync(out_accum_buffer.get(), 0, out_accum_bytes, cuda_stream));
+    }
 
     data.softmax_lse = reinterpret_cast<CudaT*>(softmax_lse_buffer.get());
     data.softmax_lse_accum = reinterpret_cast<CudaT*>(softmax_lse_accum_buffer.get());
@@ -281,7 +425,7 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
   }
 
 #if USE_MEMORY_EFFICIENT_ATTENTION
-  if (!data.use_flash_attention) {
+  if (!data.use_xqa && !data.use_flash_attention) {
     // Fall back to memory efficient attention.
     int sm = (device_prop.major * 10) + device_prop.minor;
     bool use_memory_efficient_attention =
@@ -313,6 +457,7 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
   // This ensures allocation logic stays in sync with kernel usage
   auto buffer_req = GQABufferRequirements::Compute<T>(
       parameters,
+      data.use_xqa,
       data.use_flash_attention,
       data.use_flash_attention_fast_decode,
       data.use_memory_efficient_attention);
@@ -351,11 +496,30 @@ Status GroupQueryAttention<T>::ComputeInternal(OpKernelContext* context) const {
     data.head_sink = reinterpret_cast<const CudaT*>(head_sink->Data<T>());
   }
 
+#if DUMP_TENSOR_LEVEL > 0
+  DUMP_TENSOR_INIT();
+  // Dump Scales
+  if (data.k_scale) {
+    if (parameters.k_quant_type == KVQuantizationType::PER_TENSOR) {
+      DUMP_TENSOR("k_scale", data.k_scale, 1, 1);
+    } else if (parameters.k_quant_type == KVQuantizationType::PER_CHANNEL) {
+      DUMP_TENSOR("k_scale", data.k_scale, parameters.kv_num_heads, 1, parameters.head_size);
+    }
+  }
+  if (data.v_scale) {
+    if (parameters.v_quant_type == KVQuantizationType::PER_TENSOR) {
+      DUMP_TENSOR("v_scale", data.v_scale, 1, 1);
+    } else if (parameters.v_quant_type == KVQuantizationType::PER_CHANNEL) {
+      DUMP_TENSOR("v_scale", data.v_scale, parameters.kv_num_heads, 1, parameters.head_size);
+    }
+  }
+#endif
+
   cublasHandle_t cublas = GetCublasHandle(context);
+
 
   ORT_RETURN_IF_ERROR(QkvToContext<CudaT>(
       device_prop, cublas, context->GetComputeStream(), parameters, data));
-
   return Status::OK();
 }
 

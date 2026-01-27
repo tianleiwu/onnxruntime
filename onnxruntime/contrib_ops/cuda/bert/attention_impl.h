@@ -147,18 +147,18 @@ Status PastPresentBufferShare(int batch_size, int num_heads, int qk_head_size, i
                               cudaStream_t stream,
                               int max_threads_per_block);
 
-template <typename T>
-Status LaunchStridedCopy(
-    cudaStream_t stream,
-    const T* in, int4 in_shape, LongLong4 in_strides, const int* in_seqlens_offset,  // coord (b,n,s,h)
-    T* out, LongLong4 out_strides, const int* out_seqlens_offset,                    // coord (b,n,s,h)
-    int max_threads_per_block);
+// template <typename T>
+// Status LaunchStridedCopy(
+//     cudaStream_t stream,
+//     const T* in, int4 in_shape, LongLong4 in_strides, const int* in_seqlens_offset,  // coord (b,n,s,h)
+//     T* out, LongLong4 out_strides, const int* out_seqlens_offset,                    // coord (b,n,s,h)
+//     int max_threads_per_block);
 
-template <typename T>
-Status LaunchStridedCopy(cudaStream_t stream,
-                         const T* in, int4 in_shape, LongLong4 in_strides,  // coord (b,n,s,h)
-                         T* out, LongLong4 out_strides,                     // coord (b,n,s,h)
-                         int max_threads_per_block);
+// template <typename T>
+// Status LaunchStridedCopy(cudaStream_t stream,
+//                          const T* in, int4 in_shape, LongLong4 in_strides,  // coord (b,n,s,h)
+//                          T* out, LongLong4 out_strides,                     // coord (b,n,s,h)
+//                          int max_threads_per_block);
 
 }  // namespace cuda
 }  // namespace contrib
