@@ -15,7 +15,6 @@
 #include "contrib_ops/cuda/utils/dump_cuda_tensor.h"
 #include "contrib_ops/cpu/utils/debug_macros.h"
 
-
 using namespace onnxruntime::cuda;
 using namespace ::onnxruntime::common;
 using namespace ONNX_NAMESPACE;
@@ -61,7 +60,6 @@ KVQuantizationType StringToKVQuantizationType(const std::string& s) {
 REGISTER_KERNEL_TYPED(MLFloat16, MLFloat16)
 REGISTER_KERNEL_TYPED(BFloat16, BFloat16)
 REGISTER_KERNEL_TYPED(MLFloat16, INT8)
-
 
 constexpr const char* kDisableFlashDecode = "ORT_DISABLE_FLASH_DECODE";
 
@@ -150,7 +148,6 @@ GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) const {
   const Tensor* head_sink = context->Input<Tensor>(11);
   const Tensor* k_scale = context->Input<Tensor>(12);
   const Tensor* v_scale = context->Input<Tensor>(13);
-
 
   if (k_quant_type_ != KVQuantizationType::NONE) {
     ORT_ENFORCE(k_quant_type_ == KVQuantizationType::PER_TENSOR);
@@ -516,7 +513,6 @@ GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) const {
 #endif
 
   cublasHandle_t cublas = GetCublasHandle(context);
-
 
   ORT_RETURN_IF_ERROR(QkvToContext<CudaT>(
       device_prop, cublas, context->GetComputeStream(), parameters, data));

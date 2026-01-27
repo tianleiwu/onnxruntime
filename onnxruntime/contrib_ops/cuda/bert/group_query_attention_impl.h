@@ -129,7 +129,6 @@ Status LaunchUnpackRoPEAppendKV(
     const int rotary_dim, const int64_t* position_ids, const bool interleaved,
     const bool is_cache_bnsh, cudaStream_t stream, const int max_threads_per_block);
 
-
 template <typename T>
 Status LaunchUnpackRoPEQuantizeAppend(
     const T* packed_qkv, const T* query, const T* key, const T* value,

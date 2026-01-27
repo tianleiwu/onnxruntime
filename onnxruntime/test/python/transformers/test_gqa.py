@@ -2284,6 +2284,7 @@ class TestFusedKernelParity(unittest.TestCase):
         """Test ORT_DISABLE_FLASH_DECODE: fast decode vs standard path."""
         os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
 
+
 def gqa_xqa_test_cases():
     # Decoding config (seq_len=1, share_buffer=True)
     # Testing different group sizes and query types

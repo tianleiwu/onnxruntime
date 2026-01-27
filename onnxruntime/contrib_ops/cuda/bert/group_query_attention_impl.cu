@@ -134,33 +134,32 @@ Status PrepareQKV(
 
   if (parameters.k_quant_type == KVQuantizationType::NONE && parameters.v_quant_type == KVQuantizationType::NONE) {
     ORT_RETURN_IF_ERROR(LaunchUnpackRoPEAppendKV<CudaT>(
-      parameters.is_packed_qkv ? reinterpret_cast<const CudaT*>(data.query) : nullptr,
-      parameters.is_packed_qkv ? nullptr : reinterpret_cast<const CudaT*>(data.query),
-      parameters.is_packed_qkv ? nullptr : reinterpret_cast<const CudaT*>(data.key),
-      parameters.is_packed_qkv ? nullptr : reinterpret_cast<const CudaT*>(data.value),
-      q_out, k, v,
-      num_heads, kv_num_heads, head_size, sequence_length, batch_size,
-      max_cache_length, data.past_seq_lens,
-      reinterpret_cast<const CudaT*>(data.cos_cache), reinterpret_cast<const CudaT*>(data.sin_cache),
-      parameters.rotary_dim, data.position_ids, parameters.rotary_interleaved,
-      is_cache_bnsh,
-      stream, max_threads_per_block));
-  } else { // quantized kv cache
-    constexpr int kv_bit_width = 8; // only support int8/fp8 quantization currently.
+        parameters.is_packed_qkv ? reinterpret_cast<const CudaT*>(data.query) : nullptr,
+        parameters.is_packed_qkv ? nullptr : reinterpret_cast<const CudaT*>(data.query),
+        parameters.is_packed_qkv ? nullptr : reinterpret_cast<const CudaT*>(data.key),
+        parameters.is_packed_qkv ? nullptr : reinterpret_cast<const CudaT*>(data.value),
+        q_out, k, v,
+        num_heads, kv_num_heads, head_size, sequence_length, batch_size,
+        max_cache_length, data.past_seq_lens,
+        reinterpret_cast<const CudaT*>(data.cos_cache), reinterpret_cast<const CudaT*>(data.sin_cache),
+        parameters.rotary_dim, data.position_ids, parameters.rotary_interleaved,
+        is_cache_bnsh,
+        stream, max_threads_per_block));
+  } else {                           // quantized kv cache
+    constexpr int kv_bit_width = 8;  // only support int8/fp8 quantization currently.
     ORT_RETURN_IF_ERROR(LaunchUnpackRoPEQuantizeAppend<CudaT>(
-      parameters.is_packed_qkv ? reinterpret_cast<const CudaT*>(data.query) : nullptr,
-      parameters.is_packed_qkv ? nullptr : reinterpret_cast<const CudaT*>(data.query),
-      parameters.is_packed_qkv ? nullptr : reinterpret_cast<const CudaT*>(data.key),
-      parameters.is_packed_qkv ? nullptr : reinterpret_cast<const CudaT*>(data.value),
-      q_out, k, v, data.k_scale, data.v_scale,
-      num_heads, kv_num_heads, head_size, sequence_length, batch_size,
-      max_cache_length, data.past_seq_lens,
-      reinterpret_cast<const CudaT*>(data.cos_cache), reinterpret_cast<const CudaT*>(data.sin_cache),
-      parameters.rotary_dim, data.position_ids, parameters.rotary_interleaved,
-      is_cache_bnsh, parameters.k_quant_type, kv_bit_width,
-      stream, max_threads_per_block));
+        parameters.is_packed_qkv ? reinterpret_cast<const CudaT*>(data.query) : nullptr,
+        parameters.is_packed_qkv ? nullptr : reinterpret_cast<const CudaT*>(data.query),
+        parameters.is_packed_qkv ? nullptr : reinterpret_cast<const CudaT*>(data.key),
+        parameters.is_packed_qkv ? nullptr : reinterpret_cast<const CudaT*>(data.value),
+        q_out, k, v, data.k_scale, data.v_scale,
+        num_heads, kv_num_heads, head_size, sequence_length, batch_size,
+        max_cache_length, data.past_seq_lens,
+        reinterpret_cast<const CudaT*>(data.cos_cache), reinterpret_cast<const CudaT*>(data.sin_cache),
+        parameters.rotary_dim, data.position_ids, parameters.rotary_interleaved,
+        is_cache_bnsh, parameters.k_quant_type, kv_bit_width,
+        stream, max_threads_per_block));
   }
-
 
   if (q_out != nullptr) {
     q = reinterpret_cast<const T*>(q_out);
@@ -751,9 +750,6 @@ Status FlashAttention(
   ORT_RETURN_IF_ERROR(PrepareQKV<T>(stream, max_threads_per_block, parameters, data, q_prep));
 
   void* query = const_cast<T*>(q_prep);
-
-  bool use_packed_for_fa = false;
-
   void* present_key = data.present_key;
   void* present_value = data.present_value;
 
@@ -770,6 +766,9 @@ Status FlashAttention(
   // Use padded seq lens for first prompt since mha_fwd_kvcache assumes uniform seqlen_q.
   int* seq_lens = parameters.is_first_prompt ? data.padded_seq_lens : data.total_seq_lens;
 
+  // After PrepareQKV, the input for flash attention is no longer packed.
+  constexpr bool is_packed_qkv_for_flash = false;
+
   ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd_kvcache(
       device_prop, stream, query, present_key, present_value,
       kernel_new_k, kernel_new_v,
@@ -782,10 +781,105 @@ Status FlashAttention(
       parameters.use_smooth_softmax, past_bsnh, parameters.num_splits,
       reinterpret_cast<void*>(data.softmax_lse_accum),
       reinterpret_cast<void*>(data.out_accum), parameters.local_window_size - 1,
-      parameters.rotary_interleaved, use_packed_for_fa, 0, 1));
+      parameters.rotary_interleaved, is_packed_qkv_for_flash, 0, 1));
 
   DUMP_TENSOR("Total Seq Lens", data.total_seq_lens, batch_size, 1);
   DUMP_TENSOR("Past Seq Lens", data.past_seq_lens, batch_size, 1);
+
+  return Status::OK();
+}
+
+// Use Flash Attention for float key and value, then quantize key/value to int8 to save to k/v cache.
+template <typename T>
+Status FlashAttentionAndQuantizeKV(
+    const cudaDeviceProp& device_prop,
+    cudaStream_t stream,
+    GroupQueryAttentionParameters& parameters,
+    GroupQueryAttentionData<T>& data,
+    float scale) {
+  assert(parameters.is_first_prompt);  // Only support first prompt for this function.
+  assert(parameters.k_quant_type != KVQuantizationType::NONE || parameters.v_quant_type != KVQuantizationType::NONE);
+
+  const int max_threads_per_block = device_prop.maxThreadsPerBlock;
+  const int batch_size = parameters.batch_size;
+  const int sequence_length = parameters.sequence_length;
+  const int kv_num_heads = parameters.kv_num_heads;
+  const int num_heads = parameters.num_heads;
+  const int head_size = parameters.head_size;
+
+  ORT_GQA_TRACE("FlashAttentionAndQuantizeKV");
+
+  bool past_bsnh = parameters.past_kv_format == AttentionQkvFormat::Q_K_V_BSNH;
+
+  size_t q_elements = static_cast<size_t>(batch_size) * sequence_length * num_heads * head_size;
+  size_t k_elements = static_cast<size_t>(batch_size) * sequence_length * kv_num_heads * head_size;
+
+  using CudaT = typename ToCudaType<T>::MappedType;
+  CudaT* q_final = data.qkv_buffer;
+
+  // For FlashAttentionAndQuantizeKV, we need float K and V for attention.
+  // We'll write them to qkv_buffer.
+  CudaT* k_final = q_final + q_elements;
+  CudaT* v_final = k_final + k_elements;
+
+  ORT_RETURN_IF_ERROR(LaunchUnpackRoPEAppendKV<CudaT>(
+      parameters.is_packed_qkv ? reinterpret_cast<const CudaT*>(data.query) : nullptr,
+      parameters.is_packed_qkv ? nullptr : reinterpret_cast<const CudaT*>(data.query),
+      parameters.is_packed_qkv ? nullptr : reinterpret_cast<const CudaT*>(data.key),
+      parameters.is_packed_qkv ? nullptr : reinterpret_cast<const CudaT*>(data.value),
+      q_final, k_final, v_final,
+      num_heads, kv_num_heads, head_size, sequence_length, batch_size,
+      q_final, k_final, v_final,
+      reinterpret_cast<const CudaT*>(data.cos_cache), reinterpret_cast<const CudaT*>(data.sin_cache),
+      parameters.rotary_dim, data.position_ids, parameters.rotary_interleaved,
+      false,  // BSNH for scratch
+      stream, max_threads_per_block));
+
+  // 2. Run Float Flash Attention
+  bool is_causal = parameters.is_unidirectional;
+  bool is_bf16 = std::is_same<T, BFloat16>::value;
+
+  int local_window_size = parameters.local_window_size > 0 ? parameters.local_window_size - 1 : -1;
+
+  ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd(
+      device_prop, stream, q_final, k_final, v_final, data.output,
+      reinterpret_cast<void*>(data.softmax_lse),
+      batch_size, num_heads, kv_num_heads, head_size, sequence_length, sequence_length,
+      scale, parameters.softcap, is_causal, is_bf16, parameters.use_smooth_softmax,
+      parameters.num_splits,
+      reinterpret_cast<void*>(data.softmax_lse_accum),
+      reinterpret_cast<void*>(data.out_accum),
+      true,  // kv_bsnh = true (BSNH)
+      local_window_size));
+
+  // 3. Quantize K and V to present cache
+  if (parameters.k_quant_type != KVQuantizationType::NONE) {
+    if (parameters.kv_cache_bit_width == 8) {
+      ORT_RETURN_IF_ERROR((LaunchQuantizeKV<T, int8_t, float>(
+          stream, reinterpret_cast<int8_t*>(data.present_key), k_final, data.k_scale,
+          nullptr, data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
+          head_size, 8, parameters.k_quant_type, true, past_bsnh)));
+    } else {
+      ORT_RETURN_IF_ERROR((LaunchQuantizeKV<T, uint8_t, float>(
+          stream, reinterpret_cast<uint8_t*>(data.present_key), k_final, data.k_scale,
+          nullptr, data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
+          head_size, 4, parameters.k_quant_type, true, past_bsnh)));
+    }
+  }
+
+  if (parameters.v_quant_type != KVQuantizationType::NONE) {
+    if (parameters.kv_cache_bit_width == 8) {
+      ORT_RETURN_IF_ERROR((LaunchQuantizeKV<T, int8_t, float>(
+          stream, reinterpret_cast<int8_t*>(data.present_value), v_final, data.v_scale,
+          nullptr, data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
+          head_size, 8, parameters.v_quant_type, true, past_bsnh)));
+    } else {
+      ORT_RETURN_IF_ERROR((LaunchQuantizeKV<T, uint8_t, float>(
+          stream, reinterpret_cast<uint8_t*>(data.present_value), v_final, data.v_scale,
+          nullptr, data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
+          head_size, 4, parameters.v_quant_type, true, past_bsnh)));
+    }
+  }
 
   return Status::OK();
 }
@@ -892,8 +986,6 @@ Status QkvToContext(
 
   if (data.use_flash_attention) {
     if (parameters.k_quant_type != KVQuantizationType::NONE || parameters.v_quant_type != KVQuantizationType::NONE) {
-      assert(parameters.past_present_share_buffer);
-      assert(parameters.is_first_prompt);
       return FlashAttentionAndQuantizeKV(device_prop, stream, parameters, data, scale);
     }
 
