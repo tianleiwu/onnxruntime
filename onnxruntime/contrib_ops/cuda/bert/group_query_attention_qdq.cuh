@@ -559,7 +559,7 @@ __global__ void UnpackRoPEQuantizeAppend(
   // 1. Load data into registers
   // NOTE: When packed_qkv is nullptr, separate Q/K/V inputs MUST be in BSNH layout
   // (batch, sequence, num_heads, head_size). The indexing below assumes this format.
-  T vals[elements_per_thread];
+  alignas(16) T vals[elements_per_thread];
   if (packed_qkv != nullptr) {
     const int64_t packed_idx = static_cast<int64_t>(b) * sequence_length * d +
                                static_cast<int64_t>(s) * d + offset;

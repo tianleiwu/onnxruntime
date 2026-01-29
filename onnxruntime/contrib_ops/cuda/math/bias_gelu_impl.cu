@@ -112,6 +112,7 @@ void LaunchBiasGeluKernel(cudaStream_t stream, int64_t input_size, int64_t bias_
 SPECIALIZED_BIAS_GELU_IMPL(half);
 SPECIALIZED_BIAS_GELU_IMPL(float);
 SPECIALIZED_BIAS_GELU_IMPL(double);
+SPECIALIZED_BIAS_GELU_IMPL(__nv_bfloat16);
 SPECIALIZED_BIAS_GELU_IMPL(BFloat16);
 
 #undef SPECIALIZED_BIAS_GELU_IMPL

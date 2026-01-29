@@ -62,6 +62,9 @@ template void mmha_launch_kernel<uint16_t, half, 64>(const DecoderMaskedMultiHea
 template void mmha_launch_kernel<float, BFloat16, 64>(const DecoderMaskedMultiHeadAttentionParameters&, cudaStream_t stream);
 template void mmha_launch_kernel<uint16_t, BFloat16, 64>(const DecoderMaskedMultiHeadAttentionParameters&, cudaStream_t stream);
 
+template void mmha_launch_kernel<float, __nv_bfloat16, 64>(const DecoderMaskedMultiHeadAttentionParameters&, cudaStream_t stream);
+template void mmha_launch_kernel<uint16_t, __nv_bfloat16, 64>(const DecoderMaskedMultiHeadAttentionParameters&, cudaStream_t stream);
+
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime

@@ -161,6 +161,12 @@ struct Vec_t<onnxruntime::BFloat16> {
 };
 
 template <>
+struct Vec_t<__nv_bfloat16> {
+  using Type = __nv_bfloat162;
+  static constexpr int size = 2;
+};
+
+template <>
 struct Vec_t<__nv_bfloat162> {
   using Type = uint2;
   static constexpr int size = 4;
@@ -471,6 +477,10 @@ inline __device__ uint4 add_vec(uint4 a, uint4 b) {
   c.z = add_vec(a.z, b.z);
   c.w = add_vec(a.w, b.w);
   return c;
+}
+
+inline __device__ __nv_bfloat162 add_vec(__nv_bfloat162 a, __nv_bfloat162 b) {
+  return __hadd2(a, b);
 }
 
 inline __device__ float add_vec(float a, uint16_t b) {

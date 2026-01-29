@@ -7,6 +7,7 @@
 #include "core/providers/cuda/shared_inc/cuda_utils.h"
 #include "core/common/float8.h"
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 namespace onnxruntime {
 namespace cuda {
@@ -53,21 +54,22 @@ UNARY_OPS()
 
 #if !defined(DISABLE_FLOAT8_TYPES)
 
-#define DECL_IMPL_CAST_FROM(T)    \
-  DECL_IMPL_CAST(T, half)         \
-  DECL_IMPL_CAST(T, float)        \
-  DECL_IMPL_CAST(T, double)       \
-  DECL_IMPL_CAST(T, int8_t)       \
-  DECL_IMPL_CAST(T, int16_t)      \
-  DECL_IMPL_CAST(T, int32_t)      \
-  DECL_IMPL_CAST(T, int64_t)      \
-  DECL_IMPL_CAST(T, uint8_t)      \
-  DECL_IMPL_CAST(T, uint16_t)     \
-  DECL_IMPL_CAST(T, uint32_t)     \
-  DECL_IMPL_CAST(T, uint64_t)     \
-  DECL_IMPL_CAST(T, bool)         \
-  DECL_IMPL_CAST(T, BFloat16)     \
-  DECL_IMPL_CAST(T, Float8E4M3FN) \
+#define DECL_IMPL_CAST_FROM(T)     \
+  DECL_IMPL_CAST(T, half)          \
+  DECL_IMPL_CAST(T, float)         \
+  DECL_IMPL_CAST(T, double)        \
+  DECL_IMPL_CAST(T, int8_t)        \
+  DECL_IMPL_CAST(T, int16_t)       \
+  DECL_IMPL_CAST(T, int32_t)       \
+  DECL_IMPL_CAST(T, int64_t)       \
+  DECL_IMPL_CAST(T, uint8_t)       \
+  DECL_IMPL_CAST(T, uint16_t)      \
+  DECL_IMPL_CAST(T, uint32_t)      \
+  DECL_IMPL_CAST(T, uint64_t)      \
+  DECL_IMPL_CAST(T, bool)          \
+  DECL_IMPL_CAST(T, BFloat16)      \
+  DECL_IMPL_CAST(T, __nv_bfloat16) \
+  DECL_IMPL_CAST(T, Float8E4M3FN)  \
   DECL_IMPL_CAST(T, Float8E5M2)
 
 #else
@@ -85,7 +87,8 @@ UNARY_OPS()
   DECL_IMPL_CAST(T, uint32_t)  \
   DECL_IMPL_CAST(T, uint64_t)  \
   DECL_IMPL_CAST(T, bool)      \
-  DECL_IMPL_CAST(T, BFloat16)
+  DECL_IMPL_CAST(T, BFloat16)  \
+  DECL_IMPL_CAST(T, __nv_bfloat16)
 
 #endif
 
@@ -102,6 +105,7 @@ DECL_IMPL_CAST_FROM(uint32_t)
 DECL_IMPL_CAST_FROM(uint64_t)
 DECL_IMPL_CAST_FROM(bool)
 DECL_IMPL_CAST_FROM(BFloat16)
+DECL_IMPL_CAST_FROM(__nv_bfloat16)
 
 #if !defined(DISABLE_FLOAT8_TYPES)
 

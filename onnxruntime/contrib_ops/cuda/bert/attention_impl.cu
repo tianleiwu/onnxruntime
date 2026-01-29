@@ -1050,6 +1050,8 @@ template struct AttentionData<half>;
 
 template struct AttentionData<BFloat16>;
 
+template struct AttentionData<__nv_bfloat16>;
+
 template Status QkvToContext<float>(
     const cudaDeviceProp& device_prop,
     cublasHandle_t& cublas,
@@ -1066,13 +1068,13 @@ template Status QkvToContext<half>(
     contrib::AttentionParameters& parameters,
     AttentionData<half>& data);
 
-template Status QkvToContext<BFloat16>(
+template Status QkvToContext<__nv_bfloat16>(
     const cudaDeviceProp& device_prop,
     cublasHandle_t& cublas,
     cudnnHandle_t& cudnn,
     Stream* ort_stream,
     contrib::AttentionParameters& parameters,
-    AttentionData<BFloat16>& data);
+    AttentionData<__nv_bfloat16>& data);
 
 template Status QkvToContext<float, half>(
     const cudaDeviceProp& device_prop,
@@ -1091,14 +1093,14 @@ template Status QkvToContext<half, float>(
     AttentionData<half>& data);
 
 template onnxruntime::common::Status
-QkvToContext<float, BFloat16>(
+QkvToContext<float, __nv_bfloat16>(
     const cudaDeviceProp&, cublasHandle_t&, cudnnHandle_t&,
     Stream*, contrib::AttentionParameters&, AttentionData<float>&);
 
 template onnxruntime::common::Status
-QkvToContext<BFloat16, float>(
+QkvToContext<__nv_bfloat16, float>(
     const cudaDeviceProp&, cublasHandle_t&, cudnnHandle_t&,
-    Stream*, contrib::AttentionParameters&, AttentionData<BFloat16>&);
+    Stream*, contrib::AttentionParameters&, AttentionData<__nv_bfloat16>&);
 
 template Status LaunchDecoderMaskedMultiHeadAttention<float, float>(
     const DecoderMaskedMultiHeadAttentionParameters& parameters,
@@ -1116,6 +1118,21 @@ template Status LaunchDecoderMaskedMultiHeadAttention<uint16_t, float>(
     const int head_size);
 
 template Status LaunchDecoderMaskedMultiHeadAttention<uint16_t, half>(
+    const DecoderMaskedMultiHeadAttentionParameters& parameters,
+    cudaStream_t stream,
+    const int head_size);
+
+template Status LaunchDecoderMaskedMultiHeadAttention<__nv_bfloat16, __nv_bfloat16>(
+    const DecoderMaskedMultiHeadAttentionParameters& parameters,
+    cudaStream_t stream,
+    const int head_size);
+
+template Status LaunchDecoderMaskedMultiHeadAttention<float, __nv_bfloat16>(
+    const DecoderMaskedMultiHeadAttentionParameters& parameters,
+    cudaStream_t stream,
+    const int head_size);
+
+template Status LaunchDecoderMaskedMultiHeadAttention<uint16_t, __nv_bfloat16>(
     const DecoderMaskedMultiHeadAttentionParameters& parameters,
     cudaStream_t stream,
     const int head_size);

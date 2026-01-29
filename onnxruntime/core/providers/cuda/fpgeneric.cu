@@ -61,6 +61,13 @@ __global__ void CopyVectorBFloat16(const onnxruntime::BFloat16* x, int incx, onn
   y[id * incy] = x[id * incx];
 }
 
+__global__ void CopyVectorNVBFloat16(const __nv_bfloat16* x, int incx, __nv_bfloat16* y, int incy,
+                                     int n) {
+  int id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (id >= n) return;
+  y[id * incy] = x[id * incx];
+}
+
 }  // namespace
 
 dim3 cublasTransposeHelperDimGrid(int m, int n) {
@@ -98,5 +105,13 @@ cublasStatus_t cublasCopyHelper(cudaStream_t stream, cublasHandle_t, int n, cons
   dim3 dimGrid((unsigned int)(n + COPY_BLOCK_DIM - 1) / COPY_BLOCK_DIM, 1, 1);
   dim3 dimBlock(COPY_BLOCK_DIM, 1, 1);
   CopyVectorBFloat16<<<dimGrid, dimBlock, 0, stream>>>(x, incx, y, incy, n);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasCopyHelper(cudaStream_t stream, cublasHandle_t, int n, const __nv_bfloat16* x, int incx,
+                                __nv_bfloat16* y, int incy) {
+  dim3 dimGrid((unsigned int)(n + COPY_BLOCK_DIM - 1) / COPY_BLOCK_DIM, 1, 1);
+  dim3 dimBlock(COPY_BLOCK_DIM, 1, 1);
+  CopyVectorNVBFloat16<<<dimGrid, dimBlock, 0, stream>>>(x, incx, y, incy, n);
   return CUBLAS_STATUS_SUCCESS;
 }

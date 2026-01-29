@@ -37,6 +37,9 @@ class GroupQueryAttention final : public CudaKernel {
   bool disable_flash_decode_;
   bool enable_xqa_;
 
+  KVQuantizationType k_quant_type_;
+  KVQuantizationType v_quant_type_;
+
   static constexpr int kZerosCount = 256;  // In prompt case we create a zero buffer of size 256 for seqlen (assume batch_size <= 256)
   IAllocatorUniquePtr<int> zeros_;
   const AttentionKernelOptions* kernel_options_;

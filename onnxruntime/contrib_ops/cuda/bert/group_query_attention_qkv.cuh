@@ -91,7 +91,7 @@ __global__ void UnpackRoPEAppend(
   }
 
   // 1. Load data into Registers
-  T vals[elements_per_thread];
+  alignas(16) T vals[elements_per_thread];
   if (valid) {
     if (packed_qkv != nullptr) {
       const int64_t packed_idx = static_cast<int64_t>(b) * sequence_length * d +

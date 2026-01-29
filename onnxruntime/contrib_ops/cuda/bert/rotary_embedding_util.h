@@ -45,6 +45,12 @@ inline __device__ uint32_t rotary_embedding_transform(const uint32_t v, const fl
   return Float2ToHalf2(rot_fv);
 }
 
+inline __device__ __nv_bfloat162 rotary_embedding_transform(const __nv_bfloat162 v, const float2 coef) {
+  float2 fv = __bfloat1622float2(v);
+  float2 rot_fv = rotary_embedding_transform(fv, coef);
+  return __float22bfloat162_rn(rot_fv);
+}
+
 inline __device__ void apply_rotary_embedding(float& q, int zid, int rot_embed_dim, int t_step) {
   return;
 }
@@ -138,6 +144,23 @@ inline __device__ void apply_rotary_embedding(uint2& q, uint2& k, int tid, int r
   const auto coef1 = rotary_embedding_coefficient(4 * tid + 2, rot_embed_dim, t_step);
   q.y = rotary_embedding_transform(q.y, coef1);
   k.y = rotary_embedding_transform(k.y, coef1);
+}
+
+inline __device__ void apply_rotary_embedding(__nv_bfloat162& q, int tid, int rot_embed_dim, int t_step) {
+  if (2 * tid >= rot_embed_dim) {
+    return;
+  }
+  const auto coef = rotary_embedding_coefficient(2 * tid, rot_embed_dim, t_step);
+  q = rotary_embedding_transform(q, coef);
+}
+
+inline __device__ void apply_rotary_embedding(__nv_bfloat162& q, __nv_bfloat162& k, int tid, int rot_embed_dim, int t_step) {
+  if (2 * tid >= rot_embed_dim) {
+    return;
+  }
+  const auto coef = rotary_embedding_coefficient(2 * tid, rot_embed_dim, t_step);
+  q = rotary_embedding_transform(q, coef);
+  k = rotary_embedding_transform(k, coef);
 }
 
 inline __device__ void apply_rotary_embedding(uint4& q, int tid, int rot_embed_dim, int t_step) {
@@ -418,6 +441,32 @@ template <>
 __device__ __inline__ void write_smem_transpose(const float2& vec, float* smem, int transpose_idx, int smem_pitch) {
   smem[transpose_idx] = vec.x;
   smem[smem_pitch + transpose_idx] = vec.y;
+}
+
+template <>
+__device__ __inline__ void vec_from_smem_transpose(__nv_bfloat162& vec, __nv_bfloat16* smem,
+                                                   int transpose_idx, int smem_pitch) {
+  union {
+    __nv_bfloat162 u32;  // __nv_bfloat162 is 32-bit
+    __nv_bfloat16 u16[2];
+  } tmp;
+  tmp.u16[0] = smem[transpose_idx];
+  tmp.u16[1] = smem[smem_pitch + transpose_idx];
+
+  vec = tmp.u32;
+}
+
+template <>
+__device__ __inline__ void write_smem_transpose(const __nv_bfloat162& vec, __nv_bfloat16* smem,
+                                                int transpose_idx, int smem_pitch) {
+  union {
+    __nv_bfloat162 u32;
+    __nv_bfloat16 u16[2];
+  } tmp;
+
+  tmp.u32 = vec;
+  smem[transpose_idx] = tmp.u16[0];
+  smem[smem_pitch + transpose_idx] = tmp.u16[1];
 }
 
 }  // namespace cuda

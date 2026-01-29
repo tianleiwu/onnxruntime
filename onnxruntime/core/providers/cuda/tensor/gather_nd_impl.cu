@@ -114,6 +114,7 @@ SPECIALIZED_IMPL(int64_t)
 SPECIALIZED_IMPL(half)
 SPECIALIZED_IMPL(double)
 SPECIALIZED_IMPL(BFloat16)
+SPECIALIZED_IMPL(__nv_bfloat16)
 #endif
 
 }  // namespace cuda

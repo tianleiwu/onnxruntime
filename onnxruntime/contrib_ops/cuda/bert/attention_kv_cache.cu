@@ -295,6 +295,74 @@ Status LaunchConcatTensorToTensor(cudaStream_t stream,
   return CUDA_CALL(cudaGetLastError());
 }
 
+Status LaunchConcatTensorToTensor(cudaStream_t stream,
+                                  const int all_sequence_length,
+                                  const int sequence_length,
+                                  const int batch_size,
+                                  const int head_size,
+                                  const int num_heads,
+                                  const int max_threads_per_block,
+                                  const int matrix_num,
+                                  const __nv_bfloat16* tensor_in,
+                                  const __nv_bfloat16* tensor_add,
+                                  __nv_bfloat16* tensor_out) {
+  assert(num_heads <= max_threads_per_block);
+  const dim3 grid(all_sequence_length, batch_size, matrix_num);
+  if (0 == (head_size % 8)) {
+    const int H = head_size / 8;
+    if (H * num_heads <= max_threads_per_block) {
+      const dim3 block(H, num_heads, 1);
+      ConcatTensorToTensor<float4><<<grid, block, 0, stream>>>(
+          sequence_length,
+          reinterpret_cast<const float4*>(tensor_in),
+          reinterpret_cast<const float4*>(tensor_add),
+          reinterpret_cast<float4*>(tensor_out));
+    } else {
+      const dim3 block(max_threads_per_block / num_heads, num_heads, 1);
+      ConcatTensorToTensorLarge<float4><<<grid, block, 0, stream>>>(
+          sequence_length,
+          H,
+          reinterpret_cast<const float4*>(tensor_in),
+          reinterpret_cast<const float4*>(tensor_add),
+          reinterpret_cast<float4*>(tensor_out));
+    }
+  } else if (0 == (head_size % 2)) {
+    const int H = head_size / 2;
+    if (H * num_heads <= max_threads_per_block) {
+      const dim3 block(H, num_heads, 1);
+      ConcatTensorToTensor<__nv_bfloat162><<<grid, block, 0, stream>>>(
+          sequence_length,
+          reinterpret_cast<const __nv_bfloat162*>(tensor_in),
+          reinterpret_cast<const __nv_bfloat162*>(tensor_add),
+          reinterpret_cast<__nv_bfloat162*>(tensor_out));
+    } else {
+      const dim3 block(max_threads_per_block / num_heads, num_heads, 1);
+      ConcatTensorToTensorLarge<__nv_bfloat162><<<grid, block, 0, stream>>>(
+          sequence_length,
+          H,
+          reinterpret_cast<const __nv_bfloat162*>(tensor_in),
+          reinterpret_cast<const __nv_bfloat162*>(tensor_add),
+          reinterpret_cast<__nv_bfloat162*>(tensor_out));
+    }
+  } else {
+    if (head_size * num_heads <= max_threads_per_block) {
+      const dim3 block(head_size, num_heads, 1);
+      ConcatTensorToTensor<__nv_bfloat16><<<grid, block, 0, stream>>>(
+          sequence_length, tensor_in, tensor_add, tensor_out);
+    } else {
+      const dim3 block(max_threads_per_block / num_heads, num_heads, 1);
+      ConcatTensorToTensorLarge<__nv_bfloat16><<<grid, block, 0, stream>>>(
+          sequence_length,
+          head_size,
+          tensor_in,
+          tensor_add,
+          tensor_out);
+    }
+  }
+
+  return CUDA_CALL(cudaGetLastError());
+}
+
 // ----------------------------------------------------------------------------------
 // Below kernels are for past and present sharing buffer
 // ----------------------------------------------------------------------------------
@@ -440,6 +508,18 @@ template Status LaunchAddBiasTransAppendKvToPresent(cudaStream_t stream,
                                                     const BFloat16* bias,
                                                     const BFloat16* qkv_buffer,
                                                     BFloat16* present);
+
+template Status LaunchAddBiasTransAppendKvToPresent(cudaStream_t stream,
+                                                    const int max_sequence_length,
+                                                    const int total_sequence_length,
+                                                    const int sequence_length,
+                                                    const int batch_size,
+                                                    const int head_size,
+                                                    const int num_heads,
+                                                    const int max_threads_per_block,
+                                                    const __nv_bfloat16* bias,
+                                                    const __nv_bfloat16* qkv_buffer,
+                                                    __nv_bfloat16* present);
 
 // Fused kernel to append new K and V to past in either BSNH or BNSH format.
 // Adapted from ConcatTensorToTensor kernel.
@@ -728,6 +808,30 @@ template Status LaunchConcatNewToPastKV<BFloat16>(const int batch_size,
                                                   const int64_t* position_ids,
                                                   const bool interleaved);
 
+template Status LaunchConcatNewToPastKV<__nv_bfloat16>(const int batch_size,
+                                                       const int kv_num_heads,
+                                                       const int head_size,
+                                                       const int kv_sequence_length,
+                                                       const int past_sequence_length,
+                                                       const int present_sequence_length,
+                                                       const bool is_bsnh,
+                                                       const int* past_seq_lens,
+                                                       const int* total_seq_lens,
+                                                       const __nv_bfloat16* past_key,
+                                                       const __nv_bfloat16* past_value,
+                                                       const __nv_bfloat16* new_key,
+                                                       const __nv_bfloat16* new_value,
+                                                       __nv_bfloat16* present_key,
+                                                       __nv_bfloat16* present_value,
+                                                       cudaStream_t stream,
+                                                       const int max_threads_per_block,
+                                                       const bool past_only,
+                                                       const __nv_bfloat16* cos_cache,
+                                                       const __nv_bfloat16* sin_cache,
+                                                       const int rotary_dim,
+                                                       const int64_t* position_ids,
+                                                       const bool interleaved);
+
 template Status LaunchConcatNewToPastKV<float>(const int batch_size,
                                                const int kv_num_heads,
                                                const int head_size,
@@ -959,6 +1063,22 @@ template Status LaunchConcatKVInPlace<float>(int batch_size,
                                              cudaStream_t stream,
                                              const int max_threads_per_block);
 
+template Status LaunchConcatKVInPlace<__nv_bfloat16>(int batch_size,
+                                                     int kv_num_heads,
+                                                     int head_size,
+                                                     int max_sequence_length,
+                                                     const int* past_seq_lens,
+                                                     const int* total_seq_lens,
+                                                     int new_seq_len,
+                                                     const __nv_bfloat16* new_key,
+                                                     const __nv_bfloat16* new_value,
+                                                     __nv_bfloat16* present_key,
+                                                     __nv_bfloat16* present_value,
+                                                     bool is_past_kv_bnsh_format,
+                                                     bool is_new_kv_bnsh_format,
+                                                     cudaStream_t stream,
+                                                     const int max_threads_per_block);
+
 // ============================================================================
 // ConcatKVInPlaceFused Kernel
 // ============================================================================
@@ -1176,6 +1296,21 @@ template Status LaunchConcatKVInPlaceFused<float>(int batch_size,
                                                   cudaStream_t stream,
                                                   const int max_threads_per_block);
 
+template Status LaunchConcatKVInPlaceFused<__nv_bfloat16>(int batch_size,
+                                                          int kv_num_heads,
+                                                          int head_size,
+                                                          int max_sequence_length,
+                                                          const int* past_seq_lens,
+                                                          const int* total_seq_lens,
+                                                          int new_seq_len,
+                                                          const __nv_bfloat16* new_key,
+                                                          const __nv_bfloat16* new_value,
+                                                          __nv_bfloat16* present_key,
+                                                          __nv_bfloat16* present_value,
+                                                          bool is_past_kv_bnsh_format,
+                                                          bool is_new_kv_bnsh_format,
+                                                          cudaStream_t stream,
+                                                          const int max_threads_per_block);
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime

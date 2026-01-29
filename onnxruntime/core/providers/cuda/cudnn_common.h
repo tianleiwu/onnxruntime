@@ -147,6 +147,12 @@ struct Consts<BFloat16> {
   static const float One;
 };
 
+template <>
+struct Consts<__nv_bfloat16> {
+  static const float Zero;
+  static const float One;
+};
+
 inline double ClampCudnnBatchNormEpsilon(double epsilon) {
   if (epsilon < CUDNN_BN_MIN_EPSILON) {
     if (CUDNN_BN_MIN_EPSILON - epsilon > FLT_EPSILON)

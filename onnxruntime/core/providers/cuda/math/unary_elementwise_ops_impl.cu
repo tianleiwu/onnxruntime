@@ -63,7 +63,7 @@ UNARY_OPS()
 
 #define SPECIALIZED_UNARY_ELEMENTWISE_IMPL_HFDX(name) \
   SPECIALIZED_UNARY_ELEMENTWISE_IMPL_HFD(name)        \
-  SPECIALIZED_UNARY_ELEMENTWISE_IMPL(name, BFloat16)
+  SPECIALIZED_UNARY_ELEMENTWISE_IMPL(name, __nv_bfloat16)
 
 #define SPECIALIZED_UNARY_ELEMENTWISE_IMPL_CSILHFD(name) \
   SPECIALIZED_UNARY_ELEMENTWISE_IMPL(name, int8_t)       \
@@ -93,6 +93,24 @@ SPECIALIZED_UNARY_ELEMENTWISE_IMPL_HFD(Sin)
 SPECIALIZED_UNARY_ELEMENTWISE_IMPL_HFD(Cos)
 SPECIALIZED_UNARY_ELEMENTWISE_IMPL(Not, bool)
 SPECIALIZED_UNARY_ELEMENTWISE_IMPL_BWUZCSILHFD(Sign)
+
+// UnaryDiv is often used for scaling or similar operations
+template <typename T>
+struct OP_UnaryDiv {
+  __device__ __inline__ T operator()(const T& a) const {
+    return a / div;
+  }
+  T div;
+};
+
+template <typename T>
+void Impl_UnaryDiv(cudaStream_t stream, const T* input_data, T* output_data, T div, size_t count) {
+  UnaryElementWiseImpl(stream, input_data, output_data, OP_UnaryDiv<T>{div}, count);
+}
+
+template void Impl_UnaryDiv<__nv_bfloat16>(cudaStream_t stream, const __nv_bfloat16* input_data, __nv_bfloat16* output_data, __nv_bfloat16 div, size_t count);
+template void Impl_UnaryDiv<float>(cudaStream_t stream, const float* input_data, float* output_data, float div, size_t count);
+template void Impl_UnaryDiv<half>(cudaStream_t stream, const half* input_data, half* output_data, half div, size_t count);
 
 // When casting, half needs to be converted via float type from most other types
 template <typename T>
@@ -149,6 +167,7 @@ struct OP_Cast {
   IMPL_CAST_IMPL(T, uint64_t)             \
   IMPL_CAST_IMPL(T, bool)                 \
   IMPL_CAST_IMPL(T, BFloat16)             \
+  IMPL_CAST_IMPL(T, __nv_bfloat16)        \
   IMPL_CAST_IMPL_THROW(T, Float8E4M3FN)   \
   IMPL_CAST_IMPL_THROW(T, Float8E5M2)     \
   IMPL_CAST_IMPL_THROW(T, Float8E4M3FNUZ) \
@@ -169,7 +188,8 @@ struct OP_Cast {
   IMPL_CAST_IMPL(T, uint32_t)  \
   IMPL_CAST_IMPL(T, uint64_t)  \
   IMPL_CAST_IMPL(T, bool)      \
-  IMPL_CAST_IMPL(T, BFloat16)
+  IMPL_CAST_IMPL(T, BFloat16)  \
+  IMPL_CAST_IMPL(T, __nv_bfloat16)
 
 #endif
 
@@ -186,6 +206,7 @@ IMPL_CAST_IMPL_FROM(uint32_t)
 IMPL_CAST_IMPL_FROM(uint64_t)
 IMPL_CAST_IMPL_FROM(bool)
 IMPL_CAST_IMPL_FROM(BFloat16)
+IMPL_CAST_IMPL_FROM(__nv_bfloat16)
 #if !defined(DISABLE_FLOAT8_TYPES)
 IMPL_CAST_IMPL_FROM(Float8E4M3FN)
 IMPL_CAST_IMPL_FROM(Float8E5M2)

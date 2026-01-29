@@ -327,11 +327,11 @@ template Status QkvToContext<half>(
     contrib::SparseAttentionParameters& parameters,
     SparseAttentionData<half>& data);
 
-template Status QkvToContext<BFloat16>(
+template Status QkvToContext<__nv_bfloat16>(
     const cudaDeviceProp& device_prop,
     Stream* ort_stream,
     contrib::SparseAttentionParameters& parameters,
-    SparseAttentionData<BFloat16>& data);
+    SparseAttentionData<__nv_bfloat16>& data);
 
 }  // namespace cuda
 }  // namespace contrib

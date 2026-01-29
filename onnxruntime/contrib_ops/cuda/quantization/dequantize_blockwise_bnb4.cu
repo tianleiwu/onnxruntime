@@ -37,6 +37,8 @@ template Status SetBnbQuantMap<half>(int quant_type, half* quant_map_buffer, cud
 
 template Status SetBnbQuantMap<BFloat16>(int quant_type, BFloat16* quant_map_buffer, cudaStream_t stream);
 
+template Status SetBnbQuantMap<__nv_bfloat16>(int quant_type, __nv_bfloat16* quant_map_buffer, cudaStream_t stream);
+
 template <class T, int TILE_SIZE, int THREADS, int NUM_PER_TH>
 __global__ void kDequantizeBlockwise(
     const T* quant_map,
@@ -155,6 +157,15 @@ Status DequantizeBnb4<BFloat16>(
 
   return Status::OK();
 }
+
+template Status DequantizeBnb4<__nv_bfloat16>(
+    const __nv_bfloat16* quant_map,
+    __nv_bfloat16* output,
+    const uint8_t* quant_data,
+    const __nv_bfloat16* absmax,
+    int block_size,
+    int numel,
+    cudaStream_t stream);
 
 }  // namespace cuda
 }  // namespace contrib

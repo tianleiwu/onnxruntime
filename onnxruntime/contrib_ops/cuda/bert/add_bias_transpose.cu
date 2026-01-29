@@ -824,6 +824,39 @@ void LaunchAddBiasTranspose<BFloat16>(
 }
 
 template <>
+void LaunchAddBiasTranspose<__nv_bfloat16>(
+    cudaStream_t stream, const int num_matrices, const int format, const int max_threads_per_block,
+    const int batch_size, const int sequence_length, const int num_heads, const int qk_head_size,
+    const __nv_bfloat16* input, const __nv_bfloat16* biases, __nv_bfloat16* output,
+    bool /*enable_half4*/, const int v_head_size,
+    __nv_bfloat16* qkv_add_bias, int total_matrix_count,
+    bool do_rotary, int rotary_embedding, int past_sequence_length) {
+  total_matrix_count = std::max(num_matrices, total_matrix_count);
+  if (0 == (qk_head_size & 1) && (v_head_size == -1 || 0 == (v_head_size & 1)) && !do_rotary) {
+    const int H = qk_head_size / 2;
+    const int H_v = v_head_size / 2;
+
+    const __nv_bfloat162* input2 = reinterpret_cast<const __nv_bfloat162*>(input);
+    const __nv_bfloat162* biases2 = reinterpret_cast<const __nv_bfloat162*>(biases);
+    __nv_bfloat162* output2 = reinterpret_cast<__nv_bfloat162*>(output);
+    __nv_bfloat162* qkv_add_bias2 = reinterpret_cast<__nv_bfloat162*>(qkv_add_bias);
+
+    InvokeAddBiasTranspose<__nv_bfloat162>(
+        stream, num_matrices, format, max_threads_per_block,
+        batch_size, sequence_length, num_heads, H,
+        input2, biases2, output2, qkv_add_bias2,
+        H_v, total_matrix_count);
+  } else {
+    InvokeAddBiasTranspose<__nv_bfloat16>(
+        stream, num_matrices, format, max_threads_per_block,
+        batch_size, sequence_length, num_heads, qk_head_size,
+        input, biases, output,
+        qkv_add_bias, v_head_size, total_matrix_count,
+        do_rotary, rotary_embedding, past_sequence_length);
+  }
+}
+
+template <>
 void LaunchAddBiasTranspose(
     cudaStream_t stream, const int num_matrices, const int format, const int max_threads_per_block,
     const int batch_size, const int sequence_length, const int num_heads, const int qk_head_size,
@@ -918,17 +951,31 @@ void LaunchAddBiasTransposeTrt(
 }
 
 template <>
-void LaunchAddBiasTransposeTrt<BFloat16>(
-    cudaStream_t /*stream*/, const int /*max_threads_per_block*/,
-    const int /*batch_size*/, const int /*sequence_length*/,
-    const int /*num_heads*/, const int /*head_size*/,
-    const BFloat16* /*biases*/,
-    const BFloat16* /*query*/,
-    const BFloat16* /*key*/,
-    const BFloat16* /*value*/,
-    BFloat16* /*output*/,
-    bool /*is_cross_attention*/, int /*kv_sequence_length*/) {
-  ORT_ENFORCE(false, "BF16 not supported for LaunchAddBiasTransposeTrt.");
+void LaunchAddBiasTransposeTrt<__nv_bfloat16>(
+    cudaStream_t stream, const int max_threads_per_block,
+    const int batch_size, const int sequence_length,
+    const int num_heads, const int head_size,
+    const __nv_bfloat16* biases,
+    const __nv_bfloat16* query,
+    const __nv_bfloat16* key,
+    const __nv_bfloat16* value,
+    __nv_bfloat16* output,
+    bool is_cross_attention, int kv_sequence_length) {
+  if (0 == (head_size & 1)) {
+    const int H = head_size / 2;
+    const __nv_bfloat162* query2 = reinterpret_cast<const __nv_bfloat162*>(query);
+    const __nv_bfloat162* key2 = reinterpret_cast<const __nv_bfloat162*>(key);
+    const __nv_bfloat162* value2 = reinterpret_cast<const __nv_bfloat162*>(value);
+    const __nv_bfloat162* biases2 = reinterpret_cast<const __nv_bfloat162*>(biases);
+    __nv_bfloat162* output2 = reinterpret_cast<__nv_bfloat162*>(output);
+    InvokeAddBiasTransposeTrt<__nv_bfloat162>(stream, max_threads_per_block,
+                                              batch_size, sequence_length, num_heads, H,
+                                              biases2, query2, key2, value2, output2, is_cross_attention, kv_sequence_length);
+  } else {
+    InvokeAddBiasTransposeTrt<__nv_bfloat16>(stream, max_threads_per_block,
+                                             batch_size, sequence_length, num_heads, head_size,
+                                             biases, query, key, value, output, is_cross_attention, kv_sequence_length);
+  }
 }
 
 template <>
@@ -1124,6 +1171,38 @@ void LaunchAddBias<BFloat16>(
   }
 }
 
+template <>
+void LaunchAddBias<__nv_bfloat16>(
+    cudaStream_t stream, const int max_threads_per_block,
+    const int batch_size, const int sequence_length, const int kv_sequence_length,
+    const int num_heads, const int head_size, const int v_head_size,
+    const __nv_bfloat16* biases, const __nv_bfloat16* query, const __nv_bfloat16* key, const __nv_bfloat16* value,
+    __nv_bfloat16* q, __nv_bfloat16* k, __nv_bfloat16* v) {
+  if (0 == (head_size & 1) && 0 == (v_head_size & 1)) {
+    const int H = head_size / 2;
+    const int H_v = v_head_size / 2;
+    const __nv_bfloat162* query2 = reinterpret_cast<const __nv_bfloat162*>(query);
+    const __nv_bfloat162* key2 = reinterpret_cast<const __nv_bfloat162*>(key);
+    const __nv_bfloat162* value2 = reinterpret_cast<const __nv_bfloat162*>(value);
+    const __nv_bfloat162* biases2 = reinterpret_cast<const __nv_bfloat162*>(biases);
+    __nv_bfloat162* q2 = reinterpret_cast<__nv_bfloat162*>(q);
+    __nv_bfloat162* k2 = reinterpret_cast<__nv_bfloat162*>(k);
+    __nv_bfloat162* v2 = reinterpret_cast<__nv_bfloat162*>(v);
+
+    InvokeAddBias<__nv_bfloat162>(
+        stream, max_threads_per_block,
+        batch_size, sequence_length, kv_sequence_length, num_heads, H, H_v,
+        biases2, query2, key2, value2, q2, k2, v2);
+
+  } else {
+    InvokeAddBias<__nv_bfloat16>(
+        stream, max_threads_per_block,
+        batch_size, sequence_length, kv_sequence_length, num_heads,
+        head_size, v_head_size,
+        biases, query, key, value, q, k, v);
+  }
+}
+
 template <typename T>
 void InvokeAddBias(
     cudaStream_t stream, const int max_threads_per_block,
@@ -1219,6 +1298,31 @@ void LaunchAddBias<BFloat16>(
 
   } else {
     InvokeAddBias<BFloat16>(
+        stream, max_threads_per_block,
+        batch_size, sequence_length, num_heads, head_size,
+        biases, query, q);
+  }
+}
+
+template <>
+void LaunchAddBias<__nv_bfloat16>(
+    cudaStream_t stream, const int max_threads_per_block,
+    const int batch_size, const int sequence_length,
+    const int num_heads, const int head_size,
+    const __nv_bfloat16* biases, const __nv_bfloat16* query, __nv_bfloat16* q) {
+  if (0 == (head_size & 1)) {
+    const int H = head_size / 2;
+    const __nv_bfloat162* query2 = reinterpret_cast<const __nv_bfloat162*>(query);
+    const __nv_bfloat162* biases2 = reinterpret_cast<const __nv_bfloat162*>(biases);
+    __nv_bfloat162* q2 = reinterpret_cast<__nv_bfloat162*>(q);
+
+    InvokeAddBias<__nv_bfloat162>(
+        stream, max_threads_per_block,
+        batch_size, sequence_length, num_heads, H,
+        biases2, query2, q2);
+
+  } else {
+    InvokeAddBias<__nv_bfloat16>(
         stream, max_threads_per_block,
         batch_size, sequence_length, num_heads, head_size,
         biases, query, q);

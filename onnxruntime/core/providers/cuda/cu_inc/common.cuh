@@ -232,6 +232,9 @@ __device__ __inline__ half _Erf(half a) { return half(erff((float)a)); }
 template <>
 __device__ __inline__ BFloat16 _Erf(BFloat16 a) { return BFloat16(erff((float)a)); }
 
+template <>
+__device__ __inline__ __nv_bfloat16 _Erf(__nv_bfloat16 a) { return __float2bfloat16(erff(static_cast<float>(a))); }
+
 template <typename T>
 __device__ __host__ __inline__ T _Round(T a);
 
@@ -347,6 +350,9 @@ __device__ __inline__ half _Pow(half a, half b) { return half(powf((float)a, (fl
 
 template <>
 __device__ __inline__ BFloat16 _Pow(BFloat16 a, BFloat16 b) { return BFloat16(powf((float)a, (float)b)); }
+
+template <>
+__device__ __inline__ __nv_bfloat16 _Pow(__nv_bfloat16 a, __nv_bfloat16 b) { return __float2bfloat16(powf(static_cast<float>(a), static_cast<float>(b))); }
 
 #define ISNAN_HALF(v__) static_cast<uint16_t>(*reinterpret_cast<const uint16_t*>(&v__) & ~MLFloat16::kSignMask) > MLFloat16::kPositiveInfinityBits
 
@@ -473,6 +479,21 @@ __device__ __inline__ BFloat16 _Tanh(BFloat16 a) { return tanhf(static_cast<floa
 template <>
 __device__ __inline__ BFloat16 _Normcdf(BFloat16 a) { return normcdff(static_cast<float>(a)); }
 
+template <>
+__device__ __inline__ __nv_bfloat16 _Sqrt(__nv_bfloat16 a) { return __float2bfloat16(sqrtf(static_cast<float>(a))); }
+
+template <>
+__device__ __inline__ __nv_bfloat16 _Exp(__nv_bfloat16 a) { return __float2bfloat16(expf(static_cast<float>(a))); }
+
+template <>
+__device__ __inline__ __nv_bfloat16 _Log(__nv_bfloat16 a) { return __float2bfloat16(logf(static_cast<float>(a))); }
+
+template <>
+__device__ __inline__ __nv_bfloat16 _Tanh(__nv_bfloat16 a) { return __float2bfloat16(tanhf(static_cast<float>(a))); }
+
+template <>
+__device__ __inline__ __nv_bfloat16 _Normcdf(__nv_bfloat16 a) { return __float2bfloat16(normcdff(static_cast<float>(a))); }
+
 template <typename T>
 __device__ __inline__ T _Gelu(T a) {
   return a * _Normcdf(a);
@@ -521,6 +542,11 @@ __device__ __inline__ BFloat16 _Fmod(BFloat16 a, BFloat16 b) {
   return fmodf((float)a, (float)b);
 }
 
+template <>
+__device__ __inline__ __nv_bfloat16 _Fmod(__nv_bfloat16 a, __nv_bfloat16 b) {
+  return __float2bfloat16(fmodf(static_cast<float>(a), static_cast<float>(b)));
+}
+
 namespace isinf_details {
 template <typename T>
 struct IsInfTyped {
@@ -562,6 +588,20 @@ struct IsInfTyped<BFloat16> {
     return BFloat16::kPositiveInfinityBits == *reinterpret_cast<uint16_t*>(&a);
   }
   static __device__ __inline__ bool IsInfNeg(BFloat16 a) {
+    return BFloat16::kNegativeInfinityBits == *reinterpret_cast<uint16_t*>(&a);
+  }
+};
+
+template <>
+struct IsInfTyped<__nv_bfloat16> {
+  static __device__ __inline__ bool IsInf(__nv_bfloat16 a) {
+    return BFloat16::kPositiveInfinityBits ==
+           static_cast<uint16_t>(*reinterpret_cast<uint16_t*>(&a) & ~BFloat16::kSignMask);
+  }
+  static __device__ __inline__ bool IsInfPos(__nv_bfloat16 a) {
+    return BFloat16::kPositiveInfinityBits == *reinterpret_cast<uint16_t*>(&a);
+  }
+  static __device__ __inline__ bool IsInfNeg(__nv_bfloat16 a) {
     return BFloat16::kNegativeInfinityBits == *reinterpret_cast<uint16_t*>(&a);
   }
 };
@@ -633,6 +673,13 @@ struct _IsNan<half> {
 template <>
 struct _IsNan<BFloat16> {
   __device__ __inline__ bool operator()(BFloat16 a) const {
+    return static_cast<uint16_t>(*reinterpret_cast<const uint16_t*>(&a) & ~BFloat16::kSignMask) > BFloat16::kPositiveInfinityBits;
+  }
+};
+
+template <>
+struct _IsNan<__nv_bfloat16> {
+  __device__ __inline__ bool operator()(__nv_bfloat16 a) const {
     return static_cast<uint16_t>(*reinterpret_cast<const uint16_t*>(&a) & ~BFloat16::kSignMask) > BFloat16::kPositiveInfinityBits;
   }
 };

@@ -28,6 +28,10 @@ template <>
 struct AccumulationType<BFloat16> {
   using type = float;
 };
+template <>
+struct AccumulationType<__nv_bfloat16> {
+  using type = float;
+};
 
 template <typename T>
 using AccumulationType_t = typename AccumulationType<T>::type;

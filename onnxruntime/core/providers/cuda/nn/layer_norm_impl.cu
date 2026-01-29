@@ -470,6 +470,8 @@ LAYERNORM_LINEAR_IMPL(float, float, half, false)
 LAYERNORM_LINEAR_IMPL(half, float, float, false)
 LAYERNORM_LINEAR_IMPL(BFloat16, float, BFloat16, true)
 LAYERNORM_LINEAR_IMPL(BFloat16, float, BFloat16, false)
+LAYERNORM_LINEAR_IMPL(__nv_bfloat16, float, __nv_bfloat16, true)
+LAYERNORM_LINEAR_IMPL(__nv_bfloat16, float, __nv_bfloat16, false)
 
 }  // namespace cuda
 }  // namespace onnxruntime

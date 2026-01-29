@@ -19,6 +19,7 @@
 #pragma once
 #include "cuda.h"
 #include "cuda_fp16.h"
+#include "cuda_bf16.h"
 #include "cuda_runtime.h"
 #include "core/common/float16.h"
 
@@ -84,6 +85,28 @@ __device__ __forceinline__ void atomic_add(BFloat16* address, BFloat16 value) {
   } while (assumed != old);
 }
 
+__device__ __forceinline__ void atomic_add(__nv_bfloat16* address, __nv_bfloat16 value) {
+  unsigned int* base_address =
+      reinterpret_cast<unsigned int*>(reinterpret_cast<char*>(address) - (reinterpret_cast<size_t>(address) & 2));
+  unsigned int old = *base_address;
+  unsigned int assumed;
+  union {
+    __nv_bfloat16 val;
+    unsigned short raw;
+  } bsum;
+  do {
+    assumed = old;
+    bsum.raw = reinterpret_cast<size_t>(address) & 2 ? (old >> 16) : (old & 0xffff);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    bsum.val = __hadd(bsum.val, value);
+#else
+    bsum.val = __nv_bfloat16(float(bsum.val) + float(value));
+#endif
+    old = reinterpret_cast<size_t>(address) & 2 ? (old & 0xffff) | (static_cast<unsigned int>(bsum.raw) << 16) : (old & 0xffff0000) | bsum.raw;
+    old = atomicCAS(base_address, assumed, old);
+  } while (assumed != old);
+}
+
 // CUDA's atomic_add for half type is too slow. Using half2 will be much faster. To avoid address out of bound,
 // we need to pass in the numel so that the element at the edge can be handled separately.
 // Ideally we need to deprecate above atomic_add function and use below one for better performance.
@@ -137,6 +160,13 @@ class AtomicCasType<int8_t> {
 
 template <>
 class AtomicCasType<half> {
+ public:
+  using type = unsigned short int;
+  static const unsigned int mask = 0xffffu;
+};
+
+template <>
+class AtomicCasType<__nv_bfloat16> {
  public:
   using type = unsigned short int;
   static const unsigned int mask = 0xffffu;

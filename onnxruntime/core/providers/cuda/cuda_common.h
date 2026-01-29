@@ -70,9 +70,9 @@ class ToCudaType<MLFloat16> {
 template <>
 class ToCudaType<BFloat16> {
  public:
-  typedef BFloat16 MappedType;
+  typedef __nv_bfloat16 MappedType;
   static MappedType FromFloat(float f) {
-    return MappedType(f);
+    return __float2bfloat16(f);
   }
 };
 

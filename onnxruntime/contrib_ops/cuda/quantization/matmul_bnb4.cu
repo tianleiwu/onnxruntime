@@ -227,6 +227,18 @@ template bool TryMatMulBnb4<half>(
     int block_size,
     cudaStream_t stream);
 
+template bool TryMatMulBnb4<__nv_bfloat16>(
+    const __nv_bfloat16* quant_map,
+    __nv_bfloat16* output,
+    const __nv_bfloat16* a_data,
+    const uint8_t* b_data_quant,
+    const __nv_bfloat16* absmax,
+    int m,
+    int n,
+    int k,
+    int block_size,
+    cudaStream_t stream);
+
 template <>
 bool TryMatMulBnb4<BFloat16>(
     const BFloat16* quant_map,

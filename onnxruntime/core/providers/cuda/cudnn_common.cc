@@ -203,6 +203,15 @@ cudnnDataType_t CudnnTensor::GetDataType<BFloat16>() {
 }
 
 template <>
+cudnnDataType_t CudnnTensor::GetDataType<__nv_bfloat16>() {
+#if defined(CUDNN_VERSION) && CUDNN_VERSION >= 8200
+  return CUDNN_DATA_BFLOAT16;
+#else
+  ORT_THROW("cuDNN doesn't support BFloat16.");
+#endif
+}
+
+template <>
 cudnnDataType_t CudnnTensor::GetDataType<int8_t>() {
   return CUDNN_DATA_INT8;
 }
@@ -230,6 +239,9 @@ const float Consts<half>::One = 1;
 
 const float Consts<BFloat16>::Zero = 0;
 const float Consts<BFloat16>::One = 1;
+
+const float Consts<__nv_bfloat16>::Zero = 0;
+const float Consts<__nv_bfloat16>::One = 1;
 
 template <>
 const int8_t Consts<int8_t>::Zero = 0;
@@ -330,6 +342,11 @@ cudnn_frontend::DataType_t CudnnFeTensor::GetDataType<half>() {
 
 template <>
 cudnn_frontend::DataType_t CudnnFeTensor::GetDataType<BFloat16>() {
+  return cudnn_frontend::DataType_t::BFLOAT16;
+}
+
+template <>
+cudnn_frontend::DataType_t CudnnFeTensor::GetDataType<__nv_bfloat16>() {
   return cudnn_frontend::DataType_t::BFLOAT16;
 }
 

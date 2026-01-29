@@ -121,5 +121,17 @@ Status LaunchFastGeluKernel(const cudaDeviceProp& /*prop*/, cudaStream_t stream,
   return CUDA_CALL(cudaGetLastError());
 }
 
+template <>
+Status LaunchFastGeluKernel(const cudaDeviceProp& /*prop*/, cudaStream_t stream, int input_length, int bias_length,
+                            const __nv_bfloat16* input, const __nv_bfloat16* bias, __nv_bfloat16* output, bool /*use_half2*/) {
+  constexpr int blockSize = 256;
+  const int gridSize = (input_length + blockSize - 1) / blockSize;
+  FastGeluKernel<__nv_bfloat16, blockSize>
+      <<<gridSize, blockSize, 0, stream>>>(static_cast<__nv_bfloat16>(A), static_cast<__nv_bfloat16>(B), static_cast<__nv_bfloat16>(C),
+                                           input_length, bias_length, input, bias, output);
+
+  return CUDA_CALL(cudaGetLastError());
+}
+
 }  // namespace cuda
 }  // namespace onnxruntime

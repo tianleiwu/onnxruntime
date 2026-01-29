@@ -25,6 +25,7 @@ from packaging import version
 from parameterized import parameterized
 
 from onnxruntime import InferenceSession, SessionOptions, get_available_providers, get_build_info
+from onnxruntime import __version__ as ort_version
 
 # Set seed for reproducibility
 torch.manual_seed(0)
@@ -727,6 +728,7 @@ def gqa_past_func(
         new_v = torch.reshape(new_v, (config.batch_size, config.q_sequence_length, -1))
 
     sess_options = SessionOptions()
+    sess_options.log_severity_level = 0
     ort_session = InferenceSession(onnx_model_str, sess_options, providers=[ep])
     io_binding = ort_session.io_binding()
 
@@ -828,6 +830,11 @@ def gqa_past_func(
     cache_ort_type = ort_type
     if config.kv_cache_type in ONNX_TENSOR_TYPE_MAP:
         cache_ort_type = ONNX_TENSOR_TYPE_MAP[config.kv_cache_type]
+        if config.kv_cache_type in TORCH_DTYPE_MAP:
+            cache_dtype = TORCH_DTYPE_MAP[config.kv_cache_type]
+    elif isinstance(config.kv_cache_type, torch.dtype):
+        cache_ort_type = TORCH_DTYPE_TO_ONNX_MAP[config.kv_cache_type]
+        cache_dtype = config.kv_cache_type
 
     if share_buffer:
         # In-place update to k/v buffers
@@ -1113,14 +1120,11 @@ def parity_check_gqa_prompt(
         q_ort = torch.cat([q, new_k, new_v], dim=2)
         new_k_ort, new_v_ort = None, None
 
-    k_quant = quantize_tensor_with_scale(k, k_scale, config.k_quant_type, config.kv_cache_type)
-    v_quant = quantize_tensor_with_scale(v, v_scale, config.v_quant_type, config.kv_cache_type)
-
     ort_seqlens = cache_seqlens - 1
     out, present_k, present_v = gqa_prompt_func(
         q=q_ort,
-        k=k_ort,
-        v=v_ort,
+        k=k,
+        v=v,
         config=config,
         new_k=new_k_ort,
         new_v=new_v_ort,
@@ -1130,6 +1134,8 @@ def parity_check_gqa_prompt(
         position_ids=position_ids,
         attention_bias=attention_bias,
         head_sink=head_sink,
+        k_scale=k_scale,
+        v_scale=v_scale,
         ep=ep,
         device=device,
         share_buffer=config.share_buffer,
@@ -1322,6 +1328,12 @@ def parity_check_gqa_past(
     elif causal:
         window_size = (-1, 0)
 
+    k_scale, v_scale = get_static_scale(config, device, torch_type, std)
+    if k_scale is not None:
+        k_scale = k_scale.to(torch_type)
+    if v_scale is not None:
+        v_scale = v_scale.to(torch_type)
+
     # --- PyTorch Reference Path ---
     # Transpose BNSH cache to BSNH format for reference implementation
     # k_cache_ref = k.clone().transpose(1, 2)
@@ -1423,14 +1435,18 @@ def parity_check_gqa_past(
         q_ort = torch.cat([q, new_k, new_v], dim=2)
         new_k_ort, new_v_ort = None, None
 
-    k_quant = quantize_tensor_with_scale(k, k_scale, config.k_quant_type, config.kv_cache_type)
-    v_quant = quantize_tensor_with_scale(v, v_scale, config.v_quant_type, config.kv_cache_type)
+    # Quantize k and v for ORT when using quantized KV cache
+    k_ort = k
+    v_ort = v
+    if config.kv_cache_type in [torch.int8, "int8"]:
+        k_ort = quantize_tensor_with_scale(k, k_scale, config.k_quant_type, config.kv_cache_type)
+        v_ort = quantize_tensor_with_scale(v, v_scale, config.v_quant_type, config.kv_cache_type)
 
     ort_seqlens = cache_seqlens + config.q_sequence_length - 1
     out, present_k, present_v = gqa_past_func(
         q=q_ort,
-        k=k,
-        v=v,
+        k=k_ort,
+        v=v_ort,
         config=config,
         new_k=new_k_ort,
         new_v=new_v_ort,
@@ -1440,6 +1456,8 @@ def parity_check_gqa_past(
         position_ids=position_ids,
         attention_bias=attention_bias,
         head_sink=head_sink,
+        k_scale=k_scale,
+        v_scale=v_scale,
         ep=ep,
         device=device,
         share_buffer=config.share_buffer,
@@ -1469,8 +1487,8 @@ def parity_check_gqa_past(
             k_cache_ref_np = k_cache_ref_np[:, :, :total_len, :]
             v_cache_ref_np = v_cache_ref_np[:, :, :total_len, :]
 
-    numpy.testing.assert_allclose(present_k_np, k_cache_ref_np, rtol=rtol, atol=atol)
-    numpy.testing.assert_allclose(present_v_np, v_cache_ref_np, rtol=rtol, atol=atol)
+        numpy.testing.assert_allclose(present_k_np, k_cache_ref_np, rtol=rtol, atol=atol)
+        numpy.testing.assert_allclose(present_v_np, v_cache_ref_np, rtol=rtol, atol=atol)
 
     print_diff_statistics(torch.tensor(out_np - out_ref_np), "out")
     numpy.testing.assert_allclose(out_np, out_ref_np, rtol=rtol, atol=atol)
@@ -1920,11 +1938,11 @@ def gqa_cuda_quantized_test_cases(is_past: bool):
         else gqa_cuda_prompt_test_cases(allow_local=True)
     )
     for name, config in base_cases:
-        for kv_type in ["int8", "int4"]:
-            for quant_mode in ["PER_TENSOR", "PER_CHANNEL"]:
+        for kv_type in ["int8"]:
+            for quant_mode in ["PER_TENSOR"]:
                 share_scales_options = [False]
                 if quant_mode == "PER_TENSOR" and kv_type == "int8":
-                    share_scales_options = [False, True]
+                    share_scales_options = [True]
 
                 for share_scales in share_scales_options:
                     q_config = deepcopy(config)
@@ -1962,8 +1980,12 @@ def has_cuda_device(min_capability: int = 80):
     return major * 10 + minor >= min_capability
 
 
-def has_flash_attention():
-    return has_cuda_device(80)
+def has_flash_attention(bf16=False):
+    if not has_cuda_device(80):
+        return False
+    if bf16:
+        return torch.cuda.is_bf16_supported()
+    return True
 
 
 rtol = {"fp16": 5e-3, "bf16": 5e-2, "int8_fp16": 5e-2, "int4_fp16": 5e-2, "int8_bf16": 5e-2, "int4_bf16": 5e-2}

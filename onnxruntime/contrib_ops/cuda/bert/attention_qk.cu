@@ -105,6 +105,21 @@ template Status CopyQK(cudaStream_t stream,
                        const BFloat16* input,
                        BFloat16* output);
 
+template Status CopyQK<__nv_bfloat16, float>(cudaStream_t stream,
+                                             const int qk_size,
+                                             const __nv_bfloat16* input,
+                                             float* output);
+
+template Status CopyQK<float, __nv_bfloat16>(cudaStream_t stream,
+                                             const int qk_size,
+                                             const float* input,
+                                             __nv_bfloat16* output);
+
+template Status CopyQK(cudaStream_t stream,
+                       const int qk_size,
+                       const __nv_bfloat16* input,
+                       __nv_bfloat16* output);
+
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime

@@ -59,7 +59,8 @@ KVQuantizationType StringToKVQuantizationType(const std::string& s) {
 
 REGISTER_KERNEL_TYPED(MLFloat16, MLFloat16)
 REGISTER_KERNEL_TYPED(BFloat16, BFloat16)
-REGISTER_KERNEL_TYPED(MLFloat16, INT8)
+REGISTER_KERNEL_TYPED(MLFloat16, int8_t)
+REGISTER_KERNEL_TYPED(BFloat16, int8_t)
 
 constexpr const char* kDisableFlashDecode = "ORT_DISABLE_FLASH_DECODE";
 
@@ -94,7 +95,7 @@ GroupQueryAttention<T, U>::GroupQueryAttention(const OpKernelInfo& info)
   k_quant_type_ = StringToKVQuantizationType(info.GetAttrOrDefault<std::string>("k_quant_type", "NONE"));
   v_quant_type_ = StringToKVQuantizationType(info.GetAttrOrDefault<std::string>("v_quant_type", "NONE"));
 
-  enable_xqa_ = std::is_same_v<T, MLFloat16> && ParseEnvironmentVariableWithDefault<int>("ORT_ENABLE_XQA", 0) != 0;
+  enable_xqa_ = (std::is_same_v<T, MLFloat16> || std::is_same_v<T, BFloat16>) && ParseEnvironmentVariableWithDefault<int>("ORT_ENABLE_XQA", 0) != 0;
 
   kernel_options_ = this->GetAttentionKernelOptions();
 
@@ -127,7 +128,7 @@ GroupQueryAttention<T, U>::GroupQueryAttention(const OpKernelInfo& info)
 // 10. attention_bias   (Tensor) - Not supported in this kernel
 // 11. head_sink        (Tensor) - Attention sink for GPT-OSS
 template <typename T, typename U>
-GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) const {
+Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) const {
   const Tensor* query = context->Input<Tensor>(0);
   const Tensor* key = context->Input<Tensor>(1);
   const Tensor* value = context->Input<Tensor>(2);
@@ -219,6 +220,7 @@ GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) const {
   parameters.zero_ptr = zeros_.get();
   parameters.k_quant_type = k_quant_type_;
   parameters.v_quant_type = v_quant_type_;
+  parameters.kv_cache_bit_width = sizeof(CudaU) * 8;
   parameters.do_rotary = do_rotary_;
   parameters.rotary_interleaved = rotary_interleaved_;
 
@@ -514,8 +516,8 @@ GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) const {
 
   cublasHandle_t cublas = GetCublasHandle(context);
 
-  ORT_RETURN_IF_ERROR(QkvToContext<CudaT>(
-      device_prop, cublas, context->GetComputeStream(), parameters, data));
+  ORT_RETURN_IF_ERROR((QkvToContext<CudaT, CudaU>(
+      device_prop, cublas, context->GetComputeStream(), parameters, data)));
   return Status::OK();
 }
 

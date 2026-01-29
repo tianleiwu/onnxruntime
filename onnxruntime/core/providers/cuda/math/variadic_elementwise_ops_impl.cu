@@ -133,7 +133,7 @@ void Impl_NoBroadcastInputBatch(
   SPECIALIZE_IMPL(half, VariadicElementwiseOpTag)     \
   SPECIALIZE_IMPL(float, VariadicElementwiseOpTag)    \
   SPECIALIZE_IMPL(double, VariadicElementwiseOpTag)   \
-  SPECIALIZE_IMPL(BFloat16, VariadicElementwiseOpTag)
+  SPECIALIZE_IMPL(__nv_bfloat16, VariadicElementwiseOpTag)
 
 #define SPECIALIZE_IMPL_UZILHFD(VariadicElementwiseOpTag) \
   SPECIALIZE_IMPL(uint32_t, VariadicElementwiseOpTag)     \

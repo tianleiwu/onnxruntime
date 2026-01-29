@@ -15,13 +15,13 @@ namespace onnxruntime {
 namespace contrib {
 namespace cuda {
 
-template <typename T>
+template <typename T, typename U>
 Status QkvToContext(
     const cudaDeviceProp& device_prop,
     cublasHandle_t& cublas,
     Stream* stream,
     contrib::GroupQueryAttentionParameters& parameters,
-    GroupQueryAttentionData<T>& data);
+    GroupQueryAttentionData<T, U>& data);
 
 template <typename T, bool output_bnsh>
 Status LaunchUnpackQKV(const T* packed_qkv, T* unpacked_q, T* unpacked_k, T* unpacked_v, const int num_heads,
@@ -86,9 +86,13 @@ struct GQABufferRequirements {
       // - we generally only need Q buffer (for rotary Q) if we can write K/V directly to cache/output.
 
       if (params.do_rotary || params.is_packed_qkv) {
-        // Just Q buffer needed for rotation/unpacking.
-        // K and V are written directly to present_key/value (unpacked/rotated/quantized/appended).
-        req.qkv_buffer_bytes = elem_size * q_elements;
+        // Just Q buffer needed for rotation/unpacking if not quantizing.
+        // If quantizing, we need K and V too for the float Flash Attention run.
+        if (params.k_quant_type != KVQuantizationType::NONE || params.v_quant_type != KVQuantizationType::NONE) {
+          req.qkv_buffer_bytes = elem_size * (q_elements + k_elements + v_elements);
+        } else {
+          req.qkv_buffer_bytes = elem_size * q_elements;
+        }
       }
     } else if (use_memory_efficient_attention) {
       // Memory Efficient Attention path:

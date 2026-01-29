@@ -365,13 +365,15 @@ template Status QkvToContext<half>(
     contrib::PagedAttentionParameters& parameters,
     PagedAttentionData<half>& data);
 
-template struct PagedAttentionData<BFloat16>;
-template Status QkvToContext<BFloat16>(
+// Removed redundant BFloat16 instantiation
+
+template struct PagedAttentionData<__nv_bfloat16>;
+template Status QkvToContext<__nv_bfloat16>(
     const cudaDeviceProp& device_prop,
     cublasHandle_t& cublas,
     Stream* ort_stream,
     contrib::PagedAttentionParameters& parameters,
-    PagedAttentionData<BFloat16>& data);
+    PagedAttentionData<__nv_bfloat16>& data);
 
 }  // namespace cuda
 }  // namespace contrib
