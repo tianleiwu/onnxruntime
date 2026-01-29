@@ -288,14 +288,19 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
   IAllocatorUniquePtr<void> xqa_scratch_buffer;
   if (enable_xqa_) {
     int group_size = parameters.num_heads / parameters.kv_num_heads;
+    bool is_bf16 = std::is_same<T, BFloat16>::value;
+    bool is_h64_supported = !is_bf16 || parameters.head_size != 64;
+
     bool is_int8_quantized_supported = (k_quant_type_ == KVQuantizationType::PER_TENSOR &&
                                         v_quant_type_ == KVQuantizationType::PER_TENSOR &&
                                         data.k_scale == data.v_scale &&  // XQA requires k_scale and v_scale to be the same. Here requires k_scale and v_scale are same tensor.
-                                        (parameters.head_size == 128 || parameters.head_size == 64) &&
+                                        (parameters.head_size == 256 || parameters.head_size == 128 || parameters.head_size == 64) &&
+                                        is_h64_supported &&
                                         (group_size == 8 || group_size == 16 || group_size == 32));
 
     bool is_non_quantized_supported = !is_inputs_quantized &&
-                                      (parameters.head_size == 128 || parameters.head_size == 64) &&
+                                      (parameters.head_size == 256 || parameters.head_size == 128 || parameters.head_size == 64) &&
+                                      is_h64_supported &&
                                       (64 % group_size == 0);
 
     data.use_xqa = !parameters.is_first_prompt &&

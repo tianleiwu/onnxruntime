@@ -9,6 +9,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
 # -------------------------------------------------------------------------
+import gc
 import math
 import os
 import platform
@@ -1998,6 +1999,12 @@ def has_quantized_kv_cache():
 
 @unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
 class TestFlashGQA(unittest.TestCase):
+    def tearDown(self):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        gc.collect()
+
     @parameterized.expand(gqa_cuda_prompt_test_cases())
     def test_gqa_prompt_flash_attention(self, name, config):
         if enable_debug_print:
@@ -2037,6 +2044,12 @@ class TestFlashGQA(unittest.TestCase):
 
 @unittest.skipIf(not has_flash_attention(bf16=True), "Flash Attention is not available, skipping tests.")
 class TestFlashGQABF16(unittest.TestCase):
+    def tearDown(self):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        gc.collect()
+
     @parameterized.expand(gqa_cuda_prompt_test_cases())
     def test_gqa_prompt_flash_attention_bf16(self, name, config):
         if not torch.cuda.is_bf16_supported():
@@ -2087,6 +2100,12 @@ class TestFlashGQABF16(unittest.TestCase):
     "Flash Attention is not available, skipping tests.",
 )
 class TestFlashGQABF16QuantizedKV(unittest.TestCase):
+    def tearDown(self):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        gc.collect()
+
     @parameterized.expand(gqa_cuda_quantized_test_cases(is_past=False))
     def test_gqa_quantized_prompt_bf16(self, name, config):
         if enable_debug_print:
@@ -2265,6 +2284,12 @@ def fused_kernel_test_cases():
 class TestFusedKernelParity(unittest.TestCase):
     """Tests that verify fused kernels produce the same results as unfused kernels."""
 
+    def tearDown(self):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        gc.collect()
+
     @parameterized.expand(fused_kernel_test_cases())
     def test_fused_kv_parity(self, name, config):
         """Test ORT_DISABLE_FUSED_KV: fused vs unfused KV append kernels."""
@@ -2315,7 +2340,9 @@ def gqa_xqa_test_cases():
             for past_kv_sequence_length in [1, 4]:
                 for rotary in [False, True]:
                     for packed in [False, True]:
-                        for head_size in [128, 64] if not quick_build else [128]:
+                        for head_size in [256, 128, 64]:
+                            if torch_type == torch.bfloat16 and head_size == 64:
+                                continue
                             kv_num_heads = 4
                             num_heads = kv_num_heads * group_size
                             config = GQAConfig(
@@ -2335,18 +2362,25 @@ def gqa_xqa_test_cases():
                                 kv_cache_type=torch.int8,
                                 share_kv_scale=True,
                             )
-                        type_str = "bf16" if torch_type == torch.bfloat16 else "fp16"
-                        rot_str = "rot" if rotary else "norot"
-                        pkd_str = "pkd" if packed else "sep"
-                        name = (
-                            f"{type_str}_g_{group_size}_h{head_size}_past{past_kv_sequence_length}_{rot_str}_{pkd_str}"
-                        )
-                        yield name, config, torch_type, ort_type
+                            type_str = "bf16" if torch_type == torch.bfloat16 else "fp16"
+                            rot_str = "rot" if rotary else "norot"
+                            pkd_str = "pkd" if packed else "sep"
+                            name = (
+                                f"{type_str}_g_{group_size}_h{head_size}_past{past_kv_sequence_length}_{rot_str}_{pkd_str}"
+                            )
+                            yield name, config, torch_type, ort_type
 
 
 @unittest.skipIf(not enable_quantized_kv_tests, "Quantized KV is not enabled, skipping tests.")
 class TestXQAQuantizedParity(unittest.TestCase):
     """Tests that verify fused kernels produce the same results as unfused kernels."""
+
+    def tearDown(self):
+        """Clear CUDA cache after each test to prevent memory corruption in batch runs."""
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        gc.collect()
 
     @parameterized.expand(gqa_xqa_test_cases())
     def test_xqa_quantized_parity(self, name, config, torch_type, ort_type):

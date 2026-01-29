@@ -5,3 +5,33 @@
 #define HEAD_DIM_NAMESPACE H64
 
 #include "xqa_loader_bf16_impl.cuh"
+
+namespace onnxruntime {
+namespace contrib {
+namespace cuda {
+
+// Explicit instantiation for BFloat16
+template Status HEAD_DIM_NAMESPACE::LaunchXQAKernelImpl<BFloat16>(
+    const cudaDeviceProp& device_prop,
+    cudaStream_t stream,
+    const void* query,
+    const void* key_cache,
+    const void* value_cache,
+    void* output,
+    const int batch_size,
+    const int num_heads,
+    const int kv_num_heads,
+    const int head_size,
+    const int actual_seq_len,
+    const int max_seq_len,
+    const float scale,
+    const bool is_bsnh,
+    const int* seq_lens,
+    const float* kv_cache_scale,
+    const int kv_quant_type,
+    void* workspace,
+    size_t workspace_size);
+
+}  // namespace cuda
+}  // namespace contrib
+}  // namespace onnxruntime

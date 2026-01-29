@@ -71,6 +71,37 @@ size_t GetXQAScratchSize(
     int max_seq_len);
 }  // namespace H64
 
+namespace H256 {
+template <typename T>
+Status LaunchXQAKernelImpl(
+    const cudaDeviceProp& device_prop,
+    cudaStream_t stream,
+    const void* query,
+    const void* key_cache,
+    const void* value_cache,
+    void* output,
+    const int batch_size,
+    const int num_heads,
+    const int kv_num_heads,
+    const int head_size,
+    const int actual_seq_len,
+    const int max_seq_len,
+    const float scale,
+    const bool is_bsnh,
+    const int* seq_lens,
+    const float* kv_cache_scale,
+    const int kv_quant_type,
+    void* workspace,
+    size_t workspace_size);
+
+size_t GetXQAScratchSize(
+    const cudaDeviceProp& device_prop,
+    int batch_size,
+    int num_heads,
+    int kv_num_heads,
+    int max_seq_len);
+}  // namespace H256
+
 // Dispatcher Implementation
 template <typename T>
 Status LaunchXQAKernel(
@@ -93,7 +124,11 @@ Status LaunchXQAKernel(
     const int kv_quant_type,
     void* workspace,
     size_t workspace_size) {
-  if (head_size == 128) {
+  if (head_size == 256) {
+    return H256::LaunchXQAKernelImpl<T>(
+        device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size,
+        actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, kv_quant_type, workspace, workspace_size);
+  } else if (head_size == 128) {
     return H128::LaunchXQAKernelImpl<T>(
         device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size,
         actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, kv_quant_type, workspace, workspace_size);
@@ -102,7 +137,7 @@ Status LaunchXQAKernel(
         device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size,
         actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, kv_quant_type, workspace, workspace_size);
   } else {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "XQA only supports head_size=64 or 128. Input has ", head_size);
+    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "XQA only supports head_size=64, 128, or 256. Input has ", head_size);
   }
 }
 
