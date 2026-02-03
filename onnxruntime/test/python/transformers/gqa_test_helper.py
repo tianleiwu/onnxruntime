@@ -4,10 +4,12 @@
 # --------------------------------------------------------------------------
 
 import math
-import torch
+
 import numpy
+import torch
 from onnx import TensorProto, helper
-from onnxruntime import InferenceSession, SessionOptions
+
+from onnxruntime import InferenceSession
 from onnxruntime.transformers.io_binding_helper import CudaSession
 
 # --- Quantization Helpers (from test_gqa.py) ---
@@ -45,6 +47,7 @@ NUMPY_DTYPE_MAP = {
     "int4": numpy.uint8,
 }
 
+
 def get_q_range(q_type_str):
     q_type_str = str(q_type_str)
     if q_type_str.endswith("int8"):
@@ -53,12 +56,14 @@ def get_q_range(q_type_str):
         return -8, 7
     raise ValueError(f"Unsupported quantization type for range: {q_type_str}")
 
+
 def pack_int4(tensor_int8):
     assert tensor_int8.shape[-1] % 2 == 0
     t_low = tensor_int8[..., 0::2] + 8
     t_high = tensor_int8[..., 1::2] + 8
     packed = (t_low & 0x0F) | (t_high << 4)
     return packed.to(torch.uint8)
+
 
 def unpack_int4(packed_tensor_uint8):
     t_low = (packed_tensor_uint8 & 0x0F) - 8
@@ -71,6 +76,7 @@ def unpack_int4(packed_tensor_uint8):
     unpacked[..., 0::2] = t_low
     unpacked[..., 1::2] = t_high
     return unpacked
+
 
 def compute_scale(tensor_float, quant_type, q_type_str):
     if quant_type == "NONE":
@@ -93,6 +99,7 @@ def compute_scale(tensor_float, quant_type, q_type_str):
 
     raise ValueError(f"Unsupported quant_type: {quant_type}")
 
+
 def dequantize_tensor(quantized_tensor, scale, quant_type, q_type_str):
     if quant_type == "NONE":
         return quantized_tensor
@@ -107,6 +114,7 @@ def dequantize_tensor(quantized_tensor, scale, quant_type, q_type_str):
         unpacked_tensor = unpack_int4(quantized_tensor)
 
     return unpacked_tensor.to(torch.float32) * scale
+
 
 def quantize_tensor_with_scale(tensor_float, scale, quant_type, q_type_str):
     """Quantizes a tensor using a provided scale."""
@@ -125,7 +133,8 @@ def quantize_tensor_with_scale(tensor_float, scale, quant_type, q_type_str):
     return quantized
 
 
-# --- Classes from test_sparse_attention.py ---
+# --- Classes moved from test_sparse_attention.py ---
+
 
 class AttentionConfig:
     def __init__(
@@ -507,6 +516,7 @@ def create_group_query_attention_onnx_model(config: GroupQueryAttentionConfig):
     model = helper.make_model(graph)
     return model.SerializeToString()
 
+
 def create_gqa_ort_session(
     config: GroupQueryAttentionConfig, session_options=None, enable_cuda_graph=False
 ) -> CudaSession:
@@ -532,6 +542,7 @@ def create_gqa_ort_session(
         cuda_session.set_buffer_sharing(input_name, output_name)
 
     return cuda_session
+
 
 class OrtGroupQueryAttention:
     """A wrapper of ORT GroupQueryAttention to test relevance and performance."""

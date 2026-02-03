@@ -325,29 +325,35 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
     data.use_xqa = (is_non_quantized_supported || is_int8_quantized_supported);
 
     if (data.use_xqa) {
-      size_t xqa_scratch_bytes = onnxruntime::contrib::cuda::GetXQAScratchSize(
+      size_t xqa_internal_bytes = onnxruntime::contrib::cuda::GetXQAScratchSize(
           GetDeviceProp(),
           parameters.batch_size,
           parameters.num_heads,
           parameters.kv_num_heads,
-          parameters.seqlen_present_kv_cache);
-      if (xqa_scratch_bytes > 0) {
-        // Calculate additional scratch needed for manual RoPE/Append in ExtremeDecoding
+          parameters.head_size,
+          parameters.seqlen_present_kv_cache,
+          parameters.k_quant_type != KVQuantizationType::NONE ? 1 : 0,
+          std::is_same<T, BFloat16>::value);
+      assert(xqa_internal_bytes > 0);
+      // Calculate additional scratch needed for manual RoPE/Append in ExtremeDecoding
+      size_t xqa_total_bytes = xqa_internal_bytes;
+      if (parameters.do_rotary) {
+        // 1. Q_rotated buffer: B * N * H * sizeof(T) (if rotary)
+        // 2. K_rotated buffer: B * Nk * H * sizeof(T) (if rotary)
+        size_t element_size = sizeof(CudaT);
+        size_t q_bytes = parameters.batch_size * parameters.num_heads * parameters.head_size * element_size;
+        size_t k_bytes = parameters.batch_size * parameters.kv_num_heads * parameters.head_size * element_size;
+        q_bytes = (q_bytes + 255) / 256 * 256;
+        k_bytes = (k_bytes + 255) / 256 * 256;
+        xqa_total_bytes += q_bytes + k_bytes;
+      }
 
-        if (parameters.do_rotary) {
-          // 1. Q_rotated buffer: B * N * H * sizeof(T) (if rotary)
-          // 2. K_rotated buffer: B * Nk * H * sizeof(T) (if rotary)
-          size_t element_size = sizeof(CudaT);
-          size_t q_bytes = parameters.batch_size * parameters.num_heads * parameters.head_size * element_size;
-          size_t k_bytes = parameters.batch_size * parameters.kv_num_heads * parameters.head_size * element_size;
-          q_bytes = (q_bytes + 255) / 256 * 256;
-          k_bytes = (k_bytes + 255) / 256 * 256;
-          xqa_scratch_bytes += q_bytes + k_bytes;
-        }
+      xqa_scratch_buffer = this->GetScratchBuffer<void>(xqa_total_bytes, context->GetComputeStream());
+      data.xqa_buffer = xqa_scratch_buffer.get();
+      data.xqa_buffer_bytes = xqa_internal_bytes;
 
-        xqa_scratch_buffer = this->GetScratchBuffer<void>(xqa_scratch_bytes, context->GetComputeStream());
-        data.xqa_buffer = xqa_scratch_buffer.get();
-        data.xqa_buffer_bytes = xqa_scratch_bytes;
+      if (parameters.do_rotary) {
+        data.qkv_buffer = reinterpret_cast<CudaT*>(reinterpret_cast<char*>(data.xqa_buffer) + xqa_internal_bytes);
       }
     }
   }

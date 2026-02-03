@@ -41,7 +41,10 @@ size_t GetXQAScratchSize(
     int batch_size,
     int num_heads,
     int kv_num_heads,
-    int max_seq_len);
+    int head_size,
+    int max_seq_len,
+    int kv_quant_type,  // 0=FP16/BF16, 1=INT8
+    bool is_bf16 = false);
 
 }  // namespace cuda
 }  // namespace contrib

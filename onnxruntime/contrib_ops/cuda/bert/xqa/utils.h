@@ -275,7 +275,7 @@ class MemSegmenter {
   // to use TinyPtr, alignment must be sizeof(T)
   template <typename T>
   HOST_DEVICE_FUNC TinyPtr<AddConst<T, isConst>> newSeg(uint32_t count = 1, uint32_t alignment = sizeof(T)) {
-    assert(reinterpret_cast<uintptr_t>(mBase) % alignment == 0);
+    assert(reinterpret_cast<uintptr_t>(mBase) % alignof(T) == 0);
     OffsetInt const offset = mSegmenter.template newSeg<T>(count, alignment);
     return TinyPtr<AddConst<mha::byte, isConst>>{mBase, offset}.template cast<AddConst<T, isConst>>();
   }

@@ -89,7 +89,8 @@ struct TypeConverter<__nv_bfloat16> {
 // INT8: head_size bytes per head
 // ============================================================================
 
-// Dequantization Kernel for KV cache.
+// Dequantization Kernel: Converts Quantized (Int8/Int4) KV cache back to Floating Point (T).
+// Iterates over every individual element with one thread per element.
 template <typename T, typename T_QUANT, typename T_SCALE>
 __global__ void DequantizeKernel(T* dequantized_data,
                                  const T_QUANT* quantized_data,
@@ -100,6 +101,7 @@ __global__ void DequantizeKernel(T* dequantized_data,
                                  KVQuantizationType quant_type,
                                  bool is_input_bsnh) {
   int64_t total_elements = static_cast<int64_t>(batch_size) * num_heads * cache_sequence_length * head_size;
+  // For BIT_WIDTH=4, each T_QUANT (uint8) holds 2 elements.
   int elements_per_head_packed = (bit_width == 4) ? (head_size + 1) / 2 : head_size;
 
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < total_elements;
@@ -128,10 +130,7 @@ __global__ void DequantizeKernel(T* dequantized_data,
       int64_t scale_idx = static_cast<int64_t>(n) * head_size + h;
       scale_val = static_cast<float>(scale[scale_idx]);
     }
-
     float quantized_float;
-    // The input quantized_data is indexed by the actual cache sequence length (cache_sequence_length = cache_sequence_length)
-    // not the output sequence length.
     int64_t input_idx = static_cast<int64_t>(b) * num_heads * cache_sequence_length * elements_per_head_packed +
                         static_cast<int64_t>(n) * cache_sequence_length * elements_per_head_packed +
                         static_cast<int64_t>(s) * elements_per_head_packed +
@@ -180,7 +179,9 @@ Status LaunchDequantizeKV(cudaStream_t stream, T* dequantized_data,
   return CUDA_CALL(cudaGetLastError());
 }
 
-// Quantization Kernel for KV cache.
+// Quantization Kernel: Converts Floating Point (T) cache to Quantized (Int8/Int4) values.
+// Note: This kernel is used to quantize a full input tensor, e.g. during graph initialization
+// or fallback paths. The main prompt path uses the fused UnpackRoPEAppend kernel.
 template <typename T, typename T_QUANT, typename T_SCALE>
 __global__ void QuantizeKernel(T_QUANT* quantized_data,
                                const T* dequantized_data, const T_SCALE* scale,
@@ -192,6 +193,7 @@ __global__ void QuantizeKernel(T_QUANT* quantized_data,
                                int bit_width, KVQuantizationType quant_type,
                                bool is_input_bsnh,
                                bool is_output_bsnh) {
+  // elements_per_head_packed is the number of BYTES occupied by head_size elements.
   int elements_per_head_packed = (bit_width == 4) ? (head_size + 1) / 2 : head_size;
 
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < total_packed_elements;

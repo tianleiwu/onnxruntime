@@ -19,10 +19,18 @@ namespace cuda {
 // Fused kernel: Unpack QKV + Apply RoPE to Q and K + Append K/V directly to cache + Quantize if needed
 //
 // This kernel performs the following:
-// 1. Unpacks Q, K, V from input tensor(s).
-// 2. Applies Rotary Positional Embedding (RoPE) to Q and K.
-// 3. Appends K and V to the KV cache, performing on-the-fly quantization (Int8/Int4) if configured.
-// 4. Writes the rotated Q back to global memory (for subsequent Flash Attention).
+// 1. Unpacks Q, K, V from input tensor(s). The input can be a single packed QKV tensor
+//    or three separate Q, K, V tensors.
+// 2. Applies Rotary Positional Embedding (RoPE) to Q and K if rotary_dim > 0.
+// 3. Appends K and V to the KV cache at the correct sequence index (past_seq_len + s).
+//    - Performs on-the-fly quantization (Int8 or Int4) if configured (BIT_WIDTH < 16).
+//    - Supports both BNSH and BSNH layouts for the KV cache.
+// 4. Writes the rotated Q back to global memory (unpacked_q) for the subsequent attention kernel.
+//
+// Template Parameters:
+// - T: The floating point type (half or BFloat16).
+// - BIT_WIDTH: The bit width for KV cache quantization (16=none, 8=Int8, 4=Int4).
+// - MAX_HEAD_SIZE: Maximum supported head size, used for shared memory allocation.
 template <typename T, int BIT_WIDTH = 16, int MAX_HEAD_SIZE = 256>
 __global__ void UnpackRoPEAppend(
     const T* packed_qkv,
@@ -50,10 +58,15 @@ __global__ void UnpackRoPEAppend(
   using LoadT = float4;
   constexpr int elements_per_thread = sizeof(LoadT) / sizeof(T);
 
+  // Determine grid coordinates:
+  // - s: current sequence index (within the new tokens batch)
+  // - head_idx: global head index (0 to num_heads + 2*kv_num_heads - 1)
+  // - b: batch index
   const int s = blockIdx.x;
   const int head_idx = blockIdx.y;
   const int b = blockIdx.z;
   const int tid = threadIdx.x;
+  // h: the starting channel index for this thread (multiple elements per thread via LoadT)
   const int h = tid * elements_per_thread;
 
   // Guard work with 'valid' instead of early return to ensure all threads reach __syncthreads()
@@ -61,16 +74,16 @@ __global__ void UnpackRoPEAppend(
 
   const int q_hidden = num_heads * head_size;
   const int k_hidden = kv_num_heads * head_size;
-  const int sequence_length = gridDim.x;
+  const int sequence_length = gridDim.x;  // Number of new tokens in this launch
 
   __shared__ T shared_head[MAX_HEAD_SIZE];
 
-  // Determine Head Type and Offset within hidden dimension
+  // Determine Head Type and Offset within the packed hidden dimension [Q, K, V]
   enum HeadType { QUERY,
                   KEY,
                   VALUE };
   HeadType head_type;
-  int n;  // Index within its specific type
+  int n;  // Index relative to its specific type
   int offset_in_hidden;
 
   if (head_idx < num_heads) {
@@ -115,8 +128,9 @@ __global__ void UnpackRoPEAppend(
     }
   }
 
-  // 2. Process RoPE
-  // Optimization: Only use shared memory for non-interleaved mode
+  // 2. Process RoPE (Rotary Positional Embedding)
+  // Non-interleaved RoPE requires full head visibility to pair channels (h, h + d/2).
+  // We use shared memory as a staging buffer to allow any thread to access its pair.
   const bool is_qk = (head_type == QUERY || head_type == KEY);
   if (valid && rotary_dim > 0 && is_qk && !interleaved) {
     T* shared_ptr = &shared_head[h];
@@ -124,12 +138,13 @@ __global__ void UnpackRoPEAppend(
   }
 
   // CRITICAL: Barrier must be outside the 'if(valid)' and 'if(is_qk)' blocks
-  // to ensure every thread in the block participates.
+  // to ensure every thread in the block participates and shared memory is ready.
   __syncthreads();
 
   if (valid && rotary_dim > 0 && is_qk) {
     const int past_seq_len = past_seq_lens[b];
     const int64_t pos_base = static_cast<int64_t>(b) * sequence_length;
+    // Calculate global position for RoPE: use position_ids if provided, else rely on past_seq_len.
     int pos_id = (position_ids != nullptr) ? static_cast<int>(position_ids[pos_base + s]) : (past_seq_len + s);
     const int h_idx = h / elements_per_thread;
 
@@ -142,16 +157,18 @@ __global__ void UnpackRoPEAppend(
         0);
   }
 
-  // 3. Store results back to Global Memory
+  // 3. Store results back to Global Memory (Unpacked Q and Quantized KV Cache)
   if (valid) {
     if (head_type == QUERY) {
       if (unpacked_q != nullptr) {
+        // Store rotated Q to global memory for the Attention kernel
         const int64_t q_out_idx = static_cast<int64_t>(b) * sequence_length * q_hidden +
                                   static_cast<int64_t>(s) * q_hidden +
                                   static_cast<int64_t>(n) * head_size + h;
         reinterpret_cast<LoadT*>(unpacked_q)[q_out_idx / elements_per_thread] = *reinterpret_cast<LoadT*>(vals);
       }
     } else {
+      // Store K or V into the KV cache at index (past_seqlen + s)
       const int cache_s = past_seq_lens[b] + s;
       if (cache_s < max_seqlen) {
         void* cache_ptr = (head_type == KEY) ? k_cache : v_cache;
@@ -159,41 +176,49 @@ __global__ void UnpackRoPEAppend(
           int64_t cache_idx;
           if (is_cache_bnsh) {
             // BNSH layout: [Batch, NumHeads, SeqLen, HeadSize]
-            cache_idx = static_cast<int64_t>(b) * kv_num_heads * max_seqlen * head_size +
-                        static_cast<int64_t>(n) * max_seqlen * head_size +
-                        static_cast<int64_t>(cache_s) * head_size +
-                        h;
+            // Note: For BIT_WIDTH=4, head_size refers to the number of UNPACKED elements.
+            // stride_s is the number of bytes occupied by head_size elements.
+            const int64_t stride_s = (BIT_WIDTH == 4) ? (head_size / 2) : head_size;
+            const int64_t stride_n = max_seqlen * stride_s;
+            const int64_t stride_b = kv_num_heads * stride_n;
+            cache_idx = static_cast<int64_t>(b) * stride_b +
+                        static_cast<int64_t>(n) * stride_n +
+                        static_cast<int64_t>(cache_s) * stride_s +
+                        (BIT_WIDTH == 4 ? h / 2 : h);
           } else {
             // BSNH layout: [Batch, SeqLen, NumHeads, HeadSize]
-            cache_idx = static_cast<int64_t>(b) * max_seqlen * kv_num_heads * head_size +
-                        static_cast<int64_t>(cache_s) * kv_num_heads * head_size +
-                        static_cast<int64_t>(n) * head_size +
-                        h;
+            const int64_t stride_n = (BIT_WIDTH == 4) ? (head_size / 2) : head_size;
+            const int64_t stride_s = kv_num_heads * stride_n;
+            const int64_t stride_b = max_seqlen * stride_s;
+            cache_idx = static_cast<int64_t>(b) * stride_b +
+                        static_cast<int64_t>(cache_s) * stride_s +
+                        static_cast<int64_t>(n) * stride_n +
+                        (BIT_WIDTH == 4 ? h / 2 : h);
           }
 
           if constexpr (BIT_WIDTH == 16 || BIT_WIDTH == 32) {
+            // No quantization: direct store
             reinterpret_cast<LoadT*>(cache_ptr)[cache_idx / elements_per_thread] = *reinterpret_cast<LoadT*>(vals);
           } else if constexpr (BIT_WIDTH == 8) {
+            // Int8 Quantization: 1 element per byte
             const float* scale_buffer = (head_type == KEY) ? k_scale : v_scale;
             uint64_t packed = 0;
             for (int i = 0; i < elements_per_thread; ++i) {
-              float scale_val = per_channel ? scale_buffer[n * head_size + h + i] : scale_buffer[0];
-              float inv_s = (scale_val == 0.0f) ? 0.0f : 1.0f / scale_val;
+              float sc = per_channel ? scale_buffer[n * head_size + h + i] : scale_buffer[0];
+              float inv_s = (sc == 0.0f) ? 0.0f : 1.0f / sc;
               int8_t q = static_cast<int8_t>(max(-128.0f, min(127.0f, rintf(static_cast<float>(vals[i]) * inv_s))));
               packed |= (static_cast<uint64_t>(static_cast<uint8_t>(q)) << (i * 8));
             }
-            reinterpret_cast<uint64_t*>(cache_ptr)[cache_idx / elements_per_thread] = packed;
+            // Store 8 elements (8 bytes) at once
+            reinterpret_cast<uint64_t*>(cache_ptr)[cache_idx / 8] = packed;
           } else if constexpr (BIT_WIDTH == 4) {
+            // Int4 Quantization: 2 elements per byte
             constexpr float kInt4Min = -8.0f;
             constexpr float kInt4Max = 7.0f;
             const float* scale_buffer = (head_type == KEY) ? k_scale : v_scale;
-            // Pack 8 4-bit values into one 32-bit integer (each thread handles 8 elements, i.e., 4 float4 loads? No, loop is i < 4)
-            // Loop runs 4 times. 'vals' has elements_per_thread = 8 (for half).
-            // Actually, let's verify assumptions.
-            // If T=half, elements_per_thread=8. Loop i=0..3 handles 4 pairs = 8 elements. Correct.
-            // Packing: 2 4-bit values -> 1 uint8. 4 uint8s -> 1 uint32.
             uint32_t packed = 0;
             for (int i = 0; i < 4; ++i) {
+              // Elements are paired as (0,1), (2,3), etc. into single bytes.
               float s0 = per_channel ? scale_buffer[n * head_size + h + i * 2] : scale_buffer[0];
               float s1 = per_channel ? scale_buffer[n * head_size + h + i * 2 + 1] : scale_buffer[0];
               int8_t q0 = static_cast<int8_t>(max(kInt4Min, min(kInt4Max, rintf(static_cast<float>(vals[i * 2]) * (s0 == 0 ? 0 : 1.0f / s0)))));
@@ -201,7 +226,8 @@ __global__ void UnpackRoPEAppend(
               uint8_t p = ((q0 + 8) & 0x0F) | (((q1 + 8) & 0x0F) << 4);
               packed |= (static_cast<uint32_t>(p) << (i * 8));
             }
-            reinterpret_cast<uint32_t*>(cache_ptr)[cache_idx / elements_per_thread] = packed;
+            // Store 8 elements (4 bytes) at once
+            reinterpret_cast<uint32_t*>(cache_ptr)[cache_idx / 4] = packed;
           }
         }
       }
@@ -209,6 +235,8 @@ __global__ void UnpackRoPEAppend(
   }
 }
 
+// Internal dispatcher that selects the appropriate template specialization based on head_size.
+// MAX_HEAD_SIZE is used to optimize shared memory usage and kernel performance.
 template <typename T, int BIT_WIDTH>
 Status DispatchUnpackRoPEAppendHeadSize(
     const dim3& grid, const dim3& block, cudaStream_t stream,
@@ -240,6 +268,8 @@ Status DispatchUnpackRoPEAppendHeadSize(
   return CUDA_CALL(cudaGetLastError());
 }
 
+// Public entry point to launch the Unpack+RoPE+Append kernel.
+// Handles parameter validation, grid/block sizing, and bit-width dispatching.
 template <typename T>
 Status LaunchUnpackRoPEAppend(
     const T* packed_qkv, const T* query, const T* key, const T* value,

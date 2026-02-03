@@ -38,6 +38,27 @@ size_t GetXQAScratchSize(
     int num_heads,
     int kv_num_heads,
     int max_seq_len);
+
+size_t GetXQAInt8ScratchSize(
+    const cudaDeviceProp& device_prop,
+    int batch_size,
+    int num_heads,
+    int kv_num_heads,
+    int max_seq_len);
+
+size_t GetXQAInt8ScratchSizeBF16(
+    const cudaDeviceProp& device_prop,
+    int batch_size,
+    int num_heads,
+    int kv_num_heads,
+    int max_seq_len);
+
+size_t GetXQABf16ScratchSize(
+    const cudaDeviceProp& device_prop,
+    int batch_size,
+    int num_heads,
+    int kv_num_heads,
+    int max_seq_len);
 }  // namespace H128
 
 namespace H64 {
@@ -64,6 +85,27 @@ Status LaunchXQAKernelImpl(
     size_t workspace_size);
 
 size_t GetXQAScratchSize(
+    const cudaDeviceProp& device_prop,
+    int batch_size,
+    int num_heads,
+    int kv_num_heads,
+    int max_seq_len);
+
+size_t GetXQAInt8ScratchSize(
+    const cudaDeviceProp& device_prop,
+    int batch_size,
+    int num_heads,
+    int kv_num_heads,
+    int max_seq_len);
+
+size_t GetXQAInt8ScratchSizeBF16(
+    const cudaDeviceProp& device_prop,
+    int batch_size,
+    int num_heads,
+    int kv_num_heads,
+    int max_seq_len);
+
+size_t GetXQABf16ScratchSize(
     const cudaDeviceProp& device_prop,
     int batch_size,
     int num_heads,
@@ -100,9 +142,55 @@ size_t GetXQAScratchSize(
     int num_heads,
     int kv_num_heads,
     int max_seq_len);
+
+size_t GetXQAInt8ScratchSize(
+    const cudaDeviceProp& device_prop,
+    int batch_size,
+    int num_heads,
+    int kv_num_heads,
+    int max_seq_len);
+
+size_t GetXQAInt8ScratchSizeBF16(
+    const cudaDeviceProp& device_prop,
+    int batch_size,
+    int num_heads,
+    int kv_num_heads,
+    int max_seq_len);
+
+size_t GetXQABf16ScratchSize(
+    const cudaDeviceProp& device_prop,
+    int batch_size,
+    int num_heads,
+    int kv_num_heads,
+    int max_seq_len);
 }  // namespace H256
 
 // Dispatcher Implementation
+namespace H64 {
+size_t GetXQAInt8ScratchSize(
+    const cudaDeviceProp& device_prop,
+    int batch_size,
+    int num_heads,
+    int kv_num_heads,
+    int max_seq_len);
+}
+namespace H128 {
+size_t GetXQAInt8ScratchSize(
+    const cudaDeviceProp& device_prop,
+    int batch_size,
+    int num_heads,
+    int kv_num_heads,
+    int max_seq_len);
+}
+namespace H256 {
+size_t GetXQAInt8ScratchSize(
+    const cudaDeviceProp& device_prop,
+    int batch_size,
+    int num_heads,
+    int kv_num_heads,
+    int max_seq_len);
+}
+
 template <typename T>
 Status LaunchXQAKernel(
     const cudaDeviceProp& device_prop,
@@ -150,34 +238,59 @@ size_t GetXQAScratchSize(
     int batch_size,
     int num_heads,
     int kv_num_heads,
-    int max_seq_len) {
+    int head_size,
+    int max_seq_len,
+    int kv_quant_type,
+    bool is_bf16) {
   if (device_prop.major < 8) {
     return 0;
   }
 
-  // Just use H128 logic for scratch size estimation if it doesn't depend on head size being strictly 128 in estimation logic?
-  // Looking at xqa_impl_gen.cuh, GetScratchSize depends on namespace/template params which depend on HEAD_ELEMS indirectly?
-  // Actually, GetScratchSize in xqa_impl_gen calls `grpX_fp16::GetScratchSize`.
-  // If H64 logic is different, we should pick the right one.
-  // But GetXQAScratchSize doesn't take head_size as input?
-  // Wait, the signature in xqa_loader.h DOES include head_size?
-  // No, `size_t GetXQAScratchSize(const cudaDeviceProp& device_prop, int batch_size, int num_heads, int kv_num_heads, int max_seq_len);`
-  // It does NOT have head_size.
+  // INT8 path
+  if (kv_quant_type == 1) {
+    if (is_bf16) {
+      if (head_size == 128) {
+        return H128::GetXQAInt8ScratchSizeBF16(device_prop, batch_size, num_heads, kv_num_heads, max_seq_len);
+      } else if (head_size == 64) {
+        return H64::GetXQAInt8ScratchSizeBF16(device_prop, batch_size, num_heads, kv_num_heads, max_seq_len);
+      } else if (head_size == 256) {
+        return H256::GetXQAInt8ScratchSizeBF16(device_prop, batch_size, num_heads, kv_num_heads, max_seq_len);
+      } else {
+        return 0;  // Not supported
+      }
+    } else {
+      if (head_size == 128) {
+        return H128::GetXQAInt8ScratchSize(device_prop, batch_size, num_heads, kv_num_heads, max_seq_len);
+      } else if (head_size == 64) {
+        return H64::GetXQAInt8ScratchSize(device_prop, batch_size, num_heads, kv_num_heads, max_seq_len);
+      } else if (head_size == 256) {
+        return H256::GetXQAInt8ScratchSize(device_prop, batch_size, num_heads, kv_num_heads, max_seq_len);
+      } else {
+        return 0;  // Not supported
+      }
+    }
+  }
 
-  // Checking `xqa_impl_gen.cuh`:
-  // size_t scratch_size = ::onnxruntime::contrib::cuda::NAMESPACE_NAME::GetScratchSize(nbSeq, nbSubSeqPerSeq);
+  // FP16/BF16 path
+  if (is_bf16) {
+    if (head_size == 128) {
+      return H128::GetXQABf16ScratchSize(device_prop, batch_size, num_heads, kv_num_heads, max_seq_len);
+    } else if (head_size == 64) {
+      return H64::GetXQABf16ScratchSize(device_prop, batch_size, num_heads, kv_num_heads, max_seq_len);
+    } else if (head_size == 256) {
+      return H256::GetXQABf16ScratchSize(device_prop, batch_size, num_heads, kv_num_heads, max_seq_len);
+    }
+  } else {
+    if (head_size == 128) {
+      return H128::GetXQAScratchSize(device_prop, batch_size, num_heads, kv_num_heads, max_seq_len);
+    } else if (head_size == 64) {
+      return H64::GetXQAScratchSize(device_prop, batch_size, num_heads, kv_num_heads, max_seq_len);
+    } else if (head_size == 256) {
+      return H256::GetXQAScratchSize(device_prop, batch_size, num_heads, kv_num_heads, max_seq_len);
+    }
+  }
 
-  // `NAMESPACE_NAME` (e.g. grp8_fp16) is generated including `mha_impl.cuh`.
-  // `mha_impl.cuh` depends on `HEAD_ELEMS`.
-  // So the scratch size might depend on HEAD_ELEMS.
-  // BUT the API doesn't pass head_size. This is a problem if scratch size depends on head size.
-  // Most likely, scratch size depends on sequence lengths and number of heads, not head dim (unless smem usage constraint).
-  // However, if I use H128's GetScratchSize, it assumes HEAD_ELEMS=128 for any persistent structures.
-
-  // Let's assume for now we use H128's size as a conservative estimate (usually larger head dim size -> maybe larger scratch? or same?).
-  // If the kernels are built with static smem, 128 might need more.
-
-  return H128::GetXQAScratchSize(device_prop, batch_size, num_heads, kv_num_heads, max_seq_len);
+  return 0;
 }
 
 // Instantiate template for half

@@ -916,7 +916,9 @@ def gqa_prompt_func(
         ort_outputs["output_qk"] = OrtValue.ortvalue_from_numpy(output_qk.detach().cpu().numpy(), "cpu", 0)
         io_binding.bind_ortvalue_output("output_qk", ort_outputs["output_qk"])
 
+    io_binding.synchronize_inputs()
     ort_session.run_with_iobinding(io_binding)
+    io_binding.synchronize_outputs()
 
     out_qk = None
     if config.qk_output != QKOutputType.NO_OUTPUT:
@@ -1083,7 +1085,9 @@ def gqa_past_func(
         ort_outputs["output_qk"] = OrtValue.ortvalue_from_numpy(output_qk.detach().cpu().numpy(), "cpu", 0)
         io_binding.bind_ortvalue_output("output_qk", ort_outputs["output_qk"])
 
+    io_binding.synchronize_inputs()
     ort_session.run_with_iobinding(io_binding)
+    io_binding.synchronize_outputs()
 
     out_qk = None
     if config.qk_output != QKOutputType.NO_OUTPUT:

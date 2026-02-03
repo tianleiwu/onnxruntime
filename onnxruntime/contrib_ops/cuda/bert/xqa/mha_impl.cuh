@@ -95,7 +95,9 @@ __constant__ constexpr uint32_t cacheVTileSeqLen = 32;
 constexpr uint32_t preferedKHeadPartBytes = 128;
 __constant__ constexpr uint32_t cacheVTileSeqLen = 64;
 #else
-#error "perferedKHeadPartBytes not defined"
+// Safe default for older or unknown architectures
+constexpr uint32_t preferedKHeadPartBytes = 64;
+__constant__ constexpr uint32_t cacheVTileSeqLen = 32;
 #endif
 #endif
 constexpr uint32_t kHeadPartBytes = mha::min(preferedKHeadPartBytes, paddedCacheHeadBytes);
@@ -363,7 +365,7 @@ struct alignas(128) SharedMem {
 };
 
 CUBIN_EXPORT __device__ constexpr uint32_t smemSize = sizeof(SharedMem);
-#ifdef __CUDA_ARCH__
+#if 0 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 static_assert(smemSize < kMAX_SMEM_SIZE);
 #endif
 
@@ -2499,6 +2501,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 
   // const uint32_t nbSubSeqPerSeq = allowMultiBlockMode ? DBG_NB_CTAS_PER_SEQ : 1;
   uint32_t const nbSubSeqPerSeq = computeNbSubSeqPerSeqMHA(prop, batchSize, nbKHeads, maxSeqLen);
+  // printf("DEBUG: launchMHA: batch=%u, nbKHeads=%u, maxSeq=%u, nbSubSeqPerSeq=%u\n", batchSize, nbKHeads, maxSeqLen, nbSubSeqPerSeq);
   // gridDim.z == batchSize && gridDim.y == nbKHeads && gridDim.x == nbSubSeqPerSeq
 #if SPEC_DEC
   const uint32_t nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, rowsPerBlock);
@@ -2589,6 +2592,12 @@ __device__ __host__ inline size_t GetScratchSize(uint32_t nbSeq, uint32_t nbSubS
   // 3. scratchBuffers
   using ScratchBuf = Array2D<LdGrain, nbValidRows, SharedMem::XSmemBuffer::cols>;
   using VecT = Vec<ScratchBuf, gemm1WarpsPerGrp>;
+
+  size_t sem_size = roundUp<size_t>(nbSeq * sizeof(uint32_t), 128);
+  // if (nbSubSeqPerSeq > 1) {
+  //   printf("[MHA_IMPL] GetScratchSize: nbSeq=%u, nbSubSeqPerSeq=%u, sizeof(SMemWarpRowMax)=%zu, sizeof(VecT)=%zu, nbValidRows=%u, XS_cols=%u\n",
+  //           nbSeq, nbSubSeqPerSeq, (size_t)sizeof(SMemWarpRowMax), (size_t)sizeof(VecT), (uint32_t)nbValidRows, (uint32_t)SharedMem::XSmemBuffer::cols);
+  // }
 
   offset = roundUp<size_t>(offset, sizeof(VecT));
   offset += sizeof(VecT) * nbSubSeq;

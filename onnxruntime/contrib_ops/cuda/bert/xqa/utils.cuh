@@ -797,9 +797,13 @@ __device__ inline uint3 clusterId() {
 }
 
 __device__ inline uint32_t clusterCtaRank() {
+#if __CUDA_ARCH__ >= 900
   uint32_t rank;
   asm("mov.u32 %0, %%cluster_ctarank;\n" : "=r"(rank));
   return rank;
+#else
+  return 0;
+#endif
 }
 
 __device__ inline uint3 clusterCtaId() {

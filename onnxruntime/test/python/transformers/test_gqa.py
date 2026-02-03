@@ -21,6 +21,15 @@ from dataclasses import dataclass
 import numpy
 import torch
 from einops import rearrange, repeat
+
+# --- ONNX and Torch/Numpy Dtype Mappings ---
+from gqa_test_helper import (
+    ONNX_TENSOR_TYPE_MAP,
+    TORCH_DTYPE_MAP,
+    compute_scale,
+    dequantize_tensor,
+    quantize_tensor_with_scale,
+)
 from onnx import TensorProto, helper
 from packaging import version
 from parameterized import parameterized
@@ -46,7 +55,7 @@ param_count = int(os.getenv("PARAM_COUNT", "3")) if not pipeline_mode else 2
 # When quick build is used, flash attention only supports head_size=128
 quick_build = ", quick-build=" in get_build_info()
 
-enable_debug_print = quick_build
+enable_debug_print = False
 
 enable_deterministic_check = True
 
@@ -54,16 +63,6 @@ enable_quantized_kv_tests = True
 # #################################################################################################
 #  Configuration and Helper Classes
 # #################################################################################################
-
-
-# --- ONNX and Torch/Numpy Dtype Mappings ---
-from gqa_test_helper import (
-    ONNX_TENSOR_TYPE_MAP,
-    TORCH_DTYPE_MAP,
-    compute_scale,
-    dequantize_tensor,
-    quantize_tensor_with_scale,
-)
 
 
 @dataclass
@@ -512,16 +511,13 @@ def gqa_prompt_func(
         k_scale_ort_type = TensorProto.FLOAT
         if k_scale.dtype != torch.float32:
             k_scale = k_scale.to(torch.float32)
-
-        if enable_debug_print:
-            print(
-                f"DEBUG: Binding k_scale dtype={k_scale.dtype} ort_type={k_scale_ort_type} shape={k_scale.shape} val={k_scale.flatten()[:4]}"
-            )
+        k_scale = k_scale.contiguous()
         bind_tensor(io_binding, "k_scale", k_scale, device, k_scale_ort_type)
     if v_scale is not None:
         v_scale_ort_type = TensorProto.FLOAT
         if v_scale.dtype != torch.float32:
             v_scale = v_scale.to(torch.float32)
+        v_scale = v_scale.contiguous()
         if not config.share_kv_scale:
             bind_tensor(io_binding, "v_scale", v_scale, device, v_scale_ort_type)
 
@@ -574,7 +570,9 @@ def gqa_prompt_func(
         bind_output_tensor(io_binding, "present_key", present_k, device, cache_ort_type)
         bind_output_tensor(io_binding, "present_value", present_v, device, cache_ort_type)
 
+    io_binding.synchronize_inputs()
     ort_session.run_with_iobinding(io_binding)
+    io_binding.synchronize_outputs()
 
     return out_torch, present_k, present_v
 
@@ -674,12 +672,17 @@ def gqa_past_func(
         k_scale_ort_type = TensorProto.FLOAT
         if k_scale.dtype != torch.float32:
             k_scale = k_scale.to(torch.float32)
+        k_scale = k_scale.contiguous()
         bind_tensor(io_binding, "k_scale", k_scale, device, k_scale_ort_type)
     if v_scale is not None:
-        # Per-tensor uses float32 scale, per-channel uses T type
         v_scale_ort_type = TensorProto.FLOAT
         if v_scale.dtype != torch.float32:
             v_scale = v_scale.to(torch.float32)
+        v_scale = v_scale.contiguous()
+        # Even if share_kv_scale is True, the node might have two scale inputs named "k_scale" and "v_scale"
+        # depending on the graph creation logic. We should bind "v_scale" if it's expected by the graph.
+        # In create_gqa_node_and_io, if share_kv_scale is True, Input 13 is named "k_scale".
+        # But if it's False, it's named "v_scale".
         if not config.share_kv_scale:
             bind_tensor(io_binding, "v_scale", v_scale, device, v_scale_ort_type)
 
@@ -728,7 +731,9 @@ def gqa_past_func(
         bind_output_tensor(io_binding, "present_key", present_k, device, cache_ort_type)
         bind_output_tensor(io_binding, "present_value", present_v, device, cache_ort_type)
 
+    io_binding.synchronize_inputs()
     ort_session.run_with_iobinding(io_binding)
+    io_binding.synchronize_outputs()
 
     return out_torch, present_k, present_v
 
@@ -853,11 +858,11 @@ def get_static_scale(config: GQAConfig, device, torch_type, std):
     calibration_data_v = torch.randn_like(calibration_data_k) * std
 
     # TODO: handle config.share_kv_scale here.
-    k_scale = compute_scale(calibration_data_k, config.k_quant_type, "int8")
+    k_scale = compute_scale(calibration_data_k, config.k_quant_type, config.kv_cache_type)
     if config.share_kv_scale:
         v_scale = k_scale
     else:
-        v_scale = compute_scale(calibration_data_v, config.v_quant_type, "int8")
+        v_scale = compute_scale(calibration_data_v, config.v_quant_type, config.kv_cache_type)
     return k_scale, v_scale
 
 
@@ -1202,12 +1207,15 @@ def parity_check_gqa_past(
     v = torch.randn_like(k) * std
 
     # Random past sequence lengths. This tests paddings in decoding.
+    # Use a separate generator to ensure deterministic behavior independent of prior RNG state.
+    cache_seqlens_gen = torch.Generator(device=device).manual_seed(42)
     cache_seqlens = torch.randint(
         1,
         config.past_kv_sequence_length + 1,
         (config.batch_size,),
         device=device,
         dtype=torch.long,
+        generator=cache_seqlens_gen,
     )
 
     for i in range(config.batch_size):
@@ -1353,6 +1361,7 @@ def parity_check_gqa_past(
         v_ort = v_ort.contiguous()
 
     ort_seqlens = cache_seqlens + config.q_sequence_length - 1
+
     out, present_k, present_v = gqa_past_func(
         q=q_ort,
         k=k_ort,
@@ -1727,7 +1736,7 @@ def gqa_cuda_prompt_test_cases(allow_head_sink: bool = True, allow_local: bool =
                     b = batches[combo_index % len(batches)]
                     sq, skv = seqs[combo_index % len(seqs)]
                     n, n2 = heads[combo_index % len(heads)]
-                    lws_opts = [-1, random.randint(1, skv)] if allow_local else [-1]
+                    lws_opts = [-1, max(1, skv // 2)] if allow_local else [-1]
                     lws = lws_opts[combo_index % len(lws_opts)]
                     softcap = softcap_opts[combo_index % len(softcap_opts)]
                     use_smooth_softmax, has_head_sink = smmoth_softmax__head_sink[
@@ -1805,7 +1814,7 @@ def gqa_cuda_past_test_cases(
                         b = 1  # Force batch=1 for subsequent prompt
 
                     n, n2 = heads[combo_index % len(heads)]
-                    lws_opts = [-1, random.randint(1, s2)] if allow_local else [-1]
+                    lws_opts = [-1, max(1, s2 // 2)] if allow_local else [-1]
                     lws = lws_opts[combo_index % len(lws_opts)]
                     softcap = softcap_opts[combo_index % len(softcap_opts)]
                     use_smooth_softmax, has_head_sink = smmoth_softmax__head_sink[
@@ -2010,6 +2019,17 @@ class TestFlashGQABF16(unittest.TestCase):
     "Flash Attention is not available, skipping tests.",
 )
 class TestFlashGQABF16QuantizedKV(unittest.TestCase):
+    def manual_seed(self):
+        # Reset random seeds before each test to ensure test isolation
+        torch.manual_seed(0)
+        random.seed(69)
+        numpy.random.seed(42)
+
+    def setUp(self):
+        self.manual_seed()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def tearDown(self):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -2021,6 +2041,8 @@ class TestFlashGQABF16QuantizedKV(unittest.TestCase):
         if enable_debug_print:
             print("-" * 20)
             print(f"test_case: {name}\n{config}")
+
+        self.manual_seed()
 
         os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
         parity_check_gqa_prompt(
@@ -2039,6 +2061,8 @@ class TestFlashGQABF16QuantizedKV(unittest.TestCase):
         if enable_debug_print:
             print("-" * 20)
             print(f"test_case: {name}\n{config}")
+
+        self.manual_seed()
 
         os.environ["ORT_DISABLE_FLASH_ATTENTION"] = "0"
         parity_check_gqa_past(
@@ -2295,6 +2319,48 @@ class TestGQARegressions(unittest.TestCase):
             rtol=1e-3,
             atol=1e-3,
             std=1.0,
+        )
+
+    def test_gqa_int8_large_seq_batch4(self):
+        """
+        Regression test for batch_size=4 + max_seq_len=8192 + int8 KV cache crash.
+        This reproduces a CUDA illegal memory access due to scratch size under-allocation.
+        """
+        if "CUDAExecutionProvider" not in get_available_providers():
+            self.skipTest("CUDA required")
+
+        # Config that triggers the crash: batch=4, large max_seq_len, int8 kv
+        config = GQAConfig(
+            batch_size=4,
+            num_heads=32,
+            kv_num_heads=8,
+            head_size=128,
+            q_sequence_length=1,
+            kv_sequence_length=1,
+            past_kv_sequence_length=8191,
+            buffer_sequence_length=8192,
+            rotary=True,
+            rotary_interleaved=False,
+            k_quant_type="PER_TENSOR",
+            v_quant_type="PER_TENSOR",
+            kv_cache_type="int8",
+            share_buffer=True,
+            share_kv_scale=True,
+        )
+
+        torch_type = torch.float16
+        ort_type = TensorProto.FLOAT16
+        device = "cuda"
+
+        parity_check_gqa_past(
+            config=config,
+            ep="CUDAExecutionProvider",
+            device=device,
+            torch_type=torch_type,
+            ort_type=ort_type,
+            causal=True,
+            rtol=5e-2,
+            atol=5e-2,
         )
 
 
