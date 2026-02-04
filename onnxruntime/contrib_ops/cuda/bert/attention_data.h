@@ -201,6 +201,7 @@ struct GroupQueryAttentionData {
   // XQA buffer
   void* xqa_buffer = nullptr;
   size_t xqa_buffer_bytes = 0;
+  float* kv_scale_buffer = nullptr;
 };
 
 template <typename T>

@@ -348,9 +348,16 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
         xqa_total_bytes += q_bytes + k_bytes;
       }
 
+      // Reserve space for aligned kv_scale
+      xqa_total_bytes = (xqa_total_bytes + 255) / 256 * 256;
+      size_t kv_scale_offset = xqa_total_bytes;
+      xqa_total_bytes += 256;
+
       xqa_scratch_buffer = this->GetScratchBuffer<void>(xqa_total_bytes, context->GetComputeStream());
       data.xqa_buffer = xqa_scratch_buffer.get();
       data.xqa_buffer_bytes = xqa_internal_bytes;
+
+      data.kv_scale_buffer = reinterpret_cast<float*>(reinterpret_cast<char*>(data.xqa_buffer) + kv_scale_offset);
 
       if (parameters.do_rotary) {
         data.qkv_buffer = reinterpret_cast<CudaT*>(reinterpret_cast<char*>(data.xqa_buffer) + xqa_internal_bytes);

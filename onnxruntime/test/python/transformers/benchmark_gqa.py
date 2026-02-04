@@ -7,6 +7,8 @@
 Benchmark performance of GroupQueryAttention.
 """
 
+from dataclasses import dataclass
+
 import torch
 from gqa_test_helper import GroupQueryAttentionConfig, OrtGroupQueryAttention
 
@@ -16,7 +18,13 @@ except ImportError:
     triton = None
 
 
-def get_plot_algos(sm: int, local_window_size: int | None, test_quantization: bool = False):
+@dataclass
+class TestConfig:
+    test_int4: bool = False
+    test_int8: bool = False
+
+
+def get_plot_algos(sm: int, local_window_size: int | None, config: TestConfig | None):
     # GQA with local windows only works in sm=8x
     if sm >= 80 and local_window_size:
         line_vals = ["ort_gqa", "ort_gqa_local", "ort_gqa_packed", "ort_gqa_local_packed"]
@@ -28,13 +36,18 @@ def get_plot_algos(sm: int, local_window_size: int | None, test_quantization: bo
         styles = [("red", "solid"), ("blue", "dashed")]
 
     # Add quantized variants if requested
-    if test_quantization:
+    if sm >= 80 and config:
         quant_vals = ["ort_gqa_int4", "ort_gqa_int8"]
         quant_names = ["ORT-GQA-INT4", "ORT-GQA-INT8"]
         quant_styles = [("purple", "dotted"), ("orange", "dashdot")]
-        line_vals.extend(quant_vals)
-        line_names.extend(quant_names)
-        styles.extend(quant_styles)
+        if config.test_int4:
+            line_vals.extend(quant_vals[:1])
+            line_names.extend(quant_names[:1])
+            styles.extend(quant_styles[:1])
+        if config.test_int8:
+            line_vals.extend(quant_vals[1:])
+            line_names.extend(quant_names[1:])
+            styles.extend(quant_styles[1:])
 
     return {
         "line_vals": line_vals,
@@ -53,14 +66,14 @@ def plot_prompt_performance(
     max_seq_len: int,
     local_window_size: int | None = None,
     use_smooth_softmax: bool = False,
-    test_quantization: bool = False,
+    config: TestConfig | None = None,
     dtype: str = "float16",
 ):
-    algos = get_plot_algos(sm, local_window_size, test_quantization)
+    algos = get_plot_algos(sm, local_window_size, config)
     configs = [
         triton.testing.Benchmark(
             x_names=["sequence_length"],
-            x_vals=[2**i for i in range(4, 17) if 2**i <= max_seq_len],
+            x_vals=[2**i for i in range(6, 17) if 2**i <= max_seq_len],
             line_arg="provider",
             ylabel="ms",
             **algos,
@@ -140,14 +153,14 @@ def plot_token_performance(
     max_seq_len: int,
     local_window_size: int | None = None,
     use_smooth_softmax: bool = False,
-    test_quantization: bool = False,
+    config: TestConfig | None = None,
     dtype: str = "float16",
 ):
-    algos = get_plot_algos(sm, local_window_size, test_quantization)
+    algos = get_plot_algos(sm, local_window_size, config)
     configs = [
         triton.testing.Benchmark(
             x_names=["past_sequence_length"],
-            x_vals=[2**i for i in range(4, 17) if 2**i < max_seq_len] + [max_seq_len - 1],
+            x_vals=[2**i for i in range(6, 17) if 2**i < max_seq_len] + [max_seq_len - 1],
             line_arg="provider",
             ylabel="ms",
             **algos,
@@ -191,7 +204,7 @@ def plot_token_performance(
         elif "_int8" in provider:
             k_quant_type = v_quant_type = "PER_TENSOR"
             kv_cache_type = "int8"
-            share_kv_scale = True # XQA requires shared scale
+            share_kv_scale = True  # XQA requires shared scale
 
         config: GroupQueryAttentionConfig = GroupQueryAttentionConfig(
             batch_size=batch_size,
@@ -221,7 +234,9 @@ def plot_token_performance(
     benchmark.run(save_path=".", print_data=True)
 
 
-def run_performance_test(sm: int, fast: bool = False, test_quantization: bool = False):
+def run_performance_test(
+    sm: int, fast: bool = False, config: TestConfig | None = None, dtype: str = "float16", is_prompt: bool = True
+):
     """
     Run performance tests for prompt and token generation.
 
@@ -245,7 +260,6 @@ def run_performance_test(sm: int, fast: bool = False, test_quantization: bool = 
         configures = configures[:1]
     batch_sizes = [1] if fast else [1, 4]
     smooth_softmax_options = [False] if fast else [False, True]
-    dtypes = ["float16", "bfloat16"]
 
     # Reduce max sequence length when GPU memory is not enough.
     threshold = 131072 if memory_in_gb > 24 else 65536 if memory_in_gb > 12 else 32768
@@ -253,7 +267,7 @@ def run_performance_test(sm: int, fast: bool = False, test_quantization: bool = 
     for num_heads, head_size, kv_num_heads, max_seq_len, local_window_size, model_name in configures:
         for batch_size in batch_sizes:
             for use_smooth_softmax in smooth_softmax_options:
-                for dtype in dtypes:
+                if is_prompt:
                     plot_prompt_performance(
                         sm=sm,
                         batch_size=batch_size,
@@ -264,9 +278,10 @@ def run_performance_test(sm: int, fast: bool = False, test_quantization: bool = 
                         local_window_size=local_window_size,
                         use_smooth_softmax=use_smooth_softmax,
                         model_name=model_name,
-                        test_quantization=test_quantization,
+                        config=config,
                         dtype=dtype,
                     )
+                else:
                     plot_token_performance(
                         sm=sm,
                         batch_size=batch_size,
@@ -277,7 +292,7 @@ def run_performance_test(sm: int, fast: bool = False, test_quantization: bool = 
                         local_window_size=local_window_size,
                         use_smooth_softmax=use_smooth_softmax,
                         model_name=model_name,
-                        test_quantization=test_quantization,
+                        config=config,
                         dtype=dtype,
                     )
 
@@ -288,4 +303,8 @@ if __name__ == "__main__":
 
     s = torch.cuda.Stream()
     with torch.cuda.stream(s), torch.no_grad():
-        run_performance_test(sm, fast=True, test_quantization=True)
+        config = TestConfig(test_int4=False, test_int8=True)
+        run_performance_test(sm, fast=True, config=config, dtype="float16", is_prompt=True)
+        run_performance_test(sm, fast=True, config=config, dtype="float16", is_prompt=False)
+        # run_performance_test(sm, fast=True, config=config, dtype="bfloat16", is_prompt=True)
+        # run_performance_test(sm, fast=True, config=config, dtype="bfloat16", is_prompt=False)

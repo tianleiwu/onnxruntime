@@ -600,18 +600,40 @@ Status ExtremeDecoding(
       parameters.is_packed_qkv ? nullptr : reinterpret_cast<const CudaT*>(data.query),
       parameters.is_packed_qkv ? nullptr : reinterpret_cast<const CudaT*>(data.key),
       parameters.is_packed_qkv ? nullptr : reinterpret_cast<const CudaT*>(data.value),
-      q_rot_ptr, data.present_key, data.present_value, data.k_scale, data.v_scale,
-      num_heads, kv_num_heads, head_size, sequence_length, batch_size,
-      parameters.seqlen_present_kv_cache, data.past_seq_lens,
-      reinterpret_cast<const CudaT*>(data.cos_cache), reinterpret_cast<const CudaT*>(data.sin_cache),
-      parameters.rotary_dim, data.position_ids, parameters.rotary_interleaved,
-      (parameters.past_kv_format == AttentionQkvFormat::Q_K_V_BNSH),
-      parameters.k_quant_type, parameters.kv_cache_bit_width,
-      stream, device_prop.maxThreadsPerBlock));
+      q_rot_ptr,  // unpacked_q (can be null if !do_rotary)
+      data.present_key,
+      data.present_value,
+      data.k_scale,
+      data.v_scale,
+      num_heads,
+      kv_num_heads,
+      head_size,
+      sequence_length,
+      batch_size,
+      parameters.seqlen_present_kv_cache,  // max_seqlen (capacity)
+      data.past_seq_lens,
+      data.cos_cache,
+      data.sin_cache,
+      parameters.do_rotary ? parameters.rotary_dim : 0,
+      data.position_ids,
+      parameters.rotary_interleaved,
+      !past_bsnh,  // is_cache_bnsh
+      parameters.k_quant_type,
+      parameters.kv_cache_bit_width,
+      stream,
+      device_prop.maxThreadsPerBlock));
 
   // Determine workspace size for XQA
   void* xqa_workspace = data.xqa_buffer;
   size_t xqa_workspace_size = data.xqa_buffer_bytes;
+
+  float* xqa_scale_ptr = nullptr;
+  if (parameters.k_quant_type == KVQuantizationType::PER_TENSOR) {
+    xqa_scale_ptr = data.kv_scale_buffer;
+    if (xqa_scale_ptr != nullptr && data.k_scale != nullptr) {
+      CUDA_CALL_THROW(cudaMemcpyAsync(data.kv_scale_buffer, data.k_scale, sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    }
+  }
 
   // 5. Launch XQA
   Status status = onnxruntime::contrib::cuda::LaunchXQAKernel<CudaT>(
@@ -629,8 +651,8 @@ Status ExtremeDecoding(
       parameters.seqlen_present_kv_cache,  // max_seq_len (Capacity)
       scale,
       past_bsnh,
-      data.total_seq_lens,
-      data.k_scale,                               // kv_cache_scale
+      data.past_seq_lens,
+      xqa_scale_ptr,                              // kv_cache_scale
       static_cast<int>(parameters.k_quant_type),  // kv_quant_type
       xqa_workspace,
       xqa_workspace_size);
