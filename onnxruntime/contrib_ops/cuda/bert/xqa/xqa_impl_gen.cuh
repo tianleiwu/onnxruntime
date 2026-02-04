@@ -56,7 +56,7 @@ inline Status Launch(
     [[maybe_unused]] const int max_seq_len,
     [[maybe_unused]] const float scale,
     [[maybe_unused]] const bool is_bsnh,
-    [[maybe_unused]] const int* seq_lens,
+    [[maybe_unused]] const int* past_seq_lens,
     [[maybe_unused]] const float* kv_cache_scale,
     [[maybe_unused]] void* workspace,
     [[maybe_unused]] size_t workspace_size) {
@@ -95,7 +95,7 @@ inline Status Launch(
       v_ptr,
       is_bsnh,
       static_cast<uint32_t>(max_seq_len),
-      reinterpret_cast<const uint32_t*>(seq_lens),
+      reinterpret_cast<const uint32_t*>(past_seq_lens),
       static_cast<uint32_t>(batch_size),
       kv_cache_scale,  // Pass kv_cache_scale for INT8 dequantization
       semaphores,      // semaphores

@@ -25,7 +25,7 @@ template Status HEAD_DIM_NAMESPACE::LaunchXQAKernelImpl<BFloat16>(
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,
-    const int* seq_lens,
+    const int* past_seq_lens,
     const float* kv_cache_scale,
     const int kv_quant_type,
     void* workspace,
