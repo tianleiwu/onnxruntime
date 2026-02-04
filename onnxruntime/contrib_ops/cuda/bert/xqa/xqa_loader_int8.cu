@@ -29,12 +29,6 @@ Status LaunchXQAInt8Kernel(
     void* workspace,
     size_t workspace_size);
 
-size_t GetXQAInt8ScratchSize(
-    const cudaDeviceProp& device_prop,
-    int batch_size,
-    int num_heads,
-    int kv_num_heads,
-    int max_seq_len);
 }  // namespace H64
 
 namespace H128 {
@@ -57,12 +51,6 @@ Status LaunchXQAInt8Kernel(
     void* workspace,
     size_t workspace_size);
 
-size_t GetXQAInt8ScratchSize(
-    const cudaDeviceProp& device_prop,
-    int batch_size,
-    int num_heads,
-    int kv_num_heads,
-    int max_seq_len);
 }  // namespace H128
 
 namespace H256 {
@@ -85,12 +73,6 @@ Status LaunchXQAInt8Kernel(
     void* workspace,
     size_t workspace_size);
 
-size_t GetXQAInt8ScratchSize(
-    const cudaDeviceProp& device_prop,
-    int batch_size,
-    int num_heads,
-    int kv_num_heads,
-    int max_seq_len);
 }  // namespace H256
 
 // Dispatcher for INT8 FP16 query kernel based on head_size
@@ -120,24 +102,6 @@ Status LaunchXQAInt8Kernel(
     return H64::LaunchXQAInt8Kernel(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, past_seq_lens, kv_cache_scale, workspace, workspace_size);
   } else {
     return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "XQA INT8 only supports head_size=64, 128, or 256. Input has ", head_size);
-  }
-}
-
-size_t GetXQAInt8ScratchSize(
-    const cudaDeviceProp& device_prop,
-    int batch_size,
-    int num_heads,
-    int kv_num_heads,
-    int head_size,
-    int max_seq_len) {
-  if (head_size == 256) {
-    return H256::GetXQAInt8ScratchSize(device_prop, batch_size, num_heads, kv_num_heads, max_seq_len);
-  } else if (head_size == 128) {
-    return H128::GetXQAInt8ScratchSize(device_prop, batch_size, num_heads, kv_num_heads, max_seq_len);
-  } else if (head_size == 64) {
-    return H64::GetXQAInt8ScratchSize(device_prop, batch_size, num_heads, kv_num_heads, max_seq_len);
-  } else {
-    return 0;
   }
 }
 

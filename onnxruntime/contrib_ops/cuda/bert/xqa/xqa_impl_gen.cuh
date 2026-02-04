@@ -18,29 +18,6 @@ namespace NAMESPACE_NAME {
 
 #undef HEAD_GRP_SIZE
 
-inline size_t GetScratchSize(
-    [[maybe_unused]] const cudaDeviceProp& device_prop,
-    [[maybe_unused]] int batch_size,
-    [[maybe_unused]] int kv_num_heads,
-    [[maybe_unused]] int max_seq_len) {
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-  uint32_t nbSubSeqPerSeq = computeNbSubSeqPerSeqMHA(
-      device_prop,
-      static_cast<uint32_t>(batch_size),
-      static_cast<uint32_t>(kv_num_heads),
-      static_cast<uint32_t>(max_seq_len));
-  uint32_t nbSeq = static_cast<uint32_t>(batch_size * kv_num_heads);
-
-  size_t semaphore_size = nbSeq * sizeof(uint32_t);
-  size_t scratch_size = NAMESPACE_NAME::GetScratchSize(nbSeq, nbSubSeqPerSeq);
-
-  // Return total size with alignment padding
-  return roundUp<size_t>(semaphore_size, 128) + scratch_size;
-#else
-  return 0;
-#endif
-}
-
 template <typename T>
 inline Status Launch(
     [[maybe_unused]] const cudaDeviceProp& device_prop,
@@ -74,8 +51,16 @@ inline Status Launch(
     size_t semaphore_size = nbSeq * sizeof(uint32_t);
     size_t padded_sem_size = roundUp<size_t>(semaphore_size, 128);
 
-    if (workspace_size < padded_sem_size) {
-      // Or assert/return error? For now assume caller passed correct size.
+    uint32_t nbSubSeqPerSeq = computeNbSubSeqPerSeqMHA(
+        device_prop,
+        static_cast<uint32_t>(batch_size),
+        static_cast<uint32_t>(kv_num_heads),
+        static_cast<uint32_t>(max_seq_len));
+    size_t required_scratch_size = NAMESPACE_NAME::GetScratchSize(nbSeq, nbSubSeqPerSeq);
+    size_t total_required = padded_sem_size + required_scratch_size;
+
+    if (workspace_size < total_required) {
+      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "XQA workspace size is too small. Expected at least ", total_required, ", but got ", workspace_size);
     }
     semaphores = reinterpret_cast<uint32_t*>(workspace);
     scratch = reinterpret_cast<char*>(workspace) + padded_sem_size;

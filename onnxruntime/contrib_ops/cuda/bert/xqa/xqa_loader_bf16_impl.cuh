@@ -191,31 +191,6 @@ Status LaunchXQAKernelImpl<BFloat16>(
   }
 }
 
-size_t GetXQABf16ScratchSize(
-    const cudaDeviceProp& device_prop,
-    int batch_size,
-    int num_heads,
-    int kv_num_heads,
-    int max_seq_len) {
-  int group_size = num_heads / kv_num_heads;
-  switch (group_size) {
-    case 1:
-      return grp1_bf16::GetScratchSize(device_prop, batch_size, kv_num_heads, max_seq_len);
-    case 2:
-      return grp2_bf16::GetScratchSize(device_prop, batch_size, kv_num_heads, max_seq_len);
-    case 4:
-      return grp4_bf16::GetScratchSize(device_prop, batch_size, kv_num_heads, max_seq_len);
-    case 8:
-      return grp8_bf16::GetScratchSize(device_prop, batch_size, kv_num_heads, max_seq_len);
-    case 16:
-      return grp16_bf16::GetScratchSize(device_prop, batch_size, kv_num_heads, max_seq_len);
-    case 32:
-      return grp32_bf16::GetScratchSize(device_prop, batch_size, kv_num_heads, max_seq_len);
-    default:
-      return 0;  // Not supported
-  }
-}
-
 }  // namespace HEAD_DIM_NAMESPACE
 }  // namespace cuda
 }  // namespace contrib

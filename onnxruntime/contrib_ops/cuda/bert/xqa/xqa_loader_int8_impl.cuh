@@ -113,28 +113,6 @@ Status LaunchXQAInt8Kernel(
   }
 }
 
-size_t GetXQAInt8ScratchSize(
-    const cudaDeviceProp& device_prop,
-    int batch_size,
-    int num_heads,
-    int kv_num_heads,
-    int max_seq_len) {
-  int group_size = num_heads / kv_num_heads;
-  switch (group_size) {
-    case 4:
-      return grp4_int8::GetScratchSize(device_prop, batch_size, kv_num_heads, max_seq_len);
-    case 8:
-      return grp8_int8::GetScratchSize(device_prop, batch_size, kv_num_heads, max_seq_len);
-    case 16:
-      return grp16_int8::GetScratchSize(device_prop, batch_size, kv_num_heads, max_seq_len);
-    case 32:
-      return grp32_int8::GetScratchSize(device_prop, batch_size, kv_num_heads, max_seq_len);
-    default:
-      printf("Error: XQA INT8 only supports group_size 4, 8, 16, 32. Input group_size=%d\n", group_size);
-      return 0;  // Not supported
-  }
-}
-
 }  // namespace HEAD_DIM_NAMESPACE
 }  // namespace cuda
 }  // namespace contrib
