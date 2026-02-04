@@ -22,11 +22,10 @@ Status LaunchXQAKernelImpl(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int actual_seq_len,
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,
-    const int* seq_lens,
+    const int* past_seq_lens,
     const float* kv_cache_scale,
     const int kv_quant_type,
     void* workspace,
@@ -74,11 +73,10 @@ Status LaunchXQAKernelImpl(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int actual_seq_len,
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,
-    const int* seq_lens,
+    const int* past_seq_lens,
     const float* kv_cache_scale,
     const int kv_quant_type,
     void* workspace,
@@ -126,11 +124,10 @@ Status LaunchXQAKernelImpl(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int actual_seq_len,
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,
-    const int* seq_lens,
+    const int* past_seq_lens,
     const float* kv_cache_scale,
     const int kv_quant_type,
     void* workspace,
@@ -203,11 +200,10 @@ Status LaunchXQAKernel(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int actual_seq_len,
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,
-    const int* seq_lens,
+    const int* past_seq_lens,
     const float* kv_cache_scale,
     const int kv_quant_type,
     void* workspace,
@@ -219,15 +215,15 @@ Status LaunchXQAKernel(
   if (head_size == 256) {
     return H256::LaunchXQAKernelImpl<T>(
         device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size,
-        actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, kv_quant_type, workspace, workspace_size);
+        max_seq_len, scale, is_bsnh, past_seq_lens, kv_cache_scale, kv_quant_type, workspace, workspace_size);
   } else if (head_size == 128) {
     return H128::LaunchXQAKernelImpl<T>(
         device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size,
-        actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, kv_quant_type, workspace, workspace_size);
+        max_seq_len, scale, is_bsnh, past_seq_lens, kv_cache_scale, kv_quant_type, workspace, workspace_size);
   } else if (head_size == 64) {
     return H64::LaunchXQAKernelImpl<T>(
         device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size,
-        actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, kv_quant_type, workspace, workspace_size);
+        max_seq_len, scale, is_bsnh, past_seq_lens, kv_cache_scale, kv_quant_type, workspace, workspace_size);
   } else {
     return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "XQA only supports head_size=64, 128, or 256. Input has ", head_size);
   }
@@ -305,11 +301,10 @@ template Status LaunchXQAKernel<half>(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int actual_seq_len,
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,
-    const int* seq_lens,
+    const int* past_seq_lens,
     const float* kv_cache_scale,
     const int kv_quant_type,
     void* workspace,

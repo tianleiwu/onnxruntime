@@ -22,7 +22,6 @@ template Status HEAD_DIM_NAMESPACE::LaunchXQAKernelImpl<half>(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int actual_seq_len,
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,

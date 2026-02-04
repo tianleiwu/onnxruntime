@@ -53,7 +53,6 @@ inline Status Launch(
     [[maybe_unused]] const int num_heads,
     [[maybe_unused]] const int kv_num_heads,
     [[maybe_unused]] const int head_size,
-    [[maybe_unused]] const int actual_seq_len,
     [[maybe_unused]] const int max_seq_len,
     [[maybe_unused]] const float scale,
     [[maybe_unused]] const bool is_bsnh,

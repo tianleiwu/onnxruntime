@@ -21,7 +21,6 @@ Status LaunchXQAInt8Kernel(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int actual_seq_len,
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,
@@ -50,7 +49,6 @@ Status LaunchXQAInt8Kernel(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int actual_seq_len,
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,
@@ -79,7 +77,6 @@ Status LaunchXQAInt8Kernel(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int actual_seq_len,
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,
@@ -108,7 +105,6 @@ Status LaunchXQAInt8Kernel(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int actual_seq_len,
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,
@@ -117,11 +113,11 @@ Status LaunchXQAInt8Kernel(
     void* workspace,
     size_t workspace_size) {
   if (head_size == 256) {
-    return H256::LaunchXQAInt8Kernel(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
+    return H256::LaunchXQAInt8Kernel(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
   } else if (head_size == 128) {
-    return H128::LaunchXQAInt8Kernel(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
+    return H128::LaunchXQAInt8Kernel(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
   } else if (head_size == 64) {
-    return H64::LaunchXQAInt8Kernel(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
+    return H64::LaunchXQAInt8Kernel(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
   } else {
     return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "XQA INT8 only supports head_size=64, 128, or 256. Input has ", head_size);
   }

@@ -109,7 +109,6 @@ Status LaunchXQAInt8Kernel(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int actual_seq_len,
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,
@@ -134,7 +133,6 @@ Status LaunchXQAKernelImpl(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int actual_seq_len,
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,
@@ -148,7 +146,7 @@ Status LaunchXQAKernelImpl(
   // Dispatch to INT8 path if requested
   if (kv_quant_type == 1) {
     if constexpr (std::is_same<T, half>::value) {
-      return LaunchXQAInt8Kernel(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
+      return LaunchXQAInt8Kernel(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
     } else {
       // BF16 case is handled in xqa_loader_bf16.cu via specialization
       return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "XQA INT8 path mismatch.");
@@ -158,17 +156,17 @@ Status LaunchXQAKernelImpl(
   int group_size = num_heads / kv_num_heads;
   switch (group_size) {
     case 1:
-      return grp1_fp16::Launch<T>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
+      return grp1_fp16::Launch<T>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
     case 2:
-      return grp2_fp16::Launch<T>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
+      return grp2_fp16::Launch<T>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
     case 4:
-      return grp4_fp16::Launch<T>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
+      return grp4_fp16::Launch<T>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
     case 8:
-      return grp8_fp16::Launch<T>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
+      return grp8_fp16::Launch<T>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
     case 16:
-      return grp16_fp16::Launch<T>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
+      return grp16_fp16::Launch<T>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
     case 32:
-      return grp32_fp16::Launch<T>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
+      return grp32_fp16::Launch<T>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
     default:
       return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "XQA supports group_size 1, 2, 4, 8, 16, 32. Input has ", group_size);
   }

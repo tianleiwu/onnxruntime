@@ -627,14 +627,6 @@ Status ExtremeDecoding(
   void* xqa_workspace = data.xqa_buffer;
   size_t xqa_workspace_size = data.xqa_buffer_bytes;
 
-  float* xqa_scale_ptr = nullptr;
-  if (parameters.k_quant_type == KVQuantizationType::PER_TENSOR) {
-    xqa_scale_ptr = data.kv_scale_buffer;
-    if (xqa_scale_ptr != nullptr && data.k_scale != nullptr) {
-      CUDA_CALL_THROW(cudaMemcpyAsync(data.kv_scale_buffer, data.k_scale, sizeof(float), cudaMemcpyDeviceToDevice, stream));
-    }
-  }
-
   // 5. Launch XQA
   Status status = onnxruntime::contrib::cuda::LaunchXQAKernel<CudaT>(
       device_prop,
@@ -647,12 +639,11 @@ Status ExtremeDecoding(
       num_heads,
       kv_num_heads,
       parameters.head_size,
-      sequence_length,                     // actual_seq_len (1)
       parameters.seqlen_present_kv_cache,  // max_seq_len (Capacity)
       scale,
       past_bsnh,
       data.past_seq_lens,
-      xqa_scale_ptr,                              // kv_cache_scale
+      data.k_scale,                               // kv_cache_scale
       static_cast<int>(parameters.k_quant_type),  // kv_quant_type
       xqa_workspace,
       xqa_workspace_size);

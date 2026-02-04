@@ -22,7 +22,6 @@ Status LaunchXQAKernelImpl(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int actual_seq_len,
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,
@@ -46,7 +45,6 @@ Status LaunchXQAKernelImpl(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int actual_seq_len,
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,
@@ -70,7 +68,6 @@ Status LaunchXQAKernelImpl(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int actual_seq_len,
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,
@@ -93,7 +90,6 @@ Status LaunchXQAInt8KernelBF16(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int actual_seq_len,
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,
@@ -118,7 +114,6 @@ Status LaunchXQAKernel<BFloat16>(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int actual_seq_len,
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,
@@ -129,22 +124,22 @@ Status LaunchXQAKernel<BFloat16>(
     size_t workspace_size) {
   // Dispatch to INT8 path if requested
   if (kv_quant_type == 1) {
-    return LaunchXQAInt8KernelBF16(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
+    return LaunchXQAInt8KernelBF16(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, workspace, workspace_size);
   }
 
   // Dispatch based on head_size
   if (head_size == 256) {
     return H256::LaunchXQAKernelImpl<BFloat16>(
         device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size,
-        actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, kv_quant_type, workspace, workspace_size);
+        max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, kv_quant_type, workspace, workspace_size);
   } else if (head_size == 128) {
     return H128::LaunchXQAKernelImpl<BFloat16>(
         device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size,
-        actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, kv_quant_type, workspace, workspace_size);
+        max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, kv_quant_type, workspace, workspace_size);
   } else if (head_size == 64) {
     return H64::LaunchXQAKernelImpl<BFloat16>(
         device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size,
-        actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, kv_quant_type, workspace, workspace_size);
+        max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, kv_quant_type, workspace, workspace_size);
   } else {
     return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "XQA only supports head_size=64, 128, or 256. Input has ", head_size);
   }
@@ -162,7 +157,6 @@ Status LaunchXQAKernel<__nv_bfloat16>(
     const int num_heads,
     const int kv_num_heads,
     const int head_size,
-    const int actual_seq_len,
     const int max_seq_len,
     const float scale,
     const bool is_bsnh,
@@ -173,7 +167,7 @@ Status LaunchXQAKernel<__nv_bfloat16>(
     size_t workspace_size) {
   return LaunchXQAKernel<BFloat16>(
       device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size,
-      actual_seq_len, max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, kv_quant_type, workspace, workspace_size);
+      max_seq_len, scale, is_bsnh, seq_lens, kv_cache_scale, kv_quant_type, workspace, workspace_size);
 }
 
 }  // namespace cuda
