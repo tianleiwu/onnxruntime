@@ -660,11 +660,11 @@ __device__ inline mha::tuple<uint32_t, uint32_t, decltype(bounds)..., uint32_t> 
   return mha::tuple_cat(mha::tuple<uint32_t>(i0 % bound0), carryLE<bound1, bounds...>(i1 + i0 / bound0, i..., iLast));
 }
 
-__device__ __host__ inline void assertClose(float a, float b, float threshold = 0.01f) {
+__device__ __host__ inline void assertClose([[maybe_unused]] float a, [[maybe_unused]] float b, [[maybe_unused]] float threshold = 0.01f) {
   assert(abs(a - b) < threshold);
 }
 
-__device__ __host__ inline void assertClose(half a, half b, float threshold = 0.01f) {
+__device__ __host__ inline void assertClose([[maybe_unused]] half a, [[maybe_unused]] half b, [[maybe_unused]] float threshold = 0.01f) {
   assertClose(__half2float(a), __half2float(b), threshold);
 }
 

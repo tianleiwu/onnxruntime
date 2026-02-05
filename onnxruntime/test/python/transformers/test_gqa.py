@@ -60,8 +60,6 @@ has_int4_kv_cache = ", int4-kv-cache=" in get_build_info()
 enable_debug_print = False
 
 enable_deterministic_check = True
-
-enable_quantized_kv_tests = True
 # #################################################################################################
 #  Configuration and Helper Classes
 # #################################################################################################
@@ -2010,10 +2008,7 @@ class TestFlashGQABF16(unittest.TestCase):
         )
 
 
-@unittest.skipIf(
-    not has_flash_attention() or not enable_quantized_kv_tests,
-    "Flash Attention is not available, skipping tests.",
-)
+@unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
 class TestFlashGQABF16QuantizedKV(unittest.TestCase):
     def manual_seed(self):
         # Reset random seeds before each test to ensure test isolation
@@ -2245,7 +2240,7 @@ def gqa_xqa_test_cases():
                             yield name, config, torch_type, ort_type
 
 
-@unittest.skipIf(not enable_quantized_kv_tests, "Quantized KV is not enabled, skipping tests.")
+@unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
 class TestXQAQuantizedParity(unittest.TestCase):
     """Tests that verify fused kernels produce the same results as unfused kernels."""
 
