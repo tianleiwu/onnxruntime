@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 // Template for XQA Kernel Implementation
 // Expected macros:
 // NAMESPACE_NAME: Name of the namespace (e.g., grp8)

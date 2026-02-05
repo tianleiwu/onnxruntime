@@ -106,7 +106,7 @@ class MBarrier  // rename this to MBarrier
                    : "=l"(token)
                    : "l"(addr()), "r"(update - 1U)
                    : "memory");
-      ArrivalToken refToken;
+      [[maybe_unused]] ArrivalToken refToken;
       asm volatile("mbarrier.arrive" STR_REL_CTA ".b64 %0, [%1];\n" : "=l"(refToken) : "l"(addr()) : "memory");
       assert(token == refToken);
       return token;
