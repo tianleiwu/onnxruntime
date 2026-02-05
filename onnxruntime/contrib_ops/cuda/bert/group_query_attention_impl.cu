@@ -843,7 +843,8 @@ Status DequantizeFlashAttentionFallback(
         stream, v_dequant, reinterpret_cast<const int8_t*>(data.present_value), data.v_scale,
         nullptr, parameters.batch_size, parameters.kv_num_heads, parameters.seqlen_present_kv_cache,
         parameters.head_size, 8, parameters.v_quant_type, is_bsnh)));
-  } else {
+#ifdef USE_INT4_KV_CACHE
+  } else if (parameters.kv_cache_bit_width == 4) {
     // Int4 support if needed
     ORT_RETURN_IF_ERROR((LaunchDequantizeKV<CudaT, uint8_t, float>(
         stream, k_dequant, reinterpret_cast<const uint8_t*>(data.present_key), data.k_scale,
@@ -854,6 +855,7 @@ Status DequantizeFlashAttentionFallback(
         stream, v_dequant, reinterpret_cast<const uint8_t*>(data.present_value), data.v_scale,
         nullptr, parameters.batch_size, parameters.kv_num_heads, parameters.seqlen_present_kv_cache,
         parameters.head_size, 4, parameters.v_quant_type, is_bsnh)));
+#endif
   }
 
   // Step 3: Run Flash Attention on dequantized k/v
@@ -922,7 +924,8 @@ Status FlashAttentionAndQuantizeKV(
       reinterpret_cast<const CudaT*>(data.cos_cache), reinterpret_cast<const CudaT*>(data.sin_cache),
       parameters.rotary_dim, data.position_ids, parameters.rotary_interleaved,
       false,  // BSNH for scratch
-      KVQuantizationType::NONE, 16,
+      KVQuantizationType::NONE,
+      0,  // bit_width is 0 since we are not quantizing here.
       stream, max_threads_per_block));
 
   // 2. Run Float Flash Attention
@@ -949,11 +952,13 @@ Status FlashAttentionAndQuantizeKV(
           stream, reinterpret_cast<int8_t*>(data.present_key), reinterpret_cast<const CudaT*>(k_final), data.k_scale,
           nullptr, data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
           head_size, 8, parameters.k_quant_type, true, past_bsnh)));
-    } else {
+#ifdef USE_INT4_KV_CACHE
+    } else if (parameters.kv_cache_bit_width == 4) {
       ORT_RETURN_IF_ERROR((LaunchQuantizeKV<CudaT, uint8_t, float>(
           stream, reinterpret_cast<uint8_t*>(data.present_key), reinterpret_cast<const CudaT*>(k_final), data.k_scale,
           nullptr, data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
           head_size, 4, parameters.k_quant_type, true, past_bsnh)));
+#endif
     }
   }
 
@@ -963,11 +968,13 @@ Status FlashAttentionAndQuantizeKV(
           stream, reinterpret_cast<int8_t*>(data.present_value), reinterpret_cast<const CudaT*>(v_final), data.v_scale,
           nullptr, data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
           head_size, 8, parameters.v_quant_type, true, past_bsnh)));
-    } else {
+#ifdef USE_INT4_KV_CACHE
+    } else if (parameters.kv_cache_bit_width == 4) {
       ORT_RETURN_IF_ERROR((LaunchQuantizeKV<CudaT, uint8_t, float>(
           stream, reinterpret_cast<uint8_t*>(data.present_value), reinterpret_cast<const CudaT*>(v_final), data.v_scale,
           nullptr, data.total_seq_lens, batch_size, kv_num_heads, sequence_length, parameters.seqlen_present_kv_cache,
           head_size, 4, parameters.v_quant_type, true, past_bsnh)));
+#endif
     }
   }
 

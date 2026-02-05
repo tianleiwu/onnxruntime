@@ -315,7 +315,7 @@ Status LaunchUnpackRoPEAppend(
 
   bool per_channel = (k_quant_type == KVQuantizationType::PER_CHANNEL);
 
-  if (bit_width == 16 || bit_width == 32) {
+  if (bit_width == 0) {
     return DispatchUnpackRoPEAppendHeadSize<T, 16>(
         grid, block, stream, packed_qkv, query, key, value, unpacked_q, k_cache, v_cache,
         k_scale, v_scale, num_heads, kv_num_heads, head_size, d, max_seqlen, past_seq_lens,
@@ -325,11 +325,13 @@ Status LaunchUnpackRoPEAppend(
         grid, block, stream, packed_qkv, query, key, value, unpacked_q, k_cache, v_cache,
         k_scale, v_scale, num_heads, kv_num_heads, head_size, d, max_seqlen, past_seq_lens,
         cos_cache, sin_cache, rotary_dim, position_ids, interleaved, is_cache_bnsh, per_channel);
+#ifdef USE_INT4_KV_CACHE
   } else if (bit_width == 4) {
     return DispatchUnpackRoPEAppendHeadSize<T, 4>(
         grid, block, stream, packed_qkv, query, key, value, unpacked_q, k_cache, v_cache,
         k_scale, v_scale, num_heads, kv_num_heads, head_size, d, max_seqlen, past_seq_lens,
         cos_cache, sin_cache, rotary_dim, position_ids, interleaved, is_cache_bnsh, per_channel);
+#endif
   }
 
   return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Unsupported bit_width (", bit_width, ") for GQA quantization.");

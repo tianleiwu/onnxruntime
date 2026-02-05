@@ -146,12 +146,14 @@ __global__ void DequantizeKernel(T* dequantized_data,
     if (bit_width == 8) {
       quantized_float = static_cast<float>(
           reinterpret_cast<const int8_t*>(quantized_data)[input_idx]);
-    } else {  // 4
+#ifdef USE_INT4_KV_CACHE
+    } else if (bit_width == 4) {
       const uint8_t packed_val =
           reinterpret_cast<const uint8_t*>(quantized_data)[input_idx];
       quantized_float = (h % 2 == 0)
                             ? static_cast<float>((packed_val & 0x0F) - 8)
                             : static_cast<float>((packed_val >> 4) - 8);
+#endif
     }
 
     dequantized_data[i] = static_cast<T>(quantized_float * scale_val);
@@ -229,7 +231,8 @@ __global__ void QuantizeKernel(T_QUANT* quantized_data,
                     h_idx;
         }
         reinterpret_cast<int8_t*>(quantized_data)[out_idx] = 0;
-      } else {  // INT4
+#ifdef USE_INT4_KV_CACHE
+      } else if (bit_width == 4) {  // INT4
         // With packed iteration, each thread handles one byte (2 values).
         // Since we are in the padding region, write a zero byte.
         // For BNSH/BSNH output, we need to calculate correct index.
@@ -251,6 +254,7 @@ __global__ void QuantizeKernel(T_QUANT* quantized_data,
         }
         // INT4 uses +8 bias, so zero values pack to 0x88
         reinterpret_cast<uint8_t*>(quantized_data)[out_idx] = kInt4ZeroPacked;
+#endif
       }
       continue;
     }
@@ -291,7 +295,8 @@ __global__ void QuantizeKernel(T_QUANT* quantized_data,
       int32_t val_int32 = static_cast<int32_t>(rintf(val_float));
       reinterpret_cast<int8_t*>(quantized_data)[output_idx] =
           static_cast<int8_t>(max(kInt8Min, min(kInt8Max, val_int32)));
-    } else {  // 4
+#ifdef USE_INT4_KV_CACHE
+    } else if (bit_width == 4) {
       int h0 = h_packed * 2;
       int h1 = h0 + 1;
 
@@ -345,6 +350,7 @@ __global__ void QuantizeKernel(T_QUANT* quantized_data,
       // Low nibble: q0 (even element), High nibble: q1 (odd element)
       uint8_t packed = ((q0 + 8) & 0x0F) | (((q1 + 8) & 0x0F) << 4);
       reinterpret_cast<uint8_t*>(quantized_data)[output_idx] = packed;
+#endif
     }
   }
 }
@@ -373,25 +379,6 @@ Status LaunchQuantizeKV(cudaStream_t stream, T_QUANT* quantized_data,
 
   return CUDA_CALL(cudaGetLastError());
 }
-
-// Explicit instantiations for launchers
-template Status LaunchDequantizeKV<half, int8_t, float>(
-    cudaStream_t, half*, const int8_t*, const float*, const int*, int, int, int, int, int, KVQuantizationType, bool);
-template Status LaunchDequantizeKV<half, uint8_t, float>(
-    cudaStream_t, half*, const uint8_t*, const float*, const int*, int, int, int, int, int, KVQuantizationType, bool);
-template Status LaunchDequantizeKV<__nv_bfloat16, int8_t, float>(
-    cudaStream_t, __nv_bfloat16*, const int8_t*, const float*, const int*, int, int, int, int, int, KVQuantizationType, bool);
-template Status LaunchDequantizeKV<__nv_bfloat16, uint8_t, float>(
-    cudaStream_t, __nv_bfloat16*, const uint8_t*, const float*, const int*, int, int, int, int, int, KVQuantizationType, bool);
-
-template Status LaunchQuantizeKV<half, int8_t, float>(
-    cudaStream_t, int8_t*, const half*, const float*, const int*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
-template Status LaunchQuantizeKV<half, uint8_t, float>(
-    cudaStream_t, uint8_t*, const half*, const float*, const int*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
-template Status LaunchQuantizeKV<__nv_bfloat16, int8_t, float>(
-    cudaStream_t, int8_t*, const __nv_bfloat16*, const float*, const int*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
-template Status LaunchQuantizeKV<__nv_bfloat16, uint8_t, float>(
-    cudaStream_t, uint8_t*, const __nv_bfloat16*, const float*, const int*, const int*, int, int, int, int, int, int, KVQuantizationType, bool, bool);
 
 }  // namespace cuda
 }  // namespace contrib

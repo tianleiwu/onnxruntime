@@ -55,6 +55,8 @@ param_count = int(os.getenv("PARAM_COUNT", "3")) if not pipeline_mode else 2
 # When quick build is used, flash attention only supports head_size=128
 quick_build = ", quick-build=" in get_build_info()
 
+has_int4_kv_cache = ", int4-kv-cache=" in get_build_info()
+
 enable_debug_print = False
 
 enable_deterministic_check = True
@@ -1858,7 +1860,7 @@ def gqa_cuda_quantized_test_cases(is_past: bool):
     )
 
     for name, config in base_cases:
-        for kv_type in ["int8", "int4"]:
+        for kv_type in ["int8", "int4"] if has_int4_kv_cache else ["int8"]:
             for quant_mode in ["PER_TENSOR", "PER_CHANNEL"]:
                 share_scales_options = [False]
                 if quant_mode == "PER_TENSOR" and kv_type == "int8":

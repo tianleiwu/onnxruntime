@@ -13,7 +13,7 @@ namespace cuda {
 
 // Quantization type for XQA
 enum class XqaQuantType {
-  kNone = 0, // no quantization, use FP16/BF16
+  kNone = 0,  // no quantization, use FP16/BF16
   kInt8 = 1,
   kFp8 = 2
 };
