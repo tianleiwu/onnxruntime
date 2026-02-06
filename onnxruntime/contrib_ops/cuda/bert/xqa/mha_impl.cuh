@@ -2593,7 +2593,7 @@ __device__ __host__ inline size_t GetScratchSize(uint32_t nbSeq, uint32_t nbSubS
   using ScratchBuf = Array2D<LdGrain, nbValidRows, SharedMem::XSmemBuffer::cols>;
   using VecT = Vec<ScratchBuf, gemm1WarpsPerGrp>;
 
-  size_t sem_size = roundUp<size_t>(nbSeq * sizeof(uint32_t), 128);
+  // size_t sem_size = roundUp<size_t>(nbSeq * sizeof(uint32_t), 128);
   // if (nbSubSeqPerSeq > 1) {
   //   printf("[MHA_IMPL] GetScratchSize: nbSeq=%u, nbSubSeqPerSeq=%u, sizeof(SMemWarpRowMax)=%zu, sizeof(VecT)=%zu, nbValidRows=%u, XS_cols=%u\n",
   //           nbSeq, nbSubSeqPerSeq, (size_t)sizeof(SMemWarpRowMax), (size_t)sizeof(VecT), (uint32_t)nbValidRows, (uint32_t)SharedMem::XSmemBuffer::cols);
