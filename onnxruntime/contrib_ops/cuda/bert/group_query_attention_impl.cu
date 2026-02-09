@@ -627,6 +627,8 @@ Status ExtremeDecoding(
   void* xqa_workspace = data.xqa_buffer;
   size_t xqa_workspace_size = data.xqa_buffer_bytes;
 
+  constexpr bool is_fp8 = std::is_same<T, Float8E4M3FN>::value;
+  using onnxruntime::contrib::cuda::XqaQuantType;
   // 5. Launch XQA
   Status status = onnxruntime::contrib::cuda::LaunchXQAKernel<CudaT>(
       device_prop,
@@ -644,8 +646,8 @@ Status ExtremeDecoding(
       past_bsnh,
       data.past_seq_lens,
       data.k_scale,  // kv_cache_scale
-      // Map KVQuantizationType (0=NONE, 1=TENSOR, 2=CHANNEL) to XqaQuantType (0=FP16/BF16, 1=INT8, 2=FP8)
-      (parameters.k_quant_type == KVQuantizationType::NONE) ? onnxruntime::contrib::cuda::XqaQuantType::kNone : onnxruntime::contrib::cuda::XqaQuantType::kInt8,
+      // Map cache type to XqaQuantType: NONE->kNone, Float8E4M3FN->kFp8, int8->kInt8
+      (parameters.k_quant_type == KVQuantizationType::NONE) ? XqaQuantType::kNone : (is_fp8 ? XqaQuantType::kFp8 : XqaQuantType::kInt8),
       xqa_workspace,
       xqa_workspace_size);
 
@@ -806,6 +808,7 @@ Status DequantizeFlashAttentionFallback(
   // We need to dequantize the entire KV cache (present_key/value) into a float/half buffer (data.qkv_buffer).
   // Layout in qkv_buffer: [Q (rotated)] [K_dequantized] [V_dequantized]
   typedef typename onnxruntime::cuda::OrtToCudaType<T>::type CudaT;
+  typedef typename onnxruntime::cuda::OrtToCudaType<U>::type CudaU;
   CudaT* q_rot = reinterpret_cast<CudaT*>(data.qkv_buffer);
   size_t q_elements = static_cast<size_t>(parameters.batch_size) * parameters.sequence_length * parameters.num_heads * parameters.head_size;
   size_t k_elements = static_cast<size_t>(parameters.batch_size) * parameters.seqlen_present_kv_cache * parameters.kv_num_heads * parameters.head_size;
@@ -833,30 +836,15 @@ Status DequantizeFlashAttentionFallback(
   // We now have the updated quantized cache in data.present_key/value. We need to dequantize it to k_dequant/v_dequant.
   bool is_bsnh = (parameters.past_kv_format == AttentionQkvFormat::Q_K_V_BSNH);
 
-  if (parameters.kv_cache_bit_width == 8) {
-    ORT_RETURN_IF_ERROR((LaunchDequantizeKV<CudaT, int8_t, float>(
-        stream, k_dequant, reinterpret_cast<const int8_t*>(data.present_key), data.k_scale,
-        nullptr, parameters.batch_size, parameters.kv_num_heads, parameters.seqlen_present_kv_cache,
-        parameters.head_size, 8, parameters.k_quant_type, is_bsnh)));
+  ORT_RETURN_IF_ERROR((LaunchDequantizeKV<CudaT, CudaU, float>(
+      stream, k_dequant, reinterpret_cast<const CudaU*>(data.present_key), data.k_scale,
+      nullptr, parameters.batch_size, parameters.kv_num_heads, parameters.seqlen_present_kv_cache,
+      parameters.head_size, parameters.kv_cache_bit_width, parameters.k_quant_type, is_bsnh)));
 
-    ORT_RETURN_IF_ERROR((LaunchDequantizeKV<CudaT, int8_t, float>(
-        stream, v_dequant, reinterpret_cast<const int8_t*>(data.present_value), data.v_scale,
-        nullptr, parameters.batch_size, parameters.kv_num_heads, parameters.seqlen_present_kv_cache,
-        parameters.head_size, 8, parameters.v_quant_type, is_bsnh)));
-#ifdef USE_INT4_KV_CACHE
-  } else if (parameters.kv_cache_bit_width == 4) {
-    // Int4 support if needed
-    ORT_RETURN_IF_ERROR((LaunchDequantizeKV<CudaT, uint8_t, float>(
-        stream, k_dequant, reinterpret_cast<const uint8_t*>(data.present_key), data.k_scale,
-        nullptr, parameters.batch_size, parameters.kv_num_heads, parameters.seqlen_present_kv_cache,
-        parameters.head_size, 4, parameters.k_quant_type, is_bsnh)));
-
-    ORT_RETURN_IF_ERROR((LaunchDequantizeKV<CudaT, uint8_t, float>(
-        stream, v_dequant, reinterpret_cast<const uint8_t*>(data.present_value), data.v_scale,
-        nullptr, parameters.batch_size, parameters.kv_num_heads, parameters.seqlen_present_kv_cache,
-        parameters.head_size, 4, parameters.v_quant_type, is_bsnh)));
-#endif
-  }
+  ORT_RETURN_IF_ERROR((LaunchDequantizeKV<CudaT, CudaU, float>(
+      stream, v_dequant, reinterpret_cast<const CudaU*>(data.present_value), data.v_scale,
+      nullptr, parameters.batch_size, parameters.kv_num_heads, parameters.seqlen_present_kv_cache,
+      parameters.head_size, parameters.kv_cache_bit_width, parameters.v_quant_type, is_bsnh)));
 
   // Step 3: Run Flash Attention on dequantized k/v
   bool is_causal = parameters.is_unidirectional;

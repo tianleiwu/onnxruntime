@@ -2355,6 +2355,59 @@ class TestGQARegressions(unittest.TestCase):
             atol=5e-2,
         )
 
+    def test_gqa_fp8_kv_cache(self):
+        """
+        Test GQA with FP8 E4M3 quantized KV cache.
+        Requires SM89+ (Ada Lovelace or newer) and USE_FP8_KV_CACHE build flag.
+        """
+        if "CUDAExecutionProvider" not in get_available_providers():
+            self.skipTest("CUDA required")
+
+        # Check if FP8 KV cache is supported (requires SM89+)
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+            if major < 9 or (major == 8 and minor < 9):
+                self.skipTest("FP8 requires SM89+ (Ada Lovelace or newer)")
+
+        config = GQAConfig(
+            batch_size=2,
+            num_heads=32,
+            kv_num_heads=8,
+            head_size=128,
+            q_sequence_length=1,
+            kv_sequence_length=1,
+            past_kv_sequence_length=127,
+            buffer_sequence_length=128,
+            rotary=True,
+            rotary_interleaved=False,
+            k_quant_type="PER_TENSOR",
+            v_quant_type="PER_TENSOR",
+            kv_cache_type="fp8",
+            share_buffer=True,
+            share_kv_scale=True,
+        )
+
+        torch_type = torch.float16
+        ort_type = TensorProto.FLOAT16
+        device = "cuda"
+
+        try:
+            parity_check_gqa_past(
+                config=config,
+                ep="CUDAExecutionProvider",
+                device=device,
+                torch_type=torch_type,
+                ort_type=ort_type,
+                causal=True,
+                rtol=5e-2,
+                atol=5e-2,
+            )
+        except Exception as e:
+            # FP8 may not be built, skip if kernel not registered
+            if "Float8E4M3FN" in str(e) or "fp8" in str(e).lower():
+                self.skipTest(f"FP8 KV cache not available: {e}")
+            raise
+
 
 if __name__ == "__main__":
     unittest.main()
