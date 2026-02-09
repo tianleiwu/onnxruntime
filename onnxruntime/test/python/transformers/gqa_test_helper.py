@@ -479,6 +479,8 @@ def create_group_query_attention_onnx_model(config: GroupQueryAttentionConfig):
         cache_type = TensorProto.UINT8
     elif config.kv_cache_type == "int8":
         cache_type = TensorProto.INT8
+    elif config.kv_cache_type == "fp8":
+        cache_type = TensorProto.FLOAT8E4M3FN
 
     # Compute actual cache shapes (packed for INT4)
     past_key_shape = list(shape_dict["past_key"])

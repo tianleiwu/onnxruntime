@@ -334,7 +334,7 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
                                        data.k_scale == data.v_scale &&
                                        (parameters.head_size == 256 || parameters.head_size == 128 || parameters.head_size == 64) &&
                                        (group_size == 4 || group_size == 8 || group_size == 16 || group_size == 32) &&
-                                       (device_prop.major >= 9 || device_prop.major == 8 && device_prop.minor == 9));  // FP8 requires SM89+ (Ada Lovelace)
+                                       (device_prop.major >= 9 || (device_prop.major == 8 && device_prop.minor == 9)));  // FP8 requires SM89+ (Ada Lovelace)
 #else
     constexpr bool is_fp8_quantized_supported = false;
 #endif

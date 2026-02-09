@@ -150,14 +150,16 @@ __global__ void DequantizeKernel(T* dequantized_data,
                   (bit_width == 4 ? h / 2 : h);
     }
 
-    if (bit_width == 8) {
-      quantized_float = static_cast<float>(
-          reinterpret_cast<const int8_t*>(quantized_data)[input_idx]);
+    // FP8 check must come first since it also has bit_width=8
 #ifdef USE_FP8_KV_CACHE
-    } else if constexpr (std::is_same<T_QUANT, __nv_fp8_e4m3>::value) {  // FP8 E4M3
+    if constexpr (std::is_same<T_QUANT, __nv_fp8_e4m3>::value) {
       __nv_fp8_e4m3 fp8_val = reinterpret_cast<const __nv_fp8_e4m3*>(quantized_data)[input_idx];
       quantized_float = static_cast<float>(fp8_val);
+    } else
 #endif
+        if (bit_width == 8) {
+      quantized_float = static_cast<float>(
+          reinterpret_cast<const int8_t*>(quantized_data)[input_idx]);
 #ifdef USE_INT4_KV_CACHE
     } else if (bit_width == 4) {
       const uint8_t packed_val =

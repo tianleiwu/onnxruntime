@@ -46,7 +46,7 @@
 #define DUMP_TENSOR_D(...)
 #endif
 
-#if (defined(__GNUC__) || defined(__clang__)) && !defined(NDEBUG)
+#if (defined(__GNUC__) || defined(__clang__)) && (!defined(NDEBUG) || DUMP_TENSOR_LEVEL > 0)
 #define DEBUG_PRINTF(fmt, ...) \
   std::printf("[DEBUG] " fmt "\n", ##__VA_ARGS__)
 #else

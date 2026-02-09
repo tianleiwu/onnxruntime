@@ -57,7 +57,10 @@ quick_build = ", quick-build=" in get_build_info()
 
 has_int4_kv_cache = ", int4-kv-cache=" in get_build_info()
 
-enable_debug_print = False
+has_fp8_kv_cache = ", fp8-kv-cache=" in get_build_info()
+
+# Enable debug print if tensor or node dumping is enabled in build.
+enable_debug_print = ("dump-tensor" in get_build_info()) or ("dump-node" in get_build_info())
 
 enable_deterministic_check = True
 # #################################################################################################
@@ -674,17 +677,13 @@ def gqa_past_func(
             k_scale = k_scale.to(torch.float32)
         k_scale = k_scale.contiguous()
         bind_tensor(io_binding, "k_scale", k_scale, device, k_scale_ort_type)
-    if v_scale is not None:
+
+    if v_scale is not None and not config.share_kv_scale:
         v_scale_ort_type = TensorProto.FLOAT
         if v_scale.dtype != torch.float32:
             v_scale = v_scale.to(torch.float32)
         v_scale = v_scale.contiguous()
-        # Even if share_kv_scale is True, the node might have two scale inputs named "k_scale" and "v_scale"
-        # depending on the graph creation logic. We should bind "v_scale" if it's expected by the graph.
-        # In create_gqa_node_and_io, if share_kv_scale is True, Input 13 is named "k_scale".
-        # But if it's False, it's named "v_scale".
-        if not config.share_kv_scale:
-            bind_tensor(io_binding, "v_scale", v_scale, device, v_scale_ort_type)
+        bind_tensor(io_binding, "v_scale", v_scale, device, v_scale_ort_type)
 
     # 7. Outputs
     # output shape calculation
@@ -932,7 +931,7 @@ def parity_check_gqa_prompt(
         window_size = (-1, 0)
 
     # --- PyTorch Reference Path ---
-    if config.kv_cache_bit_width == 4 or config.kv_cache_type == "int8":
+    if config.kv_cache_bit_width == 4 or config.kv_cache_type == "int8" or config.kv_cache_type == "fp8":
         k_ref_dequant = dequantize_tensor(k, k_scale, config.k_quant_type, config.kv_cache_type)
         v_ref_dequant = dequantize_tensor(v, v_scale, config.v_quant_type, config.kv_cache_type)
     else:
@@ -1097,6 +1096,9 @@ def parity_check_gqa_prompt(
             elif config.kv_cache_type == "int8":
                 # For int8, present_k is int8 data
                 present_k_torch = torch.from_numpy(present_k.astype(numpy.int8)).to(device)
+            elif config.kv_cache_type == "fp8":
+                # For fp8, present_k is float8_e4m3fn data
+                present_k_torch = torch.from_numpy(present_k).to(device)
             else:
                 present_k_torch = torch.from_numpy(present_k).to(device)
 
@@ -1134,6 +1136,8 @@ def parity_check_gqa_prompt(
                 present_v_torch = torch.from_numpy(present_v).to(device)
             elif config.kv_cache_type == "int8":
                 present_v_torch = torch.from_numpy(present_v.astype(numpy.int8)).to(device)
+            elif config.kv_cache_type == "fp8":
+                present_v_torch = torch.from_numpy(present_v).to(device)
             else:
                 present_v_torch = torch.from_numpy(present_v).to(device)
 
@@ -1345,8 +1349,8 @@ def parity_check_gqa_past(
     # Quantize k and v for ORT when using quantized KV cache
     k_ort = k
     v_ort = v
-    if config.kv_cache_type in ["int8", "int4"]:
-        # NOTE: Quantize returns tensor with kv_cache_type (int8)
+    if config.kv_cache_type in ["int8", "int4", "fp8"]:
+        # NOTE: Quantize returns tensor with kv_cache_type (int8, int4, or fp8)
         k_ort = quantize_tensor_with_scale(k, k_scale, config.k_quant_type, config.kv_cache_type)
         v_ort = quantize_tensor_with_scale(v, v_scale, config.v_quant_type, config.kv_cache_type)
 
@@ -1386,25 +1390,36 @@ def parity_check_gqa_past(
     if numpy.count_nonzero(out_ref_np) > 0 and numpy.count_nonzero(out_np) == 0:
         raise RuntimeError("Output is all zeros")
 
+    print_diff_statistics(torch.tensor(out_np - out_ref_np), "out")
+    numpy.testing.assert_allclose(out_np, out_ref_np, rtol=rtol, atol=atol)
+
     # --- Comparison ---
-    if config.k_quant_type == "NONE" and config.v_quant_type == "NONE":
+    compare_kv = (config.k_quant_type == "NONE" and config.v_quant_type == "NONE") or (config.kv_cache_type == "fp8")
+    if compare_kv:
         # Compare KV cache
         # Transpose reference back to BNSH to match ORT output
         k_cache_ref_np = k_cache_ref.transpose(1, 2).to(torch.float32).detach().cpu().numpy()
         v_cache_ref_np = v_cache_ref.transpose(1, 2).to(torch.float32).detach().cpu().numpy()
-        present_k_np = present_k.to(torch.float32).detach().cpu().numpy()
-        present_v_np = present_v.to(torch.float32).detach().cpu().numpy()
 
-        if not config.share_buffer:
-            total_len = config.past_kv_sequence_length + config.q_sequence_length
-            k_cache_ref_np = k_cache_ref_np[:, :, :total_len, :]
-            v_cache_ref_np = v_cache_ref_np[:, :, :total_len, :]
+        if isinstance(present_k, torch.Tensor):
+            present_k_torch = present_k.to(device)
+            present_v_torch = present_v.to(device)
+        else:
+            present_k_torch = torch.from_numpy(present_k).to(device)
+            present_v_torch = torch.from_numpy(present_v).to(device)
+
+        if config.kv_cache_type == "fp8":
+            # FP8 cache needs dequantization for comparison with float reference
+            present_k_dequant = dequantize_tensor(present_k_torch, k_scale, config.k_quant_type, config.kv_cache_type)
+            present_v_dequant = dequantize_tensor(present_v_torch, v_scale, config.v_quant_type, config.kv_cache_type)
+            present_k_np = present_k_dequant.to(torch.float32).detach().cpu().numpy()
+            present_v_np = present_v_dequant.to(torch.float32).detach().cpu().numpy()
+        else:
+            present_k_np = present_k_torch.to(torch.float32).detach().cpu().numpy()
+            present_v_np = present_v_torch.to(torch.float32).detach().cpu().numpy()
 
         numpy.testing.assert_allclose(present_k_np, k_cache_ref_np, rtol=rtol, atol=atol)
         numpy.testing.assert_allclose(present_v_np, v_cache_ref_np, rtol=rtol, atol=atol)
-
-    print_diff_statistics(torch.tensor(out_np - out_ref_np), "out")
-    numpy.testing.assert_allclose(out_np, out_ref_np, rtol=rtol, atol=atol)
 
     # Compare quantized cache with proper masking per batch
     if config.k_quant_type != "NONE":
@@ -1415,6 +1430,8 @@ def parity_check_gqa_past(
                 present_k_torch = torch.from_numpy(present_k).to(device)
             elif config.kv_cache_type == "int8":
                 present_k_torch = torch.from_numpy(present_k.astype(numpy.int8)).to(device)
+            elif config.kv_cache_type == "fp8":
+                present_k_torch = torch.from_numpy(present_k).to(device)
             else:
                 present_k_torch = torch.from_numpy(present_k).to(device)
 
@@ -1455,6 +1472,8 @@ def parity_check_gqa_past(
                 present_v_torch = torch.from_numpy(present_v).to(device)
             elif config.kv_cache_type == "int8":
                 present_v_torch = torch.from_numpy(present_v.astype(numpy.int8)).to(device)
+            elif config.kv_cache_type == "fp8":
+                present_v_torch = torch.from_numpy(present_v).to(device)
             else:
                 present_v_torch = torch.from_numpy(present_v).to(device)
 
@@ -2355,20 +2374,12 @@ class TestGQARegressions(unittest.TestCase):
             atol=5e-2,
         )
 
+    @unittest.skipIf(not has_cuda_device(89) or not has_fp8_kv_cache, "FP8 KV cache is not available, skipping tests.")
     def test_gqa_fp8_kv_cache(self):
         """
         Test GQA with FP8 E4M3 quantized KV cache.
         Requires SM89+ (Ada Lovelace or newer) and USE_FP8_KV_CACHE build flag.
         """
-        if "CUDAExecutionProvider" not in get_available_providers():
-            self.skipTest("CUDA required")
-
-        # Check if FP8 KV cache is supported (requires SM89+)
-        if torch.cuda.is_available():
-            major, minor = torch.cuda.get_device_capability()
-            if major < 9 or (major == 8 and minor < 9):
-                self.skipTest("FP8 requires SM89+ (Ada Lovelace or newer)")
-
         config = GQAConfig(
             batch_size=2,
             num_heads=32,
