@@ -1,0 +1,133 @@
+/*
+ * Copyright (c) Microsoft Corporation. All rights reserved.
+ * Licensed under the MIT License.
+ *
+ * Auto-generated MoE GEMM kernel instantiations for SM80.
+ * DO NOT EDIT MANUALLY.
+ */
+
+#include "contrib_ops/cuda/llm/moe_gemm/launchers/fused_moe_gemm_launcher_sm80.inl"
+
+namespace onnxruntime::llm::kernels::cutlass_kernels {
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 16, 128, 64, 2, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultSilu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 16, 128, 64, 2, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultFtGelu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 16, 128, 64, 3, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultSilu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 16, 128, 64, 3, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultFtGelu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 16, 128, 64, 4, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultSilu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 16, 128, 64, 4, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultFtGelu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 16, 256, 64, 2, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultSilu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 16, 256, 64, 2, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultFtGelu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 16, 256, 64, 3, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultSilu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 16, 256, 64, 3, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultFtGelu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 16, 256, 64, 4, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultSilu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 16, 256, 64, 4, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultFtGelu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 32, 128, 64, 2, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultSilu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 32, 128, 64, 2, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultFtGelu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 32, 128, 64, 3, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultSilu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 32, 128, 64, 3, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultFtGelu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 32, 128, 64, 4, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultSilu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 32, 128, 64, 4, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultFtGelu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 64, 128, 64, 2, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultSilu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 64, 128, 64, 2, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultFtGelu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 64, 128, 64, 3, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultSilu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 64, 128, 64, 3, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultFtGelu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 64, 128, 64, 4, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultSilu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 64, 128, 64, 4, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultFtGelu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 128, 128, 64, 2, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultSilu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 128, 128, 64, 2, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultFtGelu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 128, 128, 64, 3, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultSilu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 128, 128, 64, 3, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultFtGelu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 128, 128, 64, 4, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultSilu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+template void sm80_generic_fused_moe_gemm_kernelLauncher<cute::half_t, cute::half_t, 128, 128, 64, 4, onnxruntime::llm::cutlass_extensions::EpilogueOpDefaultFtGelu>(
+    cute::half_t const*, cute::half_t const*, cute::half_t const*, bool, cute::half_t*,
+    int64_t const*, int64_t, int64_t, int64_t, int, int, cudaStream_t, int*);
+
+}  // namespace onnxruntime::llm::kernels::cutlass_kernels
