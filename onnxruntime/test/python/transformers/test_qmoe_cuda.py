@@ -202,6 +202,7 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
         _pybind.quantize_matmul_4bits(q_weight, weights_np, scale, zero_point, block_size, n, k, is_symmetric)
 
         q_weight_reshaped = q_weight.reshape(n, -1)
+
         processed_q_weight = _pybind.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, n, k, 4, 80)
 
         # Dequantize for reference
@@ -214,6 +215,7 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
             q_high = (q_weight_torch >> 4) & 0x0F
             q_unpacked = torch.stack((q_low, q_high), dim=-1).view(n, block_per_k, block_size)
             q_unpacked = q_unpacked.to(weights.dtype)
+            # Use 8.0 as ZP for reference dequantization
             dequantized = (q_unpacked - 8.0) * scale_torch
         else:
             # Asymmetric
@@ -237,7 +239,7 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
         scale_torch_out = torch.from_numpy(scale).to(weights.device).to(torch.float16)  # N, block_per_K
 
         # zero_point_storage
-        zero_points_storage = torch.from_numpy(zero_point).to(weights.device) if asymmetric else None
+        zero_points_storage = torch.from_numpy(zero_point).to(weights.device)
 
         processed_q_weight_torch = (
             torch.from_numpy(processed_q_weight).reshape(k, n // 2).to(weights.device).view(torch.uint8)
@@ -905,6 +907,7 @@ class SparseMoeBlockORTHelper(nn.Module):
 
     def recreate_onnx_model(self):
         """Recreate the ONNX model with the current weights to reflect any changes to the quantization code."""
+        print(f"DEBUG: recreate_onnx_model called. block_size={self.block_size}, quant_bits={self.quant_bits}")
 
         w1_list, w2_list = [], []
         w1_bias_list, w2_bias_list = [], []
@@ -1162,8 +1165,8 @@ class SparseMoeBlockORTHelper(nn.Module):
             "FP16:8": (1.0, 0.01),
             "FP32:4": (0.11, 0.01),
             "FP32:8": (0.11, 0.01),
-            "BF16:4": (2.0, 0.02),
-            "BF16:8": (2.0, 0.02),
+            "BF16:4": (0.01, 0.02),
+            "BF16:8": (0.01, 0.02),
         }
 
         dtype_str = ort_dtype_name_map[self.onnx_dtype]

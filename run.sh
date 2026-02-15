@@ -42,7 +42,7 @@ RUN_TEST_MOE_CASE=false
 TEST_MOE_CASE=""
 RUN_BENCHMARK=false
 RUN_PROFILE=false
-ENABLE_DUMP="OFF"
+ENABLE_DUMP="ON"
 
 while [[ "$#" -gt 0 ]]; do
     case $1 in
