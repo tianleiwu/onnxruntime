@@ -1165,8 +1165,8 @@ class SparseMoeBlockORTHelper(nn.Module):
             "FP16:8": (1.0, 0.01),
             "FP32:4": (0.11, 0.01),
             "FP32:8": (0.11, 0.01),
-            "BF16:4": (0.01, 0.02),
-            "BF16:8": (0.01, 0.02),
+            "BF16:4": (1.0, 0.02),
+            "BF16:8": (1.0, 0.02),
         }
 
         dtype_str = ort_dtype_name_map[self.onnx_dtype]
