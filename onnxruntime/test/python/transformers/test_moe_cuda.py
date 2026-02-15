@@ -11,6 +11,7 @@
 # --------------------------------------------------------------------------
 import itertools
 import os
+import time
 import unittest
 from collections import OrderedDict
 
@@ -22,6 +23,8 @@ from parameterized import parameterized
 from torch import nn
 
 import onnxruntime
+from onnxruntime import InferenceSession, SessionOptions
+from onnxruntime.capi import _pybind_state as _quantize
 
 # Reduces number of tests to run for faster pipeline checks
 pipeline_mode = os.getenv("PIPELINE_MODE", "1") == "1"
@@ -91,8 +94,6 @@ def print_diff_statistics(diff_tensor: torch.Tensor, prefix: str = ""):
 
 def quant_dequant(weights, is_4_bit_quantization: bool = True):
     # We use the pybind directly for testing to match what we added in onnxruntime_pybind_quant.cc
-    from onnxruntime.capi import _pybind_state as _quantize
-
     if is_4_bit_quantization:
         # Quantize on CPU
         # quantize_matmul_4bits returns: (q_weight, scale, zero_point)
@@ -342,8 +343,6 @@ def quant_dequant(weights, is_4_bit_quantization: bool = True):
         # Actually `onnxruntime_pybind_quant.cc` defines a module.
         # In `onnxruntime_pybind.cc`, `init_onnxruntime_pybind` calls `CreateQuantPybindModule(m)`.
         # So the functions are available under `onnxruntime.capi._pybind_state`.
-
-    from onnxruntime.capi import _pybind_state as _quantize
 
     if is_4_bit_quantization:
         weights_t = weights.T.contiguous()
@@ -974,8 +973,6 @@ class SparseMoeBlockORTHelper(nn.Module):
         self.np_type = numpy.float16 if self.onnx_dtype == TensorProto.FLOAT16 else numpy.float32
 
     def create_ort_session(self, moe_onnx_graph):
-        from onnxruntime import InferenceSession, SessionOptions
-
         sess_options = SessionOptions()
         sess_options.log_severity_level = 0
         sess_options.log_verbosity_level = 0
@@ -1040,8 +1037,6 @@ class SparseMoeBlockORTHelper(nn.Module):
         iobinding.synchronize_outputs()
 
         if enable_performance_test:
-            import time
-
             repeat = 1000
             s = time.time()
             for _ in range(repeat):

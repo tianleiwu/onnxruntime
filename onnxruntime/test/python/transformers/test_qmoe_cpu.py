@@ -937,7 +937,6 @@ class SparseMoeBlockORTHelper(nn.Module):
                 w1 = self.experts[i].w1.weight
                 w2 = self.experts[i].w2.weight
                 w1_bias = self.experts[i].w1.bias
-                w2_bias = self.experts[i].w2.bias
 
                 if self.block_size > 0:
                     w1_scale, pre_qweight1, w1_qdq, w1_zp = quant_dequant_blockwise(

@@ -202,20 +202,6 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
         _pybind.quantize_matmul_4bits(q_weight, weights_np, scale, zero_point, block_size, n, k, is_symmetric)
 
         q_weight_reshaped = q_weight.reshape(n, -1)
-
-        # Convert from offset binary to 2's complement by flipping the MSB (bit 3) of each 4-bit value
-        # Since we have packed uint8 (two 4-bit values), we flip bit 3 and bit 7.
-        # 0x88 = 10001000
-        q_weight_reshaped = q_weight_reshaped ^ 0x88
-
-        # For symmetric quantization, the kernel normally subtracts (ZP * scale) from bias.
-        # Standard ZP is 8 (for offset binary).
-        # Since we converted weights to 2's complement (centered), we effectively baked the -8 shift into weights.
-        # So we must tell the kernel that ZP is 0, so it doesn't subtract anything from bias.
-        if is_symmetric:
-            zero_point.fill(0)
-
-        # Use force_arch=80 as requested
         processed_q_weight = _pybind.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, n, k, 4, 80)
 
         # Dequantize for reference
