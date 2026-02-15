@@ -125,7 +125,7 @@ The primary test scripts are located in `onnxruntime/test/python/transformers/`.
 *   **Tensor Cores**: The packed layout is specifically designed to feed Tensor Cores efficiently.
 
 ### 5.2 SwiGLU Fusion
-*   **Interleaved**: The operator supports `swiglu_interleaved=1`. In this mode, the weights for the Gating and Value projections are interleaved in the `fc1` tensor.
+*   **Interleaved**: The operator supports `swiglu_fusion=1`. In this mode, the weights for the Gating and Value projections are interleaved in the `fc1` tensor.
     *   Shape: `[Experts, 2 * InterSize, HiddenSize]`.
     *   The kernel computes the GEMM, then applies SwiGLU activation + gating in the epilogue.
 

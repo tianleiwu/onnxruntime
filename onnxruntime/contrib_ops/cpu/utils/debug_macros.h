@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdio>
+#include <iostream>
 #include "core/common/make_string.h"
 
 #if !defined(DUMP_TENSOR_LEVEL)
@@ -54,3 +55,8 @@
   do {                        \
   } while (0)
 #endif
+
+#define DUMP_PRINT(msg)                          \
+  do {                                           \
+    std::cout << "[DEBUG] " << msg << std::endl; \
+  } while (0)

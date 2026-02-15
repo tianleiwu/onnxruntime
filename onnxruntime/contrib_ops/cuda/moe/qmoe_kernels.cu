@@ -186,9 +186,13 @@ __global__ void QMoEPrePackPacked4BitZPKernel(const uint8_t* packed_zp, const T*
     uint8_t val = (packed_byte >> ((row & 1) << 2)) & 0x0F;
     float z = static_cast<float>(val);
 
-    // Bias calculation: Store ZP directly (Unscaled) for Cutlass GroupWise?
-    // z is 0..15.
-    out[idx] = static_cast<T>(z);
+    // Bias calculation for Cutlass dequantizer: (8.0 - ZP) * Scale
+    // Cutlass dequantizer uses formula: (q - 8) * scale + bias
+    // We want: (q - zp) * scale
+    // (q - 8) * scale + bias = q*scale - 8*scale + bias
+    // q*scale - zp*scale = q*scale - zp*scale
+    // So: -8*scale + bias = -zp*scale => bias = (8 - zp) * scale
+    out[idx] = static_cast<T>((8.0f - z) * s);
   }
 }
 
