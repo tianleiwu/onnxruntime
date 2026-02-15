@@ -903,15 +903,12 @@ class SparseMoeBlockORTHelper(nn.Module):
                 w1, w3 = self.experts[i].w1.weight, self.experts[i].w3.weight
                 w2 = self.experts[i].w2.weight
                 w1_bias = self.experts[i].w1.bias
-                w2_bias = self.experts[i].w2.bias
                 w3_bias = getattr(self.experts[i].w3, "bias", None)
 
                 # Combine and interleave w1 and w3 for the fused kernel
                 w1_combined = torch.cat([w1, w3], dim=0)  # [2*inter, hidden]
                 if getattr(self, "swiglu_fusion", 0) == 1:
-                    w1_combined = (
-                        w1_combined.view(2, -1, config.hidden_size).transpose(0, 1).reshape(-1, config.hidden_size)
-                    )
+                    w1_combined = w1_combined.view(2, -1, self.hidden_dim).transpose(0, 1).reshape(-1, self.hidden_dim)
 
                 if self.block_size > 0:
                     w1_scale, pre_qweight1, w1_qdq, w1_zp = quant_dequant_blockwise(

@@ -17,6 +17,7 @@
 # normalization on the selected experts. This provides proper weight distribution
 # while maintaining computational efficiency.
 # --------------------------------------------------------------------------
+import copy
 import time
 import unittest
 from collections import OrderedDict
@@ -29,6 +30,7 @@ from parameterized import parameterized
 from torch import nn
 
 import onnxruntime
+from onnxruntime.capi import _pybind_state as _pybind
 
 try:
     from onnx import TensorProto
@@ -148,15 +150,13 @@ def preprocess_weights_for_mixed_gemm(
 
     packed_list = []
 
-    from onnxruntime.capi import _pybind_state as pybind
-
-    if pybind and hasattr(pybind, "pack_weights_for_cuda_mixed_gemm") and torch.cuda.is_available():
+    if _pybind and hasattr(_pybind, "pack_weights_for_cuda_mixed_gemm") and torch.cuda.is_available():
         for i in range(num_experts):
             if tensor[i].dtype == torch.bfloat16:
                 weight = tensor[i].to(torch.float32).cpu().numpy()
             else:
                 weight = tensor[i].cpu().numpy()
-            packed = pybind.pack_weights_for_cuda_mixed_gemm(weight, n, k, quant_bits, sm)
+            packed = _pybind.pack_weights_for_cuda_mixed_gemm(weight, n, k, quant_bits, sm)
             # pack_weights_for_cuda_mixed_gemm returns int8 array of shape [packed_size]
             # We need to reshape it to (k, n/2) for 4-bit, (k, n) for 8-bit.
             output_rows = k
@@ -174,8 +174,6 @@ def preprocess_weights_for_mixed_gemm(
 
 
 def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = True, asymmetric: bool = False):
-    from onnxruntime.capi import _pybind_state as _quantize
-
     # DEBUG
     # print(f"DEBUG: quant_dequant input shape={weights.shape}, 4bit={is_4_bit_quantization}, asym={asymmetric}")
 
@@ -201,10 +199,24 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
         else:
             weights_np = weights_t.detach().cpu().numpy()
 
-        _quantize.quantize_matmul_4bits(q_weight, weights_np, scale, zero_point, block_size, n, k, is_symmetric)
+        _pybind.quantize_matmul_4bits(q_weight, weights_np, scale, zero_point, block_size, n, k, is_symmetric)
 
         q_weight_reshaped = q_weight.reshape(n, -1)
-        processed_q_weight = _quantize.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, n, k, 4)
+
+        # Convert from offset binary to 2's complement by flipping the MSB (bit 3) of each 4-bit value
+        # Since we have packed uint8 (two 4-bit values), we flip bit 3 and bit 7.
+        # 0x88 = 10001000
+        q_weight_reshaped = q_weight_reshaped ^ 0x88
+
+        # For symmetric quantization, the kernel normally subtracts (ZP * scale) from bias.
+        # Standard ZP is 8 (for offset binary).
+        # Since we converted weights to 2's complement (centered), we effectively baked the -8 shift into weights.
+        # So we must tell the kernel that ZP is 0, so it doesn't subtract anything from bias.
+        if is_symmetric:
+            zero_point.fill(0)
+
+        # Use force_arch=80 as requested
+        processed_q_weight = _pybind.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, n, k, 4, 80)
 
         # Dequantize for reference
         scale_torch = torch.from_numpy(scale).to(weights.device).unsqueeze(-1)
@@ -245,11 +257,18 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
             torch.from_numpy(processed_q_weight).reshape(k, n // 2).to(weights.device).view(torch.uint8)
         )
         result = dequantized.view(n, k)
-
-        return scale_torch_out.T, processed_q_weight_torch, result, zero_points_storage
+        return scale_torch_out, processed_q_weight_torch, result, zero_points_storage
 
     else:
         # 8-bit
+        # C++ binding for 8-bit blockwise quantization (if exists) or use Python implementation
+        # For now, we use a simple Python implementation that matches the 8nd bits format
+        # but in practice, we should use the same logic as the kernel.
+        # Since currently QMoE kernel only supports 4-bit, we don't have a 8-bit PrePack binding yet.
+
+        if _pybind and hasattr(_pybind, "quantize_matmul_8bits"):
+            # Placeholder for future used when 8-bit is supported
+            pass
         weights_t = weights.T.contiguous()
         rows, cols = weights_t.shape
         k, n = rows, cols
@@ -265,10 +284,10 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
         else:
             weights_np = weights_t.detach().cpu().numpy()
 
-        _quantize.quantize_matmul_8bits(q_weight, weights_np, scale, zero_point, block_size, n, k, is_symmetric)
+        _pybind.quantize_matmul_8bits(q_weight, weights_np, scale, zero_point, block_size, n, k, is_symmetric)
 
         q_weight_reshaped = q_weight.reshape(n, -1)
-        processed_q_weight = _quantize.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, n, k, 8, 80)
+        processed_q_weight = _pybind.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, n, k, 8, 80)
 
         # Use abs() for reference dequant to match Cutlass kernel's positive scales
         scale_torch = torch.from_numpy(scale).to(weights.device).unsqueeze(-1).abs()
@@ -918,9 +937,7 @@ class SparseMoeBlockORTHelper(nn.Module):
                 # Combine and interleave w1 and w3 for the fused kernel
                 w1_combined = torch.cat([w1, w3], dim=0)  # [2*inter, hidden]
                 if getattr(self, "swiglu_fusion", 0) == 1:
-                    w1_combined = (
-                        w1_combined.view(2, -1, config.hidden_size).transpose(0, 1).reshape(-1, config.hidden_size)
-                    )
+                    w1_combined = w1_combined.view(2, -1, self.hidden_dim).transpose(0, 1).reshape(-1, self.hidden_dim)
 
                 if self.block_size > 0:
                     w1_scale, pre_qweight1, w1_qdq, w1_zp = quant_dequant_blockwise(
@@ -977,7 +994,9 @@ class SparseMoeBlockORTHelper(nn.Module):
 
             if self.use_swiglu:
                 if getattr(self, "swiglu_fusion", 0) == 1:
-                    self.experts[i].w1.weight = nn.Parameter(w1_qdq.contiguous().clone().to(torch_dtype))
+                    # In PhiMoESwiGLUMLP, w1 already contains interleaved gate and linear parts.
+                    # We just need to update it with the quantized-dequantized weights.
+                    self.experts[i].w1.weight.data = w1_qdq.contiguous().clone().to(torch_dtype)
                 else:
                     intermediate_size = self.experts[i].w1.weight.shape[0]
                     gate_dequant = w1_qdq[:intermediate_size].contiguous().clone().to(torch_dtype)
@@ -1049,9 +1068,8 @@ class SparseMoeBlockORTHelper(nn.Module):
                 quant_bits=self.quant_bits,
                 # We use swiglu_fusion=1 (fused and interleaved) based on the kernel implementation.
                 # This matches the behavior of the Cutlass/MLAS kernels used in ORT.
-
                 swiglu_fusion=getattr(self, "swiglu_fusion", 0),
-                block_size=self.block_size, # Add block_size for block-wise quantization
+                block_size=self.block_size,  # Add block_size for block-wise quantization
             )
         except Exception as e:
             print(f"Failed to create ONNX graph: {e}")
@@ -1129,9 +1147,14 @@ class SparseMoeBlockORTHelper(nn.Module):
             print("ORT  sample:", ort_output.cpu().reshape(-1, hidden_dim)[i, k].item())
             # Print routing and per-expert contributions for this token from the PyTorch reference
             try:
-                hidden_states_flat = hidden_state.view(-1, hidden_dim)
+                # Use float32 for diagnostic to avoid "unsupported ScalarType BFloat16" on some platforms/ops
+                hidden_states_flat = hidden_state.view(-1, hidden_dim).float()
                 token_vec = hidden_states_flat[i : i + 1]
-                gate_logits = self.gate(token_vec)
+
+                # Copy gate to CPU and float32 for reliable debug
+                gate_cpu = copy.deepcopy(self.gate).cpu().float()
+                gate_logits = gate_cpu(token_vec.cpu())
+
                 topk_vals, topk_experts = torch.topk(gate_logits, self.top_k, dim=-1)
                 topk_soft = F.softmax(topk_vals, dim=1)
                 print("Gate logits:", gate_logits.detach().cpu().numpy())
@@ -1139,12 +1162,12 @@ class SparseMoeBlockORTHelper(nn.Module):
                 print("Routing weights:", topk_soft.detach().cpu().numpy())
                 # Compute per-expert contributions for selected experts
                 for idx_e, e in enumerate(topk_experts[0].tolist()):
-                    expert_layer = self.experts[e]
-                    expert_out = expert_layer(token_vec)
+                    expert_layer = copy.deepcopy(self.experts[e]).cpu().float()
+                    expert_out = expert_layer(token_vec.cpu())
                     contrib = expert_out[0, k].item() * topk_soft[0, idx_e].item()
                     print(f"Expert {e} contrib at hidden {k}: {contrib}")
-            except Exception as _:
-                pass
+            except Exception as e:
+                print(f"DEBUG: Diagnostic failed with error: {e}")
 
         ort_dtype_quant_bits_tolerance_map = {
             "FP32:0": (5e-3, 1e-3),
@@ -1213,55 +1236,21 @@ class SwigluMoEBlock(SparseMoeBlockORTHelper):
         self.use_swiglu = True
         self.swiglu_fusion = 1
         self.block_size = block_size
-        use_quant = self.quant_bits > 0
 
         torch_dtype = onnx_to_torch_type_map[self.onnx_dtype] if self.onnx_dtype else torch.float32
 
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=True).to(device).to(torch_dtype)
 
-        self.experts = nn.ModuleList([SwigluMlp(config).to(device).to(torch_dtype) for _ in range(self.num_experts)])
+        if self.swiglu_fusion == 1:
+            self.experts = nn.ModuleList(
+                [PhiMoESwiGLUMLP(config).to(device).to(torch_dtype) for _ in range(self.num_experts)]
+            )
+        else:
+            self.experts = nn.ModuleList(
+                [SwigluMlp(config).to(device).to(torch_dtype) for _ in range(self.num_experts)]
+            )
 
-        fc1_w_list, fc2_w_list = [], []
-        fc1_b_list, fc2_b_list = [], []
-        scale_1_list, scale_2_list = [], []
-        zp_1_list, zp_2_list = [], []
-
-        for expert in self.experts:
-            fc1_b_list.append(expert.w1.bias)
-            fc2_b_list.append(expert.w2.bias)
-            if not use_quant:
-                fc1_w_list.append(expert.w1.weight)
-                fc2_w_list.append(expert.w2.weight)
-            else:
-                is_4_bit = self.quant_bits == 4
-
-                if self.block_size > 0:
-                    scale1, pre_qweight1, w1_qdq, zp1 = quant_dequant_blockwise(
-                        expert.w1.weight, self.block_size, is_4_bit, asymmetric=self.use_asymmetric_quant
-                    )
-
-                    scale2, pre_qweight2, w2_qdq, zp2 = quant_dequant_blockwise(
-                        expert.w2.weight, self.block_size, is_4_bit, asymmetric=self.use_asymmetric_quant
-                    )
-                else:
-                    scale1, pre_qweight1, w1_qdq, zp1 = quant_dequant(
-                        expert.w1.weight, is_4_bit, asymmetric=self.use_asymmetric_quant
-                    )
-                    scale2, pre_qweight2, w2_qdq, zp2 = quant_dequant(
-                        expert.w2.weight, is_4_bit, asymmetric=self.use_asymmetric_quant
-                    )
-
-                expert.w1.weight.data = w1_qdq.to(torch_dtype)
-                expert.w2.weight.data = w2_qdq.to(torch_dtype)
-
-                fc1_w_list.append(pre_qweight1)
-                fc2_w_list.append(pre_qweight2)
-                scale_1_list.append(scale1)
-                scale_2_list.append(scale2)
-                if zp1 is not None:
-                    zp_1_list.append(zp1)
-                if zp2 is not None:
-                    zp_2_list.append(zp2)
+            # Weight update and collection is handled in recreate_onnx_model
 
         self.batch_size = batch_size
         self.sequence_length = sequence_length
@@ -1407,12 +1396,6 @@ class PhiMoESparseMoeBlock(SparseMoeBlockORTHelper):
             use_quant=use_quant,
             quant_bits=self.quant_bits,
             swiglu_fusion=getattr(self, "swiglu_fusion", 0),
-            use_swiglu=self.use_swiglu,
-            use_quant=use_quant,
-            quant_bits=self.quant_bits,
-            # We use swiglu_fusion=1 (fused and interleaved) based on the kernel implementation.
-            # This matches the behavior of the Cutlass/MLAS kernels used in ORT.
-            swiglu_fusion=getattr(self, "swiglu_fusion", 0),
             block_size=self.block_size,
         )
 
@@ -1531,7 +1514,7 @@ class TestPhiQMoE(unittest.TestCase):
         )
 
         hidden_states = torch.randn(batch_size, sequence_length, config.hidden_size).to(device).to(torch.bfloat16)
-        torch_result = phi3_moe.forward(hidden_states)
+        _ = phi3_moe.forward(hidden_states)
 
         phi3_moe.parity_check()
 
@@ -1617,7 +1600,7 @@ class TestPhiQMoE(unittest.TestCase):
         )
 
         hidden_states = torch.randn(batch_size, sequence_length, config.hidden_size).to(device).to(torch.bfloat16)
-        torch_result = phi3_moe.forward(hidden_states)
+        _ = phi3_moe.forward(hidden_states)
 
         phi3_moe.parity_check()
 
@@ -1699,7 +1682,6 @@ class TestSwigluQMoE(unittest.TestCase):
         swiglu_moe.parity_check()
 
     @parameterized.expand(swiglu_test_cases)
-    @unittest.skip("BFloat16 Bias causes session crash: basic_string: construction from null is not valid")
     def test_swiglu_qmoe_parity_bf16(self, batch_size, sequence_length, quant_bits):
         base_seed = 1500
         param_hash = hash((batch_size, sequence_length, quant_bits))
@@ -1722,7 +1704,7 @@ class TestSwigluQMoE(unittest.TestCase):
         )
 
         hidden_states = torch.randn(batch_size, sequence_length, config.hidden_size).to(device).to(torch.bfloat16)
-        torch_result = swiglu_moe.forward(hidden_states)
+        _ = swiglu_moe.forward(hidden_states)
 
         swiglu_moe.parity_check()
 
@@ -1753,8 +1735,6 @@ class TestSwigluQMoE(unittest.TestCase):
 
     @parameterized.expand(swiglu_blockwise_test_cases)
     def test_swiglu_qmoe_blockwise_parity(self, batch_size, sequence_length, quant_bits, block_size):
-        # if quant_bits == 8:
-        #     self.skipTest("8-bit blockwise quantization is not supported on CUDA")
         torch.manual_seed(42)
         numpy.random.seed(42)
 
@@ -1786,8 +1766,6 @@ class TestSwigluQMoE(unittest.TestCase):
 
     @parameterized.expand(swiglu_blockwise_test_cases)
     def test_swiglu_qmoe_blockwise_parity_bf16(self, batch_size, sequence_length, quant_bits, block_size):
-        # if quant_bits == 8:
-        #     self.skipTest("8-bit blockwise quantization is not supported on CUDA")
         torch.manual_seed(142)
         numpy.random.seed(142)
 
@@ -1807,7 +1785,7 @@ class TestSwigluQMoE(unittest.TestCase):
         )
 
         hidden_states = torch.randn(batch_size, sequence_length, config.hidden_size).to(device).to(torch.bfloat16)
-        torch_result = swiglu_moe.forward(hidden_states)
+        _ = swiglu_moe.forward(hidden_states)
 
         swiglu_moe.parity_check()
 
