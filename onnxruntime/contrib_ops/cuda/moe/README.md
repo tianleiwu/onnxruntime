@@ -59,12 +59,15 @@ To maximize performance and compatibility with Cutlass kernels, the `PrePack` st
         Bias = (128 - ZeroPoint) * Scale
         ```
         *   This effectively treats the calculation as `(W_stored + 128 - ZP) * Scale`.
-    *   **4-bit Weights**: Zero Points are unpacked from nibbles (2 per byte) and stored as **Unscaled** floating-point values (just the integer ZP cast to float/half).
-        *   The Cutlass 4-bit kernel (`FINEGRAINED_SCALE_AND_ZEROS`) natively handles `(W - ZP) * Scale` without requiring a pre-computed bias.
+    *   **4-bit Weights**: Zero Points are unpacked from nibbles (2 per byte) and converted to **Scaled Biases**:
+        ```cpp
+        Bias = (8 - ZeroPoint) * Scale
+        ```
+        *   This transformation allows the kernel to handle asymmetric quantization by adding a pre-calculated bias term, effectively computing `W * Scale + Bias` which is equivalent to `(W - (ZeroPoint - 8)) * Scale`.
     *   **Symmetric**: Bias is 0.
 
-    *   This conversion happens via generic kernels (`LaunchQMoEPrePackOffsetBias`, `QMoEPrePackPacked4BitZPKernel`).
-    *   The resulting buffer (`packed_bias`) is stored in `float16/float`, matching the Scale type.
+    *   This conversion happens via generic kernels (`LaunchQMoEPrePackOffsetBias`, `LaunchQMoEPrePackPacked4BitZPKernel`).
+    *   The resulting buffer (`packed_bias`) is stored in `float16/bfloat16/float`, matching the Scale type.
 
 ## 3. Cutlass Kernel Expectations
 
@@ -81,8 +84,8 @@ MoeGemmRunner<half, uint8_t, half>  // InputType, WeightType, OutputType
 *   **Scales & Bias**: Row-Major `[Output, Input/Block]`. (Note: Since we process one expert at a time or grouped experts, the `NumExperts` dimension is the batch).
 *   **Bias/ZP Type Constraint**:
     *   For Symmetric Quantization (`Bias=0`), the kernel works seamlessly.
-    *   For Asymmetric Quantization, the kernel expects `ElementZero` (the bias/ZP buffer type) to match `ElementScale` (`half` or `float`).
-        *   **4-bit**: Stores Unscaled ZP values.
+    *   For Asymmetric Quantization, the kernel expects `ElementZero` (the bias/ZP buffer type) to match `ElementScale` (`half`, `bfloat16`, or `float`).
+        *   **4-bit**: Stores Pre-calculated Bias.
         *   **8-bit**: Stores Pre-calculated Bias.
     *   *Note*: `DefaultGemmGrouped` may infer `ElementZero` from `ElementB` (Weights, `uint8`). This implementation ensures `ElementZero` matches `ElementScale` (Floating Point) to support asymmetric quantization correctly.
 
@@ -123,6 +126,7 @@ The primary test scripts are located in `onnxruntime/test/python/transformers/`.
 ### 5.1 Architecture Support
 *   **SM80+ (Ampere)**: The QMoE kernels (Cutlass 3.x / Mixed Input GEMM) primarily target Ampere (SM80) and newer architectures (Hopper SM90).
 *   **Tensor Cores**: The packed layout is specifically designed to feed Tensor Cores efficiently.
+*   **Data Types**: Supports `float16` and `bfloat16` for inputs and outputs.
 
 ### 5.2 SwiGLU Fusion
 *   **Interleaved**: The operator supports `swiglu_fusion=1`. In this mode, the weights for the Gating and Value projections are interleaved in the `fc1` tensor.
@@ -242,6 +246,10 @@ The operator handles three distinct modes for SwiGLU, controlled by the `swiglu_
     *   **Inputs**: 2 distinct weight tensors (`fc1`, `fc2`).
     *   **Memory Layout**: `[Gate_0 ... Gate_N | Value_0 ... Value_N]` (Concatenated).
     *   **Logic**: The kernel processes the first half as Gate and the second half as Value.
+
+### 5.4 Limitations
+*   **Row-wise Quantization**: Row-wise quantization (`block_size <= 0`) does not currently support zero points in the QMoE operator.
+*   **Block Size**: Asymmetric zero points are currently supported only when `block_size >= 64`.
 
 **Weight Conversion**:
 When exporting a model to ONNX with SwiGLU, the weights for the Gate and Value projections (typically FC1 and Gate_Proj) are often merged. To use **Interleaved** mode, these weights must be interleaved at the output channel dimension during the export/packing phase so that the GEMM output naturally results in `[G, V, G, V...]`.
