@@ -251,12 +251,35 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
 
   auto prepare_scale_zp = [&](const Tensor* scales, const Tensor* zeros,
                               const IAllocatorUniquePtr<void>& packed_scale, const IAllocatorUniquePtr<void>& packed_bias,
+                              IAllocatorUniquePtr<void>& transposed_scale_holder,
+                              IAllocatorUniquePtr<void>& transposed_zp_holder,
                               IAllocatorUniquePtr<void>& transient_bias,
                               const void*& eff_scale, const void*& eff_zp) {
     if (packed_scale) {
       eff_scale = packed_scale.get();
     } else if (scales) {
       eff_scale = scales->DataRaw();
+
+      // For block-wise quantization, Cutlass expects scales laid out as [Experts, Blocks, N].
+      // Input tensors are provided as [Experts, N, Blocks], so transpose when PrePack is not used.
+      auto scale_shape = scales->Shape();
+      if (block_size_ > 0 && scale_shape.NumDimensions() == 3 && scale_shape[2] > 1) {
+        size_t rows = scale_shape[1];   // N
+        size_t cols = scale_shape[2];   // Blocks
+        size_t batch = scale_shape[0];  // Experts
+        size_t bytes = scales->SizeInBytes();
+
+        transposed_scale_holder = GetScratchBuffer<void>(bytes, context->GetComputeStream());
+        eff_scale = transposed_scale_holder.get();
+
+        if (scales->IsDataType<MLFloat16>()) {
+          LaunchQMoETranspose2D(static_cast<const half*>(scales->DataRaw()), static_cast<half*>(transposed_scale_holder.get()), batch, rows, cols, stream);
+        } else if (scales->IsDataType<BFloat16>()) {
+          LaunchQMoETranspose2D(static_cast<const __nv_bfloat16*>(scales->DataRaw()), static_cast<__nv_bfloat16*>(transposed_scale_holder.get()), batch, rows, cols, stream);
+        } else {
+          LaunchQMoETranspose2D(static_cast<const float*>(scales->DataRaw()), static_cast<float*>(transposed_scale_holder.get()), batch, rows, cols, stream);
+        }
+      }
     }
 
     if (packed_bias) {
@@ -395,13 +418,13 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
         if (shape.NumDimensions() == 3 && shape[2] > 1) {
           // Need temporary buffer for transpose
           size_t bytes = zeros->SizeInBytes();
-          transient_bias = GetScratchBuffer<void>(bytes, context->GetComputeStream());
-          eff_zp = transient_bias.get();
+          transposed_zp_holder = GetScratchBuffer<void>(bytes, context->GetComputeStream());
+          eff_zp = transposed_zp_holder.get();
 
           size_t rows = shape[1];   // N
           size_t cols = shape[2];   // Blocks
           size_t batch = shape[0];  // Experts
-          LaunchQMoETranspose2D(static_cast<const uint8_t*>(zeros->DataRaw()), static_cast<uint8_t*>(transient_bias.get()), batch, rows, cols, stream);
+          LaunchQMoETranspose2D(static_cast<const uint8_t*>(zeros->DataRaw()), static_cast<uint8_t*>(transposed_zp_holder.get()), batch, rows, cols, stream);
         } else {
           eff_zp = zeros->DataRaw();
         }
@@ -409,8 +432,10 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
     }
   };
 
-  prepare_scale_zp(fc1_scales, fc1_zeros, packed_fc1_scales_, packed_fc1_bias_, transient_fc1_bias, p_fc1_scales, p_fc1_zp);
-  prepare_scale_zp(fc2_scales, fc2_zeros, packed_fc2_scales_, packed_fc2_bias_, transient_fc2_bias, p_fc2_scales, p_fc2_zp);
+  prepare_scale_zp(fc1_scales, fc1_zeros, packed_fc1_scales_, packed_fc1_bias_,
+                   transposed_fc1_scales_holder, transposed_fc1_zp_holder, transient_fc1_bias, p_fc1_scales, p_fc1_zp);
+  prepare_scale_zp(fc2_scales, fc2_zeros, packed_fc2_scales_, packed_fc2_bias_,
+                   transposed_fc2_scales_holder, transposed_fc2_zp_holder, transient_fc2_bias, p_fc2_scales, p_fc2_zp);
 
   // DEBUG PRINTS (Preserved and fixed)
   // if (block_size_ > 0) {
@@ -481,7 +506,6 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
 
 Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
                      bool& is_packed, PrePackedWeights* prepacked_weights) {
-  printf("DEBUG: PrePack called for input_idx=%d\n", input_idx);
   is_packed = false;
 
   cudaStream_t stream = 0;  // Use default stream for PrePack operations
@@ -532,10 +556,8 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
   auto compute_bias = [&](const IAllocatorUniquePtr<void>& packed_scale, IAllocatorUniquePtr<void>& packed_bias) {
     // If not computing bias (e.g. 8-bit ZP), we might not need scales at all, but we check anyway.
     if ((expert_weight_bits_ == 4) && !packed_scale) {
-      printf("DEBUG: compute_bias skipped because packed_scale is null! input_idx=%d\n", input_idx);
       return;
     }
-    printf("DEBUG: compute_bias executing for input_idx=%d. packed_scale=%p\n", input_idx, packed_scale.get());
 
     size_t num_elements = tensor.Shape().Size();
     auto shape = tensor.Shape();

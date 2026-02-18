@@ -200,6 +200,8 @@ def quant_dequant_blockwise(weights, block_size, is_4_bit_quantization: bool = T
             weights_np = weights_t.detach().cpu().numpy()
 
         _pybind.quantize_matmul_4bits(q_weight, weights_np, scale, zero_point, block_size, n, k, is_symmetric)
+        if is_symmetric:
+            scale = numpy.abs(scale)
 
         q_weight_reshaped = q_weight.reshape(n, -1)
         processed_q_weight = _pybind.pack_weights_for_cuda_mixed_gemm(q_weight_reshaped, n, k, 4, 80)
@@ -1158,12 +1160,12 @@ class SparseMoeBlockORTHelper(nn.Module):
         ort_dtype_quant_bits_tolerance_map = {
             "FP32:0": (5e-3, 1e-3),
             "FP16:0": (5e-2, 1e-3),
-            "FP16:4": (1.0, 0.01),
-            "FP16:8": (1.0, 0.01),
-            "FP32:4": (0.11, 0.01),
-            "FP32:8": (0.11, 0.01),
-            "BF16:4": (1.0, 0.02),
-            "BF16:8": (1.0, 0.02),
+            "FP16:4": (0.1, 0.01),
+            "FP16:8": (0.1, 0.01),
+            "FP32:4": (0.1, 0.01),
+            "FP32:8": (0.1, 0.01),
+            "BF16:4": (0.1, 0.02),
+            "BF16:8": (0.1, 0.02),
         }
 
         dtype_str = ort_dtype_name_map[self.onnx_dtype]
