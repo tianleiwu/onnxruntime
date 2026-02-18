@@ -249,9 +249,6 @@ Or the following to clean moe related build artifacts and then build and install
 If you need clean all build artifacts (rm -rf build) and then build and install wheel:
 ./run.sh --clean --build --install
 
-If you want to enable debug node inputs and outputs (You may add --clean if previous build has no --dump option):
-./run.sh --build --install --dump
-
 # How to test
 run test_moe_cuda.py:
 ./run.sh --test_moe
@@ -264,3 +261,10 @@ If you need to run a specific test case, you can use --test_moe_case or --test_q
 
 If you want to enable debug node inputs and outputs (Current build need to be built with --dump option):
 ./run.sh --test_qmoe_case TestSwigluQMoE.test_swiglu_qmoe_blockwise_parity_3 --dump
+
+# How to dump a test to show node inputs and outputs etc.
+ Add --dump option to the test command:
+./run.sh --test_qmoe_case TestSwigluQMoE.test_swiglu_qmoe_blockwise_parity_3 --dump
+
+# How to benchmark QMoE CPU:
+./run.sh --benchmark_qmoe

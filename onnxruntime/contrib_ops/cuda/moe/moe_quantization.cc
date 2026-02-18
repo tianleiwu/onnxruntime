@@ -269,6 +269,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
           size_t num_elements = zeros->Shape().Size();
           // Determine type size based on scale type
           bool is_fp16 = scales->IsDataType<MLFloat16>();
+          bool is_bf16 = scales->IsDataType<BFloat16>();
           size_t bytes = num_elements * (is_fp16 ? 2 : 4);
 
           transient_bias = GetScratchBuffer<void>(bytes, context->GetComputeStream());
@@ -316,6 +317,36 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
                     p_zp,
                     static_cast<const half*>(eff_scale),
                     static_cast<half*>(transient_bias.get()),
+                    static_cast<int>(num_elements),
+                    stream);
+              }
+            }
+          } else if (is_bf16) {
+            if (expert_weight_bits_ == 8) {
+              LaunchQMoEPrePackOffsetBias(
+                  p_zp,
+                  static_cast<const __nv_bfloat16*>(eff_scale),
+                  static_cast<__nv_bfloat16*>(transient_bias.get()),
+                  static_cast<int>(num_elements),
+                  128.0f,
+                  stream);
+            } else {
+              // 4-bit
+              size_t scale_el = scales->Shape().Size();
+              if (scale_el > num_elements * 3 / 2) {
+                int N_stride = static_cast<int>(zeros->Shape()[1]);
+                LaunchQMoEPrePackPacked4BitZPKernel(
+                    p_zp,
+                    static_cast<const __nv_bfloat16*>(eff_scale),
+                    static_cast<__nv_bfloat16*>(transient_bias.get()),
+                    static_cast<int>(scale_el),
+                    N_stride,
+                    stream);
+              } else {
+                LaunchQMoEPrePackZP(
+                    p_zp,
+                    static_cast<const __nv_bfloat16*>(eff_scale),
+                    static_cast<__nv_bfloat16*>(transient_bias.get()),
                     static_cast<int>(num_elements),
                     stream);
               }
@@ -450,6 +481,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
 
 Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
                      bool& is_packed, PrePackedWeights* prepacked_weights) {
+  printf("DEBUG: PrePack called for input_idx=%d\n", input_idx);
   is_packed = false;
 
   cudaStream_t stream = 0;  // Use default stream for PrePack operations
@@ -499,7 +531,11 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
 
   auto compute_bias = [&](const IAllocatorUniquePtr<void>& packed_scale, IAllocatorUniquePtr<void>& packed_bias) {
     // If not computing bias (e.g. 8-bit ZP), we might not need scales at all, but we check anyway.
-    if ((expert_weight_bits_ == 4) && !packed_scale) return;
+    if ((expert_weight_bits_ == 4) && !packed_scale) {
+      printf("DEBUG: compute_bias skipped because packed_scale is null! input_idx=%d\n", input_idx);
+      return;
+    }
+    printf("DEBUG: compute_bias executing for input_idx=%d. packed_scale=%p\n", input_idx, packed_scale.get());
 
     size_t num_elements = tensor.Shape().Size();
     auto shape = tensor.Shape();
@@ -607,6 +643,8 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
 
       if (is_fp16) {
         LaunchQMoEPrePackPacked4BitZPKernel(static_cast<const uint8_t*>(p_zp_for_calc), static_cast<const half*>(packed_scale.get()), static_cast<half*>(packed_bias.get()), static_cast<int>(output_count), N_stride, stream);
+      } else if (type == TensorProto_DataType_BFLOAT16) {
+        LaunchQMoEPrePackPacked4BitZPKernel(static_cast<const uint8_t*>(p_zp_for_calc), static_cast<const __nv_bfloat16*>(packed_scale.get()), static_cast<__nv_bfloat16*>(packed_bias.get()), static_cast<int>(output_count), N_stride, stream);
       } else {
         LaunchQMoEPrePackPacked4BitZPKernel(static_cast<const uint8_t*>(p_zp_for_calc), static_cast<const float*>(packed_scale.get()), static_cast<float*>(packed_bias.get()), static_cast<int>(output_count), N_stride, stream);
       }
@@ -624,7 +662,11 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
       size_t rows = shape[1];   // N
       size_t cols = shape[2];   // Blocks
       size_t batch = shape[0];  // Experts
-      DUMP_TENSOR(name, static_cast<const half*>(packed_scales.get()), int(batch), int(cols), int(rows));
+      if (expert_weight_bits_ == 8 && block_size_ <= 0 && strstr(name, "bias") != nullptr) {
+        DUMP_TENSOR(name, static_cast<const uint8_t*>(packed_scales.get()), int(batch), int(cols), int(rows));
+      } else {
+        DUMP_TENSOR(name, static_cast<const half*>(packed_scales.get()), int(batch), int(cols), int(rows));
+      }
     }
   };
 #define DUMP_PACK_TENSOR(name, packed_scales, scales) dump_tensor(name, packed_scales, scales)
@@ -645,13 +687,13 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
     TransposeAndPack(packed_fc3_scales_);
     DUMP_PACK_TENSOR("packed_fc3_scales", packed_fc3_scales_, tensor);
   } else if (input_idx == 11) {  // fc1_zeros
-    // DUMP_TENSOR("fc1_zeros", tensor);
+    DUMP_TENSOR("fc1_zeros", tensor);
     compute_bias(packed_fc1_scales_, packed_fc1_bias_);
-    // DUMP_PACK_TENSOR("packed_fc1_bias", packed_fc1_bias_, tensor);
+    DUMP_PACK_TENSOR("packed_fc1_bias", packed_fc1_bias_, tensor);
   } else if (input_idx == 12) {  // fc2_zeros
-    // DUMP_TENSOR("fc2_zeros", tensor);
+    DUMP_TENSOR("fc2_zeros", tensor);
     compute_bias(packed_fc2_scales_, packed_fc2_bias_);
-    // DUMP_PACK_TENSOR("packed_fc2_bias", packed_fc2_bias_, tensor);
+    DUMP_PACK_TENSOR("packed_fc2_bias", packed_fc2_bias_, tensor);
   }
   // TODO: fc3_zeros (13) not handled for now as it's optional and rarely used?
   // Code structure allows adding it easily.

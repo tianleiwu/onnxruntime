@@ -11,7 +11,9 @@
 #   --clean_moe       Clean moe build artifacts
 #   --test_moe        Run test_moe_cuda.py
 #   --test_qmoe       Run test_qmoe_cuda.py
+#   --test_qmoe_cpu   Run test_qmoe_cpu.py
 #   --test_qmoe_case  Run specific test case in test_qmoe_cuda.py (e.g. TestSwigluQMoE.test_swiglu_qmoe_blockwise_parity_3)
+#   --benchmark_qmoe  Run benchmark_qmoe.py
 # Options for Flash Attention only (Not Used for MoE or QMoE):
 #   --quick           Configure quick build/test (flash attention hdim128 only and exclude bf16, sets onnxruntime_QUICK_BUILD=ON)
 #   --quick_build     A combination of --quick and --build
@@ -36,13 +38,16 @@ USE_QUICK_BUILD=false
 RUN_INSTALL=false
 RUN_TEST_MOE=false
 RUN_TEST_QMOE=false
+RUN_TEST_QMOE_CPU=false
 RUN_TEST_QMOE_CASE=false
 TEST_QMOE_CASE=""
 RUN_TEST_MOE_CASE=false
 TEST_MOE_CASE=""
 RUN_BENCHMARK=false
+RUN_BENCHMARK_QMOE=false
 RUN_PROFILE=false
 ENABLE_DUMP="OFF"
+BUILD_DUMP="ON"
 
 while [[ "$#" -gt 0 ]]; do
     case $1 in
@@ -84,6 +89,10 @@ while [[ "$#" -gt 0 ]]; do
             RUN_TEST_QMOE=true
             echo "==== 🚫 Test QMoE run enabled ===="
             ;;
+        --test_qmoe_cpu)
+            RUN_TEST_QMOE_CPU=true
+            echo "==== 🚫 Test QMoE CPU run enabled ===="
+            ;;
         --test_moe_case)
             RUN_TEST_MOE_CASE=true
             TEST_MOE_CASE="$2"
@@ -99,6 +108,10 @@ while [[ "$#" -gt 0 ]]; do
         --benchmark)
             RUN_BENCHMARK=true
             echo "==== 📊 Benchmark run enabled ===="
+            ;;
+        --benchmark_qmoe)
+            RUN_BENCHMARK_QMOE=true
+            echo "==== 📊 QMoE Benchmark run enabled ===="
             ;;
         --profile)
             RUN_PROFILE=true
@@ -137,9 +150,9 @@ if [ "$RUN_BUILD" = true ]; then
             --cmake_generator Ninja \
             --enable_cuda_nhwc_ops \
             --use_binskim_compliant_compile_flags \
-            --cmake_extra_defines onnxruntime_DEBUG_NODE_INPUTS_OUTPUTS=$ENABLE_DUMP \
-            --cmake_extra_defines onnxruntime_DUMP_TENSOR=$ENABLE_DUMP \
-            --cmake_extra_defines onnxruntime_LLM_VERBOSE=$ENABLE_DUMP \
+            --cmake_extra_defines onnxruntime_DEBUG_NODE_INPUTS_OUTPUTS=$BUILD_DUMP \
+            --cmake_extra_defines onnxruntime_DUMP_TENSOR=$BUILD_DUMP \
+            --cmake_extra_defines onnxruntime_LLM_VERBOSE=$BUILD_DUMP \
             --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES="90" \
             --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF \
             --cmake_extra_defines onnxruntime_USE_FPA_INTB_GEMM=OFF \
@@ -167,8 +180,15 @@ if [ "$ENABLE_DUMP" = "ON" ]; then
     export ORT_DEBUG_NODE_IO_DUMP_SHAPE_DATA=1
     export ORT_DEBUG_NODE_IO_DUMP_INPUT_DATA=1
     export ORT_DEBUG_NODE_IO_DUMP_OUTPUT_DATA=1
+    export ORT_DEBUG_NODE_IO_DUMP_NODE_PLACEMENT=1
     export ORT_DEBUG_NODE_IO_SNIPPET_THRESHOLD=200
     export ORT_DEBUG_NODE_IO_SNIPPET_EDGE_ITEMS=3
+    export ORT_DEBUG_NODE_IO_DUMP_STATISTICS_DATA=0
+else
+    export ORT_DEBUG_NODE_IO_DUMP_SHAPE_DATA=0
+    export ORT_DEBUG_NODE_IO_DUMP_INPUT_DATA=0
+    export ORT_DEBUG_NODE_IO_DUMP_OUTPUT_DATA=0
+    export ORT_DEBUG_NODE_IO_DUMP_NODE_PLACEMENT=0
     export ORT_DEBUG_NODE_IO_DUMP_STATISTICS_DATA=0
 fi
 
@@ -195,6 +215,16 @@ if [ "$RUN_TEST_QMOE" = true ]; then
     echo "==== ✅ test_qmoe_cuda.py passed! ===="
 fi
 
+if [ "$RUN_TEST_QMOE_CPU" = true ]; then
+    python test_qmoe_cpu.py
+    test_exit_code=$?
+    if [ $test_exit_code -ne 0 ]; then
+        echo "==== ❌ test_qmoe_cpu.py failed with exit code $test_exit_code! Exiting. ===="
+        exit $test_exit_code
+    fi
+    echo "==== ✅ test_qmoe_cpu.py passed! ===="
+fi
+
 if [ "$RUN_TEST_QMOE_CASE" = true ]; then
     python test_qmoe_cuda.py -k "$TEST_QMOE_CASE"
     test_exit_code=$?
@@ -218,6 +248,11 @@ fi
 if [ "$RUN_BENCHMARK" = true ]; then
     echo "==== 📊 Running benchmark_gqa.py ... ===="
     python benchmark_gqa.py
+fi
+
+if [ "$RUN_BENCHMARK_QMOE" = true ]; then
+    echo "==== 📊 Running benchmark_qmoe.py ... ===="
+    python benchmark_qmoe.py
 fi
 
 if [ "$RUN_PROFILE" = true ]; then
