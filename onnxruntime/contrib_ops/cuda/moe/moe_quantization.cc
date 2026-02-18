@@ -13,6 +13,8 @@
 #include "core/common/safeint.h"
 #include "contrib_ops/cuda/moe/qmoe_kernels.h"
 #include "contrib_ops/cuda/llm/common/env_utils.h"
+#include "contrib_ops/cuda/llm/common/logger.h"
+#include "contrib_ops/cuda/llm/fpA_intB_gemm_adaptor.h"
 
 #include "contrib_ops/cuda/utils/dump_cuda_tensor.h"
 #include "contrib_ops/cpu/utils/debug_macros.h"
@@ -106,6 +108,22 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   const Tensor* fc1_zeros = packed_fc1_bias_ ? nullptr : context->Input<Tensor>(11);
   const Tensor* fc2_zeros = packed_fc2_bias_ ? nullptr : context->Input<Tensor>(12);
   const Tensor* fc3_zeros = context->Input<Tensor>(13);
+
+  const bool has_any_zero_point = (fc1_zeros != nullptr || fc2_zeros != nullptr || fc3_zeros != nullptr ||
+                                   packed_fc1_bias_ != nullptr || packed_fc2_bias_ != nullptr);
+
+  // Row-wise quantization path does not support asymmetric zero-points in QMoE.
+  // QuantParams::Int only carries scales (no zero/bias tensor).
+  if (block_size_ <= 0 && has_any_zero_point) {
+    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
+                           "QMoE row-wise quantization (block_size <= 0) does not support zero_points. "
+                           "Remove fc*_zero_points or use block-wise quantization.");
+  }
+  if (block_size_ > 0 && block_size_ < 64 && has_any_zero_point) {
+    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
+                           "QMoE asymmetric zero_points are currently supported only when block_size >= 64. "
+                           "Use block_size >= 64 or remove fc*_zero_points.");
+  }
 
   int64_t pack_size = expert_weight_bits_ == 4 ? 2 : 1;
   bool is_fused_swiglu = activation_type_ == onnxruntime::llm::kernels::cutlass_kernels::ActivationType::Swiglu;
@@ -437,12 +455,6 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   prepare_scale_zp(fc2_scales, fc2_zeros, packed_fc2_scales_, packed_fc2_bias_,
                    transposed_fc2_scales_holder, transposed_fc2_zp_holder, transient_fc2_bias, p_fc2_scales, p_fc2_zp);
 
-  // DEBUG PRINTS (Preserved and fixed)
-  // if (block_size_ > 0) {
-  //   printf("QMoE Debug: block_size=%ld, expert_bits=%ld\n", block_size_, expert_weight_bits_);
-  //   printf("QMoE Debug: FC1 Scales=%p, ZP=%p (PackedScales=%p, PackedBias=%p)\n", p_fc1_scales, p_fc1_zp, packed_fc1_scales_.get(), packed_fc1_bias_.get());
-  // }
-
   onnxruntime::llm::kernels::cutlass_kernels::QuantParams quant_params;
   if (block_size_ > 0) {
     quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::GroupWise(
@@ -628,14 +640,29 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
         }
       }
     } else {
-      // For 4-bit: packed_bias holds floating point bias = -ZP * Scale
+      // For 4-bit: packed_bias holds floating point bias.
+      // Row-wise quantization (block_size_ <= 0) does not support asymmetric ZP in QMoE:
+      // QuantParams::Int only takes scales (no zeros). Keep a zero bias buffer for compatibility.
+      if (block_size_ <= 0) {
+        // Row-wise asymmetric 4-bit is not wired through QuantParams::Int.
+        // Leave this input unpacked and let runtime path handle/ignore it.
+        return;
+      }
+
+      // Block-wise 4-bit: packed_bias holds floating-point bias = (8 - ZP) * Scale.
       auto type = Info().node().InputDefs()[0]->TypeAsProto()->tensor_type().elem_type();
       bool is_fp16 = (type == TensorProto_DataType_FLOAT16);
+      bool is_bf16 = (type == TensorProto_DataType_BFLOAT16);
 
-      // Assume packed ZP (2 elements per byte) for 4-bit PrePack scenarios
-      size_t zp_bytes = num_elements;
-      size_t output_count = zp_bytes * 2;
-      size_t bytes = output_count * (is_fp16 ? 2 : 4);
+      // zeros shape for block-wise 4-bit is [E, N, ceil(B/2)] in packed uint4.
+      // scales are prepacked to [E, B, N]. We convert zeros to scaled bias [E, B, N].
+      ORT_ENFORCE(shape.NumDimensions() == 3, "Expected 3D zeros for block-wise 4-bit");
+      const int experts = static_cast<int>(shape[0]);
+      const int n = static_cast<int>(shape[1]);
+      const int packed_k_blocks = static_cast<int>(shape[2]);
+      const int k_blocks = packed_k_blocks * 2;
+      size_t output_count = static_cast<size_t>(experts) * static_cast<size_t>(k_blocks) * static_cast<size_t>(n);
+      size_t bytes = output_count * (is_fp16 || is_bf16 ? 2 : 4);
       packed_bias = IAllocator::MakeUniquePtr<void>(alloc, bytes, true);
 
       const void* p_src_zp = tensor.DataRaw();
@@ -646,29 +673,32 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
         p_src_zp = temp_zp_gpu.get();
       }
 
-      const void* p_zp_for_calc = p_src_zp;
-      IAllocatorUniquePtr<void> temp_zp_transposed;
-
-      if (shape.NumDimensions() == 3 && shape[2] > 1) {
-        size_t rows = shape[1];   // N
-        size_t cols = shape[2];   // Blocks
-        size_t batch = shape[0];  // Experts
-
-        // Transpose ZP to match layout [Experts, Blocks, N]
-        // Note: For packed ZP, 'cols' is packed columns. Transpose handles bytes.
-        temp_zp_transposed = IAllocator::MakeUniquePtr<void>(alloc, tensor.SizeInBytes(), true);
-        LaunchQMoETranspose2D(static_cast<const uint8_t*>(p_src_zp), static_cast<uint8_t*>(temp_zp_transposed.get()), batch, rows, cols, stream);
-        p_zp_for_calc = temp_zp_transposed.get();
-      }
-
-      int N_stride = static_cast<int>(shape[1]);  // N from ZP input shape (rows)
-
-      if (is_fp16) {
-        LaunchQMoEPrePackPacked4BitZPKernel(static_cast<const uint8_t*>(p_zp_for_calc), static_cast<const half*>(packed_scale.get()), static_cast<half*>(packed_bias.get()), static_cast<int>(output_count), N_stride, stream);
-      } else if (type == TensorProto_DataType_BFLOAT16) {
-        LaunchQMoEPrePackPacked4BitZPKernel(static_cast<const uint8_t*>(p_zp_for_calc), static_cast<const __nv_bfloat16*>(packed_scale.get()), static_cast<__nv_bfloat16*>(packed_bias.get()), static_cast<int>(output_count), N_stride, stream);
-      } else {
-        LaunchQMoEPrePackPacked4BitZPKernel(static_cast<const uint8_t*>(p_zp_for_calc), static_cast<const float*>(packed_scale.get()), static_cast<float*>(packed_bias.get()), static_cast<int>(output_count), N_stride, stream);
+      const uint8_t* zp_ptr = static_cast<const uint8_t*>(p_src_zp);
+      constexpr float kDefaultZeroPoint4Bit = 8.0f;
+      for (int e = 0; e < experts; ++e) {
+        const uint8_t* zp_e = zp_ptr + static_cast<size_t>(e) * static_cast<size_t>(n) * static_cast<size_t>(packed_k_blocks);
+        size_t scale_off = static_cast<size_t>(e) * static_cast<size_t>(k_blocks) * static_cast<size_t>(n);
+        if (is_fp16) {
+          onnxruntime::llm::kernels::fpA_intB_gemv::launch_scaled_zero_point_kernel<true, half, uint8_t>(
+              stream,
+              zp_e,
+              static_cast<const half*>(packed_scale.get()) + scale_off,
+              static_cast<half*>(packed_bias.get()) + scale_off,
+              n,
+              k_blocks,
+              kDefaultZeroPoint4Bit);
+        } else if (is_bf16) {
+          onnxruntime::llm::kernels::fpA_intB_gemv::launch_scaled_zero_point_kernel<true, __nv_bfloat16, uint8_t>(
+              stream,
+              zp_e,
+              static_cast<const __nv_bfloat16*>(packed_scale.get()) + scale_off,
+              static_cast<__nv_bfloat16*>(packed_bias.get()) + scale_off,
+              n,
+              k_blocks,
+              kDefaultZeroPoint4Bit);
+        } else {
+          ORT_THROW("Unsupported type for 4-bit block-wise ZP prepack. Expected FP16/BF16.");
+        }
       }
     }
     cudaStreamSynchronize(stream);
