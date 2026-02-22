@@ -6,6 +6,8 @@
 #include "cuda_plugin_utils.h"
 
 #include <vector>
+#include <unordered_map>
+#include <mutex>
 
 namespace onnxruntime {
 namespace cuda_plugin {
@@ -30,7 +32,11 @@ class CudaSyncStream : public OrtSyncStreamImpl {
   void EnqueueDeferredCPUBuffer(void* cpu_buffer);
   OrtStatus* InitHandles();
 
+  static CudaSyncStream* FromCudaStream(cudaStream_t stream);
+
  private:
+  static void RegisterStream(cudaStream_t stream, CudaSyncStream* sync_stream);
+  static void UnregisterStream(cudaStream_t stream);
   static void* ORT_API_CALL GetHandleImpl(OrtSyncStreamImpl* this_ptr) noexcept;
   static OrtStatus* ORT_API_CALL CreateNotificationImpl(
       OrtSyncStreamImpl* this_ptr, OrtSyncNotificationImpl** notification) noexcept;

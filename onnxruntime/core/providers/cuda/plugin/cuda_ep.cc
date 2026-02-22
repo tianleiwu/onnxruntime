@@ -58,9 +58,18 @@ OrtStatus* ORT_API_CALL CudaEp::GetCapabilityImpl(
 
   // For each node, check if we have a registered kernel
   for (const auto& node : all_nodes) {
+    std::string op_type_str = node.GetOperatorType();
+    std::string domain_str = node.GetDomain();
+    const char* op_type = op_type_str.c_str();
+    const char* domain = domain_str.c_str();
+
     const OrtKernelDef* kernel_def = nullptr;
     RETURN_IF_ERROR(ep_api.EpGraphSupportInfo_LookUpKernel(
         graph_support_info, node, &kernel_def));
+
+    size_t input_count = node.GetInputs().size();
+    printf("GetCapability: Node op_type=%s, domain=%s, input_count=%zu, kernel_def=%p\n", op_type, domain, input_count, (void*)kernel_def);
+    fflush(stdout);
 
     if (kernel_def != nullptr) {
       RETURN_IF_ERROR(ep_api.EpGraphSupportInfo_AddSingleNode(

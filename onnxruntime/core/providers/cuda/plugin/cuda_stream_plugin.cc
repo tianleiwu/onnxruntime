@@ -3,9 +3,15 @@
 
 #include "cuda_stream_plugin.h"
 #include "cuda_ep_factory.h"
+#include <mutex>
 
 namespace onnxruntime {
 namespace cuda_plugin {
+
+namespace {
+static std::unordered_map<cudaStream_t, CudaSyncStream*> g_stream_map;
+static std::mutex g_stream_map_mutex;
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // CudaSyncStream
@@ -27,6 +33,8 @@ CudaSyncStream::CudaSyncStream(CudaEpFactory& factory, int device_id,
 CudaSyncStream::~CudaSyncStream() {
   CleanupDeferredCPUBuffers();
 
+  if (cuda_stream_) UnregisterStream(cuda_stream_);
+
   if (cublas_handle_) cublasDestroy(cublas_handle_);
   if (cudnn_handle_) cudnnDestroy(cudnn_handle_);
   if (cublas_lt_handle_) cublasLtDestroy(cublas_lt_handle_);
@@ -37,6 +45,7 @@ OrtStatus* CudaSyncStream::InitHandles() {
   cudaSetDevice(device_id_);
 
   CUDA_RETURN_IF_ERROR(cudaStreamCreateWithFlags(&cuda_stream_, cudaStreamNonBlocking));
+  RegisterStream(cuda_stream_, this);
 
   CUBLAS_RETURN_IF_ERROR(cublasCreate(&cublas_handle_));
   CUBLAS_RETURN_IF_ERROR(cublasSetStream(cublas_handle_, cuda_stream_));
@@ -61,12 +70,18 @@ void CudaSyncStream::CleanupDeferredCPUBuffers() {
 }
 
 /*static*/ void* ORT_API_CALL CudaSyncStream::GetHandleImpl(OrtSyncStreamImpl* this_ptr) noexcept {
+  printf("CudaSyncStream::GetHandleImpl called with this_ptr=%p\n", (void*)this_ptr);
+  fflush(stdout);
   auto* stream = static_cast<CudaSyncStream*>(this_ptr);
+  printf("CudaSyncStream::GetHandleImpl returning stream->cuda_stream_=%p\n", (void*)stream->cuda_stream_);
+  fflush(stdout);
   return stream->cuda_stream_;
 }
 
 /*static*/ OrtStatus* ORT_API_CALL CudaSyncStream::CreateNotificationImpl(
     OrtSyncStreamImpl* this_ptr, OrtSyncNotificationImpl** notification) noexcept {
+  printf("CudaSyncStream::CreateNotificationImpl called\n");
+  fflush(stdout);
   EXCEPTION_TO_STATUS_BEGIN
   auto* stream = static_cast<CudaSyncStream*>(this_ptr);
   auto notif = std::make_unique<CudaSyncNotification>(*stream);
@@ -76,6 +91,8 @@ void CudaSyncStream::CleanupDeferredCPUBuffers() {
 }
 
 /*static*/ OrtStatus* ORT_API_CALL CudaSyncStream::FlushImpl(OrtSyncStreamImpl* this_ptr) noexcept {
+  printf("CudaSyncStream::FlushImpl called\n");
+  fflush(stdout);
   auto* stream = static_cast<CudaSyncStream*>(this_ptr);
   CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream->cuda_stream_));
   return nullptr;
@@ -92,6 +109,31 @@ void CudaSyncStream::CleanupDeferredCPUBuffers() {
 
 /*static*/ void ORT_API_CALL CudaSyncStream::ReleaseImpl(OrtSyncStreamImpl* this_ptr) noexcept {
   delete static_cast<CudaSyncStream*>(this_ptr);
+}
+
+/*static*/ CudaSyncStream* CudaSyncStream::FromCudaStream(cudaStream_t stream) {
+  std::lock_guard<std::mutex> lock(g_stream_map_mutex);
+  auto it = g_stream_map.find(stream);
+  if (it != g_stream_map.end()) {
+    return it->second;
+  }
+  printf("CudaSyncStream::FromCudaStream: Stream %p NOT FOUND in map (size=%zu)\n", stream, g_stream_map.size());
+  fflush(stdout);
+  return nullptr;
+}
+
+/*static*/ void CudaSyncStream::RegisterStream(cudaStream_t stream, CudaSyncStream* sync_stream) {
+  std::lock_guard<std::mutex> lock(g_stream_map_mutex);
+  g_stream_map[stream] = sync_stream;
+  printf("CudaSyncStream::RegisterStream: %p -> %p (map size=%zu)\n", stream, sync_stream, g_stream_map.size());
+  fflush(stdout);
+}
+
+/*static*/ void CudaSyncStream::UnregisterStream(cudaStream_t stream) {
+  std::lock_guard<std::mutex> lock(g_stream_map_mutex);
+  g_stream_map.erase(stream);
+  printf("CudaSyncStream::UnregisterStream: %p (map size=%zu)\n", stream, g_stream_map.size());
+  fflush(stdout);
 }
 
 // ---------------------------------------------------------------------------
