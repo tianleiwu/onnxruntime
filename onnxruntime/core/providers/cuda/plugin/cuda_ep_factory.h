@@ -92,9 +92,6 @@ class CudaEpFactory : public OrtEpFactory {
   Ort::MemoryInfo pinned_memory_info_{nullptr};
   int device_id_ = 0;
 
-  // Data transfer instance (shared across sessions)
-  std::unique_ptr<CudaDataTransfer> data_transfer_impl_;
-
   // Kernel registry (cached, shared across EP instances)
   OrtKernelRegistry* kernel_registry_ = nullptr;
   std::mutex registry_mutex_;

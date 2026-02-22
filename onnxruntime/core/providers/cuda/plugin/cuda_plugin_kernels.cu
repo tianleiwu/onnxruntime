@@ -384,6 +384,143 @@ OrtStatus* ORT_API_CALL GemmKernelImpl::ComputeImpl(
 
   EXCEPTION_TO_STATUS_END
 }
+
+// ---------------------------------------------------------------------------
+// Conv Kernel Implementation
+// ---------------------------------------------------------------------------
+
+struct ConvKernelImpl : public OrtKernelImpl {
+  ConvKernelImpl(const OrtKernelInfo* info) : OrtKernelImpl{} {
+    ort_version_supported = ORT_API_VERSION;
+    flags = 0;
+    Compute = ComputeImpl;
+    Release = ReleaseImpl;
+    PrePackWeight = nullptr;
+    SetSharedPrePackedWeight = nullptr;
+
+    Ort::ConstKernelInfo k_info{info};
+    try { pads_ = k_info.GetAttributes<int64_t>("pads"); } catch(...) { pads_ = {0, 0, 0, 0}; }
+    try { strides_ = k_info.GetAttributes<int64_t>("strides"); } catch(...) { strides_ = {1, 1}; }
+    try { dilations_ = k_info.GetAttributes<int64_t>("dilations"); } catch(...) { dilations_ = {1, 1}; }
+    try { group_ = k_info.GetAttribute<int64_t>("group"); } catch(...) { group_ = 1; }
+
+    cudnnCreateTensorDescriptor(&x_desc_);
+    cudnnCreateTensorDescriptor(&y_desc_);
+    cudnnCreateFilterDescriptor(&w_desc_);
+    cudnnCreateConvolutionDescriptor(&conv_desc_);
+  }
+
+  ~ConvKernelImpl() {
+    cudnnDestroyTensorDescriptor(x_desc_);
+    cudnnDestroyTensorDescriptor(y_desc_);
+    cudnnDestroyFilterDescriptor(w_desc_);
+    cudnnDestroyConvolutionDescriptor(conv_desc_);
+  }
+
+  static OrtStatus* ORT_API_CALL ComputeImpl(OrtKernelImpl* this_ptr,
+                                             OrtKernelContext* context) noexcept;
+  static void ORT_API_CALL ReleaseImpl(OrtKernelImpl* this_ptr) noexcept {
+    delete static_cast<ConvKernelImpl*>(this_ptr);
+  }
+
+ private:
+  std::vector<int64_t> pads_;
+  std::vector<int64_t> strides_;
+  std::vector<int64_t> dilations_;
+  int64_t group_;
+
+  cudnnTensorDescriptor_t x_desc_;
+  cudnnTensorDescriptor_t y_desc_;
+  cudnnFilterDescriptor_t w_desc_;
+  cudnnConvolutionDescriptor_t conv_desc_;
+};
+
+/*static*/
+OrtStatus* ORT_API_CALL ConvKernelImpl::ComputeImpl(
+    OrtKernelImpl* this_ptr, OrtKernelContext* context) noexcept {
+  auto* self = static_cast<ConvKernelImpl*>(this_ptr);
+  EXCEPTION_TO_STATUS_BEGIN
+
+  Ort::KernelContext ctx{context};
+  Ort::ConstValue input_x = ctx.GetInput(0);
+  Ort::ConstValue input_w = ctx.GetInput(1);
+
+  auto shape_x = input_x.GetTensorTypeAndShapeInfo().GetShape();
+  auto shape_w = input_w.GetTensorTypeAndShapeInfo().GetShape();
+
+  int n = static_cast<int>(shape_x[0]);
+  int c = static_cast<int>(shape_x[1]);
+  int h = static_cast<int>(shape_x.size() > 2 ? shape_x[2] : 1);
+  int w = static_cast<int>(shape_x.size() > 3 ? shape_x[3] : 1);
+
+  int m = static_cast<int>(shape_w[0]);
+  int wc = static_cast<int>(shape_w[1]);
+  int kh = static_cast<int>(shape_w.size() > 2 ? shape_w[2] : 1);
+  int kw = static_cast<int>(shape_w.size() > 3 ? shape_w[3] : 1);
+
+  int out_h = static_cast<int>((h + self->pads_[0] + self->pads_[2] - self->dilations_[0] * (kh - 1) - 1) / self->strides_[0] + 1);
+  int out_w = static_cast<int>((w + self->pads_[1] + self->pads_[3] - self->dilations_[1] * (kw - 1) - 1) / self->strides_[1] + 1);
+
+  std::vector<int64_t> output_shape = {n, m, out_h, out_w};
+  Ort::UnownedValue output_y = ctx.GetOutput(0, output_shape);
+
+  CudaSyncStream* stream_impl = GetCudaSyncStream(ctx);
+  if (!stream_impl) {
+    return Ort::GetApi().CreateStatus(ORT_EP_FAIL, "Failed to get CUDA stream");
+  }
+
+  cudnnHandle_t cudnn = stream_impl->GetCudnnHandle();
+
+  cudnnSetTensor4dDescriptor(self->x_desc_, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w);
+  cudnnSetTensor4dDescriptor(self->y_desc_, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, m, out_h, out_w);
+  cudnnSetFilter4dDescriptor(self->w_desc_, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, m, wc, kh, kw);
+
+  cudnnSetConvolution2dDescriptor(self->conv_desc_,
+                                  static_cast<int>(self->pads_[0]), static_cast<int>(self->pads_[1]),
+                                  static_cast<int>(self->strides_[0]), static_cast<int>(self->strides_[1]),
+                                  static_cast<int>(self->dilations_[0]), static_cast<int>(self->dilations_[1]),
+                                  CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT);
+  cudnnSetConvolutionGroupCount(self->conv_desc_, static_cast<int>(self->group_));
+
+  cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
+
+  size_t workspace_size = 0;
+  cudnnGetConvolutionForwardWorkspaceSize(cudnn, self->x_desc_, self->w_desc_, self->conv_desc_, self->y_desc_, algo, &workspace_size);
+
+  void* workspace = nullptr;
+  if (workspace_size > 0) {
+    cudaMallocAsync(&workspace, workspace_size, stream_impl->GetCudaStream());
+  }
+
+  const float alpha = 1.0f, beta = 0.0f;
+  const float* x_data = input_x.GetTensorData<float>();
+  const float* w_data = input_w.GetTensorData<float>();
+  float* y_data = output_y.GetTensorMutableData<float>();
+
+  cudnnConvolutionForward(cudnn, &alpha, self->x_desc_, x_data,
+                          self->w_desc_, w_data, self->conv_desc_, algo,
+                          workspace, workspace_size, &beta, self->y_desc_, y_data);
+
+  if (workspace_size > 0) {
+    cudaFreeAsync(workspace, stream_impl->GetCudaStream());
+  }
+
+  if (ctx.GetInputCount() > 2) {
+    Ort::ConstValue input_b = ctx.GetInput(2);
+    const float* b_data = input_b.GetTensorData<float>();
+    cudnnTensorDescriptor_t b_desc;
+    cudnnCreateTensorDescriptor(&b_desc);
+    cudnnSetTensor4dDescriptor(b_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, m, 1, 1);
+    const float alpha_b = 1.0f, beta_b = 1.0f;
+    cudnnAddTensor(cudnn, &alpha_b, b_desc, b_data, &beta_b, self->y_desc_, y_data);
+    cudnnDestroyTensorDescriptor(b_desc);
+  }
+
+  return nullptr;
+
+  EXCEPTION_TO_STATUS_END
+}
+
 OrtStatus* CreateCudaKernelRegistry(const OrtEpApi& ep_api,
                                     const char* ep_name,
                                     void* /*create_kernel_state*/,
@@ -489,14 +626,35 @@ OrtStatus* CreateCudaKernelRegistry(const OrtEpApi& ep_api,
                              const OrtKernelInfo* info,
                              OrtKernelImpl** kernel_out) noexcept -> OrtStatus* {
       auto* kernel = new GemmKernelImpl(info);
-      printf("gemm_create_fn: kernel=%p, Compute=%p, Release=%p\n",
-             (void*)kernel, (void*)kernel->Compute, (void*)kernel->Release);
-      fflush(stdout);
       *kernel_out = kernel;
       return nullptr;
     };
 
     RETURN_IF_ERROR(registry.AddKernel(gemm_def.release(), gemm_create_fn, nullptr));
+  }
+
+  // --- Register Conv (ONNX opset 14+) ---
+  {
+    Ort::KernelDef conv_def = Ort::KernelDefBuilder()
+                                  .SetOperatorType("Conv")
+                                  .SetDomain("")
+                                  .SetSinceVersion(1, 21)
+                                  .SetExecutionProvider(ep_name)
+                                  .AddTypeConstraint("T", float_types)
+                                  .SetInputMemType(0, OrtMemTypeDefault)
+                                  .SetInputMemType(1, OrtMemTypeDefault)
+                                  .SetOutputMemType(0, OrtMemTypeDefault)
+                                  .Build();
+
+    auto conv_create_fn = [](void* /*state*/,
+                             const OrtKernelInfo* info,
+                             OrtKernelImpl** kernel_out) noexcept -> OrtStatus* {
+      auto* kernel = new ConvKernelImpl(info);
+      *kernel_out = kernel;
+      return nullptr;
+    };
+
+    RETURN_IF_ERROR(registry.AddKernel(conv_def.release(), conv_create_fn, nullptr));
   }
 
   *out_registry = registry.release();

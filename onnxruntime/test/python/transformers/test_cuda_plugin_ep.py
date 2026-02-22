@@ -75,6 +75,27 @@ def create_gemm_model(model_path, alpha=1.0, beta=1.0, transA=0, transB=0):
     onnx.save(model_def, model_path)
 
 
+def create_conv_model(model_path):
+    import onnx
+    from onnx import TensorProto, helper
+
+    # Create a simple Conv model: Y = Conv(X, W)
+    node_def = helper.make_node("Conv", ["X", "W"], ["Y"], pads=[1, 1, 1, 1], strides=[1, 1], dilations=[1, 1], group=1)
+    graph_def = helper.make_graph(
+        [node_def],
+        "test-model-conv",
+        [
+            helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2, 4, 4]),
+            helper.make_tensor_value_info("W", TensorProto.FLOAT, [3, 2, 3, 3]),
+        ],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 3, 4, 4])],
+    )
+    opset = onnx.OperatorSetIdProto()
+    opset.version = 11
+    model_def = helper.make_model(graph_def, producer_name="onnx-example", opset_imports=[opset])
+    onnx.save(model_def, model_path)
+
+
 def test_operator(target_device, model_creator, inputs, expected_fn, ep_name="CudaPluginExecutionProvider"):
     import os
 
@@ -163,6 +184,22 @@ def test_cuda_plugin_registration():
         {"A": a, "B": b, "C": c},
         lambda x: alpha * (x["A"] @ x["B"]) + beta * x["C"],
     ):
+        print("PASS")
+    else:
+        print("FAIL")
+        sys.exit(1)
+
+    # Test Conv
+    print("Testing Conv...", end=" ", flush=True)
+    import torch
+    import torch.nn.functional as F
+    x = np.random.rand(1, 2, 4, 4).astype(np.float32)
+    w = np.random.rand(3, 2, 3, 3).astype(np.float32)
+
+    def expected_conv(inputs):
+        return F.conv2d(torch.from_numpy(inputs["X"]), torch.from_numpy(inputs["W"]), padding=1).numpy()
+
+    if test_operator(target_device, create_conv_model, {"X": x, "W": w}, expected_conv):
         print("PASS")
     else:
         print("FAIL")

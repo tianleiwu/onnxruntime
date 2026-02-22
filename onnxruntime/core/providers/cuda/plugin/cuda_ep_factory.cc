@@ -46,10 +46,6 @@ CudaEpFactory::CudaEpFactory(const OrtApi& ort_api, const OrtEpApi& ep_api,
                                         OrtAllocatorType::OrtDeviceAllocator,
                                         0,
                                         OrtMemType::OrtMemTypeCPU};
-
-  // Create data transfer for GPU device
-  const OrtMemoryDevice* gpu_device = ep_api_.MemoryInfo_GetMemoryDevice(default_memory_info_);
-  data_transfer_impl_ = std::make_unique<CudaDataTransfer>(ort_api, ep_api, gpu_device);
 }
 
 CudaEpFactory::~CudaEpFactory() {
@@ -277,8 +273,9 @@ OrtStatus* ORT_API_CALL CudaEpFactory::CreateDataTransferImpl(
     OrtEpFactory* this_ptr,
     OrtDataTransferImpl** data_transfer) noexcept {
   auto& factory = *static_cast<CudaEpFactory*>(this_ptr);
-  // Return the shared data transfer instance (factory-owned, NOT deleted by ORT)
-  *data_transfer = factory.data_transfer_impl_.get();
+  const OrtMemoryDevice* gpu_device = factory.ep_api_.MemoryInfo_GetMemoryDevice(factory.default_memory_info_);
+  auto data_transfer_impl = std::make_unique<CudaDataTransfer>(factory.ort_api_, factory.ep_api_, gpu_device);
+  *data_transfer = data_transfer_impl.release();
   return nullptr;
 }
 
