@@ -3,6 +3,7 @@
 
 #include "cuda_ep.h"
 #include "cuda_ep_factory.h"
+#include "core/providers/cuda/plugin/cuda_kernel_adapter.h"
 
 namespace onnxruntime {
 namespace cuda_plugin {
@@ -31,6 +32,9 @@ CudaEp::CudaEp(CudaEpFactory& factory, const Config& config, const OrtLogger& lo
   Ort::Status log_status(ort_api.Logger_LogMessage(&logger_, ORT_LOGGING_LEVEL_INFO,
                                                    "CUDA Plugin EP created",
                                                    ORT_FILE, __LINE__, __FUNCTION__));
+
+  // Seed adapter-level runtime options for migrated kernels.
+  onnxruntime::cuda::SetCudaKernelAdapterRuntimeConfig(config_.use_tf32, config_.device_id);
 }
 
 CudaEp::~CudaEp() = default;
