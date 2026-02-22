@@ -26,6 +26,9 @@
     }                                                      \
   } while (0)
 
+#ifdef CUDA_RETURN_IF_ERROR
+#undef CUDA_RETURN_IF_ERROR
+#endif
 #define CUDA_RETURN_IF_ERROR(cuda_call_expr)                                  \
   do {                                                                        \
     cudaError_t _cuda_err = (cuda_call_expr);                                 \
@@ -38,6 +41,9 @@
     }                                                                         \
   } while (0)
 
+#ifdef CUBLAS_RETURN_IF_ERROR
+#undef CUBLAS_RETURN_IF_ERROR
+#endif
 #define CUBLAS_RETURN_IF_ERROR(cublas_call_expr)          \
   do {                                                    \
     cublasStatus_t _cublas_err = (cublas_call_expr);      \
@@ -50,6 +56,9 @@
     }                                                     \
   } while (0)
 
+#ifdef CUDNN_RETURN_IF_ERROR
+#undef CUDNN_RETURN_IF_ERROR
+#endif
 #define CUDNN_RETURN_IF_ERROR(cudnn_call_expr)    \
   do {                                            \
     cudnnStatus_t _cudnn_err = (cudnn_call_expr); \

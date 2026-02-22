@@ -193,6 +193,7 @@ def test_cuda_plugin_registration():
     print("Testing Conv...", end=" ", flush=True)
     import torch
     import torch.nn.functional as F
+
     x = np.random.rand(1, 2, 4, 4).astype(np.float32)
     w = np.random.rand(3, 2, 3, 3).astype(np.float32)
 

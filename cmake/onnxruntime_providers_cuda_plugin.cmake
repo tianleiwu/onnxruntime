@@ -43,31 +43,32 @@ if(DEFINED ENV{CUDNN_HOME})
   list(APPEND _CUDNN_SEARCH_PATHS "$ENV{CUDNN_HOME}")
 endif()
 
-find_path(CUDA_PLUGIN_CUDNN_INCLUDE_DIR
-    NAMES cudnn.h
-    HINTS ${_CUDNN_SEARCH_PATHS}
-    PATH_SUFFIXES include
-)
-
-find_library(CUDA_PLUGIN_CUDNN_LIBRARY
-    NAMES cudnn
-    HINTS ${_CUDNN_SEARCH_PATHS}
-    PATH_SUFFIXES lib64 lib
-)
+set(CUDA_PLUGIN_CUDNN_INCLUDE_DIR ${CUDNN_INCLUDE_DIR})
+set(CUDA_PLUGIN_CUDNN_LIBRARY ${cudnn_LIBRARY})
 
 if(NOT CUDA_PLUGIN_CUDNN_INCLUDE_DIR OR NOT CUDA_PLUGIN_CUDNN_LIBRARY)
-  message(FATAL_ERROR "cuDNN not found for CUDA Plugin EP. Set onnxruntime_CUDNN_HOME or CUDNN_HOME.")
+  message(FATAL_ERROR "cuDNN not found (from main ORT search) for CUDA Plugin EP.")
 endif()
 
 message(STATUS "CUDA Plugin EP: cuDNN include: ${CUDA_PLUGIN_CUDNN_INCLUDE_DIR}")
 message(STATUS "CUDA Plugin EP: cuDNN library: ${CUDA_PLUGIN_CUDNN_LIBRARY}")
 
-# Include directories — only public ORT headers + CUDA toolkit + cuDNN
+# Include directories — only public ORT headers + CUDA toolkit + cuDNN + internal headers for adapter
 target_include_directories(onnxruntime_providers_cuda_plugin PRIVATE
     ${REPO_ROOT}/include
     ${REPO_ROOT}/include/onnxruntime/core/session
+    ${REPO_ROOT}/onnxruntime
     ${CUDAToolkit_INCLUDE_DIRS}
     ${CUDA_PLUGIN_CUDNN_INCLUDE_DIR}
+)
+
+onnxruntime_add_include_to_target(
+    onnxruntime_providers_cuda_plugin
+    onnxruntime_common
+    onnx
+    onnx_proto
+    ${PROTOBUF_LIB}
+    flatbuffers::flatbuffers
 )
 
 # Link libraries
@@ -76,10 +77,13 @@ target_link_libraries(onnxruntime_providers_cuda_plugin PRIVATE
     CUDA::cublas
     CUDA::cublasLt
     ${CUDA_PLUGIN_CUDNN_LIBRARY}
+    safeint_interface
+    onnxruntime_common
+    onnxruntime_framework
 )
 
 # Symbol visibility — only export CreateEpFactories and ReleaseEpFactory
-target_compile_definitions(onnxruntime_providers_cuda_plugin PRIVATE ORT_API_MANUAL_INIT)
+target_compile_definitions(onnxruntime_providers_cuda_plugin PRIVATE ORT_API_MANUAL_INIT BUILD_CUDA_EP_AS_PLUGIN ONNX_ML=1 ONNX_NAMESPACE=onnx ONNX_USE_LITE_PROTO=1)
 
 if(WIN32)
   # Windows: use .def file for symbol exports

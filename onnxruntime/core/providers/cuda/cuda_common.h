@@ -30,7 +30,19 @@
 
 #endif
 
+#if !defined(BUILD_CUDA_EP_AS_PLUGIN)
 #include "core/providers/shared_library/provider_api.h"
+#else
+#include "core/util/math.h"
+#include <iostream>
+#ifndef LOGS_DEFAULT
+#define INFO 0
+#define WARNING 1
+#define ERROR 2
+#define FATAL 3
+#define LOGS_DEFAULT(severity) std::cerr
+#endif
+#endif
 #include "core/common/status.h"
 #include "core/common/float8.h"
 #include "core/common/float16.h"

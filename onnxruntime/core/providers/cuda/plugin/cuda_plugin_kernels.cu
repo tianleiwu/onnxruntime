@@ -5,6 +5,7 @@
 #include "cuda_stream_plugin.h"
 
 #include <cstring>
+#include <string_view>
 #include <vector>
 
 namespace onnxruntime {
@@ -120,8 +121,6 @@ __global__ void AddKernelCuda(const float* a, const float* b, float* c, size_t c
 /*static*/
 OrtStatus* ORT_API_CALL AddKernelImpl::ComputeImpl(
     OrtKernelImpl* /*this_ptr*/, OrtKernelContext* context) noexcept {
-  printf("AddKernelImpl::ComputeImpl start\n");
-  fflush(stdout);
   EXCEPTION_TO_STATUS_BEGIN
 
   Ort::KernelContext ctx{context};
@@ -173,8 +172,6 @@ struct MatMulKernelImpl : public OrtKernelImpl {
   static OrtStatus* ORT_API_CALL ComputeImpl(OrtKernelImpl* this_ptr,
                                              OrtKernelContext* context) noexcept;
   static void ORT_API_CALL ReleaseImpl(OrtKernelImpl* this_ptr) noexcept {
-    printf("MatMulKernelImpl::ReleaseImpl called\n");
-    fflush(stdout);
     delete static_cast<MatMulKernelImpl*>(this_ptr);
   }
 };
@@ -182,8 +179,6 @@ struct MatMulKernelImpl : public OrtKernelImpl {
 /*static*/
 OrtStatus* ORT_API_CALL MatMulKernelImpl::ComputeImpl(
     OrtKernelImpl* /*this_ptr*/, OrtKernelContext* context) noexcept {
-  printf("MatMulKernelImpl::ComputeImpl start\n");
-  fflush(stdout);
   EXCEPTION_TO_STATUS_BEGIN
 
   Ort::KernelContext ctx{context};
@@ -207,9 +202,6 @@ OrtStatus* ORT_API_CALL MatMulKernelImpl::ComputeImpl(
   const float* b_data = input_b.GetTensorData<float>();
   float* y_data = output.GetTensorMutableData<float>();
 
-  printf("MatMul: M=%d, N=%d, K=%d, a=%p, b=%p, y=%p\n", M, N, K, (void*)a_data, (void*)b_data, (void*)y_data);
-  fflush(stdout);
-
   if (M > 0 && N > 0 && K > 0) {
     CudaSyncStream* stream_impl = GetCudaSyncStream(ctx);
     if (!stream_impl) {
@@ -217,8 +209,6 @@ OrtStatus* ORT_API_CALL MatMulKernelImpl::ComputeImpl(
     }
 
     cublasHandle_t cublas_handle = stream_impl->GetCublasHandle();
-    printf("MatMul: cublas_handle=%p\n", cublas_handle);
-    fflush(stdout);
 
     float alpha = 1.0f;
     float beta = 0.0f;
@@ -231,8 +221,6 @@ OrtStatus* ORT_API_CALL MatMulKernelImpl::ComputeImpl(
                                        a_data, K,
                                        &beta,
                                        y_data, N));
-    printf("MatMul: cublasSgemm completed\n");
-    fflush(stdout);
   }
 
   return nullptr;
@@ -298,9 +286,6 @@ struct GemmKernelImpl : public OrtKernelImpl {
 OrtStatus* ORT_API_CALL GemmKernelImpl::ComputeImpl(
     OrtKernelImpl* this_ptr, OrtKernelContext* context) noexcept {
   auto* self = static_cast<GemmKernelImpl*>(this_ptr);
-  printf("GemmKernelImpl::ComputeImpl start: alpha=%f, beta=%f, trans_a=%d, trans_b=%d\n",
-         self->alpha_, self->beta_, self->trans_a_, self->trans_b_);
-  fflush(stdout);
   EXCEPTION_TO_STATUS_BEGIN
   Ort::KernelContext ctx{context};
   Ort::ConstValue input_a = ctx.GetInput(0);
@@ -399,10 +384,26 @@ struct ConvKernelImpl : public OrtKernelImpl {
     SetSharedPrePackedWeight = nullptr;
 
     Ort::ConstKernelInfo k_info{info};
-    try { pads_ = k_info.GetAttributes<int64_t>("pads"); } catch(...) { pads_ = {0, 0, 0, 0}; }
-    try { strides_ = k_info.GetAttributes<int64_t>("strides"); } catch(...) { strides_ = {1, 1}; }
-    try { dilations_ = k_info.GetAttributes<int64_t>("dilations"); } catch(...) { dilations_ = {1, 1}; }
-    try { group_ = k_info.GetAttribute<int64_t>("group"); } catch(...) { group_ = 1; }
+    try {
+      pads_ = k_info.GetAttributes<int64_t>("pads");
+    } catch (...) {
+      pads_ = {0, 0, 0, 0};
+    }
+    try {
+      strides_ = k_info.GetAttributes<int64_t>("strides");
+    } catch (...) {
+      strides_ = {1, 1};
+    }
+    try {
+      dilations_ = k_info.GetAttributes<int64_t>("dilations");
+    } catch (...) {
+      dilations_ = {1, 1};
+    }
+    try {
+      group_ = k_info.GetAttribute<int64_t>("group");
+    } catch (...) {
+      group_ = 1;
+    }
 
     cudnnCreateTensorDescriptor(&x_desc_);
     cudnnCreateTensorDescriptor(&y_desc_);
@@ -521,6 +522,67 @@ OrtStatus* ORT_API_CALL ConvKernelImpl::ComputeImpl(
   EXCEPTION_TO_STATUS_END
 }
 
+namespace {
+
+struct GeneratedKernelRegistration {
+  const char* op_type;
+  int since_version_start;
+  int since_version_end;
+  ONNXTensorElementDataType type_constraint;
+};
+
+using PluginKernelCreateFn = OrtStatus*(ORT_API_CALL*)(void*, const OrtKernelInfo*, OrtKernelImpl**) noexcept;
+
+OrtStatus* ORT_API_CALL CreateReluKernel(void* /*state*/,
+                                         const OrtKernelInfo* /*info*/,
+                                         OrtKernelImpl** kernel_out) noexcept {
+  *kernel_out = new ReluKernelImpl();
+  return nullptr;
+}
+
+OrtStatus* ORT_API_CALL CreateAddKernel(void* /*state*/,
+                                        const OrtKernelInfo* /*info*/,
+                                        OrtKernelImpl** kernel_out) noexcept {
+  *kernel_out = new AddKernelImpl();
+  return nullptr;
+}
+
+OrtStatus* ORT_API_CALL CreateMatMulKernel(void* /*state*/,
+                                           const OrtKernelInfo* /*info*/,
+                                           OrtKernelImpl** kernel_out) noexcept {
+  *kernel_out = new MatMulKernelImpl();
+  return nullptr;
+}
+
+OrtStatus* ORT_API_CALL CreateGemmKernel(void* /*state*/,
+                                         const OrtKernelInfo* info,
+                                         OrtKernelImpl** kernel_out) noexcept {
+  *kernel_out = new GemmKernelImpl(info);
+  return nullptr;
+}
+
+OrtStatus* ORT_API_CALL CreateConvKernel(void* /*state*/,
+                                         const OrtKernelInfo* info,
+                                         OrtKernelImpl** kernel_out) noexcept {
+  *kernel_out = new ConvKernelImpl(info);
+  return nullptr;
+}
+
+PluginKernelCreateFn GetCreateFnForOp(std::string_view op_type) {
+  if (op_type == "Relu") return CreateReluKernel;
+  if (op_type == "Add") return CreateAddKernel;
+  if (op_type == "MatMul") return CreateMatMulKernel;
+  if (op_type == "Gemm") return CreateGemmKernel;
+  if (op_type == "Conv") return CreateConvKernel;
+  return nullptr;
+}
+
+constexpr GeneratedKernelRegistration kGeneratedKernelRegistrations[] = {
+#include "core/providers/cuda/plugin/cuda_plugin_generated_registrations.inc"
+};
+
+}  // namespace
+
 OrtStatus* CreateCudaKernelRegistry(const OrtEpApi& ep_api,
                                     const char* ep_name,
                                     void* /*create_kernel_state*/,
@@ -531,130 +593,29 @@ OrtStatus* CreateCudaKernelRegistry(const OrtEpApi& ep_api,
 
   Ort::KernelRegistry registry;
 
-  // Get float tensor data type for type constraints
-  const OrtDataType* float_type = nullptr;
-  RETURN_IF_ERROR(ep_api.GetTensorDataType(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &float_type));
-  std::vector<const OrtDataType*> float_types = {float_type};
+  std::vector<const OrtDataType*> type_constraint;
+  for (const auto& reg : kGeneratedKernelRegistrations) {
+    PluginKernelCreateFn create_fn = GetCreateFnForOp(reg.op_type);
+    if (!create_fn) {
+      continue;
+    }
 
-  // --- Register Relu (ONNX opset 14+) ---
-  {
-    Ort::KernelDef relu_def = Ort::KernelDefBuilder()
-                                  .SetOperatorType("Relu")
-                                  .SetDomain("")
-                                  .SetSinceVersion(1, 21)
-                                  .SetExecutionProvider(ep_name)
-                                  .AddTypeConstraint("T", float_types)
-                                  .SetInputMemType(0, OrtMemTypeDefault)
-                                  .SetOutputMemType(0, OrtMemTypeDefault)
-                                  .Build();
+    Ort::KernelDefBuilder builder;
+    builder.SetOperatorType(reg.op_type)
+        .SetDomain("")
+        .SetSinceVersion(reg.since_version_start, reg.since_version_end)
+        .SetExecutionProvider(ep_name);
 
-    auto relu_create_fn = [](void* /*state*/,
-                             const OrtKernelInfo* /*info*/,
-                             OrtKernelImpl** kernel_out) noexcept -> OrtStatus* {
-      *kernel_out = new ReluKernelImpl();
-      return nullptr;
-    };
+    if (reg.type_constraint != ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED) {
+      const OrtDataType* data_type = nullptr;
+      RETURN_IF_ERROR(ep_api.GetTensorDataType(reg.type_constraint, &data_type));
+      type_constraint.clear();
+      type_constraint.push_back(data_type);
+      builder.AddTypeConstraint("T", type_constraint);
+    }
 
-    RETURN_IF_ERROR(registry.AddKernel(relu_def.release(), relu_create_fn, nullptr));
-  }
-
-  // --- Register Add (ONNX opset 14+) ---
-  {
-    Ort::KernelDef add_def = Ort::KernelDefBuilder()
-                                 .SetOperatorType("Add")
-                                 .SetDomain("")
-                                 .SetSinceVersion(1, 21)
-                                 .SetExecutionProvider(ep_name)
-                                 .AddTypeConstraint("T", float_types)
-                                 .SetInputMemType(0, OrtMemTypeDefault)
-                                 .SetInputMemType(1, OrtMemTypeDefault)
-                                 .SetOutputMemType(0, OrtMemTypeDefault)
-                                 .Build();
-
-    auto add_create_fn = [](void* /*state*/,
-                            const OrtKernelInfo* /*info*/,
-                            OrtKernelImpl** kernel_out) noexcept -> OrtStatus* {
-      *kernel_out = new AddKernelImpl();
-      return nullptr;
-    };
-
-    RETURN_IF_ERROR(registry.AddKernel(add_def.release(), add_create_fn, nullptr));
-  }
-
-  // --- Register MatMul (ONNX opset 14+) ---
-  {
-    Ort::KernelDef matmul_def = Ort::KernelDefBuilder()
-                                    .SetOperatorType("MatMul")
-                                    .SetDomain("")
-                                    .SetSinceVersion(1, 21)
-                                    .SetExecutionProvider(ep_name)
-                                    .AddTypeConstraint("T", float_types)
-                                    .SetInputMemType(0, OrtMemTypeDefault)
-                                    .SetInputMemType(1, OrtMemTypeDefault)
-                                    .SetOutputMemType(0, OrtMemTypeDefault)
-                                    .Build();
-
-    auto matmul_create_fn = [](void* /*state*/,
-                               const OrtKernelInfo* /*info*/,
-                               OrtKernelImpl** kernel_out) noexcept -> OrtStatus* {
-      auto* kernel = new MatMulKernelImpl();
-      printf("matmul_create_fn: kernel=%p, Compute=%p, Release=%p\n",
-             (void*)kernel, (void*)kernel->Compute, (void*)kernel->Release);
-      fflush(stdout);
-      *kernel_out = kernel;
-      return nullptr;
-    };
-
-    RETURN_IF_ERROR(registry.AddKernel(matmul_def.release(), matmul_create_fn, nullptr));
-  }
-
-  // --- Register Gemm (ONNX opset 14+) ---
-  {
-    Ort::KernelDef gemm_def = Ort::KernelDefBuilder()
-                                  .SetOperatorType("Gemm")
-                                  .SetDomain("")
-                                  .SetSinceVersion(1, 21)
-                                  .SetExecutionProvider(ep_name)
-                                  .AddTypeConstraint("T", float_types)
-                                  .SetInputMemType(0, OrtMemTypeDefault)
-                                  .SetInputMemType(1, OrtMemTypeDefault)
-                                  .SetInputMemType(2, OrtMemTypeDefault)
-                                  .SetOutputMemType(0, OrtMemTypeDefault)
-                                  .Build();
-
-    auto gemm_create_fn = [](void* /*state*/,
-                             const OrtKernelInfo* info,
-                             OrtKernelImpl** kernel_out) noexcept -> OrtStatus* {
-      auto* kernel = new GemmKernelImpl(info);
-      *kernel_out = kernel;
-      return nullptr;
-    };
-
-    RETURN_IF_ERROR(registry.AddKernel(gemm_def.release(), gemm_create_fn, nullptr));
-  }
-
-  // --- Register Conv (ONNX opset 14+) ---
-  {
-    Ort::KernelDef conv_def = Ort::KernelDefBuilder()
-                                  .SetOperatorType("Conv")
-                                  .SetDomain("")
-                                  .SetSinceVersion(1, 21)
-                                  .SetExecutionProvider(ep_name)
-                                  .AddTypeConstraint("T", float_types)
-                                  .SetInputMemType(0, OrtMemTypeDefault)
-                                  .SetInputMemType(1, OrtMemTypeDefault)
-                                  .SetOutputMemType(0, OrtMemTypeDefault)
-                                  .Build();
-
-    auto conv_create_fn = [](void* /*state*/,
-                             const OrtKernelInfo* info,
-                             OrtKernelImpl** kernel_out) noexcept -> OrtStatus* {
-      auto* kernel = new ConvKernelImpl(info);
-      *kernel_out = kernel;
-      return nullptr;
-    };
-
-    RETURN_IF_ERROR(registry.AddKernel(conv_def.release(), conv_create_fn, nullptr));
+    Ort::KernelDef kernel_def = builder.Build();
+    RETURN_IF_ERROR(registry.AddKernel(kernel_def.release(), create_fn, nullptr));
   }
 
   *out_registry = registry.release();

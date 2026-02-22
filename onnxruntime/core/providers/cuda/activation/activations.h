@@ -3,7 +3,10 @@
 
 #pragma once
 
+#if !defined(BUILD_CUDA_EP_AS_PLUGIN)
 #include "core/providers/shared_library/provider_api.h"
+#endif
+
 #include "core/providers/cuda/cuda_common.h"
 #include "core/providers/cuda/math/unary_elementwise_ops.h"
 #include "core/providers/cuda/math/binary_elementwise_ops.h"
