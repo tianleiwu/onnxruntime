@@ -28,6 +28,7 @@ set(CUDA_PLUGIN_EP_CC_SRCS
 set(CUDA_PLUGIN_EP_CU_SRCS
     ${CUDA_PLUGIN_EP_DIR}/cuda_plugin_kernels.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/unary_elementwise_ops_impl.cu
 )
 
 # Create shared library target using the ORT helper function for plugins
@@ -108,6 +109,7 @@ target_link_libraries(onnxruntime_providers_cuda_plugin PRIVATE
     CUDA::cublas
     CUDA::cublasLt
     ${CUDA_PLUGIN_CUDNN_LIBRARY}
+    Boost::mp11
     safeint_interface
     onnxruntime_common
     onnxruntime_framework

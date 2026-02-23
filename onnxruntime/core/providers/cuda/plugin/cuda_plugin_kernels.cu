@@ -553,6 +553,10 @@ struct GeneratedKernelRegistration {
   int registration_id;
   const char* constraint_name;
   ONNXTensorElementDataType type_constraint;
+  int input_mem_type_indices[4];
+  int num_input_mem_type_indices;
+  int output_mem_type_indices[4];
+  int num_output_mem_type_indices;
 };
 
 using PluginKernelCreateFn = OrtStatus*(ORT_API_CALL*)(void*, const OrtKernelInfo*, OrtKernelImpl**) noexcept;
@@ -651,10 +655,15 @@ OrtStatus* CreateCudaKernelRegistry(const OrtEpApi& ep_api,
     std::string domain;
     int since_version_start;
     int since_version_end;
+    std::vector<int> input_mem_type_indices;
+    std::vector<int> output_mem_type_indices;
 
     bool operator<(const KernelDefKey& other) const {
-      return std::tie(op_type, domain, since_version_start, since_version_end) <
-             std::tie(other.op_type, other.domain, other.since_version_start, other.since_version_end);
+      return std::tie(op_type, domain, since_version_start, since_version_end,
+                      input_mem_type_indices, output_mem_type_indices) <
+             std::tie(other.op_type, other.domain, other.since_version_start,
+                      other.since_version_end, other.input_mem_type_indices,
+                      other.output_mem_type_indices);
     }
   };
 
@@ -672,11 +681,17 @@ OrtStatus* CreateCudaKernelRegistry(const OrtEpApi& ep_api,
       continue;
     }
 
+    std::vector<int> in_mem, out_mem;
+    for (int j = 0; j < reg.num_input_mem_type_indices; ++j) in_mem.push_back(reg.input_mem_type_indices[j]);
+    for (int j = 0; j < reg.num_output_mem_type_indices; ++j) out_mem.push_back(reg.output_mem_type_indices[j]);
+
     KernelDefKey key{
         reg.op_type,
         reg.domain ? reg.domain : "",
         reg.since_version_start,
-        reg.since_version_end};
+        reg.since_version_end,
+        in_mem,
+        out_mem};
     const std::string constraint_name = reg.constraint_name ? reg.constraint_name : "T";
     grouped[key][constraint_name].insert(reg.type_constraint);
   }
@@ -690,6 +705,17 @@ OrtStatus* CreateCudaKernelRegistry(const OrtEpApi& ep_api,
         .SetDomain(key.domain.c_str())
         .SetSinceVersion(key.since_version_start, key.since_version_end)
         .SetExecutionProvider(ep_name);
+
+    // For each input defined in the registration, apply the memory type constraint.
+    // Index mapping matches the input positions defined for the operator.
+    for (int idx : key.input_mem_type_indices) {
+      builder.SetInputMemType(idx, OrtMemTypeCPUInput);
+    }
+    // For each output defined in the registration, apply the memory type constraint.
+    // Index mapping matches the input positions defined for the operator.
+    for (int idx : key.output_mem_type_indices) {
+      builder.SetOutputMemType(idx, OrtMemTypeCPUOutput);
+    }
 
     for (const auto& [cname, types] : constraints) {
       std::vector<const OrtDataType*> type_list;

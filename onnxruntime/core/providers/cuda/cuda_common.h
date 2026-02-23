@@ -35,11 +35,19 @@
 #else
 #include "core/util/math.h"
 #include <iostream>
-#ifndef LOGS_DEFAULT
+#ifndef INFO
 #define INFO 0
+#endif
+#ifndef WARNING
 #define WARNING 1
+#endif
+#ifndef ERROR
 #define ERROR 2
+#endif
+#ifndef FATAL
 #define FATAL 3
+#endif
+#ifndef LOGS_DEFAULT
 #define LOGS_DEFAULT(severity) std::cerr
 #endif
 #endif

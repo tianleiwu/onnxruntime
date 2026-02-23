@@ -16,7 +16,7 @@ import argparse
 import re
 import sys
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 TYPE_TO_ORT_ENUM = {
@@ -43,6 +43,39 @@ TYPE_TO_ORT_ENUM = {
     "Int4x2": "ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4",
 }
 
+# Mapping of Op -> (input_mem_type_indices, output_mem_type_indices)
+# Only OrtMemTypeCPUInput/CPUOutput are supported for now.
+# Indices are based on ORT's internal CUDA EP registration.
+# This ensures that when the plugin registers These kernels, it correctly identifies
+# which inputs (e.g., shape tensor for Reshape, axes for Concat) must reside in CPU memory.
+# Format: { op_type: ( [input_indices], [output_indices] ) }
+MEMORY_TYPE_OVERRIDES: dict[str, tuple[list[int], list[int]]] = {
+    "Reshape": ([1], []),
+    "Slice": ([1, 2, 3, 4], []),
+    "Tile": ([1], []),
+    "Expand": ([1], []),
+    "Pad": ([1, 2], []),
+    "Resize": ([1, 2, 3], []),
+    "TopK": ([1], []),
+    "CumSum": ([1], []),
+    "Range": ([0, 1, 2], []),
+    "ConstantOfShape": ([0], []),
+    "Dropout": ([1, 2], []),
+    "NonMaxSuppression": ([2, 3, 4], []),
+    "MatMulInteger": ([2, 3], []),
+    "OneHot": ([1], []),
+    "Squeeze": ([1], []),
+    "Unsqueeze": ([1], []),
+    "Split": ([1], []),
+    "SplitToSequence": ([1], []),
+    "ConcatFromSequence": ([1], []),
+    "MemcpyFromHost": ([0], []),
+    "MemcpyToHost": ([], [0]),
+    "IF": ([0], []),
+    "Loop": ([0, 1], []),
+    "Scan": ([0], []),
+}
+
 MACRO_PATTERN = re.compile(r"BuildKernelCreateInfo\s*<\s*([^>]+)\s*>")
 
 
@@ -55,6 +88,8 @@ class Entry:
     registration_id: int
     constraint_name: str
     type_enum: str
+    input_mem_types: list[int] = field(default_factory=list, compare=False)
+    output_mem_types: list[int] = field(default_factory=list, compare=False)
 
 
 @dataclass(frozen=True)
@@ -367,6 +402,7 @@ def iter_entries(
             registration_id += 1
             continue
 
+        mem_in, mem_out = MEMORY_TYPE_OVERRIDES.get(parsed.op_type, ([], []))
         constraint_pairs = get_constraint_pairs(parsed)
         if not constraint_pairs:
             if not type_filter:
@@ -378,6 +414,8 @@ def iter_entries(
                     registration_id,
                     "",
                     "ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED",
+                    mem_in,
+                    mem_out,
                 )
             registration_id += 1
             continue
@@ -398,6 +436,8 @@ def iter_entries(
                 registration_id,
                 constraint_name,
                 type_enum,
+                mem_in,
+                mem_out,
             )
 
         if not emitted_any and not type_filter:
@@ -409,6 +449,8 @@ def iter_entries(
                 registration_id,
                 "",
                 "ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED",
+                mem_in,
+                mem_out,
             )
 
         registration_id += 1
@@ -425,10 +467,15 @@ def write_output(output_path: Path, entries: list[Entry], argv: list[str]) -> No
     ]
 
     for e in entries:
+        in_mem = "{" + ", ".join(map(str, e.input_mem_types)) + "}" if e.input_mem_types else "{}"
+        out_mem = "{" + ", ".join(map(str, e.output_mem_types)) + "}" if e.output_mem_types else "{}"
+        n_in = len(e.input_mem_types)
+        n_out = len(e.output_mem_types)
         lines.append(
             f'{{"{e.op_type}", {e.since_version_start}, {e.since_version_end}, "{e.domain}", '
             f"{e.registration_id}, "
-            f'"{e.constraint_name}", {e.type_enum}}},'
+            f'"{e.constraint_name}", {e.type_enum}, '
+            f"{in_mem}, {n_in}, {out_mem}, {n_out}}},"
         )
 
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

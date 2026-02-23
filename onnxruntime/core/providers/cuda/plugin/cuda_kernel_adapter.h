@@ -403,6 +403,11 @@ class CudaKernel {
 #define ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX(...)
 
 #undef ONNX_OPERATOR_VERSIONED_TWO_TYPED_KERNEL_EX
+// These macro guards are necessary because when building as a plugin, we may include
+// framework headers that also define these macros. We use guards or undefs to ensure
+// the plugin's simplified versions are used without causing redefinition errors.
+#ifndef ONNX_OPERATOR_VERSIONED_TWO_TYPED_KERNEL_EX
 #define ONNX_OPERATOR_VERSIONED_TWO_TYPED_KERNEL_EX(...)
+#endif
 
 }  // namespace onnxruntime
