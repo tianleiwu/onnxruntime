@@ -13,11 +13,17 @@ import os
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 
+import onnxruntime as onnxrt
 from onnxruntime import get_build_info
 
+
+class _CudaPluginRegistrationState:
+    attempted = False
+    registered = False
+
+
 CUDA_PLUGIN_EP_NAME = "CudaPluginExecutionProvider"
-_cuda_plugin_ep_registration_attempted = False
-_cuda_plugin_ep_registered = False
+enable_debug_print = False
 
 
 def _get_package_root(package_name: str, directory_name: str | None = None):
@@ -64,12 +70,10 @@ def _get_default_cuda_plugin_ep_path() -> str | None:
 
 
 def ensure_cuda_plugin_ep_registered() -> bool:
-    global _cuda_plugin_ep_registration_attempted, _cuda_plugin_ep_registered
+    if _CudaPluginRegistrationState.attempted:
+        return _CudaPluginRegistrationState.registered
 
-    if _cuda_plugin_ep_registration_attempted:
-        return _cuda_plugin_ep_registered
-
-    _cuda_plugin_ep_registration_attempted = True
+    _CudaPluginRegistrationState.attempted = True
 
     if not _is_cuda_plugin_ep_built():
         return False
@@ -86,13 +90,13 @@ def ensure_cuda_plugin_ep_registered() -> bool:
 
     try:
         onnxrt.register_execution_provider_library(CUDA_PLUGIN_EP_NAME, ep_lib_path)
-        _cuda_plugin_ep_registered = True
+        _CudaPluginRegistrationState.registered = True
     except Exception as e:
         if enable_debug_print:
             print(f"Failed to register CUDA Plugin EP from {ep_lib_path}: {e}")
-        _cuda_plugin_ep_registered = False
+        _CudaPluginRegistrationState.registered = False
 
-    return _cuda_plugin_ep_registered
+    return _CudaPluginRegistrationState.registered
 
 
 def resolve_cuda_plugin_ep(ep: str) -> str:

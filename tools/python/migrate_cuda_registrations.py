@@ -478,10 +478,10 @@ def main() -> None:
         )
 
     if args.ops is None:
-        args.ops = [] if args.contrib else ["Add", "Relu", "MatMul", "Gemm", "Conv"]
+        args.ops = []
 
     if args.types is None:
-        args.types = [] if args.contrib else ["float"]
+        args.types = []
 
     source_text = args.input.read_text(encoding="utf-8")
     op_filter = set(args.ops) if args.ops else set()
