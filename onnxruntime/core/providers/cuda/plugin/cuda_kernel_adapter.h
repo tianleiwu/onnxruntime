@@ -324,13 +324,10 @@ class CudaKernel : public onnxruntime::OpKernel {
     size_t sz = detail::BytesForCount(cnt, std::is_void_v<T> ? 0 : sizeof(T));
     void* p = nullptr;
     if (cudaMalloc(&p, sz) != cudaSuccess) return IAllocatorUniquePtr<T>(nullptr, [](T*) {});
-    cudaStream_t cs = static_cast<cudaStream_t>(s);
-    return IAllocatorUniquePtr<T>(static_cast<T*>(p), [cs](T* ptr) { if (ptr) {
-#if CUDART_VERSION >= 11020
-      if (cs) { cudaFreeAsync(ptr, cs); return; }
-#endif
-      cudaFree(ptr);
-    } });
+    (void)s;
+    return IAllocatorUniquePtr<T>(static_cast<T*>(p), [](T* ptr) {
+      if (ptr) cudaFree(ptr);
+    });
   }
   inline void AddDeferredReleaseCPUPtr(void* p, void* s) const {
     if (!p) return;

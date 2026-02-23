@@ -4,7 +4,11 @@
 #include "cuda_plugin_kernels.h"
 #include "cuda_stream_plugin.h"
 #include "cuda_kernel_adapter.h"
+#include "core/common/narrow.h"
 #include "core/providers/cuda/activation/activations.h"
+#include "core/providers/cuda/tensor/concat.h"
+#include "core/providers/cuda/tensor/gather.h"
+#include "core/providers/cuda/tensor/split.h"
 
 #include <cstring>
 #include <map>
@@ -621,6 +625,34 @@ OrtStatus* ORT_API_CALL CreateConvKernel(void* /*state*/,
   return nullptr;
 }
 
+OrtStatus* ORT_API_CALL CreateConcatKernel(void* /*state*/,
+                                           const OrtKernelInfo* info,
+                                           OrtKernelImpl** kernel_out) noexcept {
+  *kernel_out = new AdapterKernelImpl<cuda::Concat>(info);
+  return nullptr;
+}
+
+OrtStatus* ORT_API_CALL CreateSplitKernel(void* /*state*/,
+                                          const OrtKernelInfo* info,
+                                          OrtKernelImpl** kernel_out) noexcept {
+  int64_t num_outputs = -1;
+  OrtStatus* status = Ort::GetApi().KernelInfoGetAttribute_int64(info, "num_outputs", &num_outputs);
+  if (status == nullptr) {
+    *kernel_out = new AdapterKernelImpl<cuda::Split_18>(info);
+  } else {
+    Ort::GetApi().ReleaseStatus(status);
+    *kernel_out = new AdapterKernelImpl<cuda::Split_2_13>(info);
+  }
+  return nullptr;
+}
+
+OrtStatus* ORT_API_CALL CreateGatherKernel(void* /*state*/,
+                                           const OrtKernelInfo* info,
+                                           OrtKernelImpl** kernel_out) noexcept {
+  *kernel_out = new AdapterKernelImpl<cuda::Gather>(info);
+  return nullptr;
+}
+
 // ---------------------------------------------------------------------------
 // Shape-Only Kernels (Reshape, Squeeze, Unsqueeze, Flatten)
 // These ops only change tensor shape metadata. On the GPU, we copy data from
@@ -914,6 +946,9 @@ PluginKernelCreateFn GetCreateFnForOp(std::string_view op_type) {
   if (op_type == "MatMul") return CreateMatMulKernel;
   if (op_type == "Gemm") return CreateGemmKernel;
   if (op_type == "Conv") return CreateConvKernel;
+  if (op_type == "Concat") return CreateConcatKernel;
+  if (op_type == "Split") return CreateSplitKernel;
+  if (op_type == "Gather") return CreateGatherKernel;
   // Shape-only ops (Task 4.1)
   if (op_type == "Reshape") return CreateReshapeKernel;
   if (op_type == "Squeeze") return CreateSqueezeKernel;

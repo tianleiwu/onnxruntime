@@ -23,6 +23,9 @@ set(CUDA_PLUGIN_EP_CC_SRCS
     ${CUDA_PLUGIN_EP_DIR}/cuda_stream_plugin.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/unary_elementwise_ops.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/concat.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/split.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/gather.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/transpose.cc
 )
 
@@ -30,6 +33,9 @@ set(CUDA_PLUGIN_EP_CU_SRCS
     ${CUDA_PLUGIN_EP_DIR}/cuda_plugin_kernels.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/unary_elementwise_ops_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/concat_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/split_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/gather_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/transpose_impl.cu
 )
 
@@ -143,9 +149,15 @@ endif()
 set(PORTED_KERNEL_SRCS
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/unary_elementwise_ops.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/concat.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/split.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/gather.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/transpose.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/unary_elementwise_ops_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/concat_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/split_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/gather_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/transpose_impl.cu
 )
 
