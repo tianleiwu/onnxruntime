@@ -16,6 +16,8 @@
 #include "core/providers/cuda/tensor/gather.h"
 #include "core/providers/cuda/tensor/split.h"
 #include "core/providers/cuda/tensor/where.h"
+#include "contrib_ops/cuda/bert/group_query_attention.h"
+#include "contrib_ops/cuda/bert/rotary_embedding.h"
 
 #include <cstring>
 #include <map>
@@ -448,10 +450,127 @@ DEFINE_ADAPTER_CREATE_FN_TYPED(ThresholdedRelu)
 DEFINE_ADAPTER_CREATE_FN_TYPED_NUMERIC(Sub)
 DEFINE_ADAPTER_CREATE_FN_TYPED_NUMERIC(Mul)
 DEFINE_ADAPTER_CREATE_FN_TYPED_NUMERIC(Div)
-DEFINE_ADAPTER_CREATE_FN_TYPED_NUMERIC_OR_BOOL(Equal)
-DEFINE_ADAPTER_CREATE_FN_TYPED_NUMERIC(Greater)
-DEFINE_ADAPTER_CREATE_FN_TYPED_NUMERIC(Less)
-DEFINE_ADAPTER_CREATE_FN_TYPED_NUMERIC_OR_BOOL(Abs)
+OrtStatus* ORT_API_CALL CreateEqualKernel(void* /*state*/,
+                                          const OrtKernelInfo* info,
+                                          OrtKernelImpl** kernel_out) noexcept {
+  EXCEPTION_TO_STATUS_BEGIN
+  Ort::ConstKernelInfo ki(info);
+  auto input_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();
+  switch (input_type) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:
+      *kernel_out = new AdapterKernelImpl<cuda::Equal<uint32_t>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64:
+      *kernel_out = new AdapterKernelImpl<cuda::Equal<uint64_t>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+      *kernel_out = new AdapterKernelImpl<cuda::Equal<int32_t>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+      *kernel_out = new AdapterKernelImpl<cuda::Equal<int64_t>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+      *kernel_out = new AdapterKernelImpl<cuda::Equal<float>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+      *kernel_out = new AdapterKernelImpl<cuda::Equal<MLFloat16>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
+      *kernel_out = new AdapterKernelImpl<cuda::Equal<double>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+      *kernel_out = new AdapterKernelImpl<cuda::Equal<BFloat16>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
+      *kernel_out = new AdapterKernelImpl<cuda::Equal<bool>>(info);
+      break;
+    default:
+      return Ort::GetApi().CreateStatus(ORT_EP_FAIL,
+                                        (std::string("Equal: unsupported type ") + std::to_string(input_type)).c_str());
+  }
+  return nullptr;
+  EXCEPTION_TO_STATUS_END
+}
+
+OrtStatus* ORT_API_CALL CreateGreaterKernel(void* /*state*/,
+                                            const OrtKernelInfo* info,
+                                            OrtKernelImpl** kernel_out) noexcept {
+  EXCEPTION_TO_STATUS_BEGIN
+  Ort::ConstKernelInfo ki(info);
+  auto input_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();
+  switch (input_type) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:
+      *kernel_out = new AdapterKernelImpl<cuda::Greater<uint32_t>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64:
+      *kernel_out = new AdapterKernelImpl<cuda::Greater<uint64_t>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+      *kernel_out = new AdapterKernelImpl<cuda::Greater<int32_t>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+      *kernel_out = new AdapterKernelImpl<cuda::Greater<int64_t>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+      *kernel_out = new AdapterKernelImpl<cuda::Greater<float>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+      *kernel_out = new AdapterKernelImpl<cuda::Greater<MLFloat16>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
+      *kernel_out = new AdapterKernelImpl<cuda::Greater<double>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+      *kernel_out = new AdapterKernelImpl<cuda::Greater<BFloat16>>(info);
+      break;
+    default:
+      return Ort::GetApi().CreateStatus(ORT_EP_FAIL,
+                                        (std::string("Greater: unsupported type ") + std::to_string(input_type)).c_str());
+  }
+  return nullptr;
+  EXCEPTION_TO_STATUS_END
+}
+
+OrtStatus* ORT_API_CALL CreateLessKernel(void* /*state*/,
+                                         const OrtKernelInfo* info,
+                                         OrtKernelImpl** kernel_out) noexcept {
+  EXCEPTION_TO_STATUS_BEGIN
+  Ort::ConstKernelInfo ki(info);
+  auto input_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();
+  switch (input_type) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:
+      *kernel_out = new AdapterKernelImpl<cuda::Less<uint32_t>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64:
+      *kernel_out = new AdapterKernelImpl<cuda::Less<uint64_t>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+      *kernel_out = new AdapterKernelImpl<cuda::Less<int32_t>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+      *kernel_out = new AdapterKernelImpl<cuda::Less<int64_t>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+      *kernel_out = new AdapterKernelImpl<cuda::Less<float>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+      *kernel_out = new AdapterKernelImpl<cuda::Less<MLFloat16>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
+      *kernel_out = new AdapterKernelImpl<cuda::Less<double>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+      *kernel_out = new AdapterKernelImpl<cuda::Less<BFloat16>>(info);
+      break;
+    default:
+      return Ort::GetApi().CreateStatus(ORT_EP_FAIL,
+                                        (std::string("Less: unsupported type ") + std::to_string(input_type)).c_str());
+  }
+  return nullptr;
+  EXCEPTION_TO_STATUS_END
+}
+
+DEFINE_ADAPTER_CREATE_FN_TYPED_NUMERIC(Abs)
 DEFINE_ADAPTER_CREATE_FN_TYPED_SIGNED_NUMERIC(Neg)
 DEFINE_ADAPTER_CREATE_FN_TYPED_HFD(Floor)
 DEFINE_ADAPTER_CREATE_FN_TYPED_HFD(Ceil)
@@ -1432,7 +1551,93 @@ OrtStatus* ORT_API_CALL CreateFlattenKernel(void*, const OrtKernelInfo* info, Or
   return nullptr;
 }
 
-PluginKernelCreateFn GetCreateFnForOp(std::string_view op_type) {
+OrtStatus* ORT_API_CALL CreateRotaryEmbeddingKernel(void* /*state*/,
+                                                    const OrtKernelInfo* info,
+                                                    OrtKernelImpl** kernel_out) noexcept {
+  EXCEPTION_TO_STATUS_BEGIN
+  Ort::ConstKernelInfo ki(info);
+  auto input_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();
+  switch (input_type) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::RotaryEmbedding<float>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::RotaryEmbedding<MLFloat16>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::RotaryEmbedding<BFloat16>>(info);
+      break;
+    default:
+      return Ort::GetApi().CreateStatus(
+          ORT_EP_FAIL,
+          (std::string("RotaryEmbedding: unsupported type ") + std::to_string(input_type)).c_str());
+  }
+  return nullptr;
+  EXCEPTION_TO_STATUS_END
+}
+
+OrtStatus* ORT_API_CALL CreateGroupQueryAttentionKernel(void* /*state*/,
+                                                        const OrtKernelInfo* info,
+                                                        OrtKernelImpl** kernel_out) noexcept {
+  EXCEPTION_TO_STATUS_BEGIN
+  Ort::ConstKernelInfo ki(info);
+  auto query_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();
+  auto cache_type = ki.GetInputTypeInfo(3).GetTensorTypeAndShapeInfo().GetElementType();
+
+  if (query_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+    switch (cache_type) {
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+        *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::GroupQueryAttention<MLFloat16, MLFloat16>>(info);
+        return nullptr;
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
+        *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::GroupQueryAttention<MLFloat16, int8_t>>(info);
+        return nullptr;
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
+        *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::GroupQueryAttention<MLFloat16, uint8_t>>(info);
+        return nullptr;
+#ifdef USE_FP8_KV_CACHE
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN:
+        *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::GroupQueryAttention<MLFloat16, Float8E4M3FN>>(info);
+        return nullptr;
+#endif
+      default:
+        break;
+    }
+  } else if (query_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16) {
+    switch (cache_type) {
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+        *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::GroupQueryAttention<BFloat16, BFloat16>>(info);
+        return nullptr;
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
+        *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::GroupQueryAttention<BFloat16, int8_t>>(info);
+        return nullptr;
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
+        *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::GroupQueryAttention<BFloat16, uint8_t>>(info);
+        return nullptr;
+#ifdef USE_FP8_KV_CACHE
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN:
+        *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::GroupQueryAttention<BFloat16, Float8E4M3FN>>(info);
+        return nullptr;
+#endif
+      default:
+        break;
+    }
+  }
+
+  return Ort::GetApi().CreateStatus(
+      ORT_EP_FAIL,
+      (std::string("GroupQueryAttention: unsupported type combination. query=") +
+       std::to_string(query_type) + ", cache=" + std::to_string(cache_type))
+          .c_str());
+  EXCEPTION_TO_STATUS_END
+}
+
+PluginKernelCreateFn GetCreateFnForOp(std::string_view op_type, std::string_view domain = "") {
+  if (domain == "com.microsoft") {
+    if (op_type == "GroupQueryAttention") return CreateGroupQueryAttentionKernel;
+    if (op_type == "RotaryEmbedding") return CreateRotaryEmbeddingKernel;
+  }
+
   if (op_type == "Relu") return CreateReluKernel;
   if (op_type == "Elu") return CreateEluKernel;
   if (op_type == "HardSigmoid") return CreateHardSigmoidKernel;
@@ -1525,7 +1730,8 @@ OrtStatus* CreateCudaKernelRegistry(const OrtEpApi& ep_api,
 
   for (size_t i = 0; i < std::size(kGeneratedKernelRegistrations); ++i) {
     const auto& reg = kGeneratedKernelRegistrations[i];
-    PluginKernelCreateFn create_fn = GetCreateFnForOp(reg.op_type);
+    const std::string_view reg_domain = reg.domain ? reg.domain : "";
+    PluginKernelCreateFn create_fn = GetCreateFnForOp(reg.op_type, reg_domain);
     if (!create_fn) {
       continue;
     }
@@ -1551,7 +1757,10 @@ OrtStatus* CreateCudaKernelRegistry(const OrtEpApi& ep_api,
 
   // Now register one KernelDef per grouped key, with all type constraints.
   for (const auto& [key, constraints] : grouped) {
-    PluginKernelCreateFn create_fn = GetCreateFnForOp(key.op_type);
+    PluginKernelCreateFn create_fn = GetCreateFnForOp(key.op_type, key.domain);
+    if (!create_fn) {
+      continue;
+    }
 
     Ort::KernelDefBuilder builder;
     builder.SetOperatorType(key.op_type.c_str())

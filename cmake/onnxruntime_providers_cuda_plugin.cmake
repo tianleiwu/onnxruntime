@@ -53,6 +53,29 @@ set(CUDA_PLUGIN_EP_CU_SRCS
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/transpose_impl.cu
 )
 
+# Contrib CUDA kernels required for GQA-focused ops (Task 4.5).
+file(GLOB CUDA_PLUGIN_GQA_XQA_CU_SRCS CONFIGURE_DEPENDS
+    "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/xqa/xqa_loader*.cu"
+)
+
+list(APPEND CUDA_PLUGIN_EP_CC_SRCS
+    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/group_query_attention.cc
+    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/rotary_embedding.cc
+    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/flash_attention/flash_api.cc
+    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/transformer_common.cc
+)
+
+list(APPEND CUDA_PLUGIN_EP_CU_SRCS
+    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/add_bias_transpose.cu
+    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention_impl.cu
+    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention_softmax.cu
+    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/bert_padding.cu
+    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/group_query_attention_impl.cu
+    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/rotary_embedding_impl.cu
+    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/cutlass_fmha/memory_efficient_attention.cu
+    ${CUDA_PLUGIN_GQA_XQA_CU_SRCS}
+)
+
 # Create shared library target using the ORT helper function for plugins
 onnxruntime_add_shared_library_module(onnxruntime_providers_cuda_plugin
     ${CUDA_PLUGIN_EP_CC_SRCS}
@@ -89,6 +112,7 @@ set_target_properties(onnxruntime_providers_cuda_plugin PROPERTIES
 )
 target_compile_options(onnxruntime_providers_cuda_plugin PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-Xcudafe;--diag_suppress=550>")
 include(cudnn_frontend)
+include(cutlass)
 
 # --- Find cuDNN (may be at a custom path via onnxruntime_CUDNN_HOME) ---
 set(_CUDNN_SEARCH_PATHS "")
@@ -116,6 +140,9 @@ target_include_directories(onnxruntime_providers_cuda_plugin PRIVATE
     ${REPO_ROOT}/onnxruntime
     ${CUDAToolkit_INCLUDE_DIRS}
     ${CUDA_PLUGIN_CUDNN_INCLUDE_DIR}
+    ${cutlass_SOURCE_DIR}/include
+    ${cutlass_SOURCE_DIR}/examples
+    ${cutlass_SOURCE_DIR}/tools/util/include
 )
 
 onnxruntime_add_include_to_target(

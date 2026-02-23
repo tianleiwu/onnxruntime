@@ -14,6 +14,7 @@
 
 #include <cublas_v2.h>
 #include <cudnn.h>
+#include "core/providers/cuda/shared_inc/cuda_call.h"
 
 #ifdef __CUDACC__
 #include <cuda_fp16.h>
@@ -142,6 +143,19 @@
 #undef LOGS
 #undef LOGS_DEFAULT
 #undef ORT_LOG_MESSAGE
+
+namespace onnxruntime {
+namespace cuda {
+struct PluginNoOpLogStream {
+  template <typename T>
+  PluginNoOpLogStream& operator<<(const T&) { return *this; }
+};
+}  // namespace cuda
+}  // namespace onnxruntime
+
+#ifndef LOGS_DEFAULT
+#define LOGS_DEFAULT(severity) ::onnxruntime::cuda::PluginNoOpLogStream()
+#endif
 
 #include <atomic>
 #include <cstring>
