@@ -8,7 +8,9 @@
 #include "core/providers/cuda/activation/activations.h"
 #include "core/providers/cuda/math/binary_elementwise_ops.h"
 #include "core/providers/cuda/math/clip.h"
+#include "core/providers/cuda/math/softmax.h"
 #include "core/providers/cuda/math/unary_elementwise_ops.h"
+#include "core/providers/cuda/reduction/reduction_ops.h"
 #include "core/providers/cuda/tensor/concat.h"
 #include "core/providers/cuda/tensor/cast_op.h"
 #include "core/providers/cuda/tensor/gather.h"
@@ -335,6 +337,114 @@ DEFINE_ADAPTER_CREATE_FN_TYPED(ThresholdedRelu)
     EXCEPTION_TO_STATUS_END                                                                \
   }
 
+#define DEFINE_ADAPTER_CREATE_FN_TYPED_I8U8I32I64HFD(OpName)                               \
+  OrtStatus* ORT_API_CALL Create##OpName##Kernel(void* /*state*/,                          \
+                                                 const OrtKernelInfo* info,                \
+                                                 OrtKernelImpl** kernel_out) noexcept {    \
+    EXCEPTION_TO_STATUS_BEGIN                                                              \
+    Ort::ConstKernelInfo ki(info);                                                         \
+    auto input_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType(); \
+    switch (input_type) {                                                                  \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:                                             \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<int8_t>>(info);                   \
+        break;                                                                             \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:                                            \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<uint8_t>>(info);                  \
+        break;                                                                             \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:                                            \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<int32_t>>(info);                  \
+        break;                                                                             \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:                                            \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<int64_t>>(info);                  \
+        break;                                                                             \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:                                            \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<float>>(info);                    \
+        break;                                                                             \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:                                          \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<MLFloat16>>(info);                \
+        break;                                                                             \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:                                           \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<double>>(info);                   \
+        break;                                                                             \
+      default:                                                                             \
+        return Ort::GetApi().CreateStatus(ORT_EP_FAIL,                                     \
+                                          (std::string(#OpName) + ": unsupported type " +  \
+                                           std::to_string(input_type))                     \
+                                              .c_str());                                   \
+    }                                                                                      \
+    return nullptr;                                                                        \
+    EXCEPTION_TO_STATUS_END                                                                \
+  }
+
+#define DEFINE_ADAPTER_CREATE_FN_TYPED_I32I64HFDX(OpName)                                  \
+  OrtStatus* ORT_API_CALL Create##OpName##Kernel(void* /*state*/,                          \
+                                                 const OrtKernelInfo* info,                \
+                                                 OrtKernelImpl** kernel_out) noexcept {    \
+    EXCEPTION_TO_STATUS_BEGIN                                                              \
+    Ort::ConstKernelInfo ki(info);                                                         \
+    auto input_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType(); \
+    switch (input_type) {                                                                  \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:                                            \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<int32_t>>(info);                  \
+        break;                                                                             \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:                                            \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<int64_t>>(info);                  \
+        break;                                                                             \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:                                            \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<float>>(info);                    \
+        break;                                                                             \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:                                          \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<MLFloat16>>(info);                \
+        break;                                                                             \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:                                           \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<double>>(info);                   \
+        break;                                                                             \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:                                         \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<BFloat16>>(info);                 \
+        break;                                                                             \
+      default:                                                                             \
+        return Ort::GetApi().CreateStatus(ORT_EP_FAIL,                                     \
+                                          (std::string(#OpName) + ": unsupported type " +  \
+                                           std::to_string(input_type))                     \
+                                              .c_str());                                   \
+    }                                                                                      \
+    return nullptr;                                                                        \
+    EXCEPTION_TO_STATUS_END                                                                \
+  }
+
+#define DEFINE_ADAPTER_CREATE_FN_TYPED_I32HFDX(OpName)                                     \
+  OrtStatus* ORT_API_CALL Create##OpName##Kernel(void* /*state*/,                          \
+                                                 const OrtKernelInfo* info,                \
+                                                 OrtKernelImpl** kernel_out) noexcept {    \
+    EXCEPTION_TO_STATUS_BEGIN                                                              \
+    Ort::ConstKernelInfo ki(info);                                                         \
+    auto input_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType(); \
+    switch (input_type) {                                                                  \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:                                            \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<int32_t>>(info);                  \
+        break;                                                                             \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:                                            \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<float>>(info);                    \
+        break;                                                                             \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:                                          \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<MLFloat16>>(info);                \
+        break;                                                                             \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:                                           \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<double>>(info);                   \
+        break;                                                                             \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:                                         \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<BFloat16>>(info);                 \
+        break;                                                                             \
+      default:                                                                             \
+        return Ort::GetApi().CreateStatus(ORT_EP_FAIL,                                     \
+                                          (std::string(#OpName) + ": unsupported type " +  \
+                                           std::to_string(input_type))                     \
+                                              .c_str());                                   \
+    }                                                                                      \
+    return nullptr;                                                                        \
+    EXCEPTION_TO_STATUS_END                                                                \
+  }
+
 DEFINE_ADAPTER_CREATE_FN_TYPED_NUMERIC(Sub)
 DEFINE_ADAPTER_CREATE_FN_TYPED_NUMERIC(Mul)
 DEFINE_ADAPTER_CREATE_FN_TYPED_NUMERIC(Div)
@@ -348,6 +458,40 @@ DEFINE_ADAPTER_CREATE_FN_TYPED_HFD(Ceil)
 DEFINE_ADAPTER_CREATE_FN_TYPED_HFDX(Sqrt)
 DEFINE_ADAPTER_CREATE_FN_TYPED_HFDX(Exp)
 DEFINE_ADAPTER_CREATE_FN_TYPED_HFD(Log)
+DEFINE_ADAPTER_CREATE_FN_TYPED_HFD(ArgMax)
+DEFINE_ADAPTER_CREATE_FN_TYPED_HFD(ArgMin)
+DEFINE_ADAPTER_CREATE_FN_TYPED_I8U8I32I64HFD(ReduceMax)
+DEFINE_ADAPTER_CREATE_FN_TYPED_I32HFDX(ReduceMean)
+DEFINE_ADAPTER_CREATE_FN_TYPED_I8U8I32I64HFD(ReduceMin)
+DEFINE_ADAPTER_CREATE_FN_TYPED_I32I64HFDX(ReduceSum)
+DEFINE_ADAPTER_CREATE_FN_TYPED_HFDX(Softmax)
+
+OrtStatus* ORT_API_CALL CreateLogSoftmaxKernel(void* /*state*/,
+                                               const OrtKernelInfo* info,
+                                               OrtKernelImpl** kernel_out) noexcept {
+  EXCEPTION_TO_STATUS_BEGIN
+  Ort::ConstKernelInfo ki(info);
+  auto input_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();
+  switch (input_type) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+      *kernel_out = new AdapterKernelImpl<cuda::Softmax<float>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+      *kernel_out = new AdapterKernelImpl<cuda::Softmax<MLFloat16>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
+      *kernel_out = new AdapterKernelImpl<cuda::Softmax<double>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+      *kernel_out = new AdapterKernelImpl<cuda::Softmax<BFloat16>>(info);
+      break;
+    default:
+      return Ort::GetApi().CreateStatus(ORT_EP_FAIL,
+                                        (std::string("LogSoftmax: unsupported type ") + std::to_string(input_type)).c_str());
+  }
+  return nullptr;
+  EXCEPTION_TO_STATUS_END
+}
 
 // ---------------------------------------------------------------------------
 // Add Kernel Implementation
@@ -1321,6 +1465,14 @@ PluginKernelCreateFn GetCreateFnForOp(std::string_view op_type) {
   if (op_type == "Clip") return CreateClipKernel;
   if (op_type == "Where") return CreateWhereKernel;
   if (op_type == "Cast") return CreateCastKernel;
+  if (op_type == "ArgMax") return CreateArgMaxKernel;
+  if (op_type == "ArgMin") return CreateArgMinKernel;
+  if (op_type == "ReduceMax") return CreateReduceMaxKernel;
+  if (op_type == "ReduceMean") return CreateReduceMeanKernel;
+  if (op_type == "ReduceMin") return CreateReduceMinKernel;
+  if (op_type == "ReduceSum") return CreateReduceSumKernel;
+  if (op_type == "Softmax") return CreateSoftmaxKernel;
+  if (op_type == "LogSoftmax") return CreateLogSoftmaxKernel;
   if (op_type == "Concat") return CreateConcatKernel;
   if (op_type == "Split") return CreateSplitKernel;
   if (op_type == "Gather") return CreateGatherKernel;

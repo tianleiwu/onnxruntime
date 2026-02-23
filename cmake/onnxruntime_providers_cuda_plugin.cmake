@@ -24,7 +24,11 @@ set(CUDA_PLUGIN_EP_CC_SRCS
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/binary_elementwise_ops.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/clip.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/softmax.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/softmax_common.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/unary_elementwise_ops.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/reduction/reduction_functions.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/reduction/reduction_ops.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/cast_op.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/concat.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/where.cc
@@ -38,7 +42,9 @@ set(CUDA_PLUGIN_EP_CU_SRCS
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/binary_elementwise_ops_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/clip_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/softmax_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/unary_elementwise_ops_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/reduction/reduction_functions.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/cast_op.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/concat_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/where_impl.cu
@@ -82,6 +88,7 @@ set_target_properties(onnxruntime_providers_cuda_plugin PROPERTIES
     CUDA_STANDARD_REQUIRED ON
 )
 target_compile_options(onnxruntime_providers_cuda_plugin PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-Xcudafe;--diag_suppress=550>")
+include(cudnn_frontend)
 
 # --- Find cuDNN (may be at a custom path via onnxruntime_CUDNN_HOME) ---
 set(_CUDNN_SEARCH_PATHS "")
@@ -125,6 +132,8 @@ target_link_libraries(onnxruntime_providers_cuda_plugin PRIVATE
     CUDA::cudart
     CUDA::cublas
     CUDA::cublasLt
+    CUDNN::cudnn_all
+    cudnn_frontend
     ${CUDA_PLUGIN_CUDNN_LIBRARY}
     Boost::mp11
     safeint_interface
@@ -158,7 +167,11 @@ set(PORTED_KERNEL_SRCS
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/binary_elementwise_ops.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/clip.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/softmax.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/softmax_common.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/unary_elementwise_ops.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/reduction/reduction_functions.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/reduction/reduction_ops.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/cast_op.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/concat.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/where.cc
@@ -168,7 +181,9 @@ set(PORTED_KERNEL_SRCS
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/binary_elementwise_ops_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/clip_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/softmax_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/unary_elementwise_ops_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/reduction/reduction_functions.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/cast_op.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/concat_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/where_impl.cu
