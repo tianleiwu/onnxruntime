@@ -75,29 +75,34 @@ using ReluKernelImpl = AdapterKernelImpl<cuda::Relu<float>>;
 // Macro to define a type-dispatching create function for activation ops.
 // At kernel creation time, ORT tells us the resolved type via the input tensor.
 // We inspect this and dispatch to the right template instantiation.
-#define DEFINE_ADAPTER_CREATE_FN_TYPED(OpName)                                               \
-  OrtStatus* ORT_API_CALL Create##OpName##Kernel(void* /*state*/,                            \
-                                                  const OrtKernelInfo* info,                  \
-                                                  OrtKernelImpl** kernel_out) noexcept {      \
-    EXCEPTION_TO_STATUS_BEGIN                                                                  \
-    Ort::ConstKernelInfo ki(info);                                                            \
-    auto input_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();    \
-    switch (input_type) {                                                                     \
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:                                               \
-        *kernel_out = new AdapterKernelImpl<cuda::OpName<float>>(info); break;                \
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:                                             \
-        *kernel_out = new AdapterKernelImpl<cuda::OpName<MLFloat16>>(info); break;            \
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:                                              \
-        *kernel_out = new AdapterKernelImpl<cuda::OpName<double>>(info); break;               \
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:                                            \
-        *kernel_out = new AdapterKernelImpl<cuda::OpName<BFloat16>>(info); break;             \
-      default:                                                                                 \
-        return Ort::GetApi().CreateStatus(ORT_EP_FAIL,                                        \
-            (std::string(#OpName) + ": unsupported type " +                                   \
-             std::to_string(input_type)).c_str());                                             \
-    }                                                                                         \
-    return nullptr;                                                                            \
-    EXCEPTION_TO_STATUS_END                                                                    \
+#define DEFINE_ADAPTER_CREATE_FN_TYPED(OpName)                                             \
+  OrtStatus* ORT_API_CALL Create##OpName##Kernel(void* /*state*/,                          \
+                                                 const OrtKernelInfo* info,                \
+                                                 OrtKernelImpl** kernel_out) noexcept {    \
+    EXCEPTION_TO_STATUS_BEGIN                                                              \
+    Ort::ConstKernelInfo ki(info);                                                         \
+    auto input_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType(); \
+    switch (input_type) {                                                                  \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:                                            \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<float>>(info);                    \
+        break;                                                                             \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:                                          \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<MLFloat16>>(info);                \
+        break;                                                                             \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:                                           \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<double>>(info);                   \
+        break;                                                                             \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:                                         \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<BFloat16>>(info);                 \
+        break;                                                                             \
+      default:                                                                             \
+        return Ort::GetApi().CreateStatus(ORT_EP_FAIL,                                     \
+                                          (std::string(#OpName) + ": unsupported type " +  \
+                                           std::to_string(input_type))                     \
+                                              .c_str());                                   \
+    }                                                                                      \
+    return nullptr;                                                                        \
+    EXCEPTION_TO_STATUS_END                                                                \
   }
 
 DEFINE_ADAPTER_CREATE_FN_TYPED(Elu)
@@ -569,16 +574,20 @@ OrtStatus* ORT_API_CALL CreateReluKernel(void* /*state*/,
   auto input_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();
   switch (input_type) {
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
-      *kernel_out = new AdapterKernelImpl<cuda::Relu<float>>(info); break;
+      *kernel_out = new AdapterKernelImpl<cuda::Relu<float>>(info);
+      break;
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
-      *kernel_out = new AdapterKernelImpl<cuda::Relu<MLFloat16>>(info); break;
+      *kernel_out = new AdapterKernelImpl<cuda::Relu<MLFloat16>>(info);
+      break;
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
-      *kernel_out = new AdapterKernelImpl<cuda::Relu<double>>(info); break;
+      *kernel_out = new AdapterKernelImpl<cuda::Relu<double>>(info);
+      break;
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
-      *kernel_out = new AdapterKernelImpl<cuda::Relu<BFloat16>>(info); break;
+      *kernel_out = new AdapterKernelImpl<cuda::Relu<BFloat16>>(info);
+      break;
     default:
       return Ort::GetApi().CreateStatus(ORT_EP_FAIL,
-          (std::string("Relu: unsupported type ") + std::to_string(input_type)).c_str());
+                                        (std::string("Relu: unsupported type ") + std::to_string(input_type)).c_str());
   }
   return nullptr;
   EXCEPTION_TO_STATUS_END

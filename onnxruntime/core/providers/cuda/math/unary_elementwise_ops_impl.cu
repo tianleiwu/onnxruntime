@@ -325,32 +325,44 @@ void Explicit_Impl_IsInf(cudaStream_t stream, int op_set,
   if (op_set < 20) {
     switch (input_data_type) {
       case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
-        isinf_details::IsInf_DispFunc<float>{}(stream, input_raw, output_data, detect_positive, detect_negative, count); break;
+        isinf_details::IsInf_DispFunc<float>{}(stream, input_raw, output_data, detect_positive, detect_negative, count);
+        break;
       case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
-        isinf_details::IsInf_DispFunc<double>{}(stream, input_raw, output_data, detect_positive, detect_negative, count); break;
-      default: break;
+        isinf_details::IsInf_DispFunc<double>{}(stream, input_raw, output_data, detect_positive, detect_negative, count);
+        break;
+      default:
+        break;
     }
   } else {
     switch (input_data_type) {
       case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
-        isinf_details::IsInf_DispFunc<float>{}(stream, input_raw, output_data, detect_positive, detect_negative, count); break;
+        isinf_details::IsInf_DispFunc<float>{}(stream, input_raw, output_data, detect_positive, detect_negative, count);
+        break;
       case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
-        isinf_details::IsInf_DispFunc<double>{}(stream, input_raw, output_data, detect_positive, detect_negative, count); break;
+        isinf_details::IsInf_DispFunc<double>{}(stream, input_raw, output_data, detect_positive, detect_negative, count);
+        break;
       case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
-        isinf_details::IsInf_DispFunc<MLFloat16>{}(stream, input_raw, output_data, detect_positive, detect_negative, count); break;
+        isinf_details::IsInf_DispFunc<MLFloat16>{}(stream, input_raw, output_data, detect_positive, detect_negative, count);
+        break;
       case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
-        isinf_details::IsInf_DispFunc<BFloat16>{}(stream, input_raw, output_data, detect_positive, detect_negative, count); break;
+        isinf_details::IsInf_DispFunc<BFloat16>{}(stream, input_raw, output_data, detect_positive, detect_negative, count);
+        break;
 #if !defined(DISABLE_FLOAT8_TYPES)
       case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN:
-        isinf_details::IsInf_DispFunc<Float8E4M3FN>{}(stream, input_raw, output_data, detect_positive, detect_negative, count); break;
+        isinf_details::IsInf_DispFunc<Float8E4M3FN>{}(stream, input_raw, output_data, detect_positive, detect_negative, count);
+        break;
       case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FNUZ:
-        isinf_details::IsInf_DispFunc<Float8E4M3FNUZ>{}(stream, input_raw, output_data, detect_positive, detect_negative, count); break;
+        isinf_details::IsInf_DispFunc<Float8E4M3FNUZ>{}(stream, input_raw, output_data, detect_positive, detect_negative, count);
+        break;
       case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2:
-        isinf_details::IsInf_DispFunc<Float8E5M2>{}(stream, input_raw, output_data, detect_positive, detect_negative, count); break;
+        isinf_details::IsInf_DispFunc<Float8E5M2>{}(stream, input_raw, output_data, detect_positive, detect_negative, count);
+        break;
       case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2FNUZ:
-        isinf_details::IsInf_DispFunc<Float8E5M2FNUZ>{}(stream, input_raw, output_data, detect_positive, detect_negative, count); break;
+        isinf_details::IsInf_DispFunc<Float8E5M2FNUZ>{}(stream, input_raw, output_data, detect_positive, detect_negative, count);
+        break;
 #endif
-      default: break;
+      default:
+        break;
     }
   }
 #else
@@ -388,24 +400,33 @@ void Explicit_Impl_IsNan(cudaStream_t stream, int32_t input_data_type,
   // Manual dispatch for plugin EP.
   switch (input_data_type) {
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
-      isnan_details::IsNan_Disp<float>{}(stream, input_raw, output_data, count); break;
+      isnan_details::IsNan_Disp<float>{}(stream, input_raw, output_data, count);
+      break;
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
-      isnan_details::IsNan_Disp<double>{}(stream, input_raw, output_data, count); break;
+      isnan_details::IsNan_Disp<double>{}(stream, input_raw, output_data, count);
+      break;
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
-      isnan_details::IsNan_Disp<MLFloat16>{}(stream, input_raw, output_data, count); break;
+      isnan_details::IsNan_Disp<MLFloat16>{}(stream, input_raw, output_data, count);
+      break;
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
-      isnan_details::IsNan_Disp<BFloat16>{}(stream, input_raw, output_data, count); break;
+      isnan_details::IsNan_Disp<BFloat16>{}(stream, input_raw, output_data, count);
+      break;
 #if !defined(DISABLE_FLOAT8_TYPES)
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN:
-      isnan_details::IsNan_Disp<Float8E4M3FN>{}(stream, input_raw, output_data, count); break;
+      isnan_details::IsNan_Disp<Float8E4M3FN>{}(stream, input_raw, output_data, count);
+      break;
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FNUZ:
-      isnan_details::IsNan_Disp<Float8E4M3FNUZ>{}(stream, input_raw, output_data, count); break;
+      isnan_details::IsNan_Disp<Float8E4M3FNUZ>{}(stream, input_raw, output_data, count);
+      break;
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2:
-      isnan_details::IsNan_Disp<Float8E5M2>{}(stream, input_raw, output_data, count); break;
+      isnan_details::IsNan_Disp<Float8E5M2>{}(stream, input_raw, output_data, count);
+      break;
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2FNUZ:
-      isnan_details::IsNan_Disp<Float8E5M2FNUZ>{}(stream, input_raw, output_data, count); break;
+      isnan_details::IsNan_Disp<Float8E5M2FNUZ>{}(stream, input_raw, output_data, count);
+      break;
 #endif
-    default: break;
+    default:
+      break;
   }
 #else
   // KernelDef constraints would ensure only subset of datatypes is used.

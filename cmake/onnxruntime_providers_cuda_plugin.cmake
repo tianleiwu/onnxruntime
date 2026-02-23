@@ -113,6 +113,7 @@ target_link_libraries(onnxruntime_providers_cuda_plugin PRIVATE
     safeint_interface
     onnxruntime_common
     onnxruntime_framework
+    cpuinfo::cpuinfo
 )
 
 # Symbol visibility — only export CreateEpFactories and ReleaseEpFactory
