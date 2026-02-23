@@ -9,7 +9,9 @@
 
 #include "core/providers/cuda/cuda_common.h"
 #include "core/providers/cuda/math/unary_elementwise_ops.h"
+#if !defined(BUILD_CUDA_EP_AS_PLUGIN)
 #include "core/providers/cuda/math/binary_elementwise_ops.h"
+#endif
 #include "activations_impl.h"
 
 namespace onnxruntime {

@@ -21,10 +21,13 @@ set(CUDA_PLUGIN_EP_CC_SRCS
     ${CUDA_PLUGIN_EP_DIR}/cuda_allocator_plugin.cc
     ${CUDA_PLUGIN_EP_DIR}/cuda_data_transfer_plugin.cc
     ${CUDA_PLUGIN_EP_DIR}/cuda_stream_plugin.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/unary_elementwise_ops.cc
 )
 
 set(CUDA_PLUGIN_EP_CU_SRCS
     ${CUDA_PLUGIN_EP_DIR}/cuda_plugin_kernels.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations_impl.cu
 )
 
 # Create shared library target using the ORT helper function for plugins

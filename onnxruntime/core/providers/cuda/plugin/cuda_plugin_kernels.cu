@@ -3,8 +3,11 @@
 
 #include "cuda_plugin_kernels.h"
 #include "cuda_stream_plugin.h"
+#include "cuda_kernel_adapter.h"
+#include "core/providers/cuda/activation/activations.h"
 
 #include <cstring>
+#include <map>
 #include <set>
 #include <string_view>
 #include <unordered_map>
@@ -28,69 +31,85 @@ CudaSyncStream* GetCudaSyncStream(const Ort::KernelContext& ctx) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Relu Kernel Implementation
+// Generic Adapter Kernel — wraps any cuda::CudaKernel-derived class
 // ---------------------------------------------------------------------------
 
-struct ReluKernelImpl : public OrtKernelImpl {
-  ReluKernelImpl() : OrtKernelImpl{} {
+template <typename KernelT>
+struct AdapterKernelImpl : public OrtKernelImpl {
+  std::unique_ptr<KernelT> kernel;
+
+  explicit AdapterKernelImpl(const OrtKernelInfo* info) : OrtKernelImpl{} {
     ort_version_supported = ORT_API_VERSION;
     Compute = ComputeImpl;
     Release = ReleaseImpl;
     PrePackWeight = nullptr;
     SetSharedPrePackedWeight = nullptr;
+
+    cuda::OpKernelInfo adapter_info(info);
+    kernel = std::make_unique<KernelT>(adapter_info);
   }
 
   static OrtStatus* ORT_API_CALL ComputeImpl(OrtKernelImpl* this_ptr,
-                                             OrtKernelContext* context) noexcept;
+                                             OrtKernelContext* context) noexcept {
+    EXCEPTION_TO_STATUS_BEGIN
+
+    auto* self = static_cast<AdapterKernelImpl*>(this_ptr);
+    cuda::OpKernelContext adapter_ctx(context);
+    Status status = self->kernel->Compute(&adapter_ctx);
+    if (!status.IsOK()) {
+      return Ort::GetApi().CreateStatus(
+          ORT_EP_FAIL, status.ErrorMessage().c_str());
+    }
+    return nullptr;
+
+    EXCEPTION_TO_STATUS_END
+  }
+
   static void ORT_API_CALL ReleaseImpl(OrtKernelImpl* this_ptr) noexcept {
-    delete static_cast<ReluKernelImpl*>(this_ptr);
+    delete static_cast<AdapterKernelImpl*>(this_ptr);
   }
 };
 
-// Simple CUDA Relu kernel
-__global__ void ReluKernelCuda(const float* input, float* output, size_t count) {
-  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < count) {
-    output[idx] = input[idx] > 0.0f ? input[idx] : 0.0f;
-  }
-}
+using ReluKernelImpl = AdapterKernelImpl<cuda::Relu<float>>;
 
-/*static*/
-OrtStatus* ORT_API_CALL ReluKernelImpl::ComputeImpl(
-    OrtKernelImpl* /*this_ptr*/, OrtKernelContext* context) noexcept {
-  EXCEPTION_TO_STATUS_BEGIN
-
-  Ort::KernelContext ctx{context};
-  Ort::ConstValue input = ctx.GetInput(0);
-  auto shape_info = input.GetTensorTypeAndShapeInfo();
-  auto shape = shape_info.GetShape();
-  size_t count = shape_info.GetElementCount();
-
-  Ort::UnownedValue output = ctx.GetOutput(0, shape);
-
-  const float* input_data = input.GetTensorData<float>();
-  float* output_data = output.GetTensorMutableData<float>();
-
-  if (count > 0) {
-    // Get CUDA stream from kernel context
-    cudaStream_t stream = static_cast<cudaStream_t>(ctx.GetGPUComputeStream());
-
-    const int block_size = 256;
-    const int grid_size = static_cast<int>((count + block_size - 1) / block_size);
-    ReluKernelCuda<<<grid_size, block_size, 0, stream>>>(input_data, output_data, count);
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      return Ort::GetApi().CreateStatus(
-          ORT_EP_FAIL,
-          (std::string("CUDA Relu kernel launch failed: ") + cudaGetErrorString(err)).c_str());
-    }
+// Macro to define a type-dispatching create function for activation ops.
+// At kernel creation time, ORT tells us the resolved type via the input tensor.
+// We inspect this and dispatch to the right template instantiation.
+#define DEFINE_ADAPTER_CREATE_FN_TYPED(OpName)                                               \
+  OrtStatus* ORT_API_CALL Create##OpName##Kernel(void* /*state*/,                            \
+                                                  const OrtKernelInfo* info,                  \
+                                                  OrtKernelImpl** kernel_out) noexcept {      \
+    EXCEPTION_TO_STATUS_BEGIN                                                                  \
+    Ort::ConstKernelInfo ki(info);                                                            \
+    auto input_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();    \
+    switch (input_type) {                                                                     \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:                                               \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<float>>(info); break;                \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:                                             \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<MLFloat16>>(info); break;            \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:                                              \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<double>>(info); break;               \
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:                                            \
+        *kernel_out = new AdapterKernelImpl<cuda::OpName<BFloat16>>(info); break;             \
+      default:                                                                                 \
+        return Ort::GetApi().CreateStatus(ORT_EP_FAIL,                                        \
+            (std::string(#OpName) + ": unsupported type " +                                   \
+             std::to_string(input_type)).c_str());                                             \
+    }                                                                                         \
+    return nullptr;                                                                            \
+    EXCEPTION_TO_STATUS_END                                                                    \
   }
 
-  return nullptr;
-
-  EXCEPTION_TO_STATUS_END
-}
+DEFINE_ADAPTER_CREATE_FN_TYPED(Elu)
+DEFINE_ADAPTER_CREATE_FN_TYPED(HardSigmoid)
+DEFINE_ADAPTER_CREATE_FN_TYPED(HardSwish)
+DEFINE_ADAPTER_CREATE_FN_TYPED(LeakyRelu)
+DEFINE_ADAPTER_CREATE_FN_TYPED(Selu)
+DEFINE_ADAPTER_CREATE_FN_TYPED(Sigmoid)
+DEFINE_ADAPTER_CREATE_FN_TYPED(Softplus)
+DEFINE_ADAPTER_CREATE_FN_TYPED(Softsign)
+DEFINE_ADAPTER_CREATE_FN_TYPED(Tanh)
+DEFINE_ADAPTER_CREATE_FN_TYPED(ThresholdedRelu)
 
 // ---------------------------------------------------------------------------
 // Add Kernel Implementation
@@ -539,10 +558,26 @@ struct GeneratedKernelRegistration {
 using PluginKernelCreateFn = OrtStatus*(ORT_API_CALL*)(void*, const OrtKernelInfo*, OrtKernelImpl**) noexcept;
 
 OrtStatus* ORT_API_CALL CreateReluKernel(void* /*state*/,
-                                         const OrtKernelInfo* /*info*/,
+                                         const OrtKernelInfo* info,
                                          OrtKernelImpl** kernel_out) noexcept {
-  *kernel_out = new ReluKernelImpl();
+  EXCEPTION_TO_STATUS_BEGIN
+  Ort::ConstKernelInfo ki(info);
+  auto input_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();
+  switch (input_type) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+      *kernel_out = new AdapterKernelImpl<cuda::Relu<float>>(info); break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+      *kernel_out = new AdapterKernelImpl<cuda::Relu<MLFloat16>>(info); break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
+      *kernel_out = new AdapterKernelImpl<cuda::Relu<double>>(info); break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+      *kernel_out = new AdapterKernelImpl<cuda::Relu<BFloat16>>(info); break;
+    default:
+      return Ort::GetApi().CreateStatus(ORT_EP_FAIL,
+          (std::string("Relu: unsupported type ") + std::to_string(input_type)).c_str());
+  }
   return nullptr;
+  EXCEPTION_TO_STATUS_END
 }
 
 OrtStatus* ORT_API_CALL CreateAddKernel(void* /*state*/,
@@ -575,6 +610,16 @@ OrtStatus* ORT_API_CALL CreateConvKernel(void* /*state*/,
 
 PluginKernelCreateFn GetCreateFnForOp(std::string_view op_type) {
   if (op_type == "Relu") return CreateReluKernel;
+  if (op_type == "Elu") return CreateEluKernel;
+  if (op_type == "HardSigmoid") return CreateHardSigmoidKernel;
+  if (op_type == "HardSwish") return CreateHardSwishKernel;
+  if (op_type == "LeakyRelu") return CreateLeakyReluKernel;
+  if (op_type == "Selu") return CreateSeluKernel;
+  if (op_type == "Sigmoid") return CreateSigmoidKernel;
+  if (op_type == "Softplus") return CreateSoftplusKernel;
+  if (op_type == "Softsign") return CreateSoftsignKernel;
+  if (op_type == "Tanh") return CreateTanhKernel;
+  if (op_type == "ThresholdedRelu") return CreateThresholdedReluKernel;
   if (op_type == "Add") return CreateAddKernel;
   if (op_type == "MatMul") return CreateMatMulKernel;
   if (op_type == "Gemm") return CreateGemmKernel;
@@ -599,11 +644,23 @@ OrtStatus* CreateCudaKernelRegistry(const OrtEpApi& ep_api,
 
   Ort::KernelRegistry registry;
 
-  // Register only kernels that have concrete implementations in this plugin.
-  // Generated files include many CUDA EP registrations that are not migrated yet.
-  // Restricting to deduplicated float "T" constraints avoids invalid/duplicate
-  // registrations and keeps runtime behavior aligned with implemented kernels.
-  std::set<std::tuple<std::string, std::string, int, int>> seen_kernel_defs;
+  // Group registrations by (op, domain, version_start, version_end) to build
+  // kernel defs with proper per-constraint type lists.
+  struct KernelDefKey {
+    std::string op_type;
+    std::string domain;
+    int since_version_start;
+    int since_version_end;
+
+    bool operator<(const KernelDefKey& other) const {
+      return std::tie(op_type, domain, since_version_start, since_version_end) <
+             std::tie(other.op_type, other.domain, other.since_version_start, other.since_version_end);
+    }
+  };
+
+  // Map: key -> { constraint_name -> set of type enums }
+  std::map<KernelDefKey, std::map<std::string, std::set<ONNXTensorElementDataType>>> grouped;
+
   for (size_t i = 0; i < std::size(kGeneratedKernelRegistrations); ++i) {
     const auto& reg = kGeneratedKernelRegistrations[i];
     PluginKernelCreateFn create_fn = GetCreateFnForOp(reg.op_type);
@@ -611,31 +668,38 @@ OrtStatus* CreateCudaKernelRegistry(const OrtEpApi& ep_api,
       continue;
     }
 
-    if (reg.type_constraint != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    if (reg.type_constraint == ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED) {
       continue;
     }
 
-    if (reg.constraint_name == nullptr || std::strcmp(reg.constraint_name, "T") != 0) {
-      continue;
-    }
+    KernelDefKey key{
+        reg.op_type,
+        reg.domain ? reg.domain : "",
+        reg.since_version_start,
+        reg.since_version_end};
+    const std::string constraint_name = reg.constraint_name ? reg.constraint_name : "T";
+    grouped[key][constraint_name].insert(reg.type_constraint);
+  }
 
-    const std::string domain = reg.domain == nullptr ? "" : reg.domain;
-    auto key = std::make_tuple(std::string(reg.op_type), domain,
-                               reg.since_version_start, reg.since_version_end);
-    if (!seen_kernel_defs.insert(key).second) {
-      continue;
-    }
+  // Now register one KernelDef per grouped key, with all type constraints.
+  for (const auto& [key, constraints] : grouped) {
+    PluginKernelCreateFn create_fn = GetCreateFnForOp(key.op_type);
 
-    const OrtDataType* float_type = nullptr;
-    RETURN_IF_ERROR(ep_api.GetTensorDataType(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &float_type));
-
-    std::vector<const OrtDataType*> type_constraint{float_type};
     Ort::KernelDefBuilder builder;
-    builder.SetOperatorType(reg.op_type)
-        .SetDomain(domain.c_str())
-        .SetSinceVersion(reg.since_version_start, reg.since_version_end)
-        .SetExecutionProvider(ep_name)
-        .AddTypeConstraint("T", type_constraint);
+    builder.SetOperatorType(key.op_type.c_str())
+        .SetDomain(key.domain.c_str())
+        .SetSinceVersion(key.since_version_start, key.since_version_end)
+        .SetExecutionProvider(ep_name);
+
+    for (const auto& [cname, types] : constraints) {
+      std::vector<const OrtDataType*> type_list;
+      for (ONNXTensorElementDataType t : types) {
+        const OrtDataType* dt = nullptr;
+        RETURN_IF_ERROR(ep_api.GetTensorDataType(t, &dt));
+        type_list.push_back(dt);
+      }
+      builder.AddTypeConstraint(cname.c_str(), type_list);
+    }
 
     Ort::KernelDef kernel_def = builder.Build();
     RETURN_IF_ERROR(registry.AddKernel(kernel_def.release(), create_fn, nullptr));

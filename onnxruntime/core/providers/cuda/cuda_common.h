@@ -55,6 +55,7 @@
 namespace onnxruntime {
 namespace cuda {
 
+#if !defined(BUILD_CUDA_EP_AS_PLUGIN)
 #define CUDA_RETURN_IF_ERROR(expr) ORT_RETURN_IF_ERROR(CUDA_CALL(expr))
 #ifndef USE_CUDA_MINIMAL
 #define CUBLAS_RETURN_IF_ERROR(expr) ORT_RETURN_IF_ERROR(CUBLAS_CALL(expr))
@@ -64,6 +65,7 @@ namespace cuda {
 #define CUDNN2_RETURN_IF_ERROR(expr, m) ORT_RETURN_IF_ERROR(CUDNN_CALL2(expr, m))
 #define CUFFT_RETURN_IF_ERROR(expr) ORT_RETURN_IF_ERROR(CUFFT_CALL(expr))
 #endif
+#endif  // !defined(BUILD_CUDA_EP_AS_PLUGIN)
 // Type mapping for MLFloat16 to half
 template <typename T>
 class ToCudaType {
