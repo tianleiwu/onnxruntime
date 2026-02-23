@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 import numpy
 import torch
+from cuda_plugin_ep_helper import resolve_cuda_plugin_ep
 from einops import rearrange, repeat
 
 # --- ONNX and Torch/Numpy Dtype Mappings ---
@@ -456,7 +457,7 @@ def gqa_prompt_func(
         new_v = torch.reshape(new_v, (config.batch_size, config.kv_sequence_length, -1))
 
     sess_options = SessionOptions()
-    ort_session = InferenceSession(onnx_model_str, sess_options, providers=[ep])
+    ort_session = InferenceSession(onnx_model_str, sess_options, providers=[resolve_cuda_plugin_ep(ep)])
     io_binding = ort_session.io_binding()
 
     # Determine input device for binding
@@ -616,7 +617,7 @@ def gqa_past_func(
 
     sess_options = SessionOptions()
     # sess_options.log_severity_level = 0
-    ort_session = InferenceSession(onnx_model_str, sess_options, providers=[ep])
+    ort_session = InferenceSession(onnx_model_str, sess_options, providers=[resolve_cuda_plugin_ep(ep)])
     io_binding = ort_session.io_binding()
 
     # Common inputs

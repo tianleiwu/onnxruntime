@@ -15,10 +15,9 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
-
 
 TYPE_TO_ORT_ENUM = {
     "bool": "ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL",
@@ -52,7 +51,51 @@ class Entry:
     op_type: str
     since_version_start: int
     since_version_end: int
+    domain: str
+    registration_id: int
+    constraint_name: str
     type_enum: str
+
+
+@dataclass(frozen=True)
+class MacroParseResult:
+    macro_name: str
+    op_type: str
+    since_version_start: int
+    since_version_end: int
+    domain_token: str
+    type_tokens: list[str]
+
+
+DOMAIN_TOKEN_TO_LITERAL = {
+    "kOnnxDomain": "",
+    "kMSDomain": "com.microsoft",
+}
+
+# Specializations for contrib kernels that encode multiple template types into one token.
+# Example: GroupQueryAttention uses type alias "BFloat16_int8_t", which maps to:
+#   T=BFloat16, T_CACHE=int8_t.
+COMPOSITE_TYPE_CONSTRAINTS: dict[str, list[str]] = {
+    "GroupQueryAttention": ["T", "T_CACHE"],
+    "MultiHeadAttention": ["T", "QK"],
+    "DecoderMaskedMultiHeadAttention": ["T", "QK"],
+    "LayerNormalization": ["T", "U", "V"],
+    "SimplifiedLayerNormalization": ["T", "U", "V"],
+    "QuantizeLinear": ["T2", "T1"],
+    "DequantizeLinear": ["T1", "T2"],
+}
+
+# Additional fixed constraints for specific ops that are not encoded in the typed class token.
+FIXED_CONSTRAINTS: dict[str, list[tuple[str, str]]] = {
+    "GroupQueryAttention": [("T_KV_SCALE", "float"), ("M", "int32_t")],
+    "GatherBlockQuantized": [("Tind", "int32_t")],
+}
+
+CRITICAL_CONTRIB_OP_CONSTRAINTS: dict[str, set[str]] = {
+    "GroupQueryAttention": {"T", "T_CACHE", "T_KV_SCALE", "M"},
+}
+
+SORTED_TYPE_TOKENS = sorted(TYPE_TO_ORT_ENUM.keys(), key=len, reverse=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,31 +109,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("onnxruntime/core/providers/cuda/plugin/cuda_plugin_generated_registrations.inc"),
-        help="Output .inc file path",
+        default=None,
+        help="Output .inc file path. Defaults depend on --contrib.",
     )
     parser.add_argument(
         "--ops",
         nargs="*",
-        default=["Add", "Relu", "MatMul", "Gemm", "Conv"],
+        default=None,
         help="Optional op-type allowlist. Empty means no op filter.",
     )
     parser.add_argument(
         "--types",
         nargs="*",
-        default=["float"],
+        default=None,
         help="Optional type-token allowlist. Empty means no type filter.",
     )
     parser.add_argument(
         "--domain",
-        default="kOnnxDomain",
-        help="Only include registrations with this domain token.",
+        default=None,
+        help="Only include registrations with this domain token. Defaults depend on --contrib.",
+    )
+    parser.add_argument(
+        "--contrib",
+        action="store_true",
+        help="Generate contrib registrations (defaults: domain=kMSDomain, include all ops/types).",
     )
     parser.add_argument(
         "--max-opset",
         type=int,
         default=23,
         help="Upper opset bound used for non-versioned registrations.",
+    )
+    parser.add_argument(
+        "--check-critical-contrib",
+        action="store_true",
+        help="Validate critical contrib ops emit required type constraints.",
     )
     return parser.parse_args()
 
@@ -116,7 +169,7 @@ def split_args(arg_blob: str) -> list[str]:
     return parts
 
 
-def parse_macro(macro_expr: str, max_opset: int) -> tuple[str, int, int, str] | None:
+def parse_macro(macro_expr: str, max_opset: int) -> MacroParseResult | None:
     m = re.match(r"([A-Z0-9_]+)\s*\((.*)\)$", macro_expr.strip())
     if not m:
         return None
@@ -125,28 +178,144 @@ def parse_macro(macro_expr: str, max_opset: int) -> tuple[str, int, int, str] | 
     args = split_args(m.group(2))
 
     if macro_name == "ONNX_OPERATOR_KERNEL_CLASS_NAME" and len(args) == 4:
-        _, _, since, op = args
-        return op, int(since), max_opset, "ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED"
+        _, domain, since, op = args
+        return MacroParseResult(macro_name, op, int(since), max_opset, domain, [])
 
     if macro_name == "ONNX_OPERATOR_VERSIONED_KERNEL_CLASS_NAME" and len(args) == 5:
-        _, _, start, end, op = args
-        return op, int(start), int(end), "ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED"
+        _, domain, start, end, op = args
+        return MacroParseResult(macro_name, op, int(start), int(end), domain, [])
 
     if macro_name == "ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME" and len(args) == 5:
-        _, _, since, t, op = args
-        type_enum = TYPE_TO_ORT_ENUM.get(t)
-        if type_enum is None:
-            return None
-        return op, int(since), max_opset, type_enum
+        _, domain, since, t, op = args
+        return MacroParseResult(macro_name, op, int(since), max_opset, domain, [t])
 
     if macro_name == "ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_CLASS_NAME" and len(args) == 6:
-        _, _, start, end, t, op = args
-        type_enum = TYPE_TO_ORT_ENUM.get(t)
-        if type_enum is None:
-            return None
-        return op, int(start), int(end), type_enum
+        _, domain, start, end, t, op = args
+        return MacroParseResult(macro_name, op, int(start), int(end), domain, [t])
+
+    if macro_name == "ONNX_OPERATOR_TWO_TYPED_KERNEL_CLASS_NAME" and len(args) == 6:
+        _, domain, since, t1, t2, op = args
+        return MacroParseResult(macro_name, op, int(since), max_opset, domain, [t1, t2])
+
+    if macro_name == "ONNX_OPERATOR_VERSIONED_TWO_TYPED_KERNEL_CLASS_NAME" and len(args) == 7:
+        _, domain, start, end, t1, t2, op = args
+        return MacroParseResult(macro_name, op, int(start), int(end), domain, [t1, t2])
+
+    if macro_name == "ONNX_OPERATOR_THREE_TYPED_KERNEL_CLASS_NAME" and len(args) == 7:
+        _, domain, since, t1, t2, t3, op = args
+        return MacroParseResult(macro_name, op, int(since), max_opset, domain, [t1, t2, t3])
+
+    if macro_name == "ONNX_OPERATOR_VERSIONED_THREE_TYPED_KERNEL_CLASS_NAME" and len(args) == 8:
+        _, domain, start, end, t1, t2, t3, op = args
+        return MacroParseResult(macro_name, op, int(start), int(end), domain, [t1, t2, t3])
+
+    # Contrib aliases in onnxruntime/contrib_ops/cuda/cuda_contrib_kernels.cc
+    if macro_name == "CUDA_MS_OP_CLASS_NAME" and len(args) == 2:
+        since, op = args
+        return MacroParseResult(macro_name, op, int(since), max_opset, "kMSDomain", [])
+
+    if macro_name == "CUDA_MS_OP_VERSIONED_CLASS_NAME" and len(args) == 3:
+        start, end, op = args
+        return MacroParseResult(macro_name, op, int(start), int(end), "kMSDomain", [])
+
+    if macro_name == "CUDA_MS_OP_TYPED_CLASS_NAME" and len(args) == 3:
+        since, t, op = args
+        return MacroParseResult(macro_name, op, int(since), max_opset, "kMSDomain", [t])
+
+    if macro_name == "CUDA_MS_OP_VERSIONED_TYPED_CLASS_NAME" and len(args) == 4:
+        start, end, t, op = args
+        return MacroParseResult(macro_name, op, int(start), int(end), "kMSDomain", [t])
+
+    if macro_name == "CUDA_MS_OP_TWO_TYPED_CLASS_NAME" and len(args) == 4:
+        since, t1, t2, op = args
+        return MacroParseResult(macro_name, op, int(since), max_opset, "kMSDomain", [t1, t2])
+
+    if macro_name == "CUDA_MS_OP_THREE_TYPED_CLASS_NAME" and len(args) == 5:
+        since, t1, t2, t3, op = args
+        return MacroParseResult(macro_name, op, int(since), max_opset, "kMSDomain", [t1, t2, t3])
+
+    # Legacy contrib operators in ONNX domain
+    if macro_name == "CUDA_ONNX_OP_TYPED_CLASS_NAME" and len(args) == 3:
+        since, t, op = args
+        return MacroParseResult(macro_name, op, int(since), max_opset, "kOnnxDomain", [t])
+
+    if macro_name == "CUDA_ONNX_OP_VERSIONED_TYPED_CLASS_NAME" and len(args) == 4:
+        start, end, t, op = args
+        return MacroParseResult(macro_name, op, int(start), int(end), "kOnnxDomain", [t])
 
     return None
+
+
+def get_constraint_pairs(parsed: MacroParseResult) -> list[tuple[str, str]]:
+    macro_name = parsed.macro_name
+    op = parsed.op_type
+    type_tokens = parsed.type_tokens
+
+    if not type_tokens:
+        return []
+
+    if len(type_tokens) == 1 and "_" in type_tokens[0]:
+        parts = split_composite_type_token(type_tokens[0])
+        names = COMPOSITE_TYPE_CONSTRAINTS.get(op)
+        if names and len(names) == len(parts):
+            return list(zip(names, parts, strict=False))
+        return [(f"T{i + 1}", token) for i, token in enumerate(parts)]
+
+    if macro_name in {
+        "ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME",
+        "ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_CLASS_NAME",
+        "CUDA_MS_OP_TYPED_CLASS_NAME",
+        "CUDA_MS_OP_VERSIONED_TYPED_CLASS_NAME",
+        "CUDA_ONNX_OP_TYPED_CLASS_NAME",
+        "CUDA_ONNX_OP_VERSIONED_TYPED_CLASS_NAME",
+    }:
+        return [("T", type_tokens[0])]
+
+    if macro_name in {
+        "ONNX_OPERATOR_TWO_TYPED_KERNEL_CLASS_NAME",
+        "ONNX_OPERATOR_VERSIONED_TWO_TYPED_KERNEL_CLASS_NAME",
+        "CUDA_MS_OP_TWO_TYPED_CLASS_NAME",
+    }:
+        return [("T1", type_tokens[0]), ("T2", type_tokens[1])]
+
+    if macro_name in {
+        "ONNX_OPERATOR_THREE_TYPED_KERNEL_CLASS_NAME",
+        "ONNX_OPERATOR_VERSIONED_THREE_TYPED_KERNEL_CLASS_NAME",
+        "CUDA_MS_OP_THREE_TYPED_CLASS_NAME",
+    }:
+        if op == "GatherBlockQuantized":
+            return [("T1", type_tokens[0]), ("T2", type_tokens[1]), ("Tind", type_tokens[2])]
+        return [("T1", type_tokens[0]), ("T2", type_tokens[1]), ("T3", type_tokens[2])]
+
+    return [("T", type_tokens[0])]
+
+
+def split_composite_type_token(token: str) -> list[str]:
+    parts: list[str] = []
+    i = 0
+    n = len(token)
+    while i < n:
+        if token[i] == "_":
+            i += 1
+            continue
+
+        matched = None
+        for t in SORTED_TYPE_TOKENS:
+            if token.startswith(t, i):
+                end = i + len(t)
+                if end == n or token[end] == "_":
+                    matched = t
+                    break
+
+        if matched is None:
+            return token.split("_")
+
+        parts.append(matched)
+        i += len(matched)
+        if i < n and token[i] == "_":
+            i += 1
+
+    return parts
 
 
 def extract_function_table(source_text: str) -> str:
@@ -170,6 +339,7 @@ def iter_entries(
 ) -> Iterable[Entry]:
     table_text = extract_function_table(source_text)
 
+    registration_id = 0
     for line in table_text.splitlines():
         if "BuildKernelCreateInfo<" not in line:
             continue
@@ -183,30 +353,65 @@ def iter_entries(
         if parsed is None:
             continue
 
-        op, start, end, type_enum = parsed
-        macro_name, arg_blob = re.match(r"([A-Z0-9_]+)\s*\((.*)\)$", macro_expr).groups()
-        args = split_args(arg_blob)
-        if len(args) < 2:
-            continue
-        domain = args[1]
-        if domain != domain_filter:
+        if parsed.domain_token != domain_filter:
             continue
 
-        if op_filter and op not in op_filter:
+        if op_filter and parsed.op_type not in op_filter:
             continue
 
-        if type_filter and macro_name in {
-            "ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME",
-            "ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_CLASS_NAME",
-        }:
-            type_token = args[-2]
-            if type_token not in type_filter:
+        if parsed.since_version_start > parsed.since_version_end:
+            continue
+
+        domain_literal = DOMAIN_TOKEN_TO_LITERAL.get(parsed.domain_token)
+        if domain_literal is None:
+            registration_id += 1
+            continue
+
+        constraint_pairs = get_constraint_pairs(parsed)
+        if not constraint_pairs:
+            if not type_filter:
+                yield Entry(
+                    parsed.op_type,
+                    parsed.since_version_start,
+                    parsed.since_version_end,
+                    domain_literal,
+                    registration_id,
+                    "",
+                    "ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED",
+                )
+            registration_id += 1
+            continue
+
+        emitted_any = False
+        for constraint_name, token in constraint_pairs + FIXED_CONSTRAINTS.get(parsed.op_type, []):
+            if type_filter and token not in type_filter:
                 continue
+            type_enum = TYPE_TO_ORT_ENUM.get(token)
+            if type_enum is None:
+                continue
+            emitted_any = True
+            yield Entry(
+                parsed.op_type,
+                parsed.since_version_start,
+                parsed.since_version_end,
+                domain_literal,
+                registration_id,
+                constraint_name,
+                type_enum,
+            )
 
-        if start > end:
-            continue
+        if not emitted_any and not type_filter:
+            yield Entry(
+                parsed.op_type,
+                parsed.since_version_start,
+                parsed.since_version_end,
+                domain_literal,
+                registration_id,
+                "",
+                "ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED",
+            )
 
-        yield Entry(op, start, end, type_enum)
+        registration_id += 1
 
 
 def write_output(output_path: Path, entries: list[Entry], argv: list[str]) -> None:
@@ -221,14 +426,62 @@ def write_output(output_path: Path, entries: list[Entry], argv: list[str]) -> No
 
     for e in entries:
         lines.append(
-            f'{{"{e.op_type}", {e.since_version_start}, {e.since_version_end}, {e.type_enum}}},'
+            f'{{"{e.op_type}", {e.since_version_start}, {e.since_version_end}, "{e.domain}", '
+            f"{e.registration_id}, "
+            f'"{e.constraint_name}", {e.type_enum}}},'
         )
 
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def validate_critical_contrib_constraints(entries: list[Entry]) -> None:
+    grouped: dict[tuple[str, int, int, str, int], set[str]] = {}
+    for entry in entries:
+        key = (entry.op_type, entry.since_version_start, entry.since_version_end, entry.domain, entry.registration_id)
+        grouped.setdefault(key, set())
+        if entry.constraint_name:
+            grouped[key].add(entry.constraint_name)
+
+    errors: list[str] = []
+    for (op_type, start, end, domain, reg_id), emitted_constraints in sorted(grouped.items()):
+        required = CRITICAL_CONTRIB_OP_CONSTRAINTS.get(op_type)
+        if required is None:
+            continue
+        missing = required - emitted_constraints
+        if missing:
+            errors.append(
+                f"{op_type} registration_id={reg_id} opset={start}-{end} domain='{domain}' "
+                f"missing constraints: {sorted(missing)} (emitted: {sorted(emitted_constraints)})"
+            )
+
+    missing_ops = set(CRITICAL_CONTRIB_OP_CONSTRAINTS) - {k[0] for k in grouped}
+    for op in sorted(missing_ops):
+        errors.append(f"{op} has no generated contrib registrations.")
+
+    if errors:
+        raise RuntimeError("Critical contrib constraint validation failed:\n  - " + "\n  - ".join(errors))
+
+
 def main() -> None:
     args = parse_args()
+    if args.domain is None:
+        args.domain = "kMSDomain" if args.contrib else "kOnnxDomain"
+
+    if args.input == Path("onnxruntime/core/providers/cuda/cuda_execution_provider.cc") and args.contrib:
+        args.input = Path("onnxruntime/contrib_ops/cuda/cuda_contrib_kernels.cc")
+
+    if args.output is None:
+        args.output = (
+            Path("onnxruntime/core/providers/cuda/plugin/cuda_plugin_generated_contrib_registrations.inc")
+            if args.contrib
+            else Path("onnxruntime/core/providers/cuda/plugin/cuda_plugin_generated_registrations.inc")
+        )
+
+    if args.ops is None:
+        args.ops = [] if args.contrib else ["Add", "Relu", "MatMul", "Gemm", "Conv"]
+
+    if args.types is None:
+        args.types = [] if args.contrib else ["float"]
 
     source_text = args.input.read_text(encoding="utf-8")
     op_filter = set(args.ops) if args.ops else set()
@@ -245,6 +498,11 @@ def main() -> None:
             )
         )
     )
+
+    if args.check_critical_contrib:
+        if not args.contrib:
+            raise RuntimeError("--check-critical-contrib requires --contrib.")
+        validate_critical_contrib_constraints(entries)
 
     write_output(
         args.output,

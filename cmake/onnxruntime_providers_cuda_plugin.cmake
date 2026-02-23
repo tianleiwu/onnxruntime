@@ -7,6 +7,11 @@
 message(STATUS "Building CUDA EP as plugin shared library")
 
 set(CUDA_PLUGIN_EP_DIR "${ONNXRUNTIME_ROOT}/core/providers/cuda/plugin")
+set(CUDA_PLUGIN_REGISTRATION_SCRIPT "${REPO_ROOT}/tools/python/migrate_cuda_registrations.py")
+set(CUDA_PLUGIN_REGISTRATION_INPUT "${ONNXRUNTIME_ROOT}/core/providers/cuda/cuda_execution_provider.cc")
+set(CUDA_PLUGIN_CONTRIB_REGISTRATION_INPUT "${REPO_ROOT}/onnxruntime/contrib_ops/cuda/cuda_contrib_kernels.cc")
+set(CUDA_PLUGIN_REGISTRATION_OUTPUT "${CUDA_PLUGIN_EP_DIR}/cuda_plugin_generated_registrations.inc")
+set(CUDA_PLUGIN_CONTRIB_REGISTRATION_OUTPUT "${CUDA_PLUGIN_EP_DIR}/cuda_plugin_generated_contrib_registrations.inc")
 
 # Source files (C++ and CUDA)
 set(CUDA_PLUGIN_EP_CC_SRCS
@@ -27,6 +32,29 @@ onnxruntime_add_shared_library_module(onnxruntime_providers_cuda_plugin
     ${CUDA_PLUGIN_EP_CC_SRCS}
     ${CUDA_PLUGIN_EP_CU_SRCS}
 )
+
+add_custom_command(
+    OUTPUT ${CUDA_PLUGIN_REGISTRATION_OUTPUT} ${CUDA_PLUGIN_CONTRIB_REGISTRATION_OUTPUT}
+    COMMAND ${Python_EXECUTABLE} ${CUDA_PLUGIN_REGISTRATION_SCRIPT}
+            --input ${CUDA_PLUGIN_REGISTRATION_INPUT}
+            --output ${CUDA_PLUGIN_REGISTRATION_OUTPUT}
+    COMMAND ${Python_EXECUTABLE} ${CUDA_PLUGIN_REGISTRATION_SCRIPT}
+            --contrib
+            --check-critical-contrib
+            --input ${CUDA_PLUGIN_CONTRIB_REGISTRATION_INPUT}
+            --output ${CUDA_PLUGIN_CONTRIB_REGISTRATION_OUTPUT}
+    DEPENDS
+        ${CUDA_PLUGIN_REGISTRATION_SCRIPT}
+        ${CUDA_PLUGIN_REGISTRATION_INPUT}
+        ${CUDA_PLUGIN_CONTRIB_REGISTRATION_INPUT}
+    COMMENT "Generating CUDA plugin kernel registrations"
+    VERBATIM
+)
+
+add_custom_target(onnxruntime_cuda_plugin_generate_registrations
+    DEPENDS ${CUDA_PLUGIN_REGISTRATION_OUTPUT} ${CUDA_PLUGIN_CONTRIB_REGISTRATION_OUTPUT}
+)
+add_dependencies(onnxruntime_providers_cuda_plugin onnxruntime_cuda_plugin_generate_registrations)
 
 # Set CUDA standard
 set_target_properties(onnxruntime_providers_cuda_plugin PROPERTIES

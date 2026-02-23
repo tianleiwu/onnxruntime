@@ -5,14 +5,15 @@ import os
 import sys
 
 import numpy as np
+import onnx
+import torch
+import torch.nn.functional as F
+from onnx import TensorProto, helper, save
 
 import onnxruntime as onnxrt
 
 
 def create_add_model(model_path):
-    import onnx
-    from onnx import TensorProto, helper
-
     # Create a simple Add model: Y = A + B
     node_def = helper.make_node("Add", ["A", "B"], ["Y"])
     graph_def = helper.make_graph(
@@ -25,13 +26,10 @@ def create_add_model(model_path):
         [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [3, 2])],
     )
     model_def = helper.make_model(graph_def, producer_name="onnx-example")
-    onnx.save(model_def, model_path)
+    save(model_def, model_path)
 
 
 def create_matmul_model(model_path):
-    import onnx
-    from onnx import TensorProto, helper
-
     # Create a simple MatMul model: Y = A @ B
     node_def = helper.make_node("MatMul", ["A", "B"], ["Y"])
     graph_def = helper.make_graph(
@@ -44,22 +42,19 @@ def create_matmul_model(model_path):
         [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [3, 5])],
     )
     model_def = helper.make_model(graph_def, producer_name="onnx-example")
-    onnx.save(model_def, model_path)
+    save(model_def, model_path)
 
 
 def create_gemm_model(model_path, alpha=1.0, beta=1.0, transA=0, transB=0):
-    import onnx
-    from onnx import TensorProto, helper
-
     # Create a simple Gemm model: Y = alpha*A*B + beta*C
     node_def = helper.make_node("Gemm", ["A", "B", "C"], ["Y"], alpha=alpha, beta=beta, transA=transA, transB=transB)
 
-    M = 3
-    K = 4
-    N = 5
-    shape_a = [M, K] if transA == 0 else [K, M]
-    shape_b = [K, N] if transB == 0 else [N, K]
-    shape_c = [N]  # Test broadcast
+    m = 3
+    k = 4
+    n = 5
+    shape_a = [m, k] if transA == 0 else [k, m]
+    shape_b = [k, n] if transB == 0 else [n, k]
+    shape_c = [n]  # Test broadcast
 
     graph_def = helper.make_graph(
         [node_def],
@@ -69,16 +64,13 @@ def create_gemm_model(model_path, alpha=1.0, beta=1.0, transA=0, transB=0):
             helper.make_tensor_value_info("B", TensorProto.FLOAT, shape_b),
             helper.make_tensor_value_info("C", TensorProto.FLOAT, shape_c),
         ],
-        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [M, N])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [m, n])],
     )
     model_def = helper.make_model(graph_def, producer_name="onnx-example")
-    onnx.save(model_def, model_path)
+    save(model_def, model_path)
 
 
 def create_conv_model(model_path):
-    import onnx
-    from onnx import TensorProto, helper
-
     # Create a simple Conv model: Y = Conv(X, W)
     node_def = helper.make_node("Conv", ["X", "W"], ["Y"], pads=[1, 1, 1, 1], strides=[1, 1], dilations=[1, 1], group=1)
     graph_def = helper.make_graph(
@@ -93,12 +85,10 @@ def create_conv_model(model_path):
     opset = onnx.OperatorSetIdProto()
     opset.version = 11
     model_def = helper.make_model(graph_def, producer_name="onnx-example", opset_imports=[opset])
-    onnx.save(model_def, model_path)
+    save(model_def, model_path)
 
 
 def test_operator(target_device, model_creator, inputs, expected_fn, ep_name="CudaPluginExecutionProvider"):
-    import os
-
     model_path = "temp.onnx"
     try:
         model_creator(model_path)
@@ -191,8 +181,6 @@ def test_cuda_plugin_registration():
 
     # Test Conv
     print("Testing Conv...", end=" ", flush=True)
-    import torch
-    import torch.nn.functional as F
 
     x = np.random.rand(1, 2, 4, 4).astype(np.float32)
     w = np.random.rand(3, 2, 3, 3).astype(np.float32)

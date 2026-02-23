@@ -6,6 +6,7 @@
 
 #include <cstring>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace onnxruntime {
@@ -528,6 +529,9 @@ struct GeneratedKernelRegistration {
   const char* op_type;
   int since_version_start;
   int since_version_end;
+  const char* domain;
+  int registration_id;
+  const char* constraint_name;
   ONNXTensorElementDataType type_constraint;
 };
 
@@ -579,6 +583,7 @@ PluginKernelCreateFn GetCreateFnForOp(std::string_view op_type) {
 
 constexpr GeneratedKernelRegistration kGeneratedKernelRegistrations[] = {
 #include "core/providers/cuda/plugin/cuda_plugin_generated_registrations.inc"
+#include "core/providers/cuda/plugin/cuda_plugin_generated_contrib_registrations.inc"
 };
 
 }  // namespace
@@ -594,24 +599,78 @@ OrtStatus* CreateCudaKernelRegistry(const OrtEpApi& ep_api,
   Ort::KernelRegistry registry;
 
   std::vector<const OrtDataType*> type_constraint;
-  for (const auto& reg : kGeneratedKernelRegistrations) {
+  for (size_t i = 0; i < std::size(kGeneratedKernelRegistrations);) {
+    const auto& reg = kGeneratedKernelRegistrations[i];
     PluginKernelCreateFn create_fn = GetCreateFnForOp(reg.op_type);
     if (!create_fn) {
+      // Skip all rows in this registration group.
+      const auto group_id = reg.registration_id;
+      const auto* group_op = reg.op_type;
+      const auto* group_domain = reg.domain;
+      const auto group_start = reg.since_version_start;
+      const auto group_end = reg.since_version_end;
+      while (i < std::size(kGeneratedKernelRegistrations)) {
+        const auto& row = kGeneratedKernelRegistrations[i];
+        if (row.registration_id != group_id ||
+            row.since_version_start != group_start ||
+            row.since_version_end != group_end ||
+            std::strcmp(row.op_type, group_op) != 0 ||
+            std::strcmp(row.domain, group_domain) != 0) {
+          break;
+        }
+        ++i;
+      }
       continue;
     }
 
     Ort::KernelDefBuilder builder;
+    const auto* domain = reg.domain;
     builder.SetOperatorType(reg.op_type)
-        .SetDomain("")
+        .SetDomain(domain == nullptr ? "" : domain)
         .SetSinceVersion(reg.since_version_start, reg.since_version_end)
         .SetExecutionProvider(ep_name);
 
-    if (reg.type_constraint != ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED) {
+    const auto group_id = reg.registration_id;
+    const auto* group_op = reg.op_type;
+    const auto* group_domain = reg.domain;
+    const auto group_start = reg.since_version_start;
+    const auto group_end = reg.since_version_end;
+
+    std::unordered_map<std::string, std::vector<const OrtDataType*>> constraints_by_name;
+    while (i < std::size(kGeneratedKernelRegistrations)) {
+      const auto& row = kGeneratedKernelRegistrations[i];
+      if (row.registration_id != group_id ||
+          row.since_version_start != group_start ||
+          row.since_version_end != group_end ||
+          std::strcmp(row.op_type, group_op) != 0 ||
+          std::strcmp(row.domain, group_domain) != 0) {
+        break;
+      }
+
+      if (row.constraint_name != nullptr &&
+          row.constraint_name[0] != '\0' &&
+          row.type_constraint != ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED) {
+        const OrtDataType* data_type = nullptr;
+        RETURN_IF_ERROR(ep_api.GetTensorDataType(row.type_constraint, &data_type));
+        constraints_by_name[row.constraint_name].push_back(data_type);
+      }
+
+      ++i;
+    }
+
+    for (auto& kv : constraints_by_name) {
+      auto& constraint_name = kv.first;
+      auto& constraint_types = kv.second;
+      if (constraint_types.empty()) {
+        continue;
+      }
       const OrtDataType* data_type = nullptr;
-      RETURN_IF_ERROR(ep_api.GetTensorDataType(reg.type_constraint, &data_type));
       type_constraint.clear();
-      type_constraint.push_back(data_type);
-      builder.AddTypeConstraint("T", type_constraint);
+      for (const auto* t : constraint_types) {
+        data_type = t;
+        type_constraint.push_back(data_type);
+      }
+      builder.AddTypeConstraint(constraint_name.c_str(), type_constraint);
     }
 
     Ort::KernelDef kernel_def = builder.Build();
