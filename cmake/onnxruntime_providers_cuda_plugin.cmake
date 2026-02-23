@@ -22,8 +22,12 @@ set(CUDA_PLUGIN_EP_CC_SRCS
     ${CUDA_PLUGIN_EP_DIR}/cuda_data_transfer_plugin.cc
     ${CUDA_PLUGIN_EP_DIR}/cuda_stream_plugin.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/binary_elementwise_ops.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/clip.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/unary_elementwise_ops.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/cast_op.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/concat.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/where.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/split.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/gather.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/transpose.cc
@@ -32,8 +36,12 @@ set(CUDA_PLUGIN_EP_CC_SRCS
 set(CUDA_PLUGIN_EP_CU_SRCS
     ${CUDA_PLUGIN_EP_DIR}/cuda_plugin_kernels.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/binary_elementwise_ops_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/clip_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/unary_elementwise_ops_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/cast_op.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/concat_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/where_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/split_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/gather_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/transpose_impl.cu
@@ -148,14 +156,22 @@ endif()
 # redefinition errors when cuda_kernel_adapter.h is force-included there.
 set(PORTED_KERNEL_SRCS
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/binary_elementwise_ops.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/clip.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/unary_elementwise_ops.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/cast_op.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/concat.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/where.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/split.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/gather.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/transpose.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/binary_elementwise_ops_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/clip_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/unary_elementwise_ops_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/cast_op.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/concat_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/where_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/split_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/gather_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/transpose_impl.cu

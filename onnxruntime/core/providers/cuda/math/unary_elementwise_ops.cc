@@ -13,8 +13,6 @@ Status UnaryElementwise::Prepare(OpKernelContext* context, UnaryElementwisePrepa
   return Status::OK();
 }
 
-#if !defined(BUILD_CUDA_EP_AS_PLUGIN)
-
 #define UNARY_ELEMENTWISE_REGISTER_VERSIONED_KERNEL(x, startver, endver, T)                \
   ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX(                                                 \
       x,                                                                                   \
@@ -254,8 +252,6 @@ UNARY_LOGICALOP_NOT_TYPED(1, bool)
 UNARY_OP_HFD(Round, 11)
 UNARY_OP_HFD(Cos, 7)
 UNARY_OP_HFD(Sin, 7)
-
-#endif  // !defined(BUILD_CUDA_EP_AS_PLUGIN)
 
 }  // namespace cuda
 }  // namespace onnxruntime

@@ -64,6 +64,7 @@
 #endif
 
 #include "core/providers/cuda/plugin/cuda_stream_plugin.h"
+#include "core/providers/cuda/shared_inc/cuda_utils.h"
 #include "core/session/onnxruntime_cxx_api.h"
 
 // Define SHARED_PROVIDER before including provider_api.h
