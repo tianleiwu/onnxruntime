@@ -45,7 +45,7 @@ struct AdapterKernelImpl : public OrtKernelImpl {
     PrePackWeight = nullptr;
     SetSharedPrePackedWeight = nullptr;
 
-    cuda::OpKernelInfo adapter_info(info);
+    const auto& adapter_info = *reinterpret_cast<const onnxruntime::OpKernelInfo*>(info);
     kernel = std::make_unique<KernelT>(adapter_info);
   }
 
@@ -54,8 +54,8 @@ struct AdapterKernelImpl : public OrtKernelImpl {
     EXCEPTION_TO_STATUS_BEGIN
 
     auto* self = static_cast<AdapterKernelImpl*>(this_ptr);
-    cuda::OpKernelContext adapter_ctx(context);
-    Status status = self->kernel->Compute(&adapter_ctx);
+    auto* adapter_ctx = reinterpret_cast<onnxruntime::OpKernelContext*>(context);
+    Status status = self->kernel->Compute(adapter_ctx);
     if (!status.IsOK()) {
       return Ort::GetApi().CreateStatus(
           ORT_EP_FAIL, status.ErrorMessage().c_str());
@@ -239,14 +239,14 @@ OrtStatus* ORT_API_CALL MatMulKernelImpl::ComputeImpl(
     float alpha = 1.0f;
     float beta = 0.0f;
 
-    CUBLAS_RETURN_IF_ERROR(cublasSgemm(cublas_handle,
-                                       CUBLAS_OP_N, CUBLAS_OP_N,
-                                       N, M, K,
-                                       &alpha,
-                                       b_data, N,
-                                       a_data, K,
-                                       &beta,
-                                       y_data, N));
+    PL_CUBLAS_RETURN_IF_ERROR(cublasSgemm(cublas_handle,
+                                          CUBLAS_OP_N, CUBLAS_OP_N,
+                                          N, M, K,
+                                          &alpha,
+                                          b_data, N,
+                                          a_data, K,
+                                          &beta,
+                                          y_data, N));
   }
 
   return nullptr;
@@ -352,21 +352,21 @@ OrtStatus* ORT_API_CALL GemmKernelImpl::ComputeImpl(
         // If we want to use the output as C, we must initialize it with C data.
         auto shape_c = input_c.GetTensorTypeAndShapeInfo().GetShape();
         if (shape_c.size() == 2 && shape_c[0] == M && shape_c[1] == N) {
-          CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(y_data, c_data, M * N * sizeof(float), cudaMemcpyDeviceToDevice, stream_impl->GetCudaStream()));
+          PL_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(y_data, c_data, M * N * sizeof(float), cudaMemcpyDeviceToDevice, stream_impl->GetCudaStream()));
         } else if (shape_c.size() == 1 && shape_c[0] == N) {
           // Broadcast [N] to [M, N]
           for (int i = 0; i < M; ++i) {
-            CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(y_data + i * N, c_data, N * sizeof(float), cudaMemcpyDeviceToDevice, stream_impl->GetCudaStream()));
+            PL_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(y_data + i * N, c_data, N * sizeof(float), cudaMemcpyDeviceToDevice, stream_impl->GetCudaStream()));
           }
         } else {
           // Fallback - just zero if unsupported broadcast
-          CUDA_RETURN_IF_ERROR(cudaMemsetAsync(y_data, 0, M * N * sizeof(float), stream_impl->GetCudaStream()));
+          PL_CUDA_RETURN_IF_ERROR(cudaMemsetAsync(y_data, 0, M * N * sizeof(float), stream_impl->GetCudaStream()));
         }
       } else {
-        CUDA_RETURN_IF_ERROR(cudaMemsetAsync(y_data, 0, M * N * sizeof(float), stream_impl->GetCudaStream()));
+        PL_CUDA_RETURN_IF_ERROR(cudaMemsetAsync(y_data, 0, M * N * sizeof(float), stream_impl->GetCudaStream()));
       }
     } else {
-      CUDA_RETURN_IF_ERROR(cudaMemsetAsync(y_data, 0, M * N * sizeof(float), stream_impl->GetCudaStream()));
+      PL_CUDA_RETURN_IF_ERROR(cudaMemsetAsync(y_data, 0, M * N * sizeof(float), stream_impl->GetCudaStream()));
     }
 
     cublasOperation_t transA = self->trans_a_ == 0 ? CUBLAS_OP_N : CUBLAS_OP_T;
@@ -381,14 +381,14 @@ OrtStatus* ORT_API_CALL GemmKernelImpl::ComputeImpl(
     int ldb = (self->trans_b_ == 0) ? N : K;
     int ldc = N;
 
-    CUBLAS_RETURN_IF_ERROR(cublasSgemm(cublas_handle,
-                                       transB, transA,
-                                       N, M, K,
-                                       &self->alpha_,
-                                       b_data, ldb,
-                                       a_data, lda,
-                                       &self->beta_,
-                                       y_data, ldc));
+    PL_CUBLAS_RETURN_IF_ERROR(cublasSgemm(cublas_handle,
+                                          transB, transA,
+                                          N, M, K,
+                                          &self->alpha_,
+                                          b_data, ldb,
+                                          a_data, lda,
+                                          &self->beta_,
+                                          y_data, ldc));
   }
 
   return nullptr;
@@ -621,6 +621,283 @@ OrtStatus* ORT_API_CALL CreateConvKernel(void* /*state*/,
   return nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// Shape-Only Kernels (Reshape, Squeeze, Unsqueeze, Flatten)
+// These ops only change tensor shape metadata. On the GPU, we copy data from
+// input to output using cudaMemcpyAsync since ORT may allocate a new buffer
+// for the output with the target shape.
+// ---------------------------------------------------------------------------
+
+// Helper: compute output shape for Reshape from the shape tensor (input 1).
+// Handles -1 (infer) and 0 (copy from input) dimensions per ONNX spec.
+static std::vector<int64_t> ComputeReshapeOutputShape(
+    const std::vector<int64_t>& input_dims,
+    const int64_t* shape_data, size_t shape_len) {
+  int64_t input_size = 1;
+  for (auto d : input_dims) input_size *= d;
+
+  std::vector<int64_t> output_dims(shape_data, shape_data + shape_len);
+  int64_t inferred_idx = -1;
+  int64_t known_size = 1;
+  for (size_t i = 0; i < output_dims.size(); ++i) {
+    if (output_dims[i] == 0 && i < input_dims.size()) {
+      output_dims[i] = input_dims[i];
+    }
+    if (output_dims[i] == -1) {
+      inferred_idx = static_cast<int64_t>(i);
+    } else {
+      known_size *= output_dims[i];
+    }
+  }
+  if (inferred_idx >= 0 && known_size > 0) {
+    output_dims[inferred_idx] = input_size / known_size;
+  }
+  return output_dims;
+}
+
+// Generic shape-copy compute: copy raw bytes from input to output.
+static OrtStatus* ShapeCopyCompute(OrtKernelContext* context,
+                                   const std::vector<int64_t>& output_shape) {
+  Ort::KernelContext ctx{context};
+  Ort::ConstValue input = ctx.GetInput(0);
+  auto info = input.GetTensorTypeAndShapeInfo();
+  size_t elem_count = info.GetElementCount();
+
+  // Determine element size from type
+  size_t elem_size = 0;
+  auto type = info.GetElementType();
+  switch (type) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+      elem_size = 4;
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
+      elem_size = 8;
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+      elem_size = 2;
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
+      elem_size = 1;
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:
+      elem_size = 2;
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:
+      elem_size = 4;
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64:
+      elem_size = 8;
+      break;
+    default:
+      elem_size = 4;
+      break;
+  }
+
+  Ort::UnownedValue output = ctx.GetOutput(0, output_shape);
+
+  if (elem_count > 0) {
+    const void* src = input.GetTensorRawData();
+    void* dst = output.GetTensorMutableRawData();
+    if (src != dst) {
+      cudaStream_t stream = static_cast<cudaStream_t>(ctx.GetGPUComputeStream());
+      cudaError_t err = cudaMemcpyAsync(dst, src, elem_count * elem_size,
+                                        cudaMemcpyDeviceToDevice, stream);
+      if (err != cudaSuccess) {
+        return Ort::GetApi().CreateStatus(ORT_EP_FAIL, cudaGetErrorString(err));
+      }
+    }
+  }
+  return nullptr;
+}
+
+// Reshape kernel: reads target shape from input 1 (CPU tensor).
+struct ReshapeKernelImpl : public OrtKernelImpl {
+  ReshapeKernelImpl() : OrtKernelImpl{} {
+    ort_version_supported = ORT_API_VERSION;
+    flags = 0;
+    Compute = ComputeImpl;
+    Release = [](OrtKernelImpl* p) noexcept { delete static_cast<ReshapeKernelImpl*>(p); };
+    PrePackWeight = nullptr;
+    SetSharedPrePackedWeight = nullptr;
+  }
+
+  static OrtStatus* ORT_API_CALL ComputeImpl(OrtKernelImpl*, OrtKernelContext* context) noexcept {
+    EXCEPTION_TO_STATUS_BEGIN
+    Ort::KernelContext ctx{context};
+    Ort::ConstValue input = ctx.GetInput(0);
+    Ort::ConstValue shape_tensor = ctx.GetInput(1);
+    auto input_info = input.GetTensorTypeAndShapeInfo();
+    auto shape_info = shape_tensor.GetTensorTypeAndShapeInfo();
+    const int64_t* shape_data = shape_tensor.GetTensorData<int64_t>();
+    size_t shape_len = shape_info.GetElementCount();
+    auto output_shape = ComputeReshapeOutputShape(
+        input_info.GetShape(), shape_data, shape_len);
+    return ShapeCopyCompute(context, output_shape);
+    EXCEPTION_TO_STATUS_END
+  }
+};
+
+// Squeeze kernel: removes dimensions of size 1.
+struct SqueezeKernelImpl : public OrtKernelImpl {
+  SqueezeKernelImpl() : OrtKernelImpl{} {
+    ort_version_supported = ORT_API_VERSION;
+    flags = 0;
+    Compute = ComputeImpl;
+    Release = [](OrtKernelImpl* p) noexcept { delete static_cast<SqueezeKernelImpl*>(p); };
+    PrePackWeight = nullptr;
+    SetSharedPrePackedWeight = nullptr;
+  }
+
+  static OrtStatus* ORT_API_CALL ComputeImpl(OrtKernelImpl*, OrtKernelContext* context) noexcept {
+    EXCEPTION_TO_STATUS_BEGIN
+    Ort::KernelContext ctx{context};
+    Ort::ConstValue input = ctx.GetInput(0);
+    auto input_info = input.GetTensorTypeAndShapeInfo();
+    auto input_shape = input_info.GetShape();
+
+    // Squeeze axes from input 1 (opset 13+) or default to all size-1 dims.
+    std::set<int64_t> axes_set;
+    if (ctx.GetInputCount() > 1) {
+      Ort::ConstValue axes_tensor = ctx.GetInput(1);
+      if (axes_tensor) {
+        auto axes_info = axes_tensor.GetTensorTypeAndShapeInfo();
+        size_t n = axes_info.GetElementCount();
+        const int64_t* axes_data = axes_tensor.GetTensorData<int64_t>();
+        for (size_t i = 0; i < n; ++i) {
+          int64_t a = axes_data[i];
+          if (a < 0) a += static_cast<int64_t>(input_shape.size());
+          axes_set.insert(a);
+        }
+      }
+    }
+
+    std::vector<int64_t> output_shape;
+    for (size_t i = 0; i < input_shape.size(); ++i) {
+      if (axes_set.empty()) {
+        if (input_shape[i] != 1) output_shape.push_back(input_shape[i]);
+      } else {
+        if (axes_set.find(static_cast<int64_t>(i)) == axes_set.end()) {
+          output_shape.push_back(input_shape[i]);
+        }
+      }
+    }
+    if (output_shape.empty()) output_shape.push_back(1);  // scalar
+    return ShapeCopyCompute(context, output_shape);
+    EXCEPTION_TO_STATUS_END
+  }
+};
+
+// Unsqueeze kernel: inserts dimensions of size 1.
+struct UnsqueezeKernelImpl : public OrtKernelImpl {
+  UnsqueezeKernelImpl() : OrtKernelImpl{} {
+    ort_version_supported = ORT_API_VERSION;
+    flags = 0;
+    Compute = ComputeImpl;
+    Release = [](OrtKernelImpl* p) noexcept { delete static_cast<UnsqueezeKernelImpl*>(p); };
+    PrePackWeight = nullptr;
+    SetSharedPrePackedWeight = nullptr;
+  }
+
+  static OrtStatus* ORT_API_CALL ComputeImpl(OrtKernelImpl*, OrtKernelContext* context) noexcept {
+    EXCEPTION_TO_STATUS_BEGIN
+    Ort::KernelContext ctx{context};
+    Ort::ConstValue input = ctx.GetInput(0);
+    auto input_info = input.GetTensorTypeAndShapeInfo();
+    auto input_shape = input_info.GetShape();
+
+    // Read axes from input 1 (opset 13+).
+    Ort::ConstValue axes_tensor = ctx.GetInput(1);
+    auto axes_info = axes_tensor.GetTensorTypeAndShapeInfo();
+    size_t n = axes_info.GetElementCount();
+    const int64_t* axes_data = axes_tensor.GetTensorData<int64_t>();
+
+    int64_t output_rank = static_cast<int64_t>(input_shape.size() + n);
+    std::set<int64_t> axes_set;
+    for (size_t i = 0; i < n; ++i) {
+      int64_t a = axes_data[i];
+      if (a < 0) a += output_rank;
+      axes_set.insert(a);
+    }
+
+    std::vector<int64_t> output_shape;
+    output_shape.reserve(output_rank);
+    size_t input_idx = 0;
+    for (int64_t i = 0; i < output_rank; ++i) {
+      if (axes_set.count(i)) {
+        output_shape.push_back(1);
+      } else {
+        output_shape.push_back(input_shape[input_idx++]);
+      }
+    }
+    return ShapeCopyCompute(context, output_shape);
+    EXCEPTION_TO_STATUS_END
+  }
+};
+
+// Flatten kernel: reshapes to 2D based on the axis attribute.
+struct FlattenKernelImpl : public OrtKernelImpl {
+  int64_t axis = 1;
+
+  explicit FlattenKernelImpl(const OrtKernelInfo* info) : OrtKernelImpl{} {
+    ort_version_supported = ORT_API_VERSION;
+    flags = 0;
+    Compute = ComputeImpl;
+    Release = [](OrtKernelImpl* p) noexcept { delete static_cast<FlattenKernelImpl*>(p); };
+    PrePackWeight = nullptr;
+    SetSharedPrePackedWeight = nullptr;
+    Ort::ConstKernelInfo ki{info};
+    try {
+      axis = ki.GetAttribute<int64_t>("axis");
+    } catch (...) {
+      axis = 1;
+    }
+  }
+
+  static OrtStatus* ORT_API_CALL ComputeImpl(OrtKernelImpl* this_ptr, OrtKernelContext* context) noexcept {
+    EXCEPTION_TO_STATUS_BEGIN
+    auto* self = static_cast<FlattenKernelImpl*>(this_ptr);
+    Ort::KernelContext ctx{context};
+    Ort::ConstValue input = ctx.GetInput(0);
+    auto input_info = input.GetTensorTypeAndShapeInfo();
+    auto input_shape = input_info.GetShape();
+
+    int64_t ax = self->axis;
+    if (ax < 0) ax += static_cast<int64_t>(input_shape.size());
+
+    int64_t d0 = 1, d1 = 1;
+    for (int64_t i = 0; i < ax; ++i) d0 *= input_shape[i];
+    for (size_t i = static_cast<size_t>(ax); i < input_shape.size(); ++i) d1 *= input_shape[i];
+
+    std::vector<int64_t> output_shape = {d0, d1};
+    return ShapeCopyCompute(context, output_shape);
+    EXCEPTION_TO_STATUS_END
+  }
+};
+
+// Creation functions for shape-only ops
+OrtStatus* ORT_API_CALL CreateReshapeKernel(void*, const OrtKernelInfo*, OrtKernelImpl** out) noexcept {
+  *out = new ReshapeKernelImpl();
+  return nullptr;
+}
+OrtStatus* ORT_API_CALL CreateSqueezeKernel(void*, const OrtKernelInfo*, OrtKernelImpl** out) noexcept {
+  *out = new SqueezeKernelImpl();
+  return nullptr;
+}
+OrtStatus* ORT_API_CALL CreateUnsqueezeKernel(void*, const OrtKernelInfo*, OrtKernelImpl** out) noexcept {
+  *out = new UnsqueezeKernelImpl();
+  return nullptr;
+}
+OrtStatus* ORT_API_CALL CreateFlattenKernel(void*, const OrtKernelInfo* info, OrtKernelImpl** out) noexcept {
+  *out = new FlattenKernelImpl(info);
+  return nullptr;
+}
+
 PluginKernelCreateFn GetCreateFnForOp(std::string_view op_type) {
   if (op_type == "Relu") return CreateReluKernel;
   if (op_type == "Elu") return CreateEluKernel;
@@ -637,6 +914,11 @@ PluginKernelCreateFn GetCreateFnForOp(std::string_view op_type) {
   if (op_type == "MatMul") return CreateMatMulKernel;
   if (op_type == "Gemm") return CreateGemmKernel;
   if (op_type == "Conv") return CreateConvKernel;
+  // Shape-only ops (Task 4.1)
+  if (op_type == "Reshape") return CreateReshapeKernel;
+  if (op_type == "Squeeze") return CreateSqueezeKernel;
+  if (op_type == "Unsqueeze") return CreateUnsqueezeKernel;
+  if (op_type == "Flatten") return CreateFlattenKernel;
   return nullptr;
 }
 

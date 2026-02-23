@@ -107,14 +107,14 @@ OrtStatus* ORT_API_CALL CudaEp::GetPreferredDataLayoutImpl(
 
 /*static*/
 OrtStatus* ORT_API_CALL CudaEp::OnRunStartImpl(
-    OrtEp* /*this_ptr*/, const OrtRunOptions* /*run_options*/) noexcept {
+    OrtEp* /*this_ptr*/, const ::OrtRunOptions* /*run_options*/) noexcept {
   // Stub: will later manage CUDA Graph capture state
   return nullptr;
 }
 
 /*static*/
 OrtStatus* ORT_API_CALL CudaEp::OnRunEndImpl(
-    OrtEp* /*this_ptr*/, const OrtRunOptions* /*run_options*/, bool /*sync_stream*/) noexcept {
+    OrtEp* /*this_ptr*/, const ::OrtRunOptions* /*run_options*/, bool /*sync_stream*/) noexcept {
   // Stub: will later manage CUDA Graph replay state
   return nullptr;
 }

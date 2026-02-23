@@ -4,10 +4,143 @@
 #pragma once
 
 #include "core/common/status.h"
+#include "core/common/float16.h"
+#include "core/common/float8.h"
+#include "core/framework/float4.h"
 #include "core/framework/allocator.h"
 #include "core/framework/tensor_shape.h"
+#include "core/util/math.h"
+#include <gsl/gsl>
+
+#include <cublas_v2.h>
+#include <cudnn.h>
+
+#ifdef __CUDACC__
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#endif
+
+// Define error handling macros BEFORE including other plugin headers.
+#ifndef PL_CUDA_RETURN_IF_ERROR
+#define PL_CUDA_RETURN_IF_ERROR(expr)                                                                                                                          \
+  {                                                                                                                                                            \
+    cudaError_t _err = (expr);                                                                                                                                 \
+    if (_err != cudaSuccess) {                                                                                                                                 \
+      return onnxruntime::common::Status(onnxruntime::common::ONNXRUNTIME, onnxruntime::common::FAIL, std::string("CUDA error: ") + cudaGetErrorString(_err)); \
+    }                                                                                                                                                          \
+  }
+#endif
+
+#ifndef CUDA_RETURN_IF_ERROR
+#define CUDA_RETURN_IF_ERROR PL_CUDA_RETURN_IF_ERROR
+#endif
+
+#ifndef PL_CUBLAS_RETURN_IF_ERROR
+#define PL_CUBLAS_RETURN_IF_ERROR(expr)                                                                                                                                           \
+  {                                                                                                                                                                               \
+    cublasStatus_t _status = (expr);                                                                                                                                              \
+    if (_status != CUBLAS_STATUS_SUCCESS) {                                                                                                                                       \
+      return onnxruntime::common::Status(onnxruntime::common::ONNXRUNTIME, onnxruntime::common::FAIL, std::string("cuBLAS error: ") + std::to_string(static_cast<int>(_status))); \
+    }                                                                                                                                                                             \
+  }
+#endif
+
+#ifndef CUBLAS_RETURN_IF_ERROR
+#define CUBLAS_RETURN_IF_ERROR PL_CUBLAS_RETURN_IF_ERROR
+#endif
+
+#ifndef PL_CUDNN_RETURN_IF_ERROR
+#define PL_CUDNN_RETURN_IF_ERROR(expr)                                                                                                                              \
+  {                                                                                                                                                                 \
+    cudnnStatus_t _status = (expr);                                                                                                                                 \
+    if (_status != CUDNN_STATUS_SUCCESS) {                                                                                                                          \
+      return onnxruntime::common::Status(onnxruntime::common::ONNXRUNTIME, onnxruntime::common::FAIL, std::string("cuDNN error: ") + cudnnGetErrorString(_status)); \
+    }                                                                                                                                                               \
+  }
+#endif
+
+#ifndef CUDNN_RETURN_IF_ERROR
+#define CUDNN_RETURN_IF_ERROR PL_CUDNN_RETURN_IF_ERROR
+#endif
+
 #include "core/providers/cuda/plugin/cuda_stream_plugin.h"
 #include "core/session/onnxruntime_cxx_api.h"
+
+// Define SHARED_PROVIDER before including provider_api.h
+#ifndef SHARED_PROVIDER
+#define SHARED_PROVIDER 1
+#endif
+
+// Include provider_api.h FIRST. This provides the "plugin" versions of ORT types.
+#include "core/providers/shared_library/provider_api.h"
+
+// Shadowing to avoid conflicts if core headers are indirectly included
+#define kOnnxDomain __kOnnxDomain_ignore
+#define kMSDomain __kMSDomain_ignore
+#define kPytorchAtenDomain __kPytorchAtenDomain_ignore
+#define kNGraphDomain __kNGraphDomain_ignore
+#define kCudaExecutionProvider __kCudaExecutionProvider_ignore
+#define kCpuExecutionProvider __kCpuExecutionProvider_ignore
+#define kAzureExecutionProvider __kAzureExecutionProvider_ignore
+
+// Include framework's cuda_common.h for math utilities and CUDA types.
+// We avoid op_kernel.h as it brings in too many conflicting types.
+#include "core/providers/cuda/cuda_common.h"
+
+#undef kOnnxDomain
+#undef kMSDomain
+#undef kPytorchAtenDomain
+#undef kNGraphDomain
+#undef kCudaExecutionProvider
+#undef kCpuExecutionProvider
+#undef kAzureExecutionProvider
+
+#ifdef __CUDACC__
+#include "core/providers/cuda/cu_inc/common.cuh"
+// namespace onnxruntime {
+// namespace cuda {
+// namespace isinf_details {
+// // Specialize to avoid std::numeric_limits<T>::infinity() in kernels as it causes host/device constexpr issues on some compilers
+// template <typename T>
+// struct IsInfTyped;
+// template <>
+// struct IsInfTyped<double> {
+//   __device__ __inline__ static bool IsInf(double a) { return isinf(a); }
+//   __device__ __inline__ static bool IsInfPos(double a) { return isinf(a) && a > 0; }
+//   __device__ __inline__ static bool IsInfNeg(double a) { return isinf(a) && a < 0; }
+// };
+// template <>
+// struct IsInfTyped<float> {
+//   __device__ __inline__ static bool IsInf(float a) { return isinf(a); }
+//   __device__ __inline__ static bool IsInfPos(float a) { return isinf(a) && a > 0; }
+//   __device__ __inline__ static bool IsInfNeg(float a) { return isinf(a) && a < 0; }
+// };
+// }  // namespace isinf_details
+// }  // namespace cuda
+// }  // namespace onnxruntime
+
+#endif
+
+// Undefine registration and logging macros - we'll define our own no-ops for registration
+#undef ONNX_OPERATOR_KERNEL_EX
+#define ONNX_OPERATOR_KERNEL_EX(...)
+#undef ONNX_OPERATOR_VERSIONED_KERNEL_EX
+#define ONNX_OPERATOR_VERSIONED_KERNEL_EX(...)
+#undef ONNX_OPERATOR_TYPED_KERNEL_EX
+#define ONNX_OPERATOR_TYPED_KERNEL_EX(...)
+#undef ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX
+#define ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX(...)
+#undef ONNX_OPERATOR_TWO_TYPED_KERNEL_EX
+#define ONNX_OPERATOR_TWO_TYPED_KERNEL_EX(...)
+#undef ONNX_OPERATOR_THREE_TYPED_KERNEL_EX
+#define ONNX_OPERATOR_THREE_TYPED_KERNEL_EX(...)
+#undef ONNX_OPERATOR_VERSIONED_TWO_TYPED_KERNEL_EX
+#define ONNX_OPERATOR_VERSIONED_TWO_TYPED_KERNEL_EX(...)
+
+#undef CREATE_MESSAGE
+#undef LOGS
+#undef LOGS_DEFAULT
+#undef ORT_LOG_MESSAGE
 
 #include <atomic>
 #include <cstring>
@@ -24,61 +157,19 @@ namespace onnxruntime {
 namespace cuda {
 
 namespace detail {
-
 struct CudaKernelAdapterRuntimeConfig {
   std::atomic<bool> use_tf32{true};
   std::atomic<int> device_id{0};
 };
-
 inline CudaKernelAdapterRuntimeConfig& GetCudaKernelAdapterRuntimeConfig() {
   static CudaKernelAdapterRuntimeConfig config;
   return config;
 }
-
 inline size_t BytesForCount(size_t count_or_bytes, size_t element_size) {
-  if (element_size == 0) {
-    return count_or_bytes;
-  }
-
-  if (count_or_bytes > (std::numeric_limits<size_t>::max() / element_size)) {
-    return 0;
-  }
-
+  if (element_size == 0) return count_or_bytes;
+  if (count_or_bytes > (std::numeric_limits<size_t>::max() / element_size)) return 0;
   return count_or_bytes * element_size;
 }
-
-template <typename T>
-inline T OneValue() {
-  return static_cast<T>(1);
-}
-
-template <>
-inline half OneValue<half>() {
-  return __float2half(1.0f);
-}
-
-template <typename T>
-struct ConstOnesState {
-  std::mutex mutex;
-  std::vector<T*> buffers;
-  T* largest_buffer = nullptr;
-  size_t largest_count = 0;
-
-  ~ConstOnesState() {
-    for (T* p : buffers) {
-      if (p != nullptr) {
-        cudaFree(p);
-      }
-    }
-  }
-};
-
-template <typename T>
-inline ConstOnesState<T>& GetConstOnesState() {
-  static ConstOnesState<T> state;
-  return state;
-}
-
 }  // namespace detail
 
 inline void SetCudaKernelAdapterRuntimeConfig(bool use_tf32, int device_id) {
@@ -87,327 +178,253 @@ inline void SetCudaKernelAdapterRuntimeConfig(bool use_tf32, int device_id) {
   config.device_id.store(device_id, std::memory_order_relaxed);
 }
 
-class Tensor {
- public:
-  explicit Tensor(Ort::ConstValue value) : const_value_(std::move(value)), is_mutable_(false) {
-    auto info = const_value_.GetTensorTypeAndShapeInfo();
-    shape_ = TensorShape(info.GetShape());
-    element_type_ = info.GetElementType();
-  }
+// Global aliases and shims
+using Status = onnxruntime::common::Status;
+using MLFloat16 = onnxruntime::MLFloat16;
+using BFloat16 = onnxruntime::BFloat16;
+using Float8E4M3FN = onnxruntime::Float8E4M3FN;
+using Float8E4M3FNUZ = onnxruntime::Float8E4M3FNUZ;
+using Float8E5M2 = onnxruntime::Float8E5M2;
+using Float8E5M2FNUZ = onnxruntime::Float8E5M2FNUZ;
 
-  explicit Tensor(Ort::UnownedValue value) : unowned_value_(std::move(value)), is_mutable_(true) {
-    auto info = unowned_value_.GetTensorTypeAndShapeInfo();
-    shape_ = TensorShape(info.GetShape());
-    element_type_ = info.GetElementType();
-  }
-
-  const TensorShape& Shape() const { return shape_; }
-  int32_t GetElementType() const { return static_cast<int32_t>(element_type_); }
-
-  template <typename T>
-  const T* Data() const {
-    return is_mutable_ ? unowned_value_.GetTensorData<T>() : const_value_.GetTensorData<T>();
-  }
-
-  template <typename T>
-  T* MutableData() {
-    if (!is_mutable_) {
-      throw std::runtime_error("Attempted MutableData() on a read-only tensor");
-    }
-    return unowned_value_.GetTensorMutableData<T>();
-  }
-
-  const void* DataRaw() const {
-    return is_mutable_ ? unowned_value_.GetTensorRawData() : const_value_.GetTensorRawData();
-  }
-
- private:
-  Ort::ConstValue const_value_{nullptr};
-  Ort::UnownedValue unowned_value_{nullptr};
-  bool is_mutable_ = false;
-  TensorShape shape_;
-  ONNXTensorElementDataType element_type_ = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+// Type mapping for CUDA
+template <typename T>
+struct ToCudaType {
+  typedef T MappedType;
+  static MappedType FromFloat(float f) { return static_cast<MappedType>(f); }
 };
 
-class OpKernelInfo {
- public:
-  explicit OpKernelInfo(const OrtKernelInfo* info) : info_(info) {}
-
-  template <typename T>
-  Status GetAttr(const std::string& name, T* value) const {
-    if (value == nullptr) {
-      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "GetAttr output pointer must be non-null");
-    }
-    try {
-      *value = info_.GetAttribute<T>(name.c_str());
-      return Status::OK();
-    } catch (const Ort::Exception& ex) {
-      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "GetAttr failed for '", name, "': ", ex.what());
-    }
+template <>
+struct ToCudaType<MLFloat16> {
+  typedef half MappedType;
+  static MappedType FromFloat(float f) {
+    uint16_t h = onnxruntime::math::floatToHalf(f);
+    return *reinterpret_cast<MappedType*>(&h);
   }
-
-  template <typename T>
-  T GetAttrOrDefault(const std::string& name, T default_value) const {
-    T value{};
-    return GetAttr(name, &value).IsOK() ? value : default_value;
-  }
-
-  struct NodeInfo {
-    int since_version = 0;
-    int SinceVersion() const { return since_version; }
-  };
-
-  NodeInfo node() const {
-    return NodeInfo{info_.GetOperatorSinceVersion()};
-  }
-
- private:
-  Ort::ConstKernelInfo info_;
 };
 
-class OpKernelContext {
- public:
-  explicit OpKernelContext(OrtKernelContext* context) : context_(context) {}
-
-  template <typename T>
-  const T* Input(int index) {
-    static_assert(std::is_same_v<T, Tensor>, "Plugin adapter currently supports Input<Tensor>() only");
-
-    Ort::ConstValue value = context_.GetInput(static_cast<size_t>(index));
-    if (!value) {
-      return nullptr;
-    }
-
-    inputs_.push_back(std::make_unique<Tensor>(std::move(value)));
-    return static_cast<const T*>(inputs_.back().get());
+#ifdef __CUDACC__
+template <>
+struct ToCudaType<BFloat16> {
+  typedef nv_bfloat16 MappedType;
+  static MappedType FromFloat(float f) {
+    return nv_bfloat16(f);
   }
-
-  Tensor* Output(int index, const TensorShape& shape) {
-    const auto& dims = shape.GetDims();
-    Ort::UnownedValue value = context_.GetOutput(static_cast<size_t>(index), dims.data(), dims.size());
-    outputs_.push_back(std::make_unique<Tensor>(std::move(value)));
-    return outputs_.back().get();
-  }
-
-  int InputCount() const { return static_cast<int>(context_.GetInputCount()); }
-  int OutputCount() const { return static_cast<int>(context_.GetOutputCount()); }
-
-  void* GetComputeStream() const { return context_.GetGPUComputeStream(); }
-
- private:
-  Ort::KernelContext context_;
-  std::vector<std::unique_ptr<Tensor>> inputs_;
-  std::vector<std::unique_ptr<Tensor>> outputs_;
 };
 
-class CudaKernel {
- public:
-  explicit CudaKernel(const OpKernelInfo& info) : info_(info) {
-    const auto& runtime_config = detail::GetCudaKernelAdapterRuntimeConfig();
-    use_tf32_ = runtime_config.use_tf32.load(std::memory_order_relaxed);
-    device_id_ = runtime_config.device_id.load(std::memory_order_relaxed);
+// Forward declare templates from common.cuh to allow specialization
+// Match signatures from common.cuh exactly (no default parameters)
+template <typename T, bool detect_positive, bool detect_negative>
+struct _IsInf;
+template <typename T>
+struct _IsNan;
 
-    int current_device = device_id_;
-    if (cudaGetDevice(&current_device) == cudaSuccess) {
-      device_id_ = current_device;
+namespace bf16_isinf_nan {
+template <typename T>
+struct IsInfTyped;
+template <>
+struct IsInfTyped<nv_bfloat16> {
+  static __device__ __inline__ bool IsInf(nv_bfloat16 a) {
+    uint16_t val = *reinterpret_cast<const uint16_t*>(&a);
+    return (val & 0x7F80) == 0x7F80 && (val & 0x007F) == 0x0000;
+  }
+  static __device__ __inline__ bool IsInfPos(nv_bfloat16 a) {
+    return *reinterpret_cast<const uint16_t*>(&a) == 0x7F80;
+  }
+  static __device__ __inline__ bool IsInfNeg(nv_bfloat16 a) {
+    return *reinterpret_cast<const uint16_t*>(&a) == 0xFF80;
+  }
+};
+}  // namespace bf16_isinf_nan
+
+// Specialize for nv_bfloat16 to avoid ambiguity with isnan/isinf overloads
+template <>
+struct _IsNan<nv_bfloat16> {
+  __device__ __inline__ bool operator()(nv_bfloat16 a) const {
+    uint16_t val = *reinterpret_cast<const uint16_t*>(&a);
+    return (val & 0x7F80) == 0x7F80 && (val & 0x007F) != 0x0000;
+  }
+};
+
+template <bool detect_positive, bool detect_negative>
+struct _IsInf<nv_bfloat16, detect_positive, detect_negative> {
+  __device__ __inline__ bool operator()(nv_bfloat16 a) const {
+    if constexpr (detect_positive && detect_negative) {
+      return bf16_isinf_nan::IsInfTyped<nv_bfloat16>::IsInf(a);
+    } else if constexpr (detect_positive) {
+      return bf16_isinf_nan::IsInfTyped<nv_bfloat16>::IsInfPos(a);
+    } else if constexpr (detect_negative) {
+      return bf16_isinf_nan::IsInfTyped<nv_bfloat16>::IsInfNeg(a);
+    } else {
+      return false;
     }
+  }
+};
+#endif
 
+// Shims for OpKernel-related types using provider_api.h's versions
+using Tensor = onnxruntime::Tensor;
+using OpKernelContext = onnxruntime::OpKernelContext;
+using OpKernelInfo = onnxruntime::OpKernelInfo;
+using OpKernel = onnxruntime::OpKernel;
+
+// Additional adapter logic for CudaKernel
+class CudaKernel : public onnxruntime::OpKernel {
+ public:
+  explicit CudaKernel(const onnxruntime::OpKernelInfo& info) : onnxruntime::OpKernel(info), info_(info) {
+    const auto& config = detail::GetCudaKernelAdapterRuntimeConfig();
+    use_tf32_ = config.use_tf32.load(std::memory_order_relaxed);
+    device_id_ = config.device_id.load(std::memory_order_relaxed);
+    int cur = device_id_;
+    if (cudaGetDevice(&cur) == cudaSuccess) device_id_ = cur;
     if (cudaGetDeviceProperties(&device_prop_, device_id_) != cudaSuccess) {
       std::memset(&device_prop_, 0, sizeof(device_prop_));
       device_prop_.major = -1;
-      device_prop_.minor = -1;
     }
   }
   virtual ~CudaKernel() = default;
-
-  Status Compute(OpKernelContext* context) const {
-    Status s = ComputeInternal(context);
+  Status Compute(onnxruntime::OpKernelContext* ctx) const {
+    Status s = ComputeInternal(ctx);
     if (s.IsOK()) {
       cudaError_t err = cudaGetLastError();
-      if (err != cudaSuccess) {
-        return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "CUDA error ", cudaGetErrorName(err), ":", cudaGetErrorString(err));
-      }
+      if (err != cudaSuccess) return Status(onnxruntime::common::ONNXRUNTIME, onnxruntime::common::FAIL, "CUDA error: " + std::string(cudaGetErrorString(err)));
     }
-
     return s;
   }
+  virtual Status ComputeInternal(onnxruntime::OpKernelContext* ctx) const = 0;
 
-  virtual Status ComputeInternal(OpKernelContext* context) const = 0;
-
-  cudaStream_t Stream(OpKernelContext* context) const {
-    return context ? static_cast<cudaStream_t>(context->GetComputeStream()) : nullptr;
+  cudaStream_t Stream(onnxruntime::OpKernelContext* ctx) const {
+    if (!ctx) return nullptr;
+    // Map onnxruntime::OpKernelContext* (plugin version) to OrtKernelContext* and use Ort::KernelContext to get GPU stream.
+    return static_cast<cudaStream_t>(Ort::KernelContext(reinterpret_cast<OrtKernelContext*>(ctx)).GetGPUComputeStream());
   }
 
-  cudnnHandle_t GetCudnnHandle(OpKernelContext* context) const {
-    cudaStream_t stream = Stream(context);
-    auto* sync_stream = cuda_plugin::CudaSyncStream::FromCudaStream(stream);
-    return sync_stream ? sync_stream->GetCudnnHandle() : nullptr;
+  static cudnnHandle_t GetCudnnHandle(cudaStream_t s) {
+    auto* sync = cuda_plugin::CudaSyncStream::FromCudaStream(s);
+    return sync ? sync->GetCudnnHandle() : nullptr;
   }
+  cudnnHandle_t GetCudnnHandle(onnxruntime::OpKernelContext* ctx) const { return GetCudnnHandle(Stream(ctx)); }
 
-  cublasHandle_t GetCublasHandle(OpKernelContext* context) const {
-    cudaStream_t stream = Stream(context);
-    auto* sync_stream = cuda_plugin::CudaSyncStream::FromCudaStream(stream);
-    return sync_stream ? sync_stream->GetCublasHandle() : nullptr;
+  static cublasHandle_t GetCublasHandle(cudaStream_t s) {
+    auto* sync = cuda_plugin::CudaSyncStream::FromCudaStream(s);
+    return sync ? sync->GetCublasHandle() : nullptr;
   }
-
-  template <typename T>
-  inline IAllocatorUniquePtr<T> GetScratchBuffer(size_t count_or_bytes, void* stream) const {
-    if (count_or_bytes == 0) {
-      return IAllocatorUniquePtr<T>(nullptr, [](T*) {});
-    }
-
-    constexpr size_t kElementSize = std::is_void_v<T> ? 0 : sizeof(T);
-    const size_t bytes = detail::BytesForCount(count_or_bytes, kElementSize);
-    if (bytes == 0) {
-      return IAllocatorUniquePtr<T>(nullptr, [](T*) {});
-    }
-
-    void* p = nullptr;
-    cudaError_t alloc_err = cudaMalloc(&p, bytes);
-    if (alloc_err != cudaSuccess) {
-      return IAllocatorUniquePtr<T>(nullptr, [](T*) {});
-    }
-
-    const auto cuda_stream = static_cast<cudaStream_t>(stream);
-    return IAllocatorUniquePtr<T>(
-        static_cast<T*>(p),
-        [cuda_stream](T* ptr) {
-          if (ptr == nullptr) {
-            return;
-          }
-#if CUDART_VERSION >= 11020
-          if (cuda_stream != nullptr) {
-            cudaFreeAsync(ptr, cuda_stream);
-            return;
-          }
-#endif
-          cudaFree(ptr);
-        });
-  }
-
-  inline void AddDeferredReleaseCPUPtr(void* p, void* stream) const {
-    if (p == nullptr) {
-      return;
-    }
-
-    auto* sync_stream =
-        cuda_plugin::CudaSyncStream::FromCudaStream(static_cast<cudaStream_t>(stream));
-    if (sync_stream != nullptr) {
-      sync_stream->EnqueueDeferredCPUBuffer(p);
-      return;
-    }
-
-    // Fallback: if no tracked stream exists, release pinned host memory immediately.
-    cudaFreeHost(p);
-  }
-
-  template <typename T>
-  inline IAllocatorUniquePtr<T> AllocateBufferOnCPUPinned(size_t count_or_bytes) const {
-    if (count_or_bytes == 0) {
-      return IAllocatorUniquePtr<T>(nullptr, [](T*) {});
-    }
-
-    constexpr size_t kElementSize = std::is_void_v<T> ? 0 : sizeof(T);
-    const size_t bytes = detail::BytesForCount(count_or_bytes, kElementSize);
-    if (bytes == 0) {
-      return IAllocatorUniquePtr<T>(nullptr, [](T*) {});
-    }
-
-    void* p = nullptr;
-    if (cudaHostAlloc(&p, bytes, cudaHostAllocDefault) != cudaSuccess) {
-      return IAllocatorUniquePtr<T>(nullptr, [](T*) {});
-    }
-
-    return IAllocatorUniquePtr<T>(
-        static_cast<T*>(p),
-        [](T* ptr) {
-          if (ptr != nullptr) {
-            cudaFreeHost(ptr);
-          }
-        });
-  }
+  cublasHandle_t GetCublasHandle(onnxruntime::OpKernelContext* ctx) const { return GetCublasHandle(Stream(ctx)); }
 
   const cudaDeviceProp& GetDeviceProp() const { return device_prop_; }
   bool UseTF32() const { return use_tf32_; }
   bool IsArchAvailable(int arch) const { return device_prop_.major >= arch; }
+  const onnxruntime::OpKernelInfo& Info() const { return info_; }
 
-  const OpKernelInfo& Info() const { return info_; }
-
- protected:
   template <typename T>
-  inline const T* GetConstOnes(size_t count, cudaStream_t stream) const {
-    if (count == 0) {
-      return nullptr;
+  using IAllocatorUniquePtr = std::unique_ptr<T, void (*)(T*)>;
+  template <typename T>
+  inline IAllocatorUniquePtr<T> GetScratchBuffer(size_t cnt, void* s) const {
+    if (cnt == 0) return IAllocatorUniquePtr<T>(nullptr, [](T*) {});
+    size_t sz = detail::BytesForCount(cnt, std::is_void_v<T> ? 0 : sizeof(T));
+    void* p = nullptr;
+    if (cudaMalloc(&p, sz) != cudaSuccess) return IAllocatorUniquePtr<T>(nullptr, [](T*) {});
+    cudaStream_t cs = static_cast<cudaStream_t>(s);
+    return IAllocatorUniquePtr<T>(static_cast<T*>(p), [cs](T* ptr) { if (ptr) {
+#if CUDART_VERSION >= 11020
+      if (cs) { cudaFreeAsync(ptr, cs); return; }
+#endif
+      cudaFree(ptr);
+    } });
+  }
+  inline void AddDeferredReleaseCPUPtr(void* p, void* s) const {
+    if (!p) return;
+    auto* sync = cuda_plugin::CudaSyncStream::FromCudaStream(static_cast<cudaStream_t>(s));
+    if (sync) {
+      sync->EnqueueDeferredCPUBuffer(p);
+      return;
     }
-
-    auto& state = detail::GetConstOnesState<T>();
-    std::lock_guard<std::mutex> lock(state.mutex);
-
-    if (count > state.largest_count) {
-      T* device_ptr = nullptr;
-      const size_t bytes = detail::BytesForCount(count, sizeof(T));
-      if (bytes == 0) {
-        return nullptr;
-      }
-
-      if (cudaMalloc(&device_ptr, bytes) != cudaSuccess || device_ptr == nullptr) {
-        return nullptr;
-      }
-
-      std::vector<T> host_ones(count, detail::OneValue<T>());
-      if (stream != nullptr) {
-        if (cudaMemcpyAsync(device_ptr, host_ones.data(), bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
-          cudaFree(device_ptr);
-          return nullptr;
-        }
-      } else {
-        if (cudaMemcpy(device_ptr, host_ones.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-          cudaFree(device_ptr);
-          return nullptr;
-        }
-      }
-
-      state.buffers.push_back(device_ptr);
-      state.largest_buffer = device_ptr;
-      state.largest_count = count;
-    }
-
-    return state.largest_buffer;
+    cudaFreeHost(p);
+  }
+  template <typename T>
+  inline IAllocatorUniquePtr<T> AllocateBufferOnCPUPinned(size_t cnt) const {
+    if (cnt == 0) return IAllocatorUniquePtr<T>(nullptr, [](T*) {});
+    size_t sz = detail::BytesForCount(cnt, std::is_void_v<T> ? 0 : sizeof(T));
+    void* p = nullptr;
+    if (cudaHostAlloc(&p, sz, cudaHostAllocDefault) != cudaSuccess) return IAllocatorUniquePtr<T>(nullptr, [](T*) {});
+    return IAllocatorUniquePtr<T>(static_cast<T*>(p), [](T* ptr) { if (ptr) cudaFreeHost(ptr); });
   }
 
+  template <typename T>
+  class CudaAsyncBuffer {
+   public:
+    CudaAsyncBuffer(const CudaKernel* ok) : gpu_(nullptr, [](T*) {}), count_(0), op_kernel_(ok) {}
+    CudaAsyncBuffer(const CudaKernel* ok, size_t n) : CudaAsyncBuffer(ok) { AllocCpuPtr(n); }
+    CudaAsyncBuffer(const CudaKernel* ok, const T& v, size_t n) : CudaAsyncBuffer(ok, n) {
+      T* p = CpuPtr();
+      for (size_t i = 0; i != n; ++i) *p++ = v;
+    }
+    CudaAsyncBuffer(const CudaKernel* ok, gsl::span<T const> vec) : CudaAsyncBuffer(ok, vec.size()) { memcpy(CpuPtr(), vec.data(), vec.size() * sizeof(T)); }
+    void AllocCpuPtr(size_t n) {
+      cpu_ = op_kernel_->AllocateBufferOnCPUPinned<T>(n);
+      if (!cpu_) throw std::runtime_error("alloc fail");
+      count_ = n;
+    }
+    Status CopyToGpu(void* s) {
+      if (cpu_) {
+        gpu_ = op_kernel_->GetScratchBuffer<T>(count_, s);
+        if (cudaMemcpyAsync(gpu_.get(), cpu_.get(), count_ * sizeof(T), cudaMemcpyHostToDevice, static_cast<cudaStream_t>(s)) != cudaSuccess) return Status(onnxruntime::common::ONNXRUNTIME, onnxruntime::common::FAIL, "Memcpy fail");
+        op_kernel_->AddDeferredReleaseCPUPtr(cpu_.release(), s);
+      }
+      return Status::OK();
+    }
+    T* CpuPtr() const { return cpu_.get(); }
+    gsl::span<T> CpuSpan() const { return gsl::span<T>(CpuPtr(), count_); }
+    T* GpuPtr() const { return gpu_.get(); }
+    size_t count() const { return count_; }
+
+   protected:
+    IAllocatorUniquePtr<T> gpu_;
+    std::unique_ptr<T, void (*)(T*)> cpu_{nullptr, [](T*) {}};
+    size_t count_;
+    const CudaKernel* op_kernel_;
+  };
+
  private:
-  OpKernelInfo info_;
+  const onnxruntime::OpKernelInfo& info_;
   cudaDeviceProp device_prop_{};
   bool use_tf32_ = true;
   int device_id_ = 0;
 };
 
+// Shims for HalfGemmOptions and CublasMathModeSetter required by fpgeneric.h
+class HalfGemmOptions {
+ public:
+  static const HalfGemmOptions* GetInstance() {
+    static HalfGemmOptions instance;
+    return &instance;
+  }
+  cublasMath_t GetMathMode() const { return CUBLAS_DEFAULT_MATH; }
+  bool IsCompute16F() const { return false; }
+#if defined(CUBLAS_COMPUTE_32F)
+  cublasComputeType_t GetComputeType() const { return CUBLAS_COMPUTE_32F; }
+#else
+  cudaDataType_t GetComputeType() const { return CUDA_R_32F; }
+#endif
+};
+
+class CublasMathModeSetter {
+ public:
+  CublasMathModeSetter(const cudaDeviceProp& prop, cublasHandle_t handle, cublasMath_t mode) {
+    (void)prop;
+    (void)handle;
+    (void)mode;
+  }
+};
+
 }  // namespace cuda
 
-#undef ONNX_OPERATOR_KERNEL_EX
-#define ONNX_OPERATOR_KERNEL_EX(...)
-
-#undef ONNX_OPERATOR_VERSIONED_KERNEL_EX
-#define ONNX_OPERATOR_VERSIONED_KERNEL_EX(...)
-
-#undef ONNX_OPERATOR_TYPED_KERNEL_EX
-#define ONNX_OPERATOR_TYPED_KERNEL_EX(...)
-
-#undef ONNX_OPERATOR_TWO_TYPED_KERNEL_EX
-#define ONNX_OPERATOR_TWO_TYPED_KERNEL_EX(...)
-
-#undef ONNX_OPERATOR_THREE_TYPED_KERNEL_EX
-#define ONNX_OPERATOR_THREE_TYPED_KERNEL_EX(...)
-
-#undef ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX
-#define ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX(...)
-
-#undef ONNX_OPERATOR_VERSIONED_TWO_TYPED_KERNEL_EX
-// These macro guards are necessary because when building as a plugin, we may include
-// framework headers that also define these macros. We use guards or undefs to ensure
-// the plugin's simplified versions are used without causing redefinition errors.
-#ifndef ONNX_OPERATOR_VERSIONED_TWO_TYPED_KERNEL_EX
-#define ONNX_OPERATOR_VERSIONED_TWO_TYPED_KERNEL_EX(...)
-#endif
+// Global aliases for convenience
+using MLFloat16 = onnxruntime::MLFloat16;
+using BFloat16 = onnxruntime::BFloat16;
+using Float8E4M3FN = onnxruntime::Float8E4M3FN;
+using Float8E4M3FNUZ = onnxruntime::Float8E4M3FNUZ;
+using Float8E5M2 = onnxruntime::Float8E5M2;
+using Float8E5M2FNUZ = onnxruntime::Float8E5M2FNUZ;
 
 }  // namespace onnxruntime

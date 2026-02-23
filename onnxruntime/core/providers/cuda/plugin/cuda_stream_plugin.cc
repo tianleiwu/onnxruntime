@@ -44,16 +44,16 @@ CudaSyncStream::~CudaSyncStream() {
 OrtStatus* CudaSyncStream::InitHandles() {
   cudaSetDevice(device_id_);
 
-  CUDA_RETURN_IF_ERROR(cudaStreamCreateWithFlags(&cuda_stream_, cudaStreamNonBlocking));
+  PL_CUDA_RETURN_IF_ERROR(cudaStreamCreateWithFlags(&cuda_stream_, cudaStreamNonBlocking));
   RegisterStream(cuda_stream_, this);
 
-  CUBLAS_RETURN_IF_ERROR(cublasCreate(&cublas_handle_));
-  CUBLAS_RETURN_IF_ERROR(cublasSetStream(cublas_handle_, cuda_stream_));
+  PL_CUBLAS_RETURN_IF_ERROR(cublasCreate(&cublas_handle_));
+  PL_CUBLAS_RETURN_IF_ERROR(cublasSetStream(cublas_handle_, cuda_stream_));
 
-  CUDNN_RETURN_IF_ERROR(cudnnCreate(&cudnn_handle_));
-  CUDNN_RETURN_IF_ERROR(cudnnSetStream(cudnn_handle_, cuda_stream_));
+  PL_CUDNN_RETURN_IF_ERROR(cudnnCreate(&cudnn_handle_));
+  PL_CUDNN_RETURN_IF_ERROR(cudnnSetStream(cudnn_handle_, cuda_stream_));
 
-  CUBLAS_RETURN_IF_ERROR(cublasLtCreate(&cublas_lt_handle_));
+  PL_CUBLAS_RETURN_IF_ERROR(cublasLtCreate(&cublas_lt_handle_));
 
   return nullptr;
 }
@@ -94,7 +94,7 @@ void CudaSyncStream::CleanupDeferredCPUBuffers() {
   printf("CudaSyncStream::FlushImpl called\n");
   fflush(stdout);
   auto* stream = static_cast<CudaSyncStream*>(this_ptr);
-  CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream->cuda_stream_));
+  PL_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream->cuda_stream_));
   return nullptr;
 }
 
@@ -102,7 +102,7 @@ void CudaSyncStream::CleanupDeferredCPUBuffers() {
   auto* stream = static_cast<CudaSyncStream*>(this_ptr);
   // Synchronize before releasing deferred CPU buffers to ensure
   // all async copies using those buffers have completed.
-  CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream->cuda_stream_));
+  PL_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream->cuda_stream_));
   stream->CleanupDeferredCPUBuffers();
   return nullptr;
 }
@@ -163,7 +163,7 @@ CudaSyncNotification::~CudaSyncNotification() {
 /*static*/ OrtStatus* ORT_API_CALL CudaSyncNotification::ActivateImpl(
     OrtSyncNotificationImpl* this_ptr) noexcept {
   auto* notif = static_cast<CudaSyncNotification*>(this_ptr);
-  CUDA_RETURN_IF_ERROR(cudaEventRecord(notif->event_, notif->stream_.GetCudaStream()));
+  PL_CUDA_RETURN_IF_ERROR(cudaEventRecord(notif->event_, notif->stream_.GetCudaStream()));
   return nullptr;
 }
 
@@ -172,14 +172,14 @@ CudaSyncNotification::~CudaSyncNotification() {
   auto* notif = static_cast<CudaSyncNotification*>(this_ptr);
   // SyncStream_GetHandle is in the main ORT API
   cudaStream_t wait_stream = static_cast<cudaStream_t>(Ort::GetApi().SyncStream_GetHandle(stream));
-  CUDA_RETURN_IF_ERROR(cudaStreamWaitEvent(wait_stream, notif->event_, 0));
+  PL_CUDA_RETURN_IF_ERROR(cudaStreamWaitEvent(wait_stream, notif->event_, 0));
   return nullptr;
 }
 
 /*static*/ OrtStatus* ORT_API_CALL CudaSyncNotification::WaitOnHostImpl(
     OrtSyncNotificationImpl* this_ptr) noexcept {
   auto* notif = static_cast<CudaSyncNotification*>(this_ptr);
-  CUDA_RETURN_IF_ERROR(cudaEventSynchronize(notif->event_));
+  PL_CUDA_RETURN_IF_ERROR(cudaEventSynchronize(notif->event_));
   return nullptr;
 }
 

@@ -23,12 +23,14 @@ set(CUDA_PLUGIN_EP_CC_SRCS
     ${CUDA_PLUGIN_EP_DIR}/cuda_stream_plugin.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/unary_elementwise_ops.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/transpose.cc
 )
 
 set(CUDA_PLUGIN_EP_CU_SRCS
     ${CUDA_PLUGIN_EP_DIR}/cuda_plugin_kernels.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations_impl.cu
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/unary_elementwise_ops_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/transpose_impl.cu
 )
 
 # Create shared library target using the ORT helper function for plugins
@@ -60,11 +62,12 @@ add_custom_target(onnxruntime_cuda_plugin_generate_registrations
 )
 add_dependencies(onnxruntime_providers_cuda_plugin onnxruntime_cuda_plugin_generate_registrations)
 
-# Set CUDA standard
+# Set CUDA standard and flags
 set_target_properties(onnxruntime_providers_cuda_plugin PROPERTIES
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
 )
+target_compile_options(onnxruntime_providers_cuda_plugin PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-Xcudafe;--diag_suppress=550>")
 
 # --- Find cuDNN (may be at a custom path via onnxruntime_CUDNN_HOME) ---
 set(_CUDNN_SEARCH_PATHS "")
@@ -132,6 +135,19 @@ else()
       CXX_VISIBILITY_PRESET hidden
   )
 endif()
+
+# Keep the ported kernel list for clarity/reuse in plugin build.
+# Do not use global source COMPILE_FLAGS here because those file properties
+# leak to other targets (e.g. onnxruntime_providers_cuda) and cause
+# redefinition errors when cuda_kernel_adapter.h is force-included there.
+set(PORTED_KERNEL_SRCS
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/unary_elementwise_ops.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/transpose.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/unary_elementwise_ops_impl.cu
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/transpose_impl.cu
+)
 
 # Set output name
 set_target_properties(onnxruntime_providers_cuda_plugin PROPERTIES

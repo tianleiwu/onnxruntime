@@ -43,10 +43,10 @@ class CudaEp : public OrtEp {
       OrtEp* this_ptr, OrtEpDataLayout* preferred_data_layout) noexcept;
 
   static OrtStatus* ORT_API_CALL OnRunStartImpl(
-      OrtEp* this_ptr, const OrtRunOptions* run_options) noexcept;
+      OrtEp* this_ptr, const ::OrtRunOptions* run_options) noexcept;
 
   static OrtStatus* ORT_API_CALL OnRunEndImpl(
-      OrtEp* this_ptr, const OrtRunOptions* run_options, bool sync_stream) noexcept;
+      OrtEp* this_ptr, const ::OrtRunOptions* run_options, bool sync_stream) noexcept;
 
   CudaEpFactory& factory_;
   std::string name_;

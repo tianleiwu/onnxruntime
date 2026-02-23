@@ -127,9 +127,9 @@ CudaDataTransfer::CudaDataTransfer(const OrtApi& ort_api, const OrtEpApi& ep_api
     if (streams != nullptr && streams[i] != nullptr) {
       cudaStream_t cuda_stream = static_cast<cudaStream_t>(
           Ort::GetApi().SyncStream_GetHandle(streams[i]));
-      CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(dst_data, src_data, bytes, copy_kind, cuda_stream));
+      PL_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(dst_data, src_data, bytes, copy_kind, cuda_stream));
     } else {
-      CUDA_RETURN_IF_ERROR(cudaMemcpy(dst_data, src_data, bytes, copy_kind));
+      PL_CUDA_RETURN_IF_ERROR(cudaMemcpy(dst_data, src_data, bytes, copy_kind));
     }
   }
 
