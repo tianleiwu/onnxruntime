@@ -269,6 +269,16 @@ using OpKernelContext = onnxruntime::OpKernelContext;
 using OpKernelInfo = onnxruntime::OpKernelInfo;
 using OpKernel = onnxruntime::OpKernel;
 
+// Guard critical adapter patterns used by Stage 4 kernels.
+static_assert(std::is_same_v<decltype(std::declval<OpKernelContext&>().Output(1, std::declval<const TensorShape&>())), Tensor*>,
+              "OpKernelContext::Output(index, shape) must support arbitrary output indices.");
+static_assert(std::is_same_v<decltype(std::declval<const OpKernelInfo&>().GetAttr<std::string>(std::declval<const std::string&>(), std::declval<std::string*>())),
+                             Status>,
+              "OpKernelInfo::GetAttr<std::string> must be available.");
+static_assert(std::is_same_v<decltype(std::declval<const OpKernelInfo&>().GetAttrs<int64_t>(std::declval<const std::string&>(), std::declval<std::vector<int64_t>&>())),
+                             Status>,
+              "OpKernelInfo::GetAttrs<int64_t> must be available.");
+
 // Additional adapter logic for CudaKernel
 class CudaKernel : public onnxruntime::OpKernel {
  public:
