@@ -26,6 +26,10 @@ CUDA_PLUGIN_EP_NAME = "CudaPluginExecutionProvider"
 enable_debug_print = False
 
 
+def _should_use_cuda_plugin_ep() -> bool:
+    return os.getenv("ORT_TEST_GQA_USE_CUDA_PLUGIN_EP", "0") == "1"
+
+
 def _get_package_root(package_name: str, directory_name: str | None = None):
     root_directory_name = directory_name or package_name
     try:
@@ -52,7 +56,13 @@ def _is_cuda_plugin_ep_built() -> bool:
 
 
 def _get_default_cuda_plugin_ep_path() -> str | None:
-    # 1) Installed wheel location (preferred for `./cuda.sh --build --install --test`).
+    # 1) Match currently imported onnxruntime module first to avoid ABI mismatch.
+    loaded_onnxruntime_root = Path(onnxrt.__file__).resolve().parent
+    loaded_candidate = loaded_onnxruntime_root / "capi" / "libonnxruntime_providers_cuda_plugin.so"
+    if loaded_candidate.exists():
+        return str(loaded_candidate)
+
+    # 2) Installed wheel location.
     for package_name in ("onnxruntime-gpu", "onnxruntime"):
         package_root = _get_package_root(package_name, "onnxruntime")
         if package_root:
@@ -60,7 +70,11 @@ def _get_default_cuda_plugin_ep_path() -> str | None:
             if os.path.exists(candidate):
                 return candidate
 
-    # 2) In-tree build location fallback.
+    # 3) In-tree build location fallback only if running with in-tree onnxruntime.
+    loaded_path_str = str(loaded_onnxruntime_root)
+    if "build/cuda/Release" not in loaded_path_str:
+        return None
+
     repo_root = Path(__file__).resolve().parents[4]
     candidate = str(repo_root / "build" / "cuda" / "Release" / "libonnxruntime_providers_cuda_plugin.so")
     if os.path.exists(candidate):
@@ -74,6 +88,9 @@ def ensure_cuda_plugin_ep_registered() -> bool:
         return _CudaPluginRegistrationState.registered
 
     _CudaPluginRegistrationState.attempted = True
+
+    if not _should_use_cuda_plugin_ep():
+        return False
 
     if not _is_cuda_plugin_ep_built():
         return False
@@ -103,5 +120,16 @@ def resolve_cuda_plugin_ep(ep: str) -> str:
     # Keep all existing test call-sites unchanged: they pass CUDA EP,
     # and we transparently route to plugin EP when it is built and loadable.
     if ep == "CUDAExecutionProvider" and ensure_cuda_plugin_ep_registered():
-        return CUDA_PLUGIN_EP_NAME
+        if _is_plugin_provider_type_available():
+            return CUDA_PLUGIN_EP_NAME
+
+        if enable_debug_print:
+            print(f"{CUDA_PLUGIN_EP_NAME} is not exposed in available provider types. Falling back to {ep}.")
     return ep
+
+
+def _is_plugin_provider_type_available() -> bool:
+    try:
+        return CUDA_PLUGIN_EP_NAME in onnxrt.get_available_providers()
+    except Exception:
+        return False
