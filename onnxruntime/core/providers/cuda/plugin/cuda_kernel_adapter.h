@@ -333,6 +333,10 @@ class CudaKernel : public onnxruntime::OpKernel {
       }
     });
   }
+  template <typename T>
+  inline IAllocatorUniquePtr<T> GetTransientScratchBuffer(size_t cnt) const {
+    return GetScratchBuffer<T>(cnt, nullptr);
+  }
   inline void AddDeferredReleaseCPUPtr(void* p, void* s) const {
     if (!p) return;
     auto* sync = cuda_plugin::CudaSyncStream::FromCudaStream(static_cast<cudaStream_t>(s));

@@ -12,6 +12,13 @@ from onnx import TensorProto, helper, save
 
 import onnxruntime as onnxrt
 
+try:
+    import faulthandler
+
+    faulthandler.enable()
+except ImportError:
+    pass
+
 
 def create_add_model(model_path):
     # Create a simple Add model: Y = A + B

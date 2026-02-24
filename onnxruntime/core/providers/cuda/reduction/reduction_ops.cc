@@ -674,6 +674,14 @@ template Status ReduceComputeCore<MLFloat16, CUDNN_REDUCE_TENSOR_NO_INDICES>(
     Stream* ort_stream,
     const TensorShape* input_shape_override);
 
+template Status ReduceComputeCore<BFloat16, CUDNN_REDUCE_TENSOR_NO_INDICES>(
+    const AllocatorPtr& gpu_allocator, const Tensor& input, PrepareReduceMetadata& prepare_reduce_metadata,
+    /*out*/ Tensor& output, cudnnReduceTensorOp_t cudnn_reduce_op,
+    gsl::span<const int64_t> axes,
+    bool calculate_log, bool calculate_sqt, bool log_sum_exp, bool fast_reduction,
+    Stream* ort_stream,
+    const TensorShape* input_shape_override);
+
 template <bool allow_multi_axes>
 template <typename T, cudnnReduceTensorIndices_t ReduceTensorIndices>
 Status ReduceKernel<allow_multi_axes>::ComputeImpl(OpKernelContext* ctx, cudnnReduceTensorOp_t cudnn_reduce_op) const {
@@ -809,6 +817,15 @@ SPECIALIZED_REDUCEKERNEL_COMPUTEIMPL(int32_t)
 SPECIALIZED_REDUCEKERNEL_COMPUTEIMPL(int64_t)
 SPECIALIZED_REDUCEKERNEL_COMPUTEIMPL(int8_t)
 SPECIALIZED_REDUCEKERNEL_COMPUTEIMPL(uint8_t)
+
+template Status ReduceKernel<true>::ComputeImpl<float, CUDNN_REDUCE_TENSOR_NO_INDICES>(OpKernelContext*, cudnnReduceTensorOp_t) const;
+template Status ReduceKernel<true>::ComputeImpl<double, CUDNN_REDUCE_TENSOR_NO_INDICES>(OpKernelContext*, cudnnReduceTensorOp_t) const;
+template Status ReduceKernel<true>::ComputeImpl<MLFloat16, CUDNN_REDUCE_TENSOR_NO_INDICES>(OpKernelContext*, cudnnReduceTensorOp_t) const;
+template Status ReduceKernel<true>::ComputeImpl<BFloat16, CUDNN_REDUCE_TENSOR_NO_INDICES>(OpKernelContext*, cudnnReduceTensorOp_t) const;
+
+template Status ReduceKernel<false>::ComputeImpl<float, CUDNN_REDUCE_TENSOR_FLATTENED_INDICES>(OpKernelContext*, cudnnReduceTensorOp_t) const;
+template Status ReduceKernel<false>::ComputeImpl<double, CUDNN_REDUCE_TENSOR_FLATTENED_INDICES>(OpKernelContext*, cudnnReduceTensorOp_t) const;
+template Status ReduceKernel<false>::ComputeImpl<MLFloat16, CUDNN_REDUCE_TENSOR_FLATTENED_INDICES>(OpKernelContext*, cudnnReduceTensorOp_t) const;
 
 namespace ReductionOps {
 

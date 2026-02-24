@@ -47,6 +47,9 @@ void AddMutableAliasesBySchemaName(const std::string& domain,
                                    const std::string& op_type,
                                    int max_inclusive_version,
                                    Ort::KernelDefBuilder& builder) {
+  if (!g_host) {
+    return;
+  }
   const auto* schema = g_host->GetSchema(op_type, max_inclusive_version, domain);
   if (!schema) {
     return;

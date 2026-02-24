@@ -24,6 +24,8 @@ set(CUDA_PLUGIN_EP_CC_SRCS
     ${CUDA_PLUGIN_EP_DIR}/provider_host_bridge.cc
     ${CUDA_PLUGIN_EP_DIR}/provider_api_shims.cc
     ${ONNXRUNTIME_ROOT}/core/providers/shared/common.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/cuda_call.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cuda/cudnn_fe_call.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/activation/activations.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/binary_elementwise_ops.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/math/clip.cc
@@ -39,6 +41,10 @@ set(CUDA_PLUGIN_EP_CC_SRCS
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/split.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/gather.cc
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/transpose.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cpu/tensor/split.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cpu/tensor/concat.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cpu/tensor/transpose.cc
+    ${ONNXRUNTIME_ROOT}/core/providers/cpu/tensor/gather.cc
 )
 
 set(CUDA_PLUGIN_EP_CU_SRCS
@@ -58,41 +64,65 @@ set(CUDA_PLUGIN_EP_CU_SRCS
     ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/transpose_impl.cu
 )
 
-# Contrib CUDA kernels required for GQA-focused ops (Task 4.5).
-file(GLOB CUDA_PLUGIN_GQA_XQA_CU_SRCS CONFIGURE_DEPENDS
-    "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/xqa/xqa_loader*.cu"
-)
-file(GLOB CUDA_PLUGIN_FLASH_ATTENTION_CU_SRCS CONFIGURE_DEPENDS
-    "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/flash_attention/flash_fwd*.cu"
-)
+if(NOT onnxruntime_DISABLE_CONTRIB_OPS)
+    # XQA and FlashAttention CUDA kernels required for GQA ops.
+    file(GLOB CUDA_PLUGIN_GQA_XQA_CU_SRCS CONFIGURE_DEPENDS
+        "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/xqa/xqa_loader*.cu"
+    )
+    file(GLOB CUDA_PLUGIN_FLASH_ATTENTION_CU_SRCS CONFIGURE_DEPENDS
+        "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/flash_attention/flash_fwd*.cu"
+    )
 
-list(APPEND CUDA_PLUGIN_EP_CC_SRCS
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/group_query_attention.cc
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/rotary_embedding.cc
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/transformer_common.cc
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/flash_attention/flash_api.cc
-)
+    list(APPEND CUDA_PLUGIN_EP_CC_SRCS
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/group_query_attention.cc
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/rotary_embedding.cc
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention.cc
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/multihead_attention.cc
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/transformer_common.cc
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention_kernel_options.cc
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/cudnn_fmha/cudnn_flash_attention.cc
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/flash_attention/flash_api.cc
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/lean_attention/lean_api.cc
+    )
 
-list(APPEND CUDA_PLUGIN_EP_CU_SRCS
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/add_bias_transpose.cu
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention_qk.cu
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention_prepare_qkv.cu
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention_kv_cache.cu
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention_softmax.cu
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention_transpose.cu
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/bert_padding.cu
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/packed_attention_impl.cu
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/packed_multihead_attention_impl.cu
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/group_query_attention_impl.cu
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/rotary_embedding_impl.cu
-    ${CUDA_PLUGIN_FLASH_ATTENTION_CU_SRCS}
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/cutlass_fmha/memory_efficient_attention.cu
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/cutlass_fmha/fmha_sm50.cu
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/cutlass_fmha/fmha_sm70.cu
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/cutlass_fmha/fmha_sm75.cu
-    ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/cutlass_fmha/fmha_sm80.cu
-    ${CUDA_PLUGIN_GQA_XQA_CU_SRCS}
-)
+    list(APPEND CUDA_PLUGIN_EP_CU_SRCS
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/add_bias_transpose.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention_qk.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention_prepare_qkv.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention_kv_cache.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention_softmax.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention_transpose.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/bert_padding.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/packed_attention_impl.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/packed_multihead_attention_impl.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/group_query_attention_impl.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/rotary_embedding_impl.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention_impl.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/fastertransformer_decoder_attention/decoder_masked_multihead_attention_impl.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/tensorrt_fused_multihead_attention/mha_runner.cu
+        ${CUDA_PLUGIN_FLASH_ATTENTION_CU_SRCS}
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/cutlass_fmha/memory_efficient_attention.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/cutlass_fmha/fmha_sm50.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/cutlass_fmha/fmha_sm70.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/cutlass_fmha/fmha_sm75.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/cutlass_fmha/fmha_sm80.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/paged_attention_impl.cu
+    )
+
+    file(GLOB CUDA_PLUGIN_XQA_CU_SRCS CONFIGURE_DEPENDS
+        "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/xqa/*.cu"
+    )
+    list(APPEND CUDA_PLUGIN_EP_CU_SRCS ${CUDA_PLUGIN_XQA_CU_SRCS})
+
+    file(GLOB CUDA_PLUGIN_TRT_FUSED_MHA_CC_SRCS CONFIGURE_DEPENDS
+        "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/tensorrt_fused_multihead_attention/*.cc"
+        "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/tensorrt_fused_multihead_attention/causal/*.cc"
+        "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/tensorrt_fused_multihead_attention/cross_attention/*.cc"
+        "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/tensorrt_fused_multihead_attention/flash_attention/*.cc"
+        "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/tensorrt_fused_multihead_attention/flash_attention_causal/*.cc"
+    )
+    list(APPEND CUDA_PLUGIN_EP_CC_SRCS ${CUDA_PLUGIN_TRT_FUSED_MHA_CC_SRCS})
+endif()
 
 # Create shared library target using the ORT helper function for plugins
 onnxruntime_add_shared_library_module(onnxruntime_providers_cuda_plugin
@@ -155,9 +185,10 @@ message(STATUS "CUDA Plugin EP: cuDNN library: ${CUDA_PLUGIN_CUDNN_LIBRARY}")
 target_include_directories(onnxruntime_providers_cuda_plugin PRIVATE
     ${REPO_ROOT}/include
     ${REPO_ROOT}/include/onnxruntime/core/session
-    ${REPO_ROOT}/onnxruntime
+    ${ONNXRUNTIME_ROOT}
     ${CUDAToolkit_INCLUDE_DIRS}
     ${CUDA_PLUGIN_CUDNN_INCLUDE_DIR}
+    ${Eigen3_SOURCE_DIR}
     ${cutlass_SOURCE_DIR}/include
     ${cutlass_SOURCE_DIR}/examples
     ${cutlass_SOURCE_DIR}/tools/util/include
