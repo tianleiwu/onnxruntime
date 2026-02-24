@@ -76,9 +76,16 @@ if(NOT onnxruntime_DISABLE_CONTRIB_OPS)
     list(APPEND CUDA_PLUGIN_EP_CC_SRCS
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/group_query_attention.cc
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/rotary_embedding.cc
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/gemma_rotary_emb.cc
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/skip_layer_norm.cc
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/embed_layer_norm.cc
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/fast_gelu.cc
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/decoder_masked_multihead_attention.cc
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention.cc
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/multihead_attention.cc
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/transformer_common.cc
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cpu/bert/bias_gelu_helper.cc
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cpu/bert/embed_layer_norm_helper.cc
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention_kernel_options.cc
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/cudnn_fmha/cudnn_flash_attention.cc
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/flash_attention/flash_api.cc
@@ -97,6 +104,9 @@ if(NOT onnxruntime_DISABLE_CONTRIB_OPS)
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/packed_multihead_attention_impl.cu
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/group_query_attention_impl.cu
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/rotary_embedding_impl.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/gemma_rotary_emb_impl.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/skip_layer_norm_impl.cu
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/embed_layer_norm_impl.cu
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention_impl.cu
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/fastertransformer_decoder_attention/decoder_masked_multihead_attention_impl.cu
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/tensorrt_fused_multihead_attention/mha_runner.cu
@@ -107,6 +117,9 @@ if(NOT onnxruntime_DISABLE_CONTRIB_OPS)
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/cutlass_fmha/fmha_sm75.cu
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/cutlass_fmha/fmha_sm80.cu
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/paged_attention_impl.cu
+        ${ONNXRUNTIME_ROOT}/core/providers/cuda/nn/layer_norm_impl.cu
+        ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/gelu_impl.cu
+        ${ONNXRUNTIME_ROOT}/core/providers/cuda/tensor/gelu_approximate_impl.cu
     )
 
     file(GLOB CUDA_PLUGIN_XQA_CU_SRCS CONFIGURE_DEPENDS

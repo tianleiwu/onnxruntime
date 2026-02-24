@@ -21,7 +21,9 @@ namespace cuda {
           .TypeConstraint("U", DataTypeImpl::GetTensorType<U>()), \
       GemmaRotaryEmbedding<T, U>);
 
+#ifndef BUILD_CUDA_EP_AS_PLUGIN
 REGISTER_KERNEL_TYPED(MLFloat16, float)
+#endif
 
 template <typename T, typename U>
 GemmaRotaryEmbedding<T, U>::GemmaRotaryEmbedding(const OpKernelInfo& info) : CudaKernel(info) {
@@ -69,6 +71,10 @@ Status GemmaRotaryEmbedding<T, U>::ComputeInternal(OpKernelContext* context) con
       seq_len,
       dim);
 }
+
+#ifdef BUILD_CUDA_EP_AS_PLUGIN
+template class GemmaRotaryEmbedding<MLFloat16, float>;
+#endif
 
 }  // namespace cuda
 }  // namespace contrib

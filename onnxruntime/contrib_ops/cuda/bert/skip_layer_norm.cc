@@ -32,9 +32,11 @@ namespace cuda {
           .TypeConstraint("T", DataTypeImpl::GetTensorType<T>()), \
       SkipLayerNorm<T, true>);
 
+#ifndef BUILD_CUDA_EP_AS_PLUGIN
 REGISTER_KERNEL_TYPED(float)
 REGISTER_KERNEL_TYPED(MLFloat16)
 REGISTER_KERNEL_TYPED(BFloat16)
+#endif
 
 using namespace ONNX_NAMESPACE;
 
@@ -43,9 +45,12 @@ SkipLayerNorm<T, Simplified>::SkipLayerNorm(const OpKernelInfo& op_kernel_info) 
   ORT_ENFORCE(op_kernel_info.GetAttr<float>("epsilon", &epsilon_).IsOK());
   ORT_ENFORCE(epsilon_ >= 0);
 
+#ifdef BUILD_CUDA_EP_AS_PLUGIN
+  strict_ = false;
+#else
   const CUDAExecutionProvider* cuda_ep = static_cast<const CUDAExecutionProvider*>(op_kernel_info.GetExecutionProvider());
-
   strict_ = cuda_ep->IsSkipLayerNormInStrictMode();
+#endif
 }
 
 template <typename T, bool Simplified>
@@ -141,6 +146,15 @@ Status SkipLayerNorm<T, Simplified>::ComputeInternal(OpKernelContext* ctx) const
   CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return Status::OK();
 }
+
+#ifdef BUILD_CUDA_EP_AS_PLUGIN
+template class SkipLayerNorm<float, false>;
+template class SkipLayerNorm<float, true>;
+template class SkipLayerNorm<MLFloat16, false>;
+template class SkipLayerNorm<MLFloat16, true>;
+template class SkipLayerNorm<BFloat16, false>;
+template class SkipLayerNorm<BFloat16, true>;
+#endif
 
 }  // namespace cuda
 }  // namespace contrib

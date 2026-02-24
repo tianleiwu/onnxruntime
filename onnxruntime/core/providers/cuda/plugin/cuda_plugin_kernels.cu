@@ -16,8 +16,13 @@
 #include "core/providers/cuda/tensor/gather.h"
 #include "core/providers/cuda/tensor/split.h"
 #include "core/providers/cuda/tensor/where.h"
+#include "contrib_ops/cuda/bert/decoder_masked_multihead_attention.h"
+#include "contrib_ops/cuda/bert/embed_layer_norm.h"
+#include "contrib_ops/cuda/bert/fast_gelu.h"
+#include "contrib_ops/cuda/bert/gemma_rotary_emb.h"
 #include "contrib_ops/cuda/bert/group_query_attention.h"
 #include "contrib_ops/cuda/bert/rotary_embedding.h"
+#include "contrib_ops/cuda/bert/skip_layer_norm.h"
 
 #include <cstring>
 #include <map>
@@ -77,6 +82,9 @@ void AddMutableAliasesBySchemaName(const std::string& domain,
 
   if (domain == "com.microsoft" && op_type == "GroupQueryAttention") {
     // present_key aliases past_key, present_value aliases past_value.
+    add_alias("past_key", "present_key");
+    add_alias("past_value", "present_value");
+  } else if (domain == "com.microsoft" && op_type == "DecoderMaskedMultiHeadAttention") {
     add_alias("past_key", "present_key");
     add_alias("past_value", "present_value");
   }
@@ -1777,10 +1785,183 @@ OrtStatus* ORT_API_CALL CreateGroupQueryAttentionKernel(void* /*state*/,
   EXCEPTION_TO_STATUS_END
 }
 
+OrtStatus* ORT_API_CALL CreateSkipLayerNormalizationKernel(void* /*state*/,
+                                                           const OrtKernelInfo* info,
+                                                           OrtKernelImpl** kernel_out) noexcept {
+  EXCEPTION_TO_STATUS_BEGIN
+  Ort::ConstKernelInfo ki(info);
+  auto input_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();
+  switch (input_type) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::SkipLayerNorm<float, false>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::SkipLayerNorm<MLFloat16, false>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::SkipLayerNorm<BFloat16, false>>(info);
+      break;
+    default:
+      return Ort::GetApi().CreateStatus(
+          ORT_EP_FAIL,
+          (std::string("SkipLayerNormalization: unsupported type ") + std::to_string(input_type)).c_str());
+  }
+  return nullptr;
+  EXCEPTION_TO_STATUS_END
+}
+
+OrtStatus* ORT_API_CALL CreateSkipSimplifiedLayerNormalizationKernel(void* /*state*/,
+                                                                     const OrtKernelInfo* info,
+                                                                     OrtKernelImpl** kernel_out) noexcept {
+  EXCEPTION_TO_STATUS_BEGIN
+  Ort::ConstKernelInfo ki(info);
+  auto input_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();
+  switch (input_type) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::SkipLayerNorm<float, true>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::SkipLayerNorm<MLFloat16, true>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::SkipLayerNorm<BFloat16, true>>(info);
+      break;
+    default:
+      return Ort::GetApi().CreateStatus(
+          ORT_EP_FAIL,
+          (std::string("SkipSimplifiedLayerNormalization: unsupported type ") + std::to_string(input_type)).c_str());
+  }
+  return nullptr;
+  EXCEPTION_TO_STATUS_END
+}
+
+OrtStatus* ORT_API_CALL CreateGemmaRotaryEmbeddingKernel(void* /*state*/,
+                                                         const OrtKernelInfo* info,
+                                                         OrtKernelImpl** kernel_out) noexcept {
+  EXCEPTION_TO_STATUS_BEGIN
+  Ort::ConstKernelInfo ki(info);
+  auto emb_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();
+  auto data_type = ki.GetInputTypeInfo(1).GetTensorTypeAndShapeInfo().GetElementType();
+  if (emb_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
+      data_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+    *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::GemmaRotaryEmbedding<MLFloat16, float>>(info);
+    return nullptr;
+  }
+  return Ort::GetApi().CreateStatus(
+      ORT_EP_FAIL,
+      (std::string("GemmaRotaryEmbedding: unsupported type combination emb=") +
+       std::to_string(emb_type) + ", data=" + std::to_string(data_type))
+          .c_str());
+  EXCEPTION_TO_STATUS_END
+}
+
+OrtStatus* ORT_API_CALL CreateEmbedLayerNormalizationKernel(void* /*state*/,
+                                                            const OrtKernelInfo* info,
+                                                            OrtKernelImpl** kernel_out) noexcept {
+  EXCEPTION_TO_STATUS_BEGIN
+  Ort::ConstKernelInfo ki(info);
+  auto emb_type = ki.GetInputTypeInfo(2).GetTensorTypeAndShapeInfo().GetElementType();
+  switch (emb_type) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::EmbedLayerNorm<float>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::EmbedLayerNorm<MLFloat16>>(info);
+      break;
+    default:
+      return Ort::GetApi().CreateStatus(
+          ORT_EP_FAIL,
+          (std::string("EmbedLayerNormalization: unsupported type ") + std::to_string(emb_type)).c_str());
+  }
+  return nullptr;
+  EXCEPTION_TO_STATUS_END
+}
+
+OrtStatus* ORT_API_CALL CreateFastGeluKernel(void* /*state*/,
+                                             const OrtKernelInfo* info,
+                                             OrtKernelImpl** kernel_out) noexcept {
+  EXCEPTION_TO_STATUS_BEGIN
+  Ort::ConstKernelInfo ki(info);
+  auto input_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();
+  switch (input_type) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::FastGelu<float>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::FastGelu<MLFloat16>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::FastGelu<BFloat16>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::FastGelu<double>>(info);
+      break;
+    default:
+      return Ort::GetApi().CreateStatus(
+          ORT_EP_FAIL,
+          (std::string("FastGelu: unsupported type ") + std::to_string(input_type)).c_str());
+  }
+  return nullptr;
+  EXCEPTION_TO_STATUS_END
+}
+
+OrtStatus* ORT_API_CALL CreateDecoderMaskedMultiHeadAttentionKernel(void* /*state*/,
+                                                                    const OrtKernelInfo* info,
+                                                                    OrtKernelImpl** kernel_out) noexcept {
+  EXCEPTION_TO_STATUS_BEGIN
+  Ort::ConstKernelInfo ki(info);
+  const auto t_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();
+
+  ONNXTensorElementDataType qk_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+  for (size_t i = 0; i < ki.GetOutputCount(); ++i) {
+    if (ki.GetOutputName(i) == "qk") {
+      qk_type = ki.GetOutputTypeInfo(i).GetTensorTypeAndShapeInfo().GetElementType();
+      break;
+    }
+  }
+  if (qk_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED) {
+    // qk is optional and can be omitted when output_qk == 0.
+    qk_type = t_type;
+  }
+
+  if (t_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    if (qk_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::DecoderMaskedMultiHeadAttention<float, float>>(info);
+      return nullptr;
+    }
+    if (qk_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::DecoderMaskedMultiHeadAttention<float, MLFloat16>>(info);
+      return nullptr;
+    }
+  } else if (t_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+    if (qk_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::DecoderMaskedMultiHeadAttention<MLFloat16, float>>(info);
+      return nullptr;
+    }
+    if (qk_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::DecoderMaskedMultiHeadAttention<MLFloat16, MLFloat16>>(info);
+      return nullptr;
+    }
+  }
+
+  return Ort::GetApi().CreateStatus(
+      ORT_EP_FAIL,
+      (std::string("DecoderMaskedMultiHeadAttention: unsupported type combination T=") +
+       std::to_string(t_type) + ", QK=" + std::to_string(qk_type))
+          .c_str());
+  EXCEPTION_TO_STATUS_END
+}
+
 PluginKernelCreateFn GetCreateFnForOp(std::string_view op_type, std::string_view domain = "") {
   if (domain == "com.microsoft") {
+    if (op_type == "DecoderMaskedMultiHeadAttention") return CreateDecoderMaskedMultiHeadAttentionKernel;
+    if (op_type == "EmbedLayerNormalization") return CreateEmbedLayerNormalizationKernel;
+    if (op_type == "FastGelu") return CreateFastGeluKernel;
+    if (op_type == "GemmaRotaryEmbedding") return CreateGemmaRotaryEmbeddingKernel;
     if (op_type == "GroupQueryAttention") return CreateGroupQueryAttentionKernel;
     if (op_type == "RotaryEmbedding") return CreateRotaryEmbeddingKernel;
+    if (op_type == "SkipLayerNormalization") return CreateSkipLayerNormalizationKernel;
+    if (op_type == "SkipSimplifiedLayerNormalization") return CreateSkipSimplifiedLayerNormalizationKernel;
   }
 
   if (op_type == "Relu") return CreateReluKernel;

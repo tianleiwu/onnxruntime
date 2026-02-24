@@ -45,10 +45,12 @@ static constexpr int kBiasIndex = 10;
           .InputMemoryType(OrtMemTypeCPUInput, kBeamWidthInputIndex),         \
       DecoderMaskedMultiHeadAttention<T, QK>);
 
+#ifndef BUILD_CUDA_EP_AS_PLUGIN
 REGISTER_KERNEL_TYPED(float, float)
 REGISTER_KERNEL_TYPED(float, MLFloat16)
 REGISTER_KERNEL_TYPED(MLFloat16, float)
 REGISTER_KERNEL_TYPED(MLFloat16, MLFloat16)
+#endif
 
 template <typename T, typename QK>
 DecoderMaskedMultiHeadAttention<T, QK>::DecoderMaskedMultiHeadAttention(const OpKernelInfo& info) : CudaKernel(info) {
@@ -269,6 +271,13 @@ Status DecoderMaskedMultiHeadAttention<T, QK>::ComputeInternal(OpKernelContext* 
   }
   return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "DecoderMaskedMultiHeadAttention is only implemented for float32 and float16.");
 }
+
+#ifdef BUILD_CUDA_EP_AS_PLUGIN
+template class DecoderMaskedMultiHeadAttention<float, float>;
+template class DecoderMaskedMultiHeadAttention<float, MLFloat16>;
+template class DecoderMaskedMultiHeadAttention<MLFloat16, float>;
+template class DecoderMaskedMultiHeadAttention<MLFloat16, MLFloat16>;
+#endif
 
 }  // namespace cuda
 }  // namespace contrib

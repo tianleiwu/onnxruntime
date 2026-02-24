@@ -23,10 +23,12 @@ namespace cuda {
           .TypeConstraint("T", DataTypeImpl::GetTensorType<T>()), \
       FastGelu<T>);
 
+#ifndef BUILD_CUDA_EP_AS_PLUGIN
 REGISTER_KERNEL_TYPED(float)
 REGISTER_KERNEL_TYPED(MLFloat16)
 REGISTER_KERNEL_TYPED(BFloat16)
 REGISTER_KERNEL_TYPED(double)
+#endif
 
 using namespace ONNX_NAMESPACE;
 
@@ -60,6 +62,13 @@ Status FastGelu<T>::ComputeInternal(OpKernelContext* context) const {
                                      reinterpret_cast<CudaT*>(output->MutableData<T>()),
                                      use_half2_);
 }
+
+#ifdef BUILD_CUDA_EP_AS_PLUGIN
+template class FastGelu<float>;
+template class FastGelu<MLFloat16>;
+template class FastGelu<BFloat16>;
+template class FastGelu<double>;
+#endif
 
 }  // namespace cuda
 }  // namespace contrib

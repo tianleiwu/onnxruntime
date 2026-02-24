@@ -21,8 +21,10 @@ namespace cuda {
           .TypeConstraint("T", DataTypeImpl::GetTensorType<T>()), \
       EmbedLayerNorm<T>);
 
+#ifndef BUILD_CUDA_EP_AS_PLUGIN
 REGISTER_KERNEL_TYPED(float)
 REGISTER_KERNEL_TYPED(MLFloat16)
+#endif
 
 using namespace ONNX_NAMESPACE;
 
@@ -84,6 +86,11 @@ Status EmbedLayerNorm<T>::ComputeInternal(OpKernelContext* context) const {
       position_ids == nullptr ? nullptr : position_ids->Data<int32_t>(),
       broadcast_position_ids);
 }
+
+#ifdef BUILD_CUDA_EP_AS_PLUGIN
+template class EmbedLayerNorm<float>;
+template class EmbedLayerNorm<MLFloat16>;
+#endif
 
 }  // namespace cuda
 }  // namespace contrib
