@@ -27,9 +27,11 @@ namespace cuda {
           .TypeConstraint("M", DataTypeImpl::GetTensorType<int64_t>()), \
       RotaryEmbedding<T>);
 
+#ifndef BUILD_CUDA_EP_AS_PLUGIN
 REGISTER_KERNEL_TYPED(float)
 REGISTER_KERNEL_TYPED(MLFloat16)
 REGISTER_KERNEL_TYPED(BFloat16)
+#endif
 
 template <typename T>
 RotaryEmbedding<T>::RotaryEmbedding(const OpKernelInfo& info) : CudaKernel(info) {
@@ -86,6 +88,11 @@ Status RotaryEmbedding<T>::ComputeInternal(OpKernelContext* context) const {
       parameters.transposed);
 }
 
+template class RotaryEmbedding<float>;
+template class RotaryEmbedding<MLFloat16>;
+template class RotaryEmbedding<BFloat16>;
+
 }  // namespace cuda
 }  // namespace contrib
+
 }  // namespace onnxruntime

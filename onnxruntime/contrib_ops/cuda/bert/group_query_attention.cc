@@ -59,6 +59,7 @@ KVQuantizationType StringToKVQuantizationType(std::string s) {
           .InputMemoryType(OrtMemTypeCPUInput, 6), /* total_sequence_length */        \
       GroupQueryAttention<T, U>);
 
+#ifndef BUILD_CUDA_EP_AS_PLUGIN
 REGISTER_KERNEL_TYPED(MLFloat16, MLFloat16)
 REGISTER_KERNEL_TYPED(BFloat16, BFloat16)
 REGISTER_KERNEL_TYPED(MLFloat16, int8_t)
@@ -70,6 +71,7 @@ REGISTER_KERNEL_TYPED(BFloat16, Float8E4M3FN)
 #ifdef USE_INT4_KV_CACHE
 REGISTER_KERNEL_TYPED(MLFloat16, uint8_t)
 REGISTER_KERNEL_TYPED(BFloat16, uint8_t)
+#endif
 #endif
 
 constexpr const char* kDisableFlashDecode = "ORT_DISABLE_FLASH_DECODE";
@@ -516,6 +518,31 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
                      std::is_same<T, BFloat16>::value);
   }
 
+#if DUMP_TENSOR_LEVEL > 0
+    std::cerr << "[GQA_DEBUG] node=" << this->Node().Name()
+              << " packed=" << static_cast<int>(parameters.is_packed_qkv)
+              << " first_prompt=" << static_cast<int>(parameters.is_first_prompt)
+              << " share_buffer=" << static_cast<int>(parameters.past_present_share_buffer)
+              << " flash=" << static_cast<int>(data.use_flash_attention)
+              << " flash_fast_decode=" << static_cast<int>(data.use_flash_attention_fast_decode)
+              << " xqa=" << static_cast<int>(data.use_xqa)
+              << " mem_efficient=" << static_cast<int>(data.use_memory_efficient_attention)
+              << " k_quant=" << static_cast<int>(parameters.k_quant_type)
+              << " v_quant=" << static_cast<int>(parameters.v_quant_type)
+              << " kv_bit_width=" << parameters.kv_cache_bit_width
+              << " q_seq=" << parameters.sequence_length
+              << " total_seq=" << parameters.total_sequence_length
+              << " past_seq_cache=" << parameters.seqlen_past_kv_cache
+              << " present_seq_cache=" << parameters.seqlen_present_kv_cache
+              << " past_key=" << static_cast<const void*>(data.past_key)
+              << " present_key=" << static_cast<const void*>(data.present_key)
+              << " past_value=" << static_cast<const void*>(data.past_value)
+              << " present_value=" << static_cast<const void*>(data.present_value)
+              << " k_scale=" << static_cast<const void*>(data.k_scale)
+              << " v_scale=" << static_cast<const void*>(data.v_scale)
+              << std::endl;
+#endif
+
   // Validate past_value pointer consistency (past_present_share_buffer was computed early after pointer setup)
   if (parameters.past_present_share_buffer) {
     ORT_ENFORCE(data.past_value == data.present_value, "past_value and present_value must be the same tensor when past_present_share_buffer is true");
@@ -559,6 +586,19 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
       device_prop, cublas, context->GetComputeStream(), parameters, data)));
   return Status::OK();
 }
+
+template class GroupQueryAttention<MLFloat16, MLFloat16>;
+template class GroupQueryAttention<BFloat16, BFloat16>;
+template class GroupQueryAttention<MLFloat16, int8_t>;
+template class GroupQueryAttention<BFloat16, int8_t>;
+#ifdef USE_INT4_KV_CACHE
+template class GroupQueryAttention<MLFloat16, uint8_t>;
+template class GroupQueryAttention<BFloat16, uint8_t>;
+#endif
+#ifdef USE_FP8_KV_CACHE
+template class GroupQueryAttention<MLFloat16, Float8E4M3FN>;
+template class GroupQueryAttention<BFloat16, Float8E4M3FN>;
+#endif
 
 }  // namespace cuda
 }  // namespace contrib
