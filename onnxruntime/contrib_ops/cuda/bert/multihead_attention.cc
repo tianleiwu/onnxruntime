@@ -560,6 +560,14 @@ Status MultiHeadAttention<T, QK>::ComputeInternal(OpKernelContext* context) cons
       device_prop, cublas, cudnn, context->GetComputeStream(), parameters, data);
 }
 
+template class MultiHeadAttention<float, float>;
+template class MultiHeadAttention<float, MLFloat16>;
+template class MultiHeadAttention<MLFloat16, float>;
+template class MultiHeadAttention<MLFloat16, MLFloat16>;
+template class MultiHeadAttention<float, BFloat16>;
+template class MultiHeadAttention<BFloat16, float>;
+template class MultiHeadAttention<BFloat16, BFloat16>;
+
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime

@@ -84,6 +84,7 @@ if(NOT onnxruntime_DISABLE_CONTRIB_OPS)
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention.cc
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/multihead_attention.cc
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/transformer_common.cc
+        ${ONNXRUNTIME_ROOT}/contrib_ops/cpu/bert/attention_base.cc
         ${ONNXRUNTIME_ROOT}/contrib_ops/cpu/bert/bias_gelu_helper.cc
         ${ONNXRUNTIME_ROOT}/contrib_ops/cpu/bert/embed_layer_norm_helper.cc
         ${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/attention_kernel_options.cc

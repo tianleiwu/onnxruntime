@@ -21,8 +21,10 @@
 #include "contrib_ops/cuda/bert/fast_gelu.h"
 #include "contrib_ops/cuda/bert/gemma_rotary_emb.h"
 #include "contrib_ops/cuda/bert/group_query_attention.h"
+#include "contrib_ops/cuda/bert/multihead_attention.h"
 #include "contrib_ops/cuda/bert/rotary_embedding.h"
 #include "contrib_ops/cuda/bert/skip_layer_norm.h"
+#include "contrib_ops/cuda/bert/attention.h"
 
 #include <cstring>
 #include <map>
@@ -1785,6 +1787,91 @@ OrtStatus* ORT_API_CALL CreateGroupQueryAttentionKernel(void* /*state*/,
   EXCEPTION_TO_STATUS_END
 }
 
+OrtStatus* ORT_API_CALL CreateAttentionKernel(void* /*state*/,
+                                              const OrtKernelInfo* info,
+                                              OrtKernelImpl** kernel_out) noexcept {
+  EXCEPTION_TO_STATUS_BEGIN
+  Ort::ConstKernelInfo ki(info);
+  auto input_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();
+  switch (input_type) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::Attention<float>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::Attention<MLFloat16>>(info);
+      break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::Attention<BFloat16>>(info);
+      break;
+    default:
+      return Ort::GetApi().CreateStatus(
+          ORT_EP_FAIL,
+          (std::string("Attention: unsupported type ") + std::to_string(input_type)).c_str());
+  }
+  return nullptr;
+  EXCEPTION_TO_STATUS_END
+}
+
+OrtStatus* ORT_API_CALL CreateMultiHeadAttentionKernel(void* /*state*/,
+                                                       const OrtKernelInfo* info,
+                                                       OrtKernelImpl** kernel_out) noexcept {
+  EXCEPTION_TO_STATUS_BEGIN
+  Ort::ConstKernelInfo ki(info);
+  const auto t_type = ki.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();
+
+  ONNXTensorElementDataType qk_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+  for (size_t i = 0; i < ki.GetOutputCount(); ++i) {
+    if (ki.GetOutputName(i) == "qk") {
+      qk_type = ki.GetOutputTypeInfo(i).GetTensorTypeAndShapeInfo().GetElementType();
+      break;
+    }
+  }
+  if (qk_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED) {
+    // qk is optional and can be omitted when output_qk == 0.
+    qk_type = t_type;
+  }
+
+  if (t_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    if (qk_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::MultiHeadAttention<float, float>>(info);
+      return nullptr;
+    }
+    if (qk_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::MultiHeadAttention<float, MLFloat16>>(info);
+      return nullptr;
+    }
+    if (qk_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16) {
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::MultiHeadAttention<float, BFloat16>>(info);
+      return nullptr;
+    }
+  } else if (t_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+    if (qk_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::MultiHeadAttention<MLFloat16, float>>(info);
+      return nullptr;
+    }
+    if (qk_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::MultiHeadAttention<MLFloat16, MLFloat16>>(info);
+      return nullptr;
+    }
+  } else if (t_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16) {
+    if (qk_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::MultiHeadAttention<BFloat16, float>>(info);
+      return nullptr;
+    }
+    if (qk_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16) {
+      *kernel_out = new AdapterKernelImpl<onnxruntime::contrib::cuda::MultiHeadAttention<BFloat16, BFloat16>>(info);
+      return nullptr;
+    }
+  }
+
+  return Ort::GetApi().CreateStatus(
+      ORT_EP_FAIL,
+      (std::string("MultiHeadAttention: unsupported type combination T=") +
+       std::to_string(t_type) + ", QK=" + std::to_string(qk_type))
+          .c_str());
+  EXCEPTION_TO_STATUS_END
+}
+
 OrtStatus* ORT_API_CALL CreateSkipLayerNormalizationKernel(void* /*state*/,
                                                            const OrtKernelInfo* info,
                                                            OrtKernelImpl** kernel_out) noexcept {
@@ -1954,11 +2041,13 @@ OrtStatus* ORT_API_CALL CreateDecoderMaskedMultiHeadAttentionKernel(void* /*stat
 
 PluginKernelCreateFn GetCreateFnForOp(std::string_view op_type, std::string_view domain = "") {
   if (domain == "com.microsoft") {
+    if (op_type == "Attention") return CreateAttentionKernel;
     if (op_type == "DecoderMaskedMultiHeadAttention") return CreateDecoderMaskedMultiHeadAttentionKernel;
     if (op_type == "EmbedLayerNormalization") return CreateEmbedLayerNormalizationKernel;
     if (op_type == "FastGelu") return CreateFastGeluKernel;
     if (op_type == "GemmaRotaryEmbedding") return CreateGemmaRotaryEmbeddingKernel;
     if (op_type == "GroupQueryAttention") return CreateGroupQueryAttentionKernel;
+    if (op_type == "MultiHeadAttention") return CreateMultiHeadAttentionKernel;
     if (op_type == "RotaryEmbedding") return CreateRotaryEmbeddingKernel;
     if (op_type == "SkipLayerNormalization") return CreateSkipLayerNormalizationKernel;
     if (op_type == "SkipSimplifiedLayerNormalization") return CreateSkipSimplifiedLayerNormalizationKernel;

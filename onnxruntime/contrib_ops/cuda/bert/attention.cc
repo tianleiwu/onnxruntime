@@ -316,6 +316,10 @@ Status Attention<T>::ComputeInternal(OpKernelContext* context) const {
   return QkvToContext<CudaT>(device_prop, cublas, cudnn, context->GetComputeStream(), parameters, data);
 }
 
+template class Attention<float>;
+template class Attention<MLFloat16>;
+template class Attention<BFloat16>;
+
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime
