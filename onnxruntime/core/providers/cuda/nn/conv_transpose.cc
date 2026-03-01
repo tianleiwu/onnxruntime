@@ -226,8 +226,7 @@ template <typename T, bool Layout>
 Status ConvTranspose<T, Layout>::UpdateState(OpKernelContext* context, bool dynamic_padding) const {
   constexpr bool channels_last = Layout == LAYOUT_NHWC;
 
-  size_t num_inputs = OpKernel::Node().InputDefs().size();
-  bool has_bias = dynamic_padding ? num_inputs == 4 : num_inputs == 3;
+  // We will determine has_bias when examining the B tensor directly.
 
   // set X
   const Tensor* X = context->Input<Tensor>(0);
@@ -256,9 +255,9 @@ Status ConvTranspose<T, Layout>::UpdateState(OpKernelContext* context, bool dyna
 
   // set B
   // Always in NCHW format
-  const Tensor* B = nullptr;
+  const Tensor* B = context->Input<Tensor>(dynamic_padding ? 3 : 2);
+  bool has_bias = B != nullptr;
   if (has_bias) {
-    B = context->Input<Tensor>(dynamic_padding ? 3 : 2);
     s_.b_data = reinterpret_cast<const CudaT*>(B->Data<T>());
   } else {
     s_.b_data = nullptr;
@@ -483,7 +482,7 @@ Status ConvTranspose<T, Layout>::DoConvTranspose(OpKernelContext* context, bool 
       CUDA_RETURN_IF_ERROR(cudaMemset(s_.y_data, 0, s_.Y->SizeInBytes()));
     }
   }
-  auto ws = GetWorkSpace(context->GetComputeStream());
+  auto ws = GetWorkSpace(GetScratchStream(context));
 
   CUDNN_FE_RETURN_IF_ERROR(s_.cudnn_fe_graph->execute(cudnn_handle,
                                                       s_.variant_pack,

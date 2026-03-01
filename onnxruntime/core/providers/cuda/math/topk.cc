@@ -61,13 +61,23 @@ TopK<inputk>::TopK(const OpKernelInfo& info) : CudaKernel(info) {
 }
 
 #define IS_PRIM_TYPE(T) utils::IsPrimitiveDataType<T>(prim_type)
+#ifndef BUILD_CUDA_EP_AS_PLUGIN
 #define TOPKIMPL(T) TopKImpl<T>(this, use_deterministic_compute,                   \
-                                ctx->GetComputeStream(), tensor_X->Data<T>(),      \
+                                GetScratchStream(ctx), tensor_X->Data<T>(),        \
                                 static_cast<T*>(tensor_V->MutableDataRaw()),       \
                                 static_cast<int64_t*>(tensor_I->MutableDataRaw()), \
                                 elem_nums_cuda,                                    \
                                 elem_nums.size(),                                  \
                                 axis, k_value, largest_, sorted_, N, dimension)
+#else
+#define TOPKIMPL(T) TopKImpl<T>(this, use_deterministic_compute,                   \
+                                Stream(ctx), tensor_X->Data<T>(),                  \
+                                static_cast<T*>(tensor_V->MutableDataRaw()),       \
+                                static_cast<int64_t*>(tensor_I->MutableDataRaw()), \
+                                elem_nums_cuda,                                    \
+                                elem_nums.size(),                                  \
+                                axis, k_value, largest_, sorted_, N, dimension)
+#endif
 
 template <bool inputk>
 Status TopK<inputk>::ComputeInternal(OpKernelContext* ctx) const {

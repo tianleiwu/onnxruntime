@@ -16,23 +16,6 @@
 
 // Error handling macros
 
-#ifndef RETURN_IF_ERROR
-#define RETURN_IF_ERROR(expr)               \
-  do {                                      \
-    OrtStatus* _status = (expr);            \
-    if (_status != nullptr) return _status; \
-  } while (0)
-#endif
-
-#ifndef RETURN_IF
-#define RETURN_IF(condition, ort_api, message)             \
-  do {                                                     \
-    if (condition) {                                       \
-      return (ort_api).CreateStatus(ORT_EP_FAIL, message); \
-    }                                                      \
-  } while (0)
-#endif
-
 #ifndef PL_CUDA_RETURN_IF_ERROR
 #define PL_CUDA_RETURN_IF_ERROR(cuda_call_expr)                               \
   do {                                                                        \

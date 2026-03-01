@@ -398,14 +398,22 @@ __global__ void ExcludeOutput(T* output_i, T K, T dimension) {
 }
 
 template <typename T>
+#ifndef BUILD_CUDA_EP_AS_PLUGIN
 Status TopKImpl(const CudaKernel* kernel, bool use_deterministic_compute,
-                Stream* ort_stream, const T* input_x, T* output_v, int64_t* output_i,
+                onnxruntime::Stream* ort_stream, const T* input_x, T* output_v, int64_t* output_i,
+#else
+Status TopKImpl(const CudaKernel* kernel, bool use_deterministic_compute,
+                cudaStream_t stream, const T* input_x, T* output_v, int64_t* output_i,
+#endif
                 const TArray<int64_t>& elem_nums, size_t size, int32_t axis, int64_t K, int64_t largest,
                 int64_t sorted, int64_t N, int64_t dimension) {
   typedef typename ToCudaType<T>::MappedType CudaT;
   const CudaT* input_x_ptr = reinterpret_cast<const CudaT*>(input_x);
   CudaT* output_v_ptr = reinterpret_cast<CudaT*>(output_v);
+
+#ifndef BUILD_CUDA_EP_AS_PLUGIN
   cudaStream_t stream = ort_stream ? static_cast<cudaStream_t>(ort_stream->GetHandle()) : nullptr;
+#endif
 
   auto aligned_K = ALIGN(K);
   auto aligned_dimension = ALIGN(dimension);
@@ -440,17 +448,28 @@ Status TopKImpl(const CudaKernel* kernel, bool use_deterministic_compute,
           NumericLimits<CudaT>::Lowest(), NumericLimits<CudaT>::Max());
     }
   } else {
+#ifndef BUILD_CUDA_EP_AS_PLUGIN
     auto input_key_buffer = kernel->GetScratchBuffer<CudaT>(dimension, ort_stream);
     auto output_key_buffer = kernel->GetScratchBuffer<CudaT>(dimension, ort_stream);
     auto input_value_buffer = kernel->GetScratchBuffer<int64_t>(dimension, ort_stream);
     auto output_value_buffer = kernel->GetScratchBuffer<int64_t>(dimension, ort_stream);
+#else
+    auto input_key_buffer = kernel->GetScratchBuffer<CudaT>(dimension, stream);
+    auto output_key_buffer = kernel->GetScratchBuffer<CudaT>(dimension, stream);
+    auto input_value_buffer = kernel->GetScratchBuffer<int64_t>(dimension, stream);
+    auto output_value_buffer = kernel->GetScratchBuffer<int64_t>(dimension, stream);
+#endif
     auto* input_key = input_key_buffer.get();
     auto* output_key = output_key_buffer.get();
     auto* input_value = input_value_buffer.get();
     auto* output_value = output_value_buffer.get();
     size_t temp_bytes = 0;
     CUDA_RETURN_IF_ERROR(cub::DeviceRadixSort::SortPairs(nullptr, temp_bytes, input_key, output_key, input_value, output_value, dimension, 0, sizeof(T) * 8, stream));
+#ifndef BUILD_CUDA_EP_AS_PLUGIN
     auto temp_storage_buffer = kernel->GetScratchBuffer<char>(temp_bytes, ort_stream);
+#else
+    auto temp_storage_buffer = kernel->GetScratchBuffer<char>(temp_bytes, stream);
+#endif
     auto* temp_storage = temp_storage_buffer.get();
     auto blocks_per_grid_D = (int)(ceil(static_cast<float>(dimension) / BT));
     auto blocks_per_grid_K = (int)(ceil(static_cast<float>(K) / BT));
@@ -470,9 +489,10 @@ Status TopKImpl(const CudaKernel* kernel, bool use_deterministic_compute,
   return Status::OK();
 }
 
+#ifndef BUILD_CUDA_EP_AS_PLUGIN
 #define TOPKIMPLE(T) template Status TopKImpl<T>(const CudaKernel* kernel,         \
                                                  bool use_deterministic_compute,   \
-                                                 Stream* ort_stream,               \
+                                                 onnxruntime::Stream* ort_stream,  \
                                                  const T* input_x,                 \
                                                  T* output_v,                      \
                                                  int64_t* output_i,                \
@@ -484,6 +504,22 @@ Status TopKImpl(const CudaKernel* kernel, bool use_deterministic_compute,
                                                  int64_t sorted,                   \
                                                  int64_t N,                        \
                                                  int64_t dimension)
+#else
+#define TOPKIMPLE(T) template Status TopKImpl<T>(const CudaKernel* kernel,         \
+                                                 bool use_deterministic_compute,   \
+                                                 cudaStream_t stream,              \
+                                                 const T* input_x,                 \
+                                                 T* output_v,                      \
+                                                 int64_t* output_i,                \
+                                                 const TArray<int64_t>& elem_nums, \
+                                                 size_t size,                      \
+                                                 int32_t axis,                     \
+                                                 int64_t K,                        \
+                                                 int64_t largest,                  \
+                                                 int64_t sorted,                   \
+                                                 int64_t N,                        \
+                                                 int64_t dimension)
+#endif
 
 // This file is causing excessive long compilation time. Split all those compilations into multiple
 // translation units to speed it up.

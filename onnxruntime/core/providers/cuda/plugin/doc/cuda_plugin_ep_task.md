@@ -443,7 +443,8 @@ Refactor `cuda_kernel_adapter.h` to inherit from `adapter::OpKernel` (from `ep/a
 # Quick rebuild + plugin test only
 ./cuda_plugin.sh --build --test_plugin
 
-# Non plugin build and test to ensure backward compatibility
+# If you change files except those under onnxruntime/core/providers/cuda/plugin (This directory are excluded from non-plugin build),
+# you need run non plugin build and test to ensure backward compatibility
 ./cuda.sh --build --test
 
 # Audit for legacy references

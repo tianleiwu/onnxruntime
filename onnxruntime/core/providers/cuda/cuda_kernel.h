@@ -80,6 +80,12 @@ class CudaKernel : public OpKernel {
     return stream ? static_cast<cudaStream_t>(stream->GetHandle()) : nullptr;
   }
 
+  // Returns the compute stream pointer in the type expected by GetScratchBuffer.
+  // In the framework build, GetScratchBuffer expects onnxruntime::Stream*.
+  inline onnxruntime::Stream* GetScratchStream(OpKernelContext* ctx) const {
+    return ctx->GetComputeStream();
+  }
+
   inline cudnnHandle_t GetCudnnHandle(OpKernelContext* ctx) const {
     return GetCudnnHandle(static_cast<CudaStream*>(ctx->GetComputeStream()));
   }

@@ -26,6 +26,11 @@ struct Node {
     return kernel_info_.GetOperatorType();
   }
 
+  /** Gets the Node's domain. */
+  const std::string Domain() const {
+    return kernel_info_.GetOperatorDomain();
+  }
+
   /** Gets the since version of the operator. */
   int SinceVersion() const noexcept {
     return kernel_info_.GetOperatorSinceVersion();

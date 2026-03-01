@@ -267,15 +267,13 @@ OrtStatus* CreateCudaKernelRegistryFromOrtTables(const OrtEpApi& ep_api,
   // Map: key -> { constraint_name -> set of type enums }
   std::map<KernelDefKey, std::map<std::string, std::set<ONNXTensorElementDataType>>> grouped;
 
-  // Use PluginRegistry for O(log n) per-key lookup (keyed by op+domain+since+end).
-  const auto& plugin_map = onnxruntime::cuda::PluginRegistry::Instance().AllEntries();
-
   for (const auto& reg : kAdapterRegistrations) {
     std::string domain = reg.domain ? reg.domain : "";
-    onnxruntime::cuda::PluginRegistry::EntryKey lookup_key{
-        reg.op_type, domain, reg.since_version_start, reg.since_version_end};
-    if (plugin_map.find(lookup_key) == plugin_map.end()) {
-      continue;  // Op not implemented via new registration — skip
+
+    // Check if a kernel factory exists for this op
+    auto create_fn = ResolvePluginKernelCreateFn(reg.op_type, domain);
+    if (!create_fn) {
+      continue;  // Op not implemented — skip
     }
 
     KernelDefKey key{
@@ -296,10 +294,8 @@ OrtStatus* CreateCudaKernelRegistryFromOrtTables(const OrtEpApi& ep_api,
 
   // Build and register kernel defs from grouped data.
   for (const auto& [key, constraints] : grouped) {
-    onnxruntime::cuda::PluginRegistry::EntryKey lookup_key{
-        key.op_type, key.domain, key.since_version_start, key.since_version_end};
-    auto it = plugin_map.find(lookup_key);
-    if (it == plugin_map.end()) continue;
+    auto create_fn = ResolvePluginKernelCreateFn(key.op_type, key.domain);
+    if (!create_fn) continue;
 
     Ort::KernelDefBuilder builder;
     builder.SetOperatorType(key.op_type.c_str());
@@ -323,9 +319,7 @@ OrtStatus* CreateCudaKernelRegistryFromOrtTables(const OrtEpApi& ep_api,
     }
 
     Ort::KernelDef kernel_def = builder.Build();
-    // context is &it->second (const KernelFactory*). std::map values have stable
-    // addresses. Casting object pointer to void* is valid C++ (no fn-ptr cast).
-    RETURN_IF_ERROR(registry.AddKernel(kernel_def.release(), onnxruntime::cuda::GenericCreateKernel, (void*)(&it->second)));
+    RETURN_IF_ERROR(registry.AddKernel(kernel_def.release(), reinterpret_cast<OrtKernelCreateFunc>(create_fn), nullptr));
   }
 
   *out_registry = registry.release();

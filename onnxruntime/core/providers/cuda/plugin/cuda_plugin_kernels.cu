@@ -27,7 +27,8 @@
 #include "contrib_ops/cuda/bert/attention.h"
 #include "contrib_ops/cuda/moe/moe.h"
 #include "contrib_ops/cuda/quantization/gather_block_quantized.h"
-#include "contrib_ops/cuda/quantization/matmul_nbits.h"
+// matmul_nbits.h excluded: uses InputDefs() not available in adapter Node.
+// #include "contrib_ops/cuda/quantization/matmul_nbits.h"
 #include "contrib_ops/cuda/quantization/moe_quantization.h"
 
 #include <cstring>

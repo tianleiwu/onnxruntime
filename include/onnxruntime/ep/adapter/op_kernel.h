@@ -35,7 +35,7 @@ struct OpKernel {
   explicit OpKernel(const OpKernelInfo& info) : op_kernel_info_{info} {}
   virtual ~OpKernel() {}
 
-  Node Node() const {
+  adapter::Node Node() const {
     return op_kernel_info_.node();
   }
   const OpKernelInfo& Info() const {
@@ -163,11 +163,11 @@ struct KernelImpl : OrtKernelImpl {
     OpKernelContext ctx{context, *kernel_impl};
     Status status;
     ORT_TRY {
-      status = kernel_impl->Compute(&ctx);
+      (void)(status = kernel_impl->Compute(&ctx));
     }
     ORT_CATCH(const std::exception& ex) {
       ORT_HANDLE_EXCEPTION([&]() {
-        status = ORT_MAKE_STATUS(ONNXRUNTIME, RUNTIME_EXCEPTION, ex.what());
+        (void)(status = ORT_MAKE_STATUS(ONNXRUNTIME, RUNTIME_EXCEPTION, ex.what()));
       });
     }
     if (status.IsOK()) {
@@ -191,11 +191,11 @@ struct KernelImpl : OrtKernelImpl {
     const auto tensor = CreateTensorFromApiValue(weight);
     Status status;
     ORT_TRY {
-      status = kernel_impl->PrePack(tensor, input_index, AllocatorPtr{}, *is_packed, nullptr);
+      (void)(status = kernel_impl->PrePack(tensor, input_index, AllocatorPtr{}, *is_packed, nullptr));
     }
     ORT_CATCH(const std::exception& ex) {
       ORT_HANDLE_EXCEPTION([&]() {
-        status = ORT_MAKE_STATUS(ONNXRUNTIME, RUNTIME_EXCEPTION, ex.what());
+        (void)(status = ORT_MAKE_STATUS(ONNXRUNTIME, RUNTIME_EXCEPTION, ex.what()));
       });
     }
     if (!status.IsOK()) {

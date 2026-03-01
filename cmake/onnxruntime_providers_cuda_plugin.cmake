@@ -97,17 +97,73 @@ list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/size\\.cc$")
 # lives in the CPU provider's scatter_nd.cc (not linked into the plugin).
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/scatter_nd\\.cc$")
 
+# Exclude llm/ — attention.cc calls QkvToContext which dereferences
+# onnxruntime::Stream* (not available in plugin build's adapter OpKernelContext).
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/llm/.*")
+list(FILTER CUDA_PLUGIN_EP_CU_SRCS EXCLUDE REGEX ".*/llm/.*")
+
+# Exclude constant_of_shape — inherits from ConstantOfShapeBase (CPU provider)
+# which is not linked into the plugin.
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/generator/constant_of_shape\\.cc$")
+
+# Exclude matmul_integer.cc — uses GetComputeStream() with GemmInt8 which expects
+# onnxruntime::Stream* (not available in adapter OpKernelContext).
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/matmul_integer\\.cc$")
+
+# Exclude matmul.cc — uses GetComputeStream() in FuncCallAdapter (needs onnxruntime::Stream*).
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/matmul\\.cc$")
+
+# Exclude variadic_elementwise_ops.cc — uses InputArgCount/RequiredInput/RequiredOutput
+# which are not in the adapter Node/OpKernelContext.
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/variadic_elementwise_ops\\.cc$")
+
+# Exclude slice — inherits from SliceBase (CPU provider) not linked into the plugin.
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/slice\\.cc$")
+
+# Exclude space_depth_ops — inherits from SpaceDepthBase (CPU provider).
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/space_depth_ops\\.cc$")
+
+# Exclude concat.cc — uses InputArgCount and OpKernelContext::GetComputeStream() with CopyToGpu.
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/concat\\.cc$")
+
+# Exclude gather.cc — passes adapter OpKernelContext* to framework PrepareForCompute
+# which expects onnxruntime::OpKernelContext*.
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/gather\\.cc$")
+
+# Exclude gather_nd.cc — uses GetComputeStream() with PrepareCompute framework function.
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/gather_nd\\.cc$")
+
+# Exclude pad.cc — passes adapter OpKernelContext to framework PadBase::HandleDimension.
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/pad\\.cc$")
+
+# Exclude reshape.cc/reshape.h — uses GetComputeStream() and CopyTensor with framework types.
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/reshape\\.cc$")
+
+# Exclude split.cc — uses GetComputeStream() with CopyToGpu.
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/split\\.cc$")
+
 # Exclude object_detection/ — NonMaxSuppression and RoiAlign inherit from CPU
 # base classes (NonMaxSuppressionBase, RoiAlignBase) not linked into the plugin.
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/object_detection/.*")
 list(FILTER CUDA_PLUGIN_EP_CU_SRCS EXCLUDE REGEX ".*/object_detection/.*")
+
+# Exclude upsample.cc — UpsampleBase uses InputDefs() and
+# OpKernelInfo::GetAllocator() not available in adapter.
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/upsample\\.cc$")
+
+# Exclude unsqueeze.cc — passes adapter OpKernelContext* to framework
+# FlattenHelper/CopyTensor which expects onnxruntime::OpKernelContext*.
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/unsqueeze\\.cc$")
+
+# Exclude shape_op.cc — Shape inherits from onnxruntime::OpKernel (framework)
+# which cannot convert to ep::adapter::OpKernel in the plugin build.
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/shape_op\\.cc$")
 
 # Create shared library target using the ORT helper function for plugins
 onnxruntime_add_shared_library_module(onnxruntime_providers_cuda_plugin
     ${CUDA_PLUGIN_EP_CC_SRCS}
     ${CUDA_PLUGIN_EP_CU_SRCS}
 )
-
 target_sources(onnxruntime_providers_cuda_plugin PRIVATE
     ${CUDA_PLUGIN_EP_DIR}/cuda_plugin_adapter_registry.cc
 )
@@ -117,13 +173,20 @@ set_target_properties(onnxruntime_providers_cuda_plugin PROPERTIES
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
 )
+
+# Suppress -Werror=maybe-uninitialized for local variables written by
+# adapter OpKernelInfo::GetAttr<> (GCC falsely warns about variables that are
+# initialised inside GetAttr’s output parameter path).
+target_compile_options(onnxruntime_providers_cuda_plugin PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-Wno-maybe-uninitialized>
+)
 target_compile_options(onnxruntime_providers_cuda_plugin PRIVATE
     # Flash-attention, XQA, MoE, and other pure CUDA kernel .cu files must NOT
     # receive the ORT-framework force-include (it conflicts with cute::Tensor etc.).
     # cuda_plugin_kernels.cu already #include "cuda_kernel_adapter.h" directly.
     # Op-registration .cc files do not include it directly, so they need it here.
     "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-Xcudafe;--diag_suppress=550>"
-    "$<$<COMPILE_LANGUAGE:CXX>:-include;${CUDA_PLUGIN_EP_DIR}/cuda_kernel_adapter.h>"
+    "$<$<COMPILE_LANGUAGE:CXX>:-include;${REPO_ROOT}/include/onnxruntime/ep/adapters.h>"
 )
 
 # --- EP Adapter Framework ---

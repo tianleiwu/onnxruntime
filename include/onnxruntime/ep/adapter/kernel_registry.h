@@ -70,7 +70,7 @@ struct KernelRegistry {
     //
     // If the kernel being created is one of the control flow kernels, `CreateControlFlowKernelImpl` should be overriden
     // to write the value of `out` to the created `OrtKernelImpl`, and the returned status should be OK.
-    status = kernel->CreateControlFlowKernelImpl(info, out);
+    (void)(status = kernel->CreateControlFlowKernelImpl(info, out));
     if (!status.IsOK()) {
       return ToOrtStatus(status);
     }
@@ -82,9 +82,9 @@ struct KernelRegistry {
   }
 
   Status Register(KernelCreateInfo&& create_info) {
-    registry_.AddKernel(create_info.kernel_def,
-                        KernelRegistry::CreateKernel,
-                        reinterpret_cast<void*>(create_info.kernel_create_func));
+    (void)registry_.AddKernel(create_info.kernel_def,
+                              KernelRegistry::CreateKernel,
+                              reinterpret_cast<void*>(create_info.kernel_create_func));
     return Status::OK();
   }
 
