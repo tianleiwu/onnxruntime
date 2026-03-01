@@ -4,24 +4,14 @@
 // cuda_kernel_adapter.h — Compatibility shim for migrating CUDA kernels to the
 // plugin EP architecture.
 //
-// This header supports three compilation modes:
-//
-//   1. ORT_CUDA_PLUGIN_USE_ADAPTER: kernels are compiled against the real
-//      ORT framework types (OpKernel, OpKernelContext, etc.) and use the
-//      adapter-path registration macros that feed into PluginRegistry.
-//
-//   2. BUILD_CUDA_EP_AS_PLUGIN (without ORT_CUDA_PLUGIN_USE_ADAPTER): the
-//      legacy plugin path where kernels use provider_api.h types.  Kernel
-//      registration macros are no-opped because registration happens via
-//      generated .inc tables.
-//
-//   3. Neither defined: the standard in-tree build.
-//
-// In modes 1 and 2 this header also provides:
+// This header provides:
 //   - CudaKernel base class (scratch buffers, CUDA handles, etc.)
 //   - Error-return macros (CUDA_RETURN_IF_ERROR, etc.)
 //   - Type mapping helpers (ToCudaType)
 //   - Math/compute shims (HalfGemmOptions, CublasMathModeSetter)
+//   - Registration macros that feed into PluginRegistry
+//   - CUDAExecutionProvider shim class
+//   - CPU provider shims for the plugin build
 
 #pragma once
 
@@ -63,49 +53,6 @@ struct CudaStream;
 // Section 1: Include path selection
 // ===================================================================
 
-#ifndef ORT_CUDA_PLUGIN_USE_ADAPTER
-// Legacy path: Define SHARED_PROVIDER before including provider_api.h.
-// When adapters.h is active, provider_api.h becomes a no-op (via its own guard),
-// and we skip this entire block.
-#ifndef SHARED_PROVIDER
-#define SHARED_PROVIDER 1
-#endif
-
-// Include provider_api.h FIRST. This provides the "plugin" versions of ORT types.
-#include "core/providers/shared_library/provider_api.h"
-
-// Shadowing to avoid conflicts if core headers are indirectly included
-#define kOnnxDomain __kOnnxDomain_ignore
-#define kMSDomain __kMSDomain_ignore
-#define kPytorchAtenDomain __kPytorchAtenDomain_ignore
-#define kNGraphDomain __kNGraphDomain_ignore
-#define kCudaExecutionProvider __kCudaExecutionProvider_ignore
-#define kCpuExecutionProvider __kCpuExecutionProvider_ignore
-#define kAzureExecutionProvider __kAzureExecutionProvider_ignore
-
-// Include framework's cuda_common.h for math utilities and CUDA types.
-// We avoid op_kernel.h as it brings in too many conflicting types.
-#include "core/providers/cuda/cuda_common.h"
-
-#undef kOnnxDomain
-#undef kMSDomain
-#undef kPytorchAtenDomain
-#undef kNGraphDomain
-#undef kCudaExecutionProvider
-#undef kCpuExecutionProvider
-#undef kAzureExecutionProvider
-
-namespace onnxruntime {
-namespace cuda {
-using Tensor = ::onnxruntime::Tensor;
-using ::onnxruntime::HandleNegativeAxis;
-// Tensor creation helper to replace deprecated Tensor::Create
-inline std::unique_ptr<::onnxruntime::Tensor> TensorCreate(MLDataType type, const TensorShape& shape, AllocatorPtr allocator) {
-  return ::onnxruntime::Tensor::Create(type, shape, std::move(allocator));
-}
-}  // namespace cuda
-}  // namespace onnxruntime
-#else  // ORT_CUDA_PLUGIN_USE_ADAPTER
 // Adapter path: use real framework types but provide local templates and
 // namespace aliases to allow registration macros to work in nested namespaces.
 #include <map>
@@ -177,8 +124,6 @@ using ::onnxruntime::HandleNegativeAxis;
 }  // namespace contrib
 #endif
 }  // namespace onnxruntime
-
-#endif  // !ORT_CUDA_PLUGIN_USE_ADAPTER
 
 // ===================================================================
 // Section 2: Error-return macros (redefined for all plugin paths)
@@ -631,25 +576,6 @@ struct _IsInf<nv_bfloat16, detect_positive, detect_negative> {
   }
 };
 #endif
-
-#ifndef ORT_CUDA_PLUGIN_USE_ADAPTER
-// Legacy path: Shims for OpKernel-related types using provider_api.h's versions.
-// When adapter is active, these are provided by the namespace aliases in adapters.h.
-using Tensor = onnxruntime::Tensor;
-using OpKernelContext = onnxruntime::OpKernelContext;
-using OpKernelInfo = onnxruntime::OpKernelInfo;
-using OpKernel = onnxruntime::OpKernel;
-
-// Guard critical adapter patterns used by Stage 4 kernels.
-static_assert(std::is_same_v<decltype(std::declval<OpKernelContext&>().Output(1, std::declval<const TensorShape&>())), Tensor*>,
-              "OpKernelContext::Output(index, shape) must support arbitrary output indices.");
-static_assert(std::is_same_v<decltype(std::declval<const OpKernelInfo&>().GetAttr<std::string>(std::declval<const std::string&>(), std::declval<std::string*>())),
-                             Status>,
-              "OpKernelInfo::GetAttr<std::string> must be available.");
-static_assert(std::is_same_v<decltype(std::declval<const OpKernelInfo&>().GetAttrs<int64_t>(std::declval<const std::string&>(), std::declval<std::vector<int64_t>&>())),
-                             Status>,
-              "OpKernelInfo::GetAttrs<int64_t> must be available.");
-#endif  // !ORT_CUDA_PLUGIN_USE_ADAPTER
 
 // ===================================================================
 // Section 6b: CPU provider shims for the plugin build
