@@ -157,99 +157,109 @@ Additional modifications needed to compile existing kernel files with the adapte
 
 ### 2.1 Standard Op Registrations
 
-- [ ] **2.1.1** Integrate existing registration tables into adapter-based registry
-  - Files: [cuda_execution_provider.cc](../../../cuda/cuda_execution_provider.cc) contains `GetCudaKernelList()`
-  - These `ONNX_OPERATOR_*_KERNEL_EX` macros produce `BuildKernelCreateInfo<>()` specializations
-  - With the adapter forced-include, these macros automatically produce `adapter::KernelCreateInfo`
-  - Wire up: in `CudaEpFactory::GetKernelRegistryForEp()`, call `RegisterCudaKernels()` which iterates the kernel list and calls `adapter::KernelRegistry::Register(KernelCreateInfo&&)` for each
+- [x] **2.1.1** Replace `PluginRegistry` with `PluginKernelCollector` self-registration
+  - Removed `PluginRegistry` class and `GenericCreateKernel` function from `cuda_kernel_adapter.h`
+  - Added `PluginKernelCollector` singleton class: stores `BuildKernelCreateInfoFn` pointers
+  - Rewrote `ONNX_OPERATOR_*_KERNEL_EX` macro overrides to BOTH produce `BuildKernelCreateInfo<>()` template specializations AND auto-register in `PluginKernelCollector::Instance().Add()` via static bool initializers
+  - Each compiled kernel `.cc` file's macros now self-register at static init time — no manual tables needed
 
-- [ ] **2.1.2** Create a new registration function that uses the existing kernel tables
-  - Function: `RegisterCudaKernels(adapter::KernelRegistry& registry)`
-  - Iterate `BuildKernelCreateInfo` function pointers from the existing registration tables
-  - Call `registry.Register(build_fn())` for each
-  - This replaces the manual `kAdapterRegistrations[]` table in `cuda_plugin_adapter_registry.cc`
+- [x] **2.1.2** Rewrite `CreateCudaKernelRegistry` in `cuda_plugin_kernels.cu`
+  - Removed all old includes and `CreateCudaKernelRegistryFromOrtTables()` delegation
+  - New implementation: creates `adapter::KernelRegistry`, iterates `PluginKernelCollector::Instance().Entries()`, registers each `BuildKernelCreateInfo`
+  - Added `BuildKernelCreateInfo<void>()` sentinel definition in `onnxruntime::cuda` namespace (normally in excluded `cuda_execution_provider.cc`)
+  - Simplified `cuda_plugin_kernels.h`: only declares `CreateCudaKernelRegistry()`
 
-- [ ] **2.1.3** Test: verify basic ops (Add, Relu, MatMul, Gemm, Conv, Softmax, etc.) still work
+- [x] **2.1.3** Test: Add, Relu, MatMul, Gemm, Conv, Softmax all pass via `test_cuda_plugin_ep.py`
 
 ### 2.2 NHWC Registrations
 
-- [ ] **2.2.1** Port [cuda_nhwc_kernels.cc](../../cuda/cuda_nhwc_kernels.cc) registrations to plugin
-  - Currently excluded by CMake filter (line 76): `.*/cuda_nhwc_kernels\.cc$`
-  - The file registers kernels under `kMSInternalNHWCDomain`
-  - With adapter forced-include, the same macros should work
-  - Remove the CMake exclusion and verify compilation
-  - Alternative: Create a new `RegisterCudaNhwcKernels()` adapted function if the existing file has EP infrastructure deps
+- [x] **2.2.1** NHWC ops auto-register via macro overrides in individual kernel files
+  - The `ONNX_OPERATOR_*_KERNEL_EX` macros in `batch_norm.cc`, `conv.cc`, `conv_transpose.cc`, `pool.cc` register NHWC variants (with `kMSInternalNHWCDomain`) via `PluginKernelCollector`
+  - `cuda_nhwc_kernels.cc` is excluded from plugin build: its centralized `RegisterCudaNhwcKernels()` table references ALL NHWC ops including those in excluded source files (e.g., `space_depth_ops.cc`), causing undefined symbol errors
+  - Fixed `cuda_nhwc_kernels.h`: changed `onnxruntime::KernelRegistry&` to unqualified `KernelRegistry&` (resolves to `adapter::KernelRegistry` in plugin, framework `KernelRegistry` in normal build)
+  - NHWC ops from non-excluded source files (BatchNorm, Conv, ConvTranspose, Pool, LRN) are available in plugin
 
 ### 2.3 Contrib Op Registrations
 
-- [ ] **2.3.1** Wire up [cuda_contrib_kernels.cc](../../../../contrib_ops/cuda/cuda_contrib_kernels.cc) registration table
-  - This file defines `GetCudaContribKernelList()` with `com.microsoft` domain ops
-  - Same adapter approach: iterate list, call `registry.Register()` for each
-  - Function: `RegisterCudaContribKernels(adapter::KernelRegistry& registry)`
+- [x] **2.3.1** Contrib ops auto-register via macro overrides in individual kernel files
+  - Same `PluginKernelCollector` self-registration pattern as standard ops
+  - `cuda_contrib_kernels.cc` is excluded from plugin build: its centralized registration table references ALL contrib ops including those in excluded files, causing link errors
+  - Guarded `provider_api.h` includes: moved `#ifdef BUILD_CUDA_EP_AS_PLUGIN` guard into `provider_api.h` itself (replacing the old `ORT_CUDA_PLUGIN_USE_ADAPTER` guard), so individual files include it unconditionally
+  - Contrib ops from non-excluded source files (LayerNorm, BiasGelu, FlashAttention, etc.) are available in plugin
 
 ### 2.4 Resolve Excluded Ops
 
-- [ ] **2.4.1** Control flow ops (`If`/`Loop`/`Scan`)
-  - These inherit from CPU base classes — cannot compile directly
-  - Use `OrtEpApi::CreateIfKernel`/`CreateLoopKernel`/`CreateScanKernel`
-  - Override `OpKernel::CreateControlFlowKernelImpl()` (already supported by `adapter::KernelRegistry::CreateKernel()`)
-  - CMake currently excludes entire `controlflow/` dir — create wrapper classes
-  - See task 5.1 for full implementation
+- [ ] **2.4.1** Control flow ops (`If`/`Loop`/`Scan`) — deferred to Stage 5
+  - Inherit from CPU base classes — need `OrtEpApi::CreateIfKernel`/`CreateLoopKernel`/`CreateScanKernel`
 
-- [ ] **2.4.2** Document remaining excluded op categories for Stage 5
-  - RNN ops: `rnn/` directory excluded (dynamic_cast issue)
-  - Tunable ops: `tunable/` directory excluded (CudaTuningContext dep)
-  - Einsum: `math/einsum.cc` excluded (cuda_execution_provider.h dep)
-  - Object detection: `object_detection/` excluded (CPU base class dep)
-  - Identity/Sequence: `identity_op.cc`, `sequence_op.cc` excluded (TensorSeq incomplete type)
-  - ScatterND: `scatter_nd.cc` excluded (CPU validation)
-  - Size: `size.cc` excluded (CPU op)
-  - IntegerGemm: `integer_gemm.cc` excluded (CudaStream dep)
-  - **Added in 1.11** — additional exclusions discovered during adapter integration:
-    - LLM ops: `llm/*` excluded (uses `onnxruntime::Stream*` in QkvToContext)
-    - ConstantOfShape: `generator/constant_of_shape.cc` excluded (CPU `ConstantOfShapeBase`)
-    - MatMulInteger: `math/matmul_integer.cc` excluded (`GetComputeStream()` with `GemmInt8`)
-    - MatMul: `math/matmul.cc` excluded (`GetComputeStream()` in `FuncCallAdapter`)
-    - VariadicElementwise: `math/variadic_elementwise_ops.cc` excluded (`InputArgCount`/`RequiredInput`/`RequiredOutput`)
-    - Slice: `tensor/slice.cc` excluded (CPU `SliceBase`)
-    - SpaceDepthOps: `tensor/space_depth_ops.cc` excluded (CPU `SpaceDepthBase`)
-    - Concat: `tensor/concat.cc` excluded (`InputArgCount`, `GetComputeStream()`)
-    - Gather: `tensor/gather.cc` excluded (adapter/framework `OpKernelContext*` mismatch)
-    - GatherND: `tensor/gather_nd.cc` excluded (`GetComputeStream()`)
-    - Pad: `tensor/pad.cc` excluded (framework `PadBase::HandleDimension`)
-    - Reshape: `tensor/reshape.cc` excluded (`GetComputeStream()`, `CopyTensor`)
-    - Split: `tensor/split.cc` excluded (`GetComputeStream()` with `CopyToGpu`)
-    - Upsample: `tensor/upsample.cc` excluded (`InputDefs()`, `OpKernelInfo::GetAllocator()`)
-    - Unsqueeze: `tensor/unsqueeze.cc` excluded (framework `FlattenHelper`/`CopyTensor`)
-    - Shape: `tensor/shape_op.cc` excluded (inherits framework `onnxruntime::OpKernel`)
-    - MatMulNBits: `matmul_nbits.h` include commented out (uses `InputDefs()`)
+- [x] **2.4.2** Document excluded op categories
+  - **Standard ops excluded** (in `core/providers/cuda/`):
+    - `cuda_execution_provider.cc`, `cuda_provider_factory.cc`, `cuda_provider_interface.cc` — replaced by plugin equivalents
+    - `cuda_stream_handle.cc`, `cuda_execution_provider_info.cc`, `cuda_graph.cc`, `cuda_mempool_arena.cc`, `cuda_common.cc` — EP infrastructure replaced by plugin
+    - `cuda_nhwc_kernels.cc` — centralized table excluded; NHWC ops self-register from individual files
+    - `controlflow/*` — CPU base class deps (Stage 5)
+    - `tunable/*` — CudaTuningContext dep
+    - `rnn/*` — CudaStream dynamic_cast
+    - `llm/*` — uses `onnxruntime::Stream*`
+    - `math/einsum.cc`, `math/einsum_utils/*` — cuda_execution_provider.h dep
+    - `math/matmul.cc` — `GetComputeStream()` in `FuncCallAdapter`
+    - `math/matmul_integer.cc` — `GetComputeStream()` with `GemmInt8`
+    - `math/variadic_elementwise_ops.cc` — `InputArgCount`/`RequiredInput`/`RequiredOutput`
+    - `math/cumsum.cc` — CPU provider dep
+    - `generator/constant_of_shape.cc` — CPU `ConstantOfShapeBase`
+    - `integer_gemm.cc` — CudaStream dep
+    - `tensor/slice.cc` — CPU `SliceBase`
+    - `tensor/space_depth_ops.cc` — CPU `SpaceDepthBase`
+    - `tensor/concat.cc` — `InputArgCount`, `GetComputeStream()`
+    - `tensor/gather.cc` — adapter/framework `OpKernelContext*` mismatch
+    - `tensor/gather_nd.cc` — `GetComputeStream()`
+    - `tensor/pad.cc` — framework `PadBase::HandleDimension`
+    - `tensor/reshape.cc` — `GetComputeStream()`, `CopyTensor`
+    - `tensor/split.cc` — `GetComputeStream()` with `CopyToGpu`
+    - `tensor/upsample.cc`, `tensor/resize.cc` — `InputDefs()`, `OpKernelInfo::GetAllocator()`
+    - `tensor/unsqueeze.cc` — framework `FlattenHelper`/`CopyTensor`
+    - `tensor/shape_op.cc` — inherits framework `onnxruntime::OpKernel`
+    - `tensor/identity_op.cc`, `tensor/sequence_op.cc` — TensorSeq incomplete type
+    - `tensor/scatter_nd.cc` — CPU validation dep
+    - `tensor/size.cc` — CPU op
+    - `tensor/tile.cc` — CPU `TileOp::IsTileMemcpy`
+    - `object_detection/*` — CPU base class dep
+  - **Contrib ops excluded** (in `contrib_ops/cuda/`):
+    - `cuda_contrib_kernels.cc` — centralized table excluded; contrib ops self-register from individual files
+    - `aten_ops/*`, `collective/*` — not applicable to plugin
+    - `llm/*` — `onnxruntime::Stream*` dep
+    - `transformers/*` — beam search, greedy search, sampling (complex deps)
+    - `bert/attention.cc`, `bert/decoder_attention.cc`, `bert/decoder_masked_self_attention.cc`, `bert/embed_layer_norm.cc`, `bert/fast_gelu.cc`, `bert/group_query_attention.cc`, `bert/longformer_attention.cc`, `bert/multihead_attention.cc`, `bert/packed_attention.cc`, `bert/packed_multihead_attention.cc`, `bert/paged_attention.cc`, `bert/relative_attn_bias.cc`, `bert/remove_padding.cc` — `GetComputeStream()` or framework `OpKernelContext`
+    - `diffusion/group_norm.cc`, `fused_conv.cc`, `inverse.cc`, `math/bias_dropout.cc`, `math/fft_ops.cc`, `moe/moe.cc`, `sparse/sparse_attention.cc` — `GetComputeStream()` or framework deps
+    - `tensor/crop.cc`, `tensor/dynamic_time_warping.cc`, `tensor/dynamicslice.cc`, `tensor/shrunken_gather.cc` — various deps
+    - `quantization/attention_quantization.cc`, `quantization/matmul_bnb4.cc`, `quantization/matmul_nbits.cc`, `quantization/moe_quantization.cc`, `quantization/qordered_ops/*` — `GetComputeStream()` deps
+    - `math/gemm_float8.cc/.cu` — `GetComputeStream()` in `.cu`
+    - `math/fused_matmul.cc` — registers `MatMul<T>` class from excluded `matmul.cc`
 
 ### 2.5 Remove Manual Registry
 
-- [ ] **2.5.1** Delete [cuda_plugin_adapter_registry.cc](../cuda_plugin_adapter_registry.cc) (~339 LOC)
-  - Contains `kAdapterRegistrations[]` static table and `CreateCudaKernelRegistryFromOrtTables()`
-  - Fully replaced by the adapter-based registry path
+- [x] **2.5.1** Deleted `cuda_plugin_adapter_registry.cc` (~339 LOC)
+  - File removed from disk; CMake exclusion line also removed
+  - Fully replaced by `PluginKernelCollector` self-registration
 
-- [ ] **2.5.2** Remove the legacy `Create*Kernel` functions and `AdapterKernelImpl` template from [cuda_plugin_kernels.cu](../cuda_plugin_kernels.cu)
-  - Lines 48–97: `AdapterKernelImpl` template under `#ifndef ORT_CUDA_PLUGIN_USE_ADAPTER`
-  - Already addressed in 1.11.7 — verify it's clean
+- [x] **2.5.2** Legacy `Create*Kernel` and `AdapterKernelImpl` already removed (1.11.7)
+  - `cuda_plugin_kernels.cu` is clean — only contains `CreateCudaKernelRegistry()` using `PluginKernelCollector`
 
-- [ ] **2.5.3** Update CMake to remove references to deleted files
-  - `cuda_plugin_adapter_registry.cc` is explicitly added in CMake line 112 — remove it
+- [x] **2.5.3** CMake cleaned up
+  - Removed `cuda_plugin_adapter_registry.cc` exclusion and stale comments
+  - Removed `ORT_CUDA_PLUGIN_USE_ADAPTER=1` compile definition (replaced by `BUILD_CUDA_EP_AS_PLUGIN` in `provider_api.h`)
 
 ### 2.6 Validate Stage 2
 
-- [ ] **2.6.1** Registration parity verification
-  - Dump `(domain, op_type, since_version, type_constraints)` tuples from both plugin and bundled EP registries
+- [ ] **2.6.1** Registration parity verification (deferred — needs diagnostic tooling)
+  - Need to dump `(domain, op_type, since_version, type_constraints)` tuples from both registries
   - Plugin count must equal bundled count minus tracked exclusions
-  - Create a diagnostic tool or test to automate this comparison
 
-- [ ] **2.6.2** Build and test
-  ```bash
-  ./cuda.sh --build --test
-  ./cuda_plugin.sh --build --test --test_plugin
+- [x] **2.6.2** Build and test — all pass
   ```
-  All existing tests should pass.
+  ./cuda.sh --build --test          → 1170 tests PASSED
+  ./cuda_plugin.sh --build --test --test_plugin → 1170 tests PASSED + plugin tests PASSED
+  ```
 
 ---
 

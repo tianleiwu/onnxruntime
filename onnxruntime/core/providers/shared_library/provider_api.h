@@ -8,16 +8,16 @@
 
 #pragma once
 
-// When building an EP plugin using the adapter framework (ep/adapters.h),
-// skip all SHARED_PROVIDER type redefinitions. The adapter header provides
-// its own facade types, and the SHARED_PROVIDER bridge would conflict.
-#ifdef ORT_CUDA_PLUGIN_USE_ADAPTER
+// When building the CUDA EP as a plugin (BUILD_CUDA_EP_AS_PLUGIN),
+// skip all SHARED_PROVIDER type redefinitions. The adapter header (ep/adapters.h)
+// provides its own facade types, and the SHARED_PROVIDER bridge would conflict.
+#ifdef BUILD_CUDA_EP_AS_PLUGIN
 
-// When building with the adapter framework (ep/adapters.h), provider_api.h
-// is a complete no-op. We do NOT define SHARED_PROVIDER so that #ifndef
-// SHARED_PROVIDER guards in framework headers (op_kernel.h, etc.) remain active.
+// Plugin build: provider_api.h is a complete no-op. We do NOT define
+// SHARED_PROVIDER so that #ifndef SHARED_PROVIDER guards in framework
+// headers (op_kernel.h, etc.) remain active.
 
-#else  // !ORT_CUDA_PLUGIN_USE_ADAPTER — normal SHARED_PROVIDER path
+#else  // !BUILD_CUDA_EP_AS_PLUGIN — normal SHARED_PROVIDER path
 
 #define SHARED_PROVIDER 1
 
@@ -528,4 +528,4 @@ inline T* Initializer::data() {
 #define LOGS_DEFAULT(severity) \
   LOGS_DEFAULT_CATEGORY(severity, ::onnxruntime::logging::Category::onnxruntime)
 
-#endif  // !ORT_CUDA_PLUGIN_USE_ADAPTER
+#endif  // !BUILD_CUDA_EP_AS_PLUGIN

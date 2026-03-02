@@ -1,51 +1,58 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+// This file provides the CreateCudaKernelRegistry entrypoint for the CUDA plugin EP.
+//
+// Kernel registration is now fully automatic: each compiled kernel .cc file's
+// ONNX_OPERATOR_*_KERNEL_EX macro expansion creates a BuildKernelCreateInfo<>()
+// template specialization and auto-registers it in PluginKernelCollector via
+// the macro overrides in cuda_kernel_adapter.h.
+//
+// CreateCudaKernelRegistry iterates the collector and registers each entry
+// into an adapter::KernelRegistry which is then returned to the EP factory.
+
 #include "cuda_plugin_kernels.h"
 #include "cuda_stream_plugin.h"
 #include "cuda_kernel_adapter.h"
-#include "core/common/narrow.h"
-#include "core/providers/cuda/activation/activations.h"
-#include "core/providers/cuda/math/binary_elementwise_ops.h"
-#include "core/providers/cuda/math/clip.h"
-#include "core/providers/cuda/math/softmax.h"
-#include "core/providers/cuda/math/unary_elementwise_ops.h"
-#include "core/providers/cuda/reduction/reduction_ops.h"
-#include "core/providers/cuda/tensor/concat.h"
-#include "core/providers/cuda/tensor/cast_op.h"
-#include "core/providers/cuda/tensor/gather.h"
-#include "core/providers/cuda/tensor/split.h"
-#include "core/providers/cuda/tensor/where.h"
-#include "contrib_ops/cuda/bert/decoder_masked_multihead_attention.h"
-#include "contrib_ops/cuda/bert/embed_layer_norm.h"
-#include "contrib_ops/cuda/bert/fast_gelu.h"
-#include "contrib_ops/cuda/bert/gemma_rotary_emb.h"
-#include "contrib_ops/cuda/bert/group_query_attention.h"
-#include "contrib_ops/cuda/bert/multihead_attention.h"
-#include "contrib_ops/cuda/bert/rotary_embedding.h"
-#include "contrib_ops/cuda/bert/skip_layer_norm.h"
-#include "contrib_ops/cuda/bert/attention.h"
-#include "contrib_ops/cuda/moe/moe.h"
-#include "contrib_ops/cuda/quantization/gather_block_quantized.h"
-// matmul_nbits.h excluded: uses InputDefs() not available in adapter Node.
-// #include "contrib_ops/cuda/quantization/matmul_nbits.h"
-#include "contrib_ops/cuda/quantization/moe_quantization.h"
 
-#include <cstring>
-#include <map>
-#include <set>
-#include <string_view>
-#include <unordered_map>
-#include <vector>
+// Define the BuildKernelCreateInfo<void>() sentinel in onnxruntime::cuda.
+// This is normally defined in cuda_execution_provider.cc (excluded from plugin).
+// The NHWC registration tables reference it as a placeholder to prevent empty arrays.
+namespace onnxruntime::cuda {
+template <>
+KernelCreateInfo BuildKernelCreateInfo<void>() {
+  KernelCreateInfo info;
+  return info;
+}
+}  // namespace onnxruntime::cuda
 
 namespace onnxruntime {
 namespace cuda_plugin {
 
-OrtStatus* CreateCudaKernelRegistry(const OrtEpApi& ep_api,
-                                    const char* ep_name,
-                                    void* create_kernel_state,
+OrtStatus* CreateCudaKernelRegistry(const OrtEpApi& /*ep_api*/,
+                                    const char* /*ep_name*/,
+                                    void* /*create_kernel_state*/,
                                     OrtKernelRegistry** out_registry) {
-  return CreateCudaKernelRegistryFromOrtTables(ep_api, ep_name, create_kernel_state, out_registry);
+  *out_registry = nullptr;
+
+  EXCEPTION_TO_STATUS_BEGIN
+
+  // adapter::KernelRegistry wraps OrtKernelRegistry via the Ort C++ API.
+  ::onnxruntime::ep::adapter::KernelRegistry registry;
+
+  // Iterate all self-registered BuildKernelCreateInfoFn pointers.
+  const auto& entries = ::onnxruntime::cuda::PluginKernelCollector::Instance().Entries();
+  for (auto build_fn : entries) {
+    ::onnxruntime::ep::adapter::KernelCreateInfo info = build_fn();
+    if (info.kernel_def != nullptr) {  // filter the BuildKernelCreateInfo<void> sentinel
+      (void)registry.Register(std::move(info));
+    }
+  }
+
+  *out_registry = registry.release();
+  return nullptr;
+
+  EXCEPTION_TO_STATUS_END
 }
 
 }  // namespace cuda_plugin
