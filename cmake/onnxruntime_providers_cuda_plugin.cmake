@@ -82,11 +82,13 @@ list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/cuda_contrib_kernels\\.cc$"
 # integer_gemm.cc: dynamic_cast<CudaStream*> replaced with GetCublasHandle(cudaStream_t).
 # list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/integer_gemm\\.cc$")  # REMOVED in Stage 5
 
-# RNN ops: dynamic_cast<CudaStream*> and Stream* dependencies have been fixed
-# by changing to GetCudnnHandle(cudaStream_t) and void* alloc_stream parameters.
-# list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/rnn/.*")  # REMOVED in Stage 5
+# RNN ops: dual-build-compatible signatures are in place (void* alloc_stream,
+# cudaStream_t, cudnnHandle_t), but the ORT C API lacks KernelInfoGetAttributeArray_string
+# which rnn.h uses via GetAttrs<std::string>("activations", ...).
+# Re-excluded until the C API is extended to support string array attributes.
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/rnn/.*")
 
-# list(FILTER CUDA_PLUGIN_EP_CU_SRCS EXCLUDE REGEX ".*/rnn/.*")  # REMOVED in Stage 5
+list(FILTER CUDA_PLUGIN_EP_CU_SRCS EXCLUDE REGEX ".*/rnn/.*")
 
 # Exclude files that use TensorSeq (incomplete type in plugin build).
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/identity_op\\.cc$")

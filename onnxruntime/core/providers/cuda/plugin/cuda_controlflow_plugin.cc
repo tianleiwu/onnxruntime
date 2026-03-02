@@ -259,7 +259,7 @@ ONNX_OPERATOR_VERSIONED_KERNEL_EX(If,
                                   (*KernelDefBuilder::Create())
                                       .InputMemoryType(OrtMemTypeCPUInput, 0)
                                       .TypeConstraint("B", DataTypeImpl::GetTensorType<bool>())
-                                      .TypeConstraint("V", DataTypeImpl::AllTensorAndSequenceTensorTypes()),
+                                      .TypeConstraint("V", DataTypeImpl::AllFixedSizeTensorTypes()),
                                   PluginIfKernel);
 
 ONNX_OPERATOR_KERNEL_EX(If,
@@ -269,7 +269,7 @@ ONNX_OPERATOR_KERNEL_EX(If,
                         (*KernelDefBuilder::Create())
                             .InputMemoryType(OrtMemTypeCPUInput, 0)
                             .TypeConstraint("B", DataTypeImpl::GetTensorType<bool>())
-                            .TypeConstraint("V", DataTypeImpl::AllTensorAndSequenceTensorTypesIRv9()),
+                            .TypeConstraint("V", DataTypeImpl::AllFixedSizeTensorTypesIRv9()),
                         PluginIfKernel);
 
 // --- Loop ---
@@ -307,7 +307,7 @@ ONNX_OPERATOR_VERSIONED_KERNEL_EX(Loop,
                                       .InputMemoryType(OrtMemTypeCPUInput, 1)
                                       .TypeConstraint("I", DataTypeImpl::GetTensorType<int64_t>())
                                       .TypeConstraint("B", DataTypeImpl::GetTensorType<bool>())
-                                      .TypeConstraint("V", DataTypeImpl::AllTensorAndSequenceTensorTypes()),
+                                      .TypeConstraint("V", DataTypeImpl::AllFixedSizeTensorTypes()),
                                   PluginLoopKernel);
 
 ONNX_OPERATOR_KERNEL_EX(Loop,
@@ -319,7 +319,7 @@ ONNX_OPERATOR_KERNEL_EX(Loop,
                             .InputMemoryType(OrtMemTypeCPUInput, 1)
                             .TypeConstraint("I", DataTypeImpl::GetTensorType<int64_t>())
                             .TypeConstraint("B", DataTypeImpl::GetTensorType<bool>())
-                            .TypeConstraint("V", DataTypeImpl::AllTensorAndSequenceTensorTypesIRv9()),
+                            .TypeConstraint("V", DataTypeImpl::AllFixedSizeTensorTypesIRv9()),
                         PluginLoopKernel);
 
 // --- Scan (opset 8) ---
