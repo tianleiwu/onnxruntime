@@ -8,12 +8,6 @@
 namespace onnxruntime {
 namespace cuda {
 
-#ifndef BUILD_CUDA_EP_AS_PLUGIN
-inline onnxruntime::Stream* GetScratchStream(OpKernelContext* ctx) { return ctx->GetComputeStream(); }
-#else
-inline void* GetScratchStream(OpKernelContext* ctx) { return ctx->GetGPUComputeStream(); }
-#endif
-
 // kernel builder functions
 #define NONZERO_TYPED_KERNEL_WITH_TYPE_NAME(type, type_name)                                  \
   ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX(                                                    \
@@ -69,13 +63,13 @@ Status NonZero<T>::ComputeInternal(OpKernelContext* context) const {
     auto x_data = reinterpret_cast<const typename ToCudaType<T>::MappedType*>(x->Data<T>());
 
     const int number_of_blocks = NonZeroCalcBlockCount(x_size);
-    auto prefix_buffer = GetScratchBuffer<int>(number_of_blocks, GetScratchStream(context));
+    auto prefix_buffer = GetScratchBuffer<int>(number_of_blocks, GetComputeStream(context));
     int* prefix_counts = prefix_buffer.get();
     CUDA_RETURN_IF_ERROR(NonZeroCountEachBlock(Stream(context), x_data, x_size, prefix_counts));
 
     size_t temp_storage_bytes = 0;
     CUDA_RETURN_IF_ERROR(NonZeroCalcPrefixSumTempStorageBytes(Stream(context), prefix_counts, number_of_blocks, temp_storage_bytes));
-    auto temp_buffer = GetScratchBuffer<uint8_t>(temp_storage_bytes, GetScratchStream(context));
+    auto temp_buffer = GetScratchBuffer<uint8_t>(temp_storage_bytes, GetComputeStream(context));
     auto d_temp_storage = temp_buffer.get();
     CUDA_RETURN_IF_ERROR(NonZeroInclusivePrefixSum(Stream(context), d_temp_storage, temp_storage_bytes, prefix_counts, number_of_blocks));
 

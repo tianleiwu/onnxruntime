@@ -234,8 +234,8 @@ Status Pool<T, PoolType, Layout>::ComputeInternal(OpKernelContext* context) cons
     const auto input_count = x_shape.Size();
     const auto output_count = y_shape.Size();
 
-    IAllocatorUniquePtr<float> temp_X = GetScratchBuffer<float>(input_count, GetScratchStream(context));
-    auto temp_Y = GetScratchBuffer<float>(output_count, GetScratchStream(context));
+    IAllocatorUniquePtr<float> temp_X = GetScratchBuffer<float>(input_count, GetComputeStream(context));
+    auto temp_Y = GetScratchBuffer<float>(output_count, GetComputeStream(context));
     Impl_Cast<CudaT, float>(Stream(context), reinterpret_cast<const CudaT*>(x_data), temp_X.get(), input_count);
     CUDNN_RETURN_IF_ERROR(PoolingForwardHelper(GetCudnnHandle(context), pooling_desc, &alpha, x_tensor, temp_X.get(),
                                                &beta, y_tensor, temp_Y.get()));

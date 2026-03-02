@@ -40,12 +40,6 @@ REGISTER_VERSIONED_TYPED_KERNEL(MLFloat16, 9, 9);
 REGISTER_VERSIONED_TYPED_KERNEL(int32_t, 9, 9);
 REGISTER_VERSIONED_TYPED_KERNEL(uint8_t, 9, 9);
 
-#ifndef BUILD_CUDA_EP_AS_PLUGIN
-inline onnxruntime::Stream* GetScratchStream(OpKernelContext* ctx) { return ctx->GetComputeStream(); }
-#else
-inline void* GetScratchStream(OpKernelContext* ctx) { return ctx->GetGPUComputeStream(); }
-#endif
-
 template <typename T>
 Upsample<T>::Upsample(const OpKernelInfo& info) : UpsampleBase(info), CudaKernel(info) {
   if (UpsampleBase::antialias_) {
@@ -111,7 +105,7 @@ Status Upsample<T>::BaseCompute(OpKernelContext* context,
 
     if (antialias_) {
       TempSpaceAllocateFunc allocate_temp_space = [&](size_t bytes_size) {
-        return GetScratchBuffer<uint8_t>(bytes_size, GetScratchStream(context));
+        return GetScratchBuffer<uint8_t>(bytes_size, GetComputeStream(context));
       };
 
       std::optional<float> extrapolation_value;
@@ -280,7 +274,7 @@ Status Upsample<T>::BaseCompute(OpKernelContext* context,
       TArray<float> scales_vals(scales);
 
       size_t temp_buffer_size = CalcResizeBufferSize(mode_, output_dims);
-      auto dims_mapping_buffer = GetScratchBuffer<unsigned char>(temp_buffer_size, GetScratchStream(context));
+      auto dims_mapping_buffer = GetScratchBuffer<unsigned char>(temp_buffer_size, GetComputeStream(context));
       void* dims_mapping = reinterpret_cast<void*>(dims_mapping_buffer.get());
       ResizeImpl(Stream(context), mode_, rank, input_shape, output_shape,
                  input_strides, output_div_pitches, scales_vals, roi_vals,

@@ -37,15 +37,9 @@ class ConvTranspose : public CudaKernel {
   bool W_already_nhwc = false;  // In case NHWC == true and Conv is not in kMSInternalNHWCDomain
 
  protected:
-#ifndef BUILD_CUDA_EP_AS_PLUGIN
-  inline IAllocatorUniquePtr<void> GetWorkSpace(onnxruntime::Stream* stream) const {
-    return GetScratchBuffer<void>(s_.workspace_bytes, stream);
-  }
-#else
   inline IAllocatorUniquePtr<void> GetWorkSpace(void* stream) const {
     return GetScratchBuffer<void>(s_.workspace_bytes, stream);
   }
-#endif
 
   Status UpdateState(OpKernelContext* context, bool bias_expected) const;
 

@@ -9,11 +9,7 @@
 namespace onnxruntime {
 namespace cuda {
 
-#ifndef BUILD_CUDA_EP_AS_PLUGIN
-using SoftmaxComputeStreamT = Stream*;
-#else
 using SoftmaxComputeStreamT = cudaStream_t;
-#endif
 
 template <typename T, typename TOut, bool is_log_softmax>
 Status SoftMaxComputeHelper(

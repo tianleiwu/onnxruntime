@@ -177,11 +177,7 @@ Status Softmax<T>::ComputeInternal(OpKernelContext* ctx) const {
   }
 
   Status status;
-#ifndef BUILD_CUDA_EP_AS_PLUGIN
-  auto compute_stream = GetScratchStream(ctx);
-#else
   auto compute_stream = Stream(ctx);
-#endif
   if (log_softmax_) {
     status = SoftMaxComputeHelper<T, T, true>(compute_stream, X_data, *compute_input_shape, Y_data,
                                               is_transpose_required ? static_cast<int64_t>(rank) - 1

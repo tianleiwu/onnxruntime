@@ -3,6 +3,8 @@
 > **Plan**: [cuda_plugin_ep_plan.md](cuda_plugin_ep_plan.md)
 > **Prototype commit**: `31a6e1d2b96801033053f559bbd20d817ea8642e`
 > **EP Adapter commit**: `72a4cd7025a8740f2f8996f9899f898223c34941`
+> **1.10 commit**: `98dea517f3` — Remove SHARED_PROVIDER bridge
+> **1.11 commit**: `4f18312537` — EP Adapter forced-include integration
 > **Build & Test**: `./cuda_plugin.sh --build --test --test_plugin`
 
 ---
@@ -17,92 +19,135 @@
 Remove all `provider_api.h` / `g_host` / `ProviderHost_impl.h` dependencies from the plugin build.
 The `SHARED_PROVIDER` bridge's namespace-level type stubs **conflict** with the adapter's `using` declarations and must be severed **before** the adapter forced include is enabled.
 
-- [ ] **1.10.1** Delete [provider_host_bridge.cc](../provider_host_bridge.cc) from plugin sources
-  - This file initializes `g_host = Provider_GetHost()` under `#ifndef ORT_CUDA_PLUGIN_USE_ADAPTER`
-  - Currently 19 LOC, fully guarded — safe to delete since `ORT_CUDA_PLUGIN_USE_ADAPTER=1` is always set
-  - Also remove from CMake source list if explicitly listed
+- [x] **1.10.1** Delete `provider_host_bridge.cc` from plugin sources *(commit `98dea517f3`)*
+  - File deleted entirely (was 18 LOC). `g_host = Provider_GetHost()` dependency removed.
 
-- [ ] **1.10.2** Refactor [provider_api_shims.cc](../provider_api_shims.cc) to remove dual-path pattern
-  - Currently has `#ifndef ORT_CUDA_PLUGIN_USE_ADAPTER` / `#else` blocks
-  - Remove the `#ifndef` (legacy) path entirely — keep only the adapter implementations:
-    - `GetEnvironmentVar()` → `std::getenv()`
-    - `math::floatToHalf()` → `MLFloat16(f).val`
-    - `math::halfToFloat()` → `MLFloat16::FromBits(h).ToFloat()`
-  - Remove `#include "core/providers/shared_library/provider_api.h"` include
+- [x] **1.10.2** Refactor [provider_api_shims.cc](../provider_api_shims.cc) to remove dual-path pattern *(commit `98dea517f3`)*
+  - Removed all `#ifndef ORT_CUDA_PLUGIN_USE_ADAPTER` / `#else` blocks
+  - Kept only direct implementations: `GetEnvironmentVar()` → `std::getenv()`, `math::floatToHalf()` → `MLFloat16(f).val`, `math::halfToFloat()` → `MLFloat16::FromBits(h).ToFloat()`
+  - Removed `#include "core/providers/shared_library/provider_api.h"`
 
-- [ ] **1.10.3** Audit and remove all `provider_api.h` includes from plugin-compiled files
-  - Run: `grep -rn 'provider_api\.h\|SHARED_PROVIDER\|g_host' onnxruntime/core/providers/cuda/plugin/`
-  - Address each hit — the force-included [cuda_kernel_adapter.h](../cuda_kernel_adapter.h) currently includes `provider_api.h` under `#if SHARED_PROVIDER` (line ~76)
-  - The `SHARED_PROVIDER` define/include block in `cuda_kernel_adapter.h` (lines 72–76) should be removed on the adapter path
+- [x] **1.10.3** Audit and remove all `provider_api.h` includes from plugin-compiled files *(commit `98dea517f3`)*
+  - Removed the `#ifndef ORT_CUDA_PLUGIN_USE_ADAPTER` block from `cuda_kernel_adapter.h` (Section 1) which contained `#define SHARED_PROVIDER` and `#include "core/providers/shared_library/provider_api.h"`
+  - Removed legacy `OpKernel`/`OpKernelContext`/`OpKernelInfo` type aliases and `static_assert` blocks from the `#ifndef` path in `cuda_kernel_adapter.h` (Section 6a)
+  - Removed legacy `AdapterKernelImpl` template from `cuda_plugin_kernels.cu` (57 lines under `#ifndef ORT_CUDA_PLUGIN_USE_ADAPTER`)
 
-- [ ] **1.10.4** Remove `core/providers/shared/common.cc` from plugin build if present
-  - This provides `Provider_GetHost()` which is only needed for the legacy bridge
-  - Verify in CMake that this file is not collected by the glob patterns
+- [x] **1.10.4** Remove `core/providers/shared/common.cc` from plugin build *(commit `98dea517f3`)*
+  - `Provider_GetHost()` dependency eliminated by deleting `provider_host_bridge.cc`
+  - `common.cc` not collected by CMake glob patterns (confirmed)
 
-- [ ] **1.10.5** Verify: `grep -rn 'provider_api\.h\|SHARED_PROVIDER\|g_host' plugin/` returns zero matches
+- [x] **1.10.5** Verify: `grep -rn 'provider_api\.h\|SHARED_PROVIDER\|g_host' plugin/` returns zero matches *(verified)*
+  - Only documentation files match — no code references remain
 
 ### 1.11 EP Adapter Forced-Include Integration
 
 Refactor `cuda_kernel_adapter.h` to inherit from `adapter::OpKernel` (from `ep/adapters.h`) instead of the `SHARED_PROVIDER` bridge types.
 
-- [ ] **1.11.1** Remove `AdapterKernelImpl` class from `cuda_kernel_adapter.h` (lines ~225–247)
-  - This is replaced by `ep::adapter::KernelImpl` in [adapter/op_kernel.h](../../../../../../include/onnxruntime/ep/adapter/op_kernel.h)
-  - The adapter framework's `KernelImpl` already wraps `OpKernel` → `OrtKernelImpl` with `Compute`/`Release`/`PrePackWeight`
+- [x] **1.11.1** Remove `AdapterKernelImpl` class from `cuda_kernel_adapter.h` *(commit `4f18312537`)*
+  - Removed `AdapterKernelImpl` struct, `GenericCreateKernel`, `KernelFactory` typedef, and all `ONNX_OPERATOR_*_KERNEL_EX` macro overrides (~200 lines)
+  - Now provided by `ep::adapter::KernelImpl` in [adapter/op_kernel.h](../../../../../../include/onnxruntime/ep/adapter/op_kernel.h)
 
-- [ ] **1.11.2** Remove `PluginRegistry` class from `cuda_kernel_adapter.h` (if present)
-  - Replaced by `ep::adapter::KernelRegistry` in [adapter/kernel_registry.h](../../../../../../include/onnxruntime/ep/adapter/kernel_registry.h)
+- [x] **1.11.2** Remove `PluginRegistry` class from `cuda_kernel_adapter.h` *(commit `4f18312537`)*
+  - Removed `PluginRegistry` class and legacy `BUILD_CUDA_EP_AS_PLUGIN` no-op macro definitions
+  - `cuda_plugin_adapter_registry.cc` updated to use `ResolvePluginKernelCreateFn()` instead of `PluginRegistry::Instance().AllEntries()`
 
-- [ ] **1.11.3** Refactor `CudaKernel` base class in `cuda_kernel_adapter.h`
-  - Currently provides CUDA-specific methods: `Stream()`, `GetCublasHandle()`, `GetCudnnHandle()`, `GetCublasLtHandle()`, `GetScratchBuffer<T>()`, `GetDeviceProp()`, `UseTF32()`
-  - Must inherit from `ep::adapter::OpKernel` instead of current base
-  - Keep all CUDA-specific accessor methods — these are what `adapter::OpKernel` does *not* provide
-  - Preserve the runtime config pattern (`CudaKernelAdapterRuntimeConfig` with atomics for `use_tf32`, `device_id`, etc.)
+- [x] **1.11.3** Refactor `CudaKernel` base class in `cuda_kernel_adapter.h` *(commit `4f18312537`)*
+  - `CudaKernel` now inherits from `OpKernel` (resolved to `ep::adapter::OpKernel` via `adapters.h`)
+  - All CUDA-specific accessors preserved: `Stream()`, `GetCublasHandle()`, `GetCudnnHandle()`, etc.
+  - `Stream()` simplified: uses `ctx->GetGPUComputeStream()` directly instead of `Ort::KernelContext` reinterpretation
+  - Added `GetScratchStream()` method returning `void*` (plugin) to match `GetScratchBuffer` parameter type
+  - Corresponding `GetScratchStream()` added to framework [cuda_kernel.h](../../cuda_kernel.h) returning `onnxruntime::Stream*`
+  - Runtime config pattern (`CudaKernelAdapterRuntimeConfig` with atomics) preserved
 
-- [ ] **1.11.4** Switch forced include from `cuda_kernel_adapter.h` to `ep/adapters.h`
-  - In [onnxruntime_providers_cuda_plugin.cmake](../../../../../../cmake/onnxruntime_providers_cuda_plugin.cmake) line 126:
-    ```cmake
-    # Before:
-    "$<$<COMPILE_LANGUAGE:CXX>:-include;${CUDA_PLUGIN_EP_DIR}/cuda_kernel_adapter.h>"
-    # After:
-    "$<$<COMPILE_LANGUAGE:CXX>:-include;${REPO_ROOT}/include/onnxruntime/ep/adapters.h>"
-    ```
-  - `cuda_kernel_adapter.h` is **not removed** — it continues to provide the `CudaKernel` base class
-  - It will be included explicitly by files that need CUDA-specific accessors (e.g., `cuda_plugin_kernels.cu`)
+- [x] **1.11.4** Switch forced include from `cuda_kernel_adapter.h` to `ep/adapters.h` *(commit `4f18312537`)*
+  - CMake changed: `-include;${CUDA_PLUGIN_EP_DIR}/cuda_kernel_adapter.h` → `-include;${REPO_ROOT}/include/onnxruntime/ep/adapters.h`
+  - `cuda_kernel_adapter.h` now explicitly `#include "ep/adapters.h"` at line 57
+  - `cuda_kernel_adapter.h` continues to provide `CudaKernel` base class (included by `cuda_plugin_kernels.cu`)
 
-- [ ] **1.11.5** Resolve namespace conflicts
-  - `ep/adapters.h` defines `EP_SPECIFIC_USING_DECLARATIONS` in `onnxruntime::cuda` and `onnxruntime::contrib::cuda`
-  - These remap `OpKernel`, `OpKernelContext`, `KernelDefBuilder`, etc. to adapter types
-  - Verify that `cuda_kernel_adapter.h`'s own `using` declarations (lines ~96–101, 128–150) do not conflict
-  - Remove duplicate aliases from `cuda_kernel_adapter.h` that are now provided by `adapters.h`
-  - Domain constant shadowing (`#define kOnnxDomain __kOnnxDomain_ignore`, lines 77–85) should also be reviewed — the adapter framework may handle this differently
+- [x] **1.11.5** Resolve namespace conflicts *(commit `4f18312537`)*
+  - Removed all duplicate `using` aliases from `cuda_kernel_adapter.h` in both `onnxruntime::cuda` and `onnxruntime::contrib::cuda` namespaces (~30 aliases total)
+  - These are now provided by `EP_SPECIFIC_USING_DECLARATIONS` in `adapters.h`
+  - Domain constant shadowing (`#define kOnnxDomain __kOnnxDomain_ignore`) removed — handled by adapter framework
+  - Kept only `BuildKernelCreateInfo` forward declaration and `HandleNegativeAxis` using-declaration
 
-- [ ] **1.11.6** Remove the `#ifndef ORT_CUDA_PLUGIN_USE_ADAPTER` legacy path from `cuda_kernel_adapter.h`
-  - The file currently has two major branches: SHARED_PROVIDER path (lines ~70–105) and adapter path (lines ~107+)
-  - Since `ORT_CUDA_PLUGIN_USE_ADAPTER=1` is always set, remove the SHARED_PROVIDER branch entirely
-  - Simplify the file to only contain:
-    - The `CudaKernelAdapterRuntimeConfig` struct
-    - The `CudaKernel` base class (inheriting from `ep::adapter::OpKernel`)
-    - The `CUDAExecutionProvider` shim class
-    - Error-return macros (`CUDA_RETURN_IF_ERROR`, `CUBLAS_RETURN_IF_ERROR`, `CUDNN_RETURN_IF_ERROR`)
+- [x] **1.11.6** Remove legacy path from `cuda_kernel_adapter.h` *(commit `4f18312537`)*
+  - All `#ifndef ORT_CUDA_PLUGIN_USE_ADAPTER` / `#ifdef ORT_CUDA_PLUGIN_USE_ADAPTER` guards removed
+  - File reduced from ~900 LOC to ~665 LOC, containing only:
+    - `CudaKernelAdapterRuntimeConfig` struct
+    - `CudaKernel` base class (inheriting from `OpKernel` → `ep::adapter::OpKernel`)
+    - `CUDAExecutionProvider` shim class
+    - Error-return macros, type mapping helpers, CPU provider shims
 
-- [ ] **1.11.7** Remove the `#ifndef ORT_CUDA_PLUGIN_USE_ADAPTER` legacy path from `cuda_plugin_kernels.cu`
-  - Lines 48–97 define `AdapterKernelImpl` template under `#ifndef ORT_CUDA_PLUGIN_USE_ADAPTER`
-  - Remove this block entirely — the adapter path uses `ep::adapter::KernelImpl` instead
+- [x] **1.11.7** Remove legacy path from `cuda_plugin_kernels.cu` *(done in 1.10 commit `98dea517f3`)*
+  - Removed `AdapterKernelImpl` template and `GetCudaSyncStream` helper (57 lines under `#ifndef ORT_CUDA_PLUGIN_USE_ADAPTER`)
+
+### 1.11b Kernel Compatibility Fixes *(commit `4f18312537`)*
+
+Additional modifications needed to compile existing kernel files with the adapter forced-include.
+
+- [x] **1.11b.1** Introduce `GetScratchStream` abstraction for `GetScratchBuffer` calls
+  - Framework `CudaKernel::GetScratchBuffer` expects `onnxruntime::Stream*`; plugin version expects `void*` (from `GetGPUComputeStream()`)
+  - Added `CudaKernel::GetScratchStream(OpKernelContext*)` to both [cuda_kernel.h](../../cuda_kernel.h) and [cuda_kernel_adapter.h](../cuda_kernel_adapter.h)
+  - Updated callers: `batch_norm.cc`, `conv.cc`, `conv_transpose.cc`, `dropout.cc`, `instance_norm.cc`, `pool.cc`, `compress.cc`, `nonzero_op.cc`, `upsample.cc`
+  - For standalone files (`compress.cc`, `nonzero_op.cc`, `upsample.cc`, `reduction_ops.cc`), added local `GetScratchStream` inline helpers with `#ifdef BUILD_CUDA_EP_AS_PLUGIN` guards
+
+- [x] **1.11b.2** Abstract stream type for softmax, topk, reduction compute functions
+  - Introduced `SoftmaxComputeStreamT` (`Stream*` or `cudaStream_t`) in [softmax.h](../../math/softmax.h)
+  - Introduced `ReduceComputeStreamT` (`Stream*` or `cudaStream_t`) in [reduction_ops.h](../../reduction/reduction_ops.h)
+  - Updated `TopKImpl` to accept `cudaStream_t` directly in plugin build ([topk_impl.h](../../math/topk_impl.h), [topk_impl.cuh](../../math/topk_impl.cuh))
+  - Template instantiation macros updated to match new stream types
+  - `ReduceComputeCore` takes additional `const CudaKernel*` parameter for scratch buffer allocation in plugin path
+
+- [x] **1.11b.3** Remove CPU base class dependencies from specific kernels
+  - `Clip_6`: Inlined `Clip_6Base` attribute reading (`min`/`max` via `GetAttrOrDefault`) directly in [clip.h](../../math/clip.h), removing inheritance from CPU `Clip_6Base`
+  - `ConvTranspose`: Replaced `OpKernel::Node().InputDefs().size()` with `context->Input<Tensor>(idx) != nullptr` for bias detection in [conv_transpose.cc](../../nn/conv_transpose.cc) and [conv_transpose_8.h](../../nn/conv_transpose_8.h)
+  - `Conv`/`ConvTranspose`: Added `#ifdef BUILD_CUDA_EP_AS_PLUGIN` overloads for `GetWorkSpace()` accepting `void*` instead of `onnxruntime::Stream*` in [conv.h](../../nn/conv.h) and [conv_transpose.h](../../nn/conv_transpose.h)
+
+- [x] **1.11b.4** EP Adapter framework fixes (in `include/onnxruntime/ep/adapter/`)
+  - `adapter::OpKernel::Node()` return type fixed: `Node` → `adapter::Node` (resolved ambiguity)
+  - `adapter::Node::Domain()` method added in [node.h](../../../../../../include/onnxruntime/ep/adapter/node.h)
+  - Added `(void)` casts for unused-result warnings in `KernelImpl::ComputeImpl`, `KernelImpl::PrePackImpl`, `KernelRegistry::CreateKernel`, `KernelRegistry::Register`
+
+- [x] **1.11b.5** New CMake exclusions for ops not yet compatible with adapter
+  - Added 18 new exclusion filters in [onnxruntime_providers_cuda_plugin.cmake](../../../../../../cmake/onnxruntime_providers_cuda_plugin.cmake):
+    - `llm/*` — uses `onnxruntime::Stream*` in QkvToContext
+    - `generator/constant_of_shape.cc` — inherits CPU `ConstantOfShapeBase`
+    - `math/matmul_integer.cc` — uses `GetComputeStream()` with `GemmInt8`
+    - `math/matmul.cc` — uses `GetComputeStream()` in `FuncCallAdapter`
+    - `math/variadic_elementwise_ops.cc` — uses `InputArgCount`/`RequiredInput`/`RequiredOutput`
+    - `tensor/slice.cc` — inherits CPU `SliceBase`
+    - `tensor/space_depth_ops.cc` — inherits CPU `SpaceDepthBase`
+    - `tensor/concat.cc` — uses `InputArgCount` and `GetComputeStream()`
+    - `tensor/gather.cc` — passes adapter `OpKernelContext*` to framework `PrepareForCompute`
+    - `tensor/gather_nd.cc` — uses `GetComputeStream()` with `PrepareCompute`
+    - `tensor/pad.cc` — passes adapter context to framework `PadBase::HandleDimension`
+    - `tensor/reshape.cc` — uses `GetComputeStream()` and `CopyTensor`
+    - `tensor/split.cc` — uses `GetComputeStream()` with `CopyToGpu`
+    - `tensor/upsample.cc` — uses `InputDefs()` and `OpKernelInfo::GetAllocator()`
+    - `tensor/unsqueeze.cc` — passes adapter context to framework `FlattenHelper`/`CopyTensor`
+    - `tensor/shape_op.cc` — inherits from framework `onnxruntime::OpKernel`
+  - Commented out `matmul_nbits.h` include in `cuda_plugin_kernels.cu` (uses `InputDefs()`)
+
+- [x] **1.11b.6** Misc cleanup
+  - Removed `RETURN_IF_ERROR` and `RETURN_IF` macros from [cuda_plugin_utils.h](../cuda_plugin_utils.h) (now provided by `adapters.h`)
+  - Added `-Wno-maybe-uninitialized` to suppress false GCC warnings with adapter `GetAttr` output parameters
+  - Guarded `ReductionOps::ReduceCompute` helper with `#ifndef BUILD_CUDA_EP_AS_PLUGIN` (uses `AllocatorPtr` + `Stream*` pattern)
 
 ### 1.12 Validate Stage 1
 
-- [ ] **1.12.1** Build plugin: `./cuda_plugin.sh --build`
+- [x] **1.12.1** Build plugin: `./cuda_plugin.sh --build`
   - Verify clean compilation with zero warnings related to adapter/SHARED_PROVIDER conflicts
-- [ ] **1.12.2** Run C++ tests: `./cuda_plugin.sh --build --test`
+- [x] **1.12.2** Run C++ tests: `./cuda_plugin.sh --build --test`
   - `onnxruntime_test_all` with plugin mode should pass
-- [ ] **1.12.3** Run plugin Python tests: `./cuda_plugin.sh --build --test --test_plugin`
+- [x] **1.12.3** Run plugin Python tests: `./cuda_plugin.sh --build --test --test_plugin`
   - `test_cuda_plugin_ep.py`: Add, MatMul, Gemm, Conv should all pass
-- [ ] **1.12.4** Verify no SHARED_PROVIDER references:
+- [x] **1.12.4** Run non-plugin build and test: `./cuda.sh --build --test` to make sure no regression.
+- [x] **1.12.5** Verify no SHARED_PROVIDER references *(verified)*
   ```bash
   grep -rn 'provider_api\.h\|SHARED_PROVIDER\|g_host' \
     onnxruntime/core/providers/cuda/plugin/
   ```
-  Should return zero matches.
+  Returns only documentation matches — zero code matches.
 
 ---
 
@@ -160,6 +205,24 @@ Refactor `cuda_kernel_adapter.h` to inherit from `adapter::OpKernel` (from `ep/a
   - ScatterND: `scatter_nd.cc` excluded (CPU validation)
   - Size: `size.cc` excluded (CPU op)
   - IntegerGemm: `integer_gemm.cc` excluded (CudaStream dep)
+  - **Added in 1.11** — additional exclusions discovered during adapter integration:
+    - LLM ops: `llm/*` excluded (uses `onnxruntime::Stream*` in QkvToContext)
+    - ConstantOfShape: `generator/constant_of_shape.cc` excluded (CPU `ConstantOfShapeBase`)
+    - MatMulInteger: `math/matmul_integer.cc` excluded (`GetComputeStream()` with `GemmInt8`)
+    - MatMul: `math/matmul.cc` excluded (`GetComputeStream()` in `FuncCallAdapter`)
+    - VariadicElementwise: `math/variadic_elementwise_ops.cc` excluded (`InputArgCount`/`RequiredInput`/`RequiredOutput`)
+    - Slice: `tensor/slice.cc` excluded (CPU `SliceBase`)
+    - SpaceDepthOps: `tensor/space_depth_ops.cc` excluded (CPU `SpaceDepthBase`)
+    - Concat: `tensor/concat.cc` excluded (`InputArgCount`, `GetComputeStream()`)
+    - Gather: `tensor/gather.cc` excluded (adapter/framework `OpKernelContext*` mismatch)
+    - GatherND: `tensor/gather_nd.cc` excluded (`GetComputeStream()`)
+    - Pad: `tensor/pad.cc` excluded (framework `PadBase::HandleDimension`)
+    - Reshape: `tensor/reshape.cc` excluded (`GetComputeStream()`, `CopyTensor`)
+    - Split: `tensor/split.cc` excluded (`GetComputeStream()` with `CopyToGpu`)
+    - Upsample: `tensor/upsample.cc` excluded (`InputDefs()`, `OpKernelInfo::GetAllocator()`)
+    - Unsqueeze: `tensor/unsqueeze.cc` excluded (framework `FlattenHelper`/`CopyTensor`)
+    - Shape: `tensor/shape_op.cc` excluded (inherits framework `onnxruntime::OpKernel`)
+    - MatMulNBits: `matmul_nbits.h` include commented out (uses `InputDefs()`)
 
 ### 2.5 Remove Manual Registry
 
@@ -183,6 +246,7 @@ Refactor `cuda_kernel_adapter.h` to inherit from `adapter::OpKernel` (from `ep/a
 
 - [ ] **2.6.2** Build and test
   ```bash
+  ./cuda.sh --build --test
   ./cuda_plugin.sh --build --test --test_plugin
   ```
   All existing tests should pass.
@@ -232,6 +296,7 @@ Refactor `cuda_kernel_adapter.h` to inherit from `adapter::OpKernel` (from `ep/a
 - [ ] **3.4.2** Verify CPU-fallback nodes (Shape, NonZero, etc.) correctly left on CPU
 - [ ] **3.4.3** Build and test:
   ```bash
+  ./cuda.sh --build --test
   ./cuda_plugin.sh --build --test --test_plugin
   ```
 
@@ -293,6 +358,7 @@ Refactor `cuda_kernel_adapter.h` to inherit from `adapter::OpKernel` (from `ep/a
 
 - [ ] **4.6.2** Build and test:
   ```bash
+  ./cuda.sh --build --test
   ./cuda_plugin.sh --build --test --test_plugin
   ```
 
@@ -361,6 +427,7 @@ Refactor `cuda_kernel_adapter.h` to inherit from `adapter::OpKernel` (from `ep/a
 - [ ] **5.7.2** Verify all excluded ops are included or have documented deferral
 - [ ] **5.7.3** Full CI suite with plugin-only CUDA EP:
   ```bash
+  ./cuda.sh --build --test
   ./cuda_plugin.sh --build --test --test_plugin
   ```
 
@@ -411,19 +478,47 @@ Refactor `cuda_kernel_adapter.h` to inherit from `adapter::OpKernel` (from `ep/a
 
 ### Files to Delete (cumulative across stages)
 
-| File | Stage | Replaced By |
-|------|-------|-------------|
-| `plugin/provider_host_bridge.cc` | 1.10 | N/A (legacy bridge) |
-| `plugin/provider_api_shims.cc` | 1.10 | Standalone implementations (may keep simplified version) |
-| `plugin/cuda_plugin_adapter_registry.cc` | 2.5 | Adapter-based `RegisterCudaKernels()` |
-| Legacy `AdapterKernelImpl` in `cuda_plugin_kernels.cu` | 1.11 | `ep::adapter::KernelImpl` |
+| File | Stage | Status | Replaced By |
+|------|-------|--------|-------------|
+| `plugin/provider_host_bridge.cc` | 1.10 | ✅ Deleted | N/A (legacy bridge) |
+| `plugin/provider_api_shims.cc` | 1.10 | ✅ Simplified | Standalone implementations (kept; `g_host` calls removed) |
+| `plugin/cuda_plugin_adapter_registry.cc` | 2.5 | Pending | Adapter-based `RegisterCudaKernels()` |
+| Legacy `AdapterKernelImpl` in `cuda_plugin_kernels.cu` | 1.10 | ✅ Removed | `ep::adapter::KernelImpl` |
+| `AdapterKernelImpl`/`PluginRegistry`/macro overrides in `cuda_kernel_adapter.h` | 1.11 | ✅ Removed | `ep::adapter::KernelImpl`/`KernelRegistry` |
 
-### Files to Modify Significantly
+### Files Modified (completed)
 
 | File | Stage | Changes |
 |------|-------|---------|
-| `plugin/cuda_kernel_adapter.h` | 1.11 | Remove SHARED_PROVIDER path; `CudaKernel` inherits from `adapter::OpKernel`; remove `AdapterKernelImpl`/`PluginRegistry` |
-| `cmake/onnxruntime_providers_cuda_plugin.cmake` | 1.11, 2.5 | Switch forced-include to `ep/adapters.h`; remove manual registry entry; progressively remove exclusion filters |
+| `plugin/cuda_kernel_adapter.h` | 1.10, 1.11 | Removed SHARED_PROVIDER path, legacy guards, `AdapterKernelImpl`, `PluginRegistry`, macro overrides, duplicate type aliases. `CudaKernel` now inherits from `adapter::OpKernel`. Added `GetScratchStream()`. Reduced from ~900 to ~665 LOC. |
+| `cmake/onnxruntime_providers_cuda_plugin.cmake` | 1.11 | Switched forced-include to `ep/adapters.h`; added 18 new op exclusions; added `-Wno-maybe-uninitialized` |
+| `include/onnxruntime/ep/adapter/op_kernel.h` | 1.11 | Fixed `Node()` return type; added `(void)` casts for warnings |
+| `include/onnxruntime/ep/adapter/node.h` | 1.11 | Added `Domain()` method |
+| `include/onnxruntime/ep/adapter/kernel_registry.h` | 1.11 | Added `(void)` casts for `AddKernel` and `CreateControlFlowKernelImpl` |
+| `cuda/cuda_kernel.h` | 1.11 | Added `GetScratchStream()` for framework build |
+| `cuda/math/clip.h` | 1.11 | Inlined `Clip_6Base` attributes to remove CPU base class dep |
+| `cuda/math/softmax.h/.cc/.cu` | 1.11 | Introduced `SoftmaxComputeStreamT` abstraction |
+| `cuda/math/topk.cc/.cuh/.h` | 1.11 | `TopKImpl` stream parameter uses `cudaStream_t` in plugin build |
+| `cuda/nn/batch_norm.cc` | 1.11 | `GetScratchBuffer` → `GetScratchStream` |
+| `cuda/nn/conv.cc/.h` | 1.11 | `GetWorkSpace` overload for `void*`; `GetScratchStream` |
+| `cuda/nn/conv_transpose.cc/.h` | 1.11 | Bias detection via `Input!=nullptr`; `GetWorkSpace` overload; `GetScratchStream` |
+| `cuda/nn/conv_transpose_8.h` | 1.11 | Same as conv_transpose; `Stream(context)` for scratch |
+| `cuda/nn/dropout.cc` | 1.11 | `GetScratchStream` |
+| `cuda/nn/instance_norm.cc` | 1.11 | `GetScratchStream` |
+| `cuda/nn/pool.cc` | 1.11 | `GetScratchStream` |
+| `cuda/reduction/reduction_ops.cc/.h` | 1.11 | `ReduceComputeStreamT`; `AllocateScratchBuffer` helper; extra `CudaKernel*` param |
+| `cuda/tensor/compress.cc` | 1.11 | Local `GetScratchStream` helper |
+| `cuda/tensor/nonzero_op.cc` | 1.11 | Local `GetScratchStream` helper |
+| `cuda/tensor/upsample.cc` | 1.11 | Local `GetScratchStream` helper |
+| `plugin/cuda_plugin_adapter_registry.cc` | 1.11 | Uses `ResolvePluginKernelCreateFn` instead of `PluginRegistry` |
+| `plugin/cuda_plugin_kernels.cu` | 1.11 | Commented out `matmul_nbits.h` include |
+| `plugin/cuda_plugin_utils.h` | 1.11 | Removed `RETURN_IF_ERROR`/`RETURN_IF` macros |
+
+### Files to Modify (remaining stages)
+
+| File | Stage | Changes |
+|------|-------|---------|
+| `cmake/onnxruntime_providers_cuda_plugin.cmake` | 2.5 | Remove manual registry entry; progressively remove exclusion filters |
 | `plugin/cuda_ep.h` / `cuda_ep.cc` | 3.1, 4.2, 4.3 | Add `ShouldConvertDataLayoutForOp`, CUDA graph callbacks |
 | `plugin/cuda_ep_factory.cc` | 2.1 | Use `adapter::KernelRegistry` for registration |
 

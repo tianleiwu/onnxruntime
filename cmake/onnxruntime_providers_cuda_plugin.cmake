@@ -52,6 +52,7 @@ list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX "onnxruntime/contrib_ops/cuda/c
 # which conflicts with the adapter shim CUDAExecutionProvider class.
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/cuda_execution_provider\\.cc$")
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/cuda_provider_factory\\.cc$")
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/cuda_provider_interface\\.cc$")
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/einsum\\.cc$")
 
 # Exclude the entire controlflow/ subdirectory — these inherit from CPU base
@@ -151,6 +152,14 @@ list(FILTER CUDA_PLUGIN_EP_CU_SRCS EXCLUDE REGEX ".*/object_detection/.*")
 # OpKernelInfo::GetAllocator() not available in adapter.
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/upsample\\.cc$")
 
+# Exclude resize.cc — Resize inherits from Upsample (excluded above).
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/resize\\.cc$")
+
+# Exclude einsum — einsum_auxiliary_ops.cc calls ReductionOps::ReduceCompute
+# which is framework-only (guarded by #ifndef BUILD_CUDA_EP_AS_PLUGIN).
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/einsum_utils/.*")
+list(FILTER CUDA_PLUGIN_EP_CU_SRCS EXCLUDE REGEX ".*/math/einsum_utils/.*")
+
 # Exclude unsqueeze.cc — passes adapter OpKernelContext* to framework
 # FlattenHelper/CopyTensor which expects onnxruntime::OpKernelContext*.
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/unsqueeze\\.cc$")
@@ -158,6 +167,12 @@ list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/unsqueeze\\.cc$")
 # Exclude shape_op.cc — Shape inherits from onnxruntime::OpKernel (framework)
 # which cannot convert to ep::adapter::OpKernel in the plugin build.
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/shape_op\\.cc$")
+
+# Exclude cumsum.cc — cumsum_op::GetAxis is defined in framework CPU provider.
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/cumsum\\.cc$")
+
+# Exclude tile.cc — TileOp::IsTileMemcpy is defined in framework CPU provider.
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/tile\\.cc$")
 
 # Create shared library target using the ORT helper function for plugins
 onnxruntime_add_shared_library_module(onnxruntime_providers_cuda_plugin
@@ -187,6 +202,7 @@ target_compile_options(onnxruntime_providers_cuda_plugin PRIVATE
     # Op-registration .cc files do not include it directly, so they need it here.
     "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-Xcudafe;--diag_suppress=550>"
     "$<$<COMPILE_LANGUAGE:CXX>:-include;${REPO_ROOT}/include/onnxruntime/ep/adapters.h>"
+    "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${CUDA_PLUGIN_EP_DIR}/cuda_kernel_adapter.h>"
 )
 
 # --- EP Adapter Framework ---

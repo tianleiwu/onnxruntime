@@ -482,7 +482,7 @@ Status ConvTranspose<T, Layout>::DoConvTranspose(OpKernelContext* context, bool 
       CUDA_RETURN_IF_ERROR(cudaMemset(s_.y_data, 0, s_.Y->SizeInBytes()));
     }
   }
-  auto ws = GetWorkSpace(GetScratchStream(context));
+  auto ws = GetWorkSpace(GetComputeStream(context));
 
   CUDNN_FE_RETURN_IF_ERROR(s_.cudnn_fe_graph->execute(cudnn_handle,
                                                       s_.variant_pack,

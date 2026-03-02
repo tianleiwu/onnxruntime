@@ -126,6 +126,126 @@ using ::onnxruntime::HandleNegativeAxis;
 // Section 3: Adapter-path kernel registration and PluginRegistry
 // ===================================================================
 
+#include <map>
+
+namespace onnxruntime {
+namespace cuda {
+
+// KernelFactory: a plain function-pointer type for creating kernels.
+// Uses adapter types since plugin kernels inherit from ep::adapter::OpKernel.
+using KernelFactory = ::onnxruntime::ep::adapter::OpKernel* (*)(const ::onnxruntime::ep::adapter::OpKernelInfo&);
+
+// GenericCreateKernel: ORT plugin registry callback.
+// context is a const KernelFactory* (pointer to a KernelFactory stored in the
+// PluginRegistry map). Casting an object pointer to/from void* is valid C++.
+inline OrtStatus* ORT_API_CALL GenericCreateKernel(void* context, const OrtKernelInfo* info, OrtKernelImpl** out) noexcept {
+  ORT_TRY {
+    const auto* factory = static_cast<const KernelFactory*>(context);
+    ::onnxruntime::ep::adapter::OpKernelInfo adapter_info(info);
+    auto* kernel_raw = (*factory)(adapter_info);
+    if (!kernel_raw) return Ort::GetApi().CreateStatus(ORT_EP_FAIL, "Failed to create kernel");
+    *out = new ::onnxruntime::ep::adapter::KernelImpl(
+        std::unique_ptr<::onnxruntime::ep::adapter::OpKernel>(kernel_raw));
+    return nullptr;
+  }
+  ORT_CATCH(const std::exception& e) {
+    ORT_HANDLE_EXCEPTION([&]() {});
+    return Ort::GetApi().CreateStatus(ORT_EP_FAIL, e.what());
+  }
+}
+
+// PluginRegistry: singleton mapping (op, domain, since, end_version, type_name) to a KernelFactory.
+// std::map values have stable addresses, so &entry.second is a valid long-lived
+// void* context for GenericCreateKernel.
+// type_name is the stringified C++ type for typed kernels (e.g. "float",
+// "MLFloat16") or empty for untyped ops.
+class PluginRegistry {
+ public:
+  struct EntryKey {
+    std::string op;
+    std::string domain;
+    int since{0};
+    int end{0};             // 0 = open-ended
+    std::string type_name;  // empty for untyped ops
+    bool operator<(const EntryKey& o) const {
+      return std::tie(op, domain, since, end, type_name) < std::tie(o.op, o.domain, o.since, o.end, o.type_name);
+    }
+  };
+
+  static PluginRegistry& Instance() {
+    static PluginRegistry instance;
+    return instance;
+  }
+
+  const KernelFactory* Add(const std::string& op, const char* domain, int since, int end_ver,
+                           const char* type_name, KernelFactory fn) {
+    auto& slot = fns_[EntryKey{op, domain ? domain : "", since, end_ver, type_name ? type_name : ""}];
+    slot = fn;
+    return &slot;
+  }
+
+  const std::map<EntryKey, KernelFactory>& AllEntries() const { return fns_; }
+
+ private:
+  std::map<EntryKey, KernelFactory> fns_;
+};
+
+}  // namespace cuda
+}  // namespace onnxruntime
+
+// --- Macro extensions: redefine kernel registration macros to also populate PluginRegistry ---
+
+#define ORT_ADAPTER_CONCAT_IMPL(x, y) x##y
+#define ORT_ADAPTER_CONCAT(x, y) ORT_ADAPTER_CONCAT_IMPL(x, y)
+
+#undef ONNX_OPERATOR_KERNEL_EX
+#define ONNX_OPERATOR_KERNEL_EX(op, domain, since, _ep, builder, ...)                                       \
+  class ONNX_OPERATOR_KERNEL_CLASS_NAME(_ep, domain, since, op);                                            \
+  static bool ORT_ADAPTER_CONCAT(_reg_##op##_, __COUNTER__) = []() {                                        \
+    ::onnxruntime::cuda::PluginRegistry::Instance().Add(                                                    \
+        #op, domain, since, 0, "",                                                                          \
+        [](const ::onnxruntime::ep::adapter::OpKernelInfo& info) -> ::onnxruntime::ep::adapter::OpKernel* { \
+          return new __VA_ARGS__(info);                                                                     \
+        });                                                                                                 \
+    return true;                                                                                            \
+  }();
+
+#undef ONNX_OPERATOR_VERSIONED_KERNEL_EX
+#define ONNX_OPERATOR_VERSIONED_KERNEL_EX(op, domain, since, end, _ep, builder, ...)                        \
+  class ONNX_OPERATOR_VERSIONED_KERNEL_CLASS_NAME(_ep, domain, since, end, op);                             \
+  static bool ORT_ADAPTER_CONCAT(_reg_##op##_, __COUNTER__) = []() {                                        \
+    ::onnxruntime::cuda::PluginRegistry::Instance().Add(                                                    \
+        #op, domain, since, end, "",                                                                        \
+        [](const ::onnxruntime::ep::adapter::OpKernelInfo& info) -> ::onnxruntime::ep::adapter::OpKernel* { \
+          return new __VA_ARGS__(info);                                                                     \
+        });                                                                                                 \
+    return true;                                                                                            \
+  }();
+
+#undef ONNX_OPERATOR_TYPED_KERNEL_EX
+#define ONNX_OPERATOR_TYPED_KERNEL_EX(op, domain, since, type, _ep, builder, ...)                           \
+  class ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME(_ep, domain, since, type, op);                                \
+  static bool ORT_ADAPTER_CONCAT(_reg_##op##_##type##_, __COUNTER__) = []() {                               \
+    ::onnxruntime::cuda::PluginRegistry::Instance().Add(                                                    \
+        #op, domain, since, 0, #type,                                                                       \
+        [](const ::onnxruntime::ep::adapter::OpKernelInfo& info) -> ::onnxruntime::ep::adapter::OpKernel* { \
+          return new __VA_ARGS__(info);                                                                     \
+        });                                                                                                 \
+    return true;                                                                                            \
+  }();
+
+#undef ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX
+#define ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX(op, domain, since, end, type, _ep, builder, ...)            \
+  class ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_CLASS_NAME(_ep, domain, since, end, type, op);                 \
+  static bool ORT_ADAPTER_CONCAT(_reg_##op##_##type##_, __COUNTER__) = []() {                               \
+    ::onnxruntime::cuda::PluginRegistry::Instance().Add(                                                    \
+        #op, domain, since, end, #type,                                                                     \
+        [](const ::onnxruntime::ep::adapter::OpKernelInfo& info) -> ::onnxruntime::ep::adapter::OpKernel* { \
+          return new __VA_ARGS__(info);                                                                     \
+        });                                                                                                 \
+    return true;                                                                                            \
+  }();
+
 // ===================================================================
 // Section 4: Logging shim (adapter path only)
 // Replaces LOGS_DEFAULT with a no-op stream to avoid pulling in the
@@ -467,9 +587,9 @@ class CudaKernel : public OpKernel {
     return static_cast<cudaStream_t>(ctx->GetGPUComputeStream());
   }
 
-  // Returns the compute stream pointer in the type expected by GetScratchBuffer.
-  // In the plugin build, GetScratchBuffer expects void*.
-  inline void* GetScratchStream(OpKernelContext* ctx) const {
+  // Returns an opaque stream pointer for passing to GetScratchBuffer/AddDeferredReleaseCPUPtr/CopyToGpu.
+  // Returns void* for dual-build compatibility: framework wraps Stream*, plugin wraps cudaStream_t.
+  inline void* GetComputeStream(OpKernelContext* ctx) const {
     return ctx->GetGPUComputeStream();
   }
 

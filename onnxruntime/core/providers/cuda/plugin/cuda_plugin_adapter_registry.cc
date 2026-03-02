@@ -250,76 +250,77 @@ OrtStatus* CreateCudaKernelRegistryFromOrtTables(const OrtEpApi& ep_api,
 
   Ort::KernelRegistry registry;
 
-  // Group registrations by (op, domain, version_start, version_end) to build
-  // kernel defs with proper per-constraint type lists.
-  struct KernelDefKey {
-    std::string op_type;
-    std::string domain;
-    int since_version_start;
-    int since_version_end;
-
-    bool operator<(const KernelDefKey& other) const {
-      return std::tie(op_type, domain, since_version_start, since_version_end) <
-             std::tie(other.op_type, other.domain, other.since_version_start, other.since_version_end);
+  // Map ONNX tensor element data type enum to C++ type name (matching #type from macros).
+  auto OnnxTypeEnumToName = [](ONNXTensorElementDataType t) -> const char* {
+    switch (t) {
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+        return "float";
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
+        return "double";
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+        return "MLFloat16";
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+        return "BFloat16";
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
+        return "int8_t";
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
+        return "uint8_t";
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16:
+        return "int16_t";
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:
+        return "uint16_t";
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+        return "int32_t";
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:
+        return "uint32_t";
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+        return "int64_t";
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64:
+        return "uint64_t";
+      case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
+        return "bool";
+      default:
+        return "";
     }
   };
 
-  // Map: key -> { constraint_name -> set of type enums }
-  std::map<KernelDefKey, std::map<std::string, std::set<ONNXTensorElementDataType>>> grouped;
+  // Use PluginRegistry for lookup (keyed by op+domain+since+end+type_name).
+  const auto& plugin_map = onnxruntime::cuda::PluginRegistry::Instance().AllEntries();
 
   for (const auto& reg : kAdapterRegistrations) {
     std::string domain = reg.domain ? reg.domain : "";
+    std::string type_name = (reg.type_constraint != ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED)
+                                ? OnnxTypeEnumToName(reg.type_constraint)
+                                : "";
 
-    // Check if a kernel factory exists for this op
-    auto create_fn = ResolvePluginKernelCreateFn(reg.op_type, domain);
-    if (!create_fn) {
-      continue;  // Op not implemented — skip
+    onnxruntime::cuda::PluginRegistry::EntryKey lookup_key{
+        reg.op_type, domain, reg.since_version_start, reg.since_version_end, type_name};
+    auto it = plugin_map.find(lookup_key);
+    if (it == plugin_map.end()) {
+      continue;  // Op/type not implemented via new registration — skip
     }
 
-    KernelDefKey key{
-        reg.op_type,
-        domain,
-        reg.since_version_start,
-        reg.since_version_end,
-    };
+    Ort::KernelDefBuilder builder;
+    builder.SetOperatorType(reg.op_type);
+    if (!domain.empty()) {
+      builder.SetDomain(domain.c_str());
+    }
+
+    builder.SetSinceVersion(reg.since_version_start,
+                            reg.since_version_end > 0 ? reg.since_version_end : 2147483647);
+    builder.SetExecutionProvider(ep_name);
 
     if (reg.constraint_name && reg.constraint_name[0] != '\0' &&
         reg.type_constraint != ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED) {
-      grouped[key][reg.constraint_name].insert(reg.type_constraint);
-    } else {
-      // Unconstrained registration — ensure key exists
-      grouped[key];
-    }
-  }
-
-  // Build and register kernel defs from grouped data.
-  for (const auto& [key, constraints] : grouped) {
-    auto create_fn = ResolvePluginKernelCreateFn(key.op_type, key.domain);
-    if (!create_fn) continue;
-
-    Ort::KernelDefBuilder builder;
-    builder.SetOperatorType(key.op_type.c_str());
-    if (!key.domain.empty()) {
-      builder.SetDomain(key.domain.c_str());
-    }
-
-    builder.SetSinceVersion(key.since_version_start,
-                            key.since_version_end > 0 ? key.since_version_end : 2147483647);
-
-    builder.SetExecutionProvider(ep_name);
-
-    for (const auto& [cname, types] : constraints) {
-      std::vector<const OrtDataType*> type_list;
-      for (ONNXTensorElementDataType t : types) {
-        const OrtDataType* dt = nullptr;
-        RETURN_IF_ERROR(ep_api.GetTensorDataType(t, &dt));
-        type_list.push_back(dt);
-      }
-      builder.AddTypeConstraint(cname.c_str(), type_list);
+      const OrtDataType* dt = nullptr;
+      RETURN_IF_ERROR(ep_api.GetTensorDataType(reg.type_constraint, &dt));
+      builder.AddTypeConstraint(reg.constraint_name, {dt});
     }
 
     Ort::KernelDef kernel_def = builder.Build();
-    RETURN_IF_ERROR(registry.AddKernel(kernel_def.release(), reinterpret_cast<OrtKernelCreateFunc>(create_fn), nullptr));
+    // context is &it->second (const KernelFactory*). std::map values have stable
+    // addresses. Casting object pointer to void* is valid C++ (no fn-ptr cast).
+    RETURN_IF_ERROR(registry.AddKernel(kernel_def.release(), onnxruntime::cuda::GenericCreateKernel, (void*)(&it->second)));
   }
 
   *out_registry = registry.release();
