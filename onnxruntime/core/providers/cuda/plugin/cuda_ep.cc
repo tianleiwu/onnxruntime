@@ -4,6 +4,11 @@
 #include "cuda_ep.h"
 #include "cuda_ep_factory.h"
 #include "core/providers/cuda/plugin/cuda_kernel_adapter.h"
+#include "ep/get_capability_utils.h"
+
+#include <cstring>
+#include <string_view>
+#include <unordered_set>
 
 namespace onnxruntime {
 namespace cuda_plugin {
@@ -21,6 +26,7 @@ CudaEp::CudaEp(CudaEpFactory& factory, const Config& config, const OrtLogger& lo
   GetCapability = GetCapabilityImpl;
   GetKernelRegistry = GetKernelRegistryImpl;
   GetPreferredDataLayout = GetPreferredDataLayoutImpl;
+  ShouldConvertDataLayoutForOp = ShouldConvertDataLayoutForOpImpl;
   OnRunStart = OnRunStartImpl;
   OnRunEnd = OnRunEndImpl;
 
@@ -62,13 +68,38 @@ OrtStatus* ORT_API_CALL CudaEp::GetCapabilityImpl(
     return nullptr;
   }
 
-  // For each node, check if we have a registered kernel
+  // Phase 1: Collect tentative nodes — those for which we have a registered kernel.
+  std::vector<const OrtNode*> tentative_nodes;
+  tentative_nodes.reserve(all_nodes.size());
+
   for (const auto& node : all_nodes) {
+    // Skip nodes already assigned to another EP.
+    std::string ep_name = node.GetEpName();
+    if (!ep_name.empty()) {
+      continue;
+    }
+
     const OrtKernelDef* kernel_def = nullptr;
     RETURN_IF_ERROR(ep_api.EpGraphSupportInfo_LookUpKernel(
         graph_support_info, node, &kernel_def));
 
     if (kernel_def != nullptr) {
+      tentative_nodes.push_back(node);
+    }
+  }
+
+  // Phase 2: Filter out CPU-preferred nodes (e.g., Shape, NonZero, small compute ops
+  // that would be cheaper on CPU than incurring device-to-host copy overhead).
+  std::unordered_set<const OrtNode*> cpu_preferred_nodes;
+  RETURN_IF_ERROR(ep::GetCpuPreferredNodes(
+      *ort_graph, *graph_support_info, ep->logger_,
+      gsl::span<const OrtNode* const>(tentative_nodes.data(), tentative_nodes.size()),
+      cpu_preferred_nodes));
+
+  // Phase 3: Add final supported nodes (tentative minus CPU-preferred).
+  for (const OrtNode* ort_node : tentative_nodes) {
+    if (cpu_preferred_nodes.count(ort_node) == 0) {
+      Ort::ConstNode node{ort_node};
       RETURN_IF_ERROR(ep_api.EpGraphSupportInfo_AddSingleNode(
           graph_support_info, node));
     }
@@ -95,6 +126,51 @@ OrtStatus* ORT_API_CALL CudaEp::GetPreferredDataLayoutImpl(
     OrtEp* this_ptr, OrtEpDataLayout* preferred_data_layout) noexcept {
   const auto* ep = static_cast<const CudaEp*>(this_ptr);
   *preferred_data_layout = ep->config_.prefer_nhwc ? OrtEpDataLayout_NHWC : OrtEpDataLayout_NCHW;
+  return nullptr;
+}
+
+/*static*/
+OrtStatus* ORT_API_CALL CudaEp::ShouldConvertDataLayoutForOpImpl(
+    OrtEp* this_ptr, const char* domain, const char* op_type,
+    OrtEpDataLayout target_data_layout, int* should_convert) noexcept {
+  (void)this_ptr;
+
+  // Only convert to NHWC; for any other target layout, let ORT decide.
+  if (target_data_layout != OrtEpDataLayout_NHWC) {
+    *should_convert = -1;  // Let ORT decide
+    return nullptr;
+  }
+
+  // ONNX domain ops that have NHWC kernel registrations.
+  static const std::unordered_set<std::string_view> cuda_nhwc_onnx_ops{
+      "BatchNormalization",
+      "Conv",
+      "ConvTranspose",
+      "GlobalMaxPool",
+      "MaxPool",
+      "GlobalAveragePool",
+      "AveragePool",
+      "GridSample",
+      "DepthToSpace",
+      "SpaceToDepth",
+      "LRN",
+  };
+
+  // Check ONNX domain (empty string) or MS domain (com.microsoft)
+  bool is_onnx_domain = (domain[0] == '\0');
+  bool is_ms_domain = (std::strcmp(domain, "com.microsoft") == 0);
+
+  if (is_onnx_domain && cuda_nhwc_onnx_ops.count(op_type) > 0) {
+    *should_convert = 1;  // Convert
+    return nullptr;
+  }
+
+  if (is_ms_domain && std::strcmp(op_type, "GridSample") == 0) {
+    *should_convert = 1;  // Convert
+    return nullptr;
+  }
+
+  *should_convert = -1;  // Let ORT decide for other ops
   return nullptr;
 }
 

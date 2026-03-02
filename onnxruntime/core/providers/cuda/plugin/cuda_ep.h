@@ -49,6 +49,10 @@ class CudaEp : public OrtEp {
   static OrtStatus* ORT_API_CALL OnRunStartImpl(
       OrtEp* this_ptr, const ::OrtRunOptions* run_options) noexcept;
 
+  static OrtStatus* ORT_API_CALL ShouldConvertDataLayoutForOpImpl(
+      OrtEp* this_ptr, const char* domain, const char* op_type,
+      OrtEpDataLayout target_data_layout, int* should_convert) noexcept;
+
   static OrtStatus* ORT_API_CALL OnRunEndImpl(
       OrtEp* this_ptr, const ::OrtRunOptions* run_options, bool sync_stream) noexcept;
 
