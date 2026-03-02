@@ -51,9 +51,10 @@ list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/cuda_provider_factory\\.cc$
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/cuda_provider_interface\\.cc$")
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/einsum\\.cc$")
 
-# Exclude the entire controlflow/ subdirectory — these inherit from CPU base
-# classes (If, Loop, Scan) which are not available in the plugin build.
-list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/controlflow/.*")
+# Exclude the framework controlflow/ subdirectory — these inherit from CPU base
+# classes (If, Loop, Scan). The plugin has its own control flow wrappers in
+# plugin/cuda_controlflow_plugin.cc that delegate to OrtEpApi.
+list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/core/providers/cuda/controlflow/.*")
 
 # Exclude the entire tunable/ subdirectory — it depends on the real CudaTuningContext
 # and CUDAExecutionProvider which are not available in the plugin build.
@@ -78,15 +79,14 @@ list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/cuda_common\\.cc$")
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/cuda_nhwc_kernels\\.cc$")
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/cuda_contrib_kernels\\.cc$")
 
-# Exclude files that use CudaStream (incomplete type in plugin build — requires
-# cuda_stream_handle.h which depends on EP infrastructure).
-list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/integer_gemm\\.cc$")
+# integer_gemm.cc: dynamic_cast<CudaStream*> replaced with GetCublasHandle(cudaStream_t).
+# list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/integer_gemm\\.cc$")  # REMOVED in Stage 5
 
-# Exclude entire rnn/ subdirectory — CudnnRnnBase and its subclasses (RNN, GRU, LSTM)
-# all depend on CudaStream (dynamic_cast in cudnn_rnn_base.cc).
-list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/rnn/.*")
+# RNN ops: dynamic_cast<CudaStream*> and Stream* dependencies have been fixed
+# by changing to GetCudnnHandle(cudaStream_t) and void* alloc_stream parameters.
+# list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/rnn/.*")  # REMOVED in Stage 5
 
-list(FILTER CUDA_PLUGIN_EP_CU_SRCS EXCLUDE REGEX ".*/rnn/.*")
+# list(FILTER CUDA_PLUGIN_EP_CU_SRCS EXCLUDE REGEX ".*/rnn/.*")  # REMOVED in Stage 5
 
 # Exclude files that use TensorSeq (incomplete type in plugin build).
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/identity_op\\.cc$")
@@ -96,9 +96,8 @@ list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/sequence_op\\.cc$")
 # lives in the CPU provider and is not linked into the plugin.
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/size\\.cc$")
 
-# Exclude scatter_nd.cc — calls ScatterND::ValidateShapes whose implementation
-# lives in the CPU provider's scatter_nd.cc (not linked into the plugin).
-list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/scatter_nd\\.cc$")
+# scatter_nd.cc: ValidateShapes inlined for plugin, GetComputeStream fixed.
+# list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/scatter_nd\\.cc$")  # REMOVED in Stage 5
 
 # Exclude llm/ — attention.cc calls QkvToContext which dereferences
 # onnxruntime::Stream* (not available in plugin build's adapter OpKernelContext).
@@ -109,12 +108,11 @@ list(FILTER CUDA_PLUGIN_EP_CU_SRCS EXCLUDE REGEX ".*/llm/.*")
 # which is not linked into the plugin.
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/generator/constant_of_shape\\.cc$")
 
-# Exclude matmul_integer.cc — uses GetComputeStream() with GemmInt8 which expects
-# onnxruntime::Stream* (not available in adapter OpKernelContext).
-list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/matmul_integer\\.cc$")
+# matmul_integer.cc: GetComputeStream fixed, GemmInt8 signature updated.
+# list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/matmul_integer\.cc$")  # REMOVED in Stage 5
 
-# Exclude matmul.cc — uses GetComputeStream() in FuncCallAdapter (needs onnxruntime::Stream*).
-list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/matmul\\.cc$")
+# matmul.cc: GetComputeStream fixed, GetTuningContext guarded.
+# list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/matmul\.cc$")  # REMOVED in Stage 5
 
 # Exclude variadic_elementwise_ops.cc — uses InputArgCount/RequiredInput/RequiredOutput
 # which are not in the adapter Node/OpKernelContext.
@@ -133,8 +131,8 @@ list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/concat\\.cc$")
 # which expects onnxruntime::OpKernelContext*.
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/gather\\.cc$")
 
-# Exclude gather_nd.cc — uses GetComputeStream() with PrepareCompute framework function.
-list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/gather_nd\\.cc$")
+# gather_nd.cc: PrepareCompute signature changed to void*/cudaStream_t, GetComputeStream fixed.
+# list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/gather_nd\\.cc$")  # REMOVED in Stage 5
 
 # Exclude pad.cc — passes adapter OpKernelContext to framework PadBase::HandleDimension.
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/pad\\.cc$")
@@ -229,9 +227,8 @@ list(FILTER CUDA_PLUGIN_EP_CU_SRCS EXCLUDE REGEX ".*/contrib_ops/cuda/transforme
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/contrib_ops/cuda/math/gemm_float8\\.cc$")
 list(FILTER CUDA_PLUGIN_EP_CU_SRCS EXCLUDE REGEX ".*/contrib_ops/cuda/math/gemm_float8\\.cu$")
 
-# Exclude fused_matmul.cc — registers MatMul<T> as kernel class, pulling in
-# MatMul<T>::ComputeInternal which is in the excluded matmul.cc.
-list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/contrib_ops/cuda/math/fused_matmul\\.cc$")
+# fused_matmul.cc: matmul.cc is now included, so fused_matmul can be too.
+# list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/contrib_ops/cuda/math/fused_matmul\\.cc$")  # REMOVED in Stage 5
 
 # Create shared library target using the ORT helper function for plugins
 onnxruntime_add_shared_library_module(onnxruntime_providers_cuda_plugin
