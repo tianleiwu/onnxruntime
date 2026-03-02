@@ -4,8 +4,12 @@
 #pragma once
 
 #include "cuda_plugin_utils.h"
+#include "cuda_graph_plugin.h"
 
+#include <atomic>
 #include <string>
+#include <unordered_map>
+#include <mutex>
 
 namespace onnxruntime {
 namespace cuda_plugin {
@@ -23,6 +27,8 @@ class CudaEp : public OrtEp {
     int device_id = 0;                                ///< CUDA device ordinal.
     int cudnn_conv_algo = 0;                          ///< cuDNN convolution algorithm selection.
     bool cudnn_conv1d_pad_to_nc1d = false;            ///< Pad 1D convolutions to NC1D format.
+    bool enable_cuda_graph = false;                   ///< Enable CUDA graph capture/replay.
+    int min_num_runs_before_cuda_graph_capture = 1;   ///< Warm-up runs before graph capture.
   };
 
   CudaEp(CudaEpFactory& factory, const Config& config, const OrtLogger& logger);
@@ -56,10 +62,22 @@ class CudaEp : public OrtEp {
   static OrtStatus* ORT_API_CALL OnRunEndImpl(
       OrtEp* this_ptr, const ::OrtRunOptions* run_options, bool sync_stream) noexcept;
 
+  // CUDA Graph helpers
+  CudaGraphAnnotation_t GetAnnotationId(const ::OrtRunOptions* run_options) const;
+  bool IsGraphCaptureAllowed(CudaGraphAnnotation_t annotation_id) const;
+
   CudaEpFactory& factory_;
   std::string name_;
   Config config_;
   const OrtLogger& logger_;
+
+  // CUDA Graph state
+  std::atomic<bool> cuda_graph_enabled_{false};
+  int min_runs_before_capture_ = 1;
+  CUDAGraphManager cuda_graph_manager_;
+  std::unordered_map<CudaGraphAnnotation_t, int> graph_id_to_run_count_;
+  bool is_capturing_ = false;
+  CudaGraphAnnotation_t capturing_annotation_id_ = kCudaGraphAnnotationDefault;
 };
 
 }  // namespace cuda_plugin

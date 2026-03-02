@@ -105,14 +105,18 @@ def create_batch_norm_model(model_path):
         epsilon=1e-5,
     )
     # scale, B, mean, var are 1D tensors of shape [num_channels]
-    scale_init = helper.make_tensor("scale", TensorProto.FLOAT, [num_channels],
-                                    np.ones(num_channels, dtype=np.float32).tolist())
-    bias_init = helper.make_tensor("B", TensorProto.FLOAT, [num_channels],
-                                   np.zeros(num_channels, dtype=np.float32).tolist())
-    mean_init = helper.make_tensor("input_mean", TensorProto.FLOAT, [num_channels],
-                                   np.zeros(num_channels, dtype=np.float32).tolist())
-    var_init = helper.make_tensor("input_var", TensorProto.FLOAT, [num_channels],
-                                  np.ones(num_channels, dtype=np.float32).tolist())
+    scale_init = helper.make_tensor(
+        "scale", TensorProto.FLOAT, [num_channels], np.ones(num_channels, dtype=np.float32).tolist()
+    )
+    bias_init = helper.make_tensor(
+        "B", TensorProto.FLOAT, [num_channels], np.zeros(num_channels, dtype=np.float32).tolist()
+    )
+    mean_init = helper.make_tensor(
+        "input_mean", TensorProto.FLOAT, [num_channels], np.zeros(num_channels, dtype=np.float32).tolist()
+    )
+    var_init = helper.make_tensor(
+        "input_var", TensorProto.FLOAT, [num_channels], np.ones(num_channels, dtype=np.float32).tolist()
+    )
 
     graph_def = helper.make_graph(
         [node_def],
@@ -345,5 +349,164 @@ def test_cuda_plugin_registration():
     print("\nAll Stage 3 NHWC tests finished successfully.", flush=True)
 
 
+def test_cuda_plugin_cuda_graph():
+    """Stage 4: CUDA Graph capture/replay tests using IO binding for memory-stable buffers."""
+    ep_name = "CudaPluginExecutionProvider"
+
+    devices = onnxrt.get_ep_devices()
+    plugin_devices = [d for d in devices if d.ep_name == ep_name]
+    if not plugin_devices:
+        print("Error: No plugin devices found! Run test_cuda_plugin_registration first.", flush=True)
+        sys.exit(1)
+
+    target_device = plugin_devices[0]
+
+    print("\n==================== Stage 4: CUDA Graph Tests ====================", flush=True)
+
+    # ---- Test 1: Add model with IO binding (warmup + capture + replay) ----
+    print("Testing CUDA Graph (Add, IO binding, warmup + capture + replay)...", end=" ", flush=True)
+    try:
+        model_path = "temp_graph.onnx"
+        create_add_model(model_path)
+
+        sess_options = onnxrt.SessionOptions()
+        sess_options.add_session_config_entry("ep.cuda.enable_cuda_graph", "1")
+        sess_options.add_session_config_entry("ep.cuda.min_num_runs_before_cuda_graph_capture", "2")
+        sess_options.add_provider_for_devices([target_device], {})
+        sess = onnxrt.InferenceSession(model_path, sess_options=sess_options)
+
+        active_providers = sess.get_providers()
+        assert ep_name in active_providers, f"Expected {ep_name} in providers, got {active_providers}"
+
+        # Create GPU-resident OrtValues for fixed-address I/O binding
+        a = np.random.rand(3, 2).astype(np.float32)
+        b = np.random.rand(3, 2).astype(np.float32)
+        y = np.zeros([3, 2], dtype=np.float32)
+        a_ortvalue = onnxrt.OrtValue.ortvalue_from_numpy(a, "cuda", 0)
+        b_ortvalue = onnxrt.OrtValue.ortvalue_from_numpy(b, "cuda", 0)
+        y_ortvalue = onnxrt.OrtValue.ortvalue_from_numpy(y, "cuda", 0)
+
+        io_binding = sess.io_binding()
+        io_binding.bind_ortvalue_input("A", a_ortvalue)
+        io_binding.bind_ortvalue_input("B", b_ortvalue)
+        io_binding.bind_ortvalue_output("Y", y_ortvalue)
+
+        expected = a + b
+        ro = onnxrt.RunOptions()
+        ro.add_run_config_entry("gpu_graph_id", "0")
+
+        # Warm-up run (before capture threshold)
+        sess.run_with_iobinding(io_binding, ro)
+        np.testing.assert_allclose(y_ortvalue.numpy(), expected, rtol=1e-5, atol=1e-5)
+
+        # Capture run (warm-up count met → capture begins/ends + first replay)
+        sess.run_with_iobinding(io_binding, ro)
+        np.testing.assert_allclose(y_ortvalue.numpy(), expected, rtol=1e-5, atol=1e-5)
+
+        # Replay runs with same inputs — should produce same results
+        for _ in range(5):
+            sess.run_with_iobinding(io_binding, ro)
+            np.testing.assert_allclose(y_ortvalue.numpy(), expected, rtol=1e-5, atol=1e-5)
+
+        print("PASS")
+        os.remove(model_path)
+    except Exception as e:
+        print(f"FAIL ({e})")
+        if os.path.exists("temp_graph.onnx"):
+            os.remove("temp_graph.onnx")
+
+    # ---- Test 2: MatMul model with IO binding ----
+    print("Testing CUDA Graph (MatMul, IO binding, warmup + capture + replay)...", end=" ", flush=True)
+    try:
+        model_path = "temp_graph_matmul.onnx"
+        create_matmul_model(model_path)
+
+        sess_options = onnxrt.SessionOptions()
+        sess_options.add_session_config_entry("ep.cuda.enable_cuda_graph", "1")
+        sess_options.add_session_config_entry("ep.cuda.min_num_runs_before_cuda_graph_capture", "1")
+        sess_options.add_provider_for_devices([target_device], {})
+        sess = onnxrt.InferenceSession(model_path, sess_options=sess_options)
+
+        a = np.random.rand(3, 4).astype(np.float32)
+        b = np.random.rand(4, 5).astype(np.float32)
+        y = np.zeros([3, 5], dtype=np.float32)
+        a_ortvalue = onnxrt.OrtValue.ortvalue_from_numpy(a, "cuda", 0)
+        b_ortvalue = onnxrt.OrtValue.ortvalue_from_numpy(b, "cuda", 0)
+        y_ortvalue = onnxrt.OrtValue.ortvalue_from_numpy(y, "cuda", 0)
+
+        io_binding = sess.io_binding()
+        io_binding.bind_ortvalue_input("A", a_ortvalue)
+        io_binding.bind_ortvalue_input("B", b_ortvalue)
+        io_binding.bind_ortvalue_output("Y", y_ortvalue)
+
+        expected = a @ b
+        ro = onnxrt.RunOptions()
+        ro.add_run_config_entry("gpu_graph_id", "0")
+
+        # Warm-up
+        sess.run_with_iobinding(io_binding, ro)
+        np.testing.assert_allclose(y_ortvalue.numpy(), expected, rtol=1e-3, atol=1e-3)
+
+        # Capture
+        sess.run_with_iobinding(io_binding, ro)
+        np.testing.assert_allclose(y_ortvalue.numpy(), expected, rtol=1e-3, atol=1e-3)
+
+        # Replays
+        for _ in range(5):
+            sess.run_with_iobinding(io_binding, ro)
+            np.testing.assert_allclose(y_ortvalue.numpy(), expected, rtol=1e-3, atol=1e-3)
+
+        print("PASS")
+        os.remove(model_path)
+    except Exception as e:
+        print(f"FAIL ({e})")
+        if os.path.exists("temp_graph_matmul.onnx"):
+            os.remove("temp_graph_matmul.onnx")
+
+    # ---- Test 3: Disable CUDA graph via gpu_graph_id = -1 ----
+    print("Testing CUDA Graph disabled via gpu_graph_id=-1...", end=" ", flush=True)
+    try:
+        model_path = "temp_graph_disabled.onnx"
+        create_add_model(model_path)
+
+        sess_options = onnxrt.SessionOptions()
+        sess_options.add_session_config_entry("ep.cuda.enable_cuda_graph", "1")
+        sess_options.add_session_config_entry("ep.cuda.min_num_runs_before_cuda_graph_capture", "1")
+        sess_options.add_provider_for_devices([target_device], {})
+        sess = onnxrt.InferenceSession(model_path, sess_options=sess_options)
+
+        a = np.random.rand(3, 2).astype(np.float32)
+        b = np.random.rand(3, 2).astype(np.float32)
+        y = np.zeros([3, 2], dtype=np.float32)
+        a_ortvalue = onnxrt.OrtValue.ortvalue_from_numpy(a, "cuda", 0)
+        b_ortvalue = onnxrt.OrtValue.ortvalue_from_numpy(b, "cuda", 0)
+        y_ortvalue = onnxrt.OrtValue.ortvalue_from_numpy(y, "cuda", 0)
+
+        io_binding = sess.io_binding()
+        io_binding.bind_ortvalue_input("A", a_ortvalue)
+        io_binding.bind_ortvalue_input("B", b_ortvalue)
+        io_binding.bind_ortvalue_output("Y", y_ortvalue)
+
+        expected = a + b
+
+        # gpu_graph_id = -1 disables capture/replay for the run (matches non-plugin EP)
+        ro = onnxrt.RunOptions()
+        ro.add_run_config_entry("gpu_graph_id", "-1")
+
+        for _ in range(3):
+            sess.run_with_iobinding(io_binding, ro)
+            np.testing.assert_allclose(y_ortvalue.numpy(), expected, rtol=1e-5, atol=1e-5)
+
+        print("PASS")
+        os.remove(model_path)
+    except Exception as e:
+        print(f"FAIL ({e})")
+        if os.path.exists("temp_graph_disabled.onnx"):
+            os.remove("temp_graph_disabled.onnx")
+
+    print("\nAll Stage 4 CUDA Graph tests finished.", flush=True)
+
+
 if __name__ == "__main__":
     test_cuda_plugin_registration()
+    test_cuda_plugin_cuda_graph()
