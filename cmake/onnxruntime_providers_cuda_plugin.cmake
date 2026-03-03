@@ -254,7 +254,11 @@ target_compile_options(onnxruntime_providers_cuda_plugin PRIVATE
     # receive the ORT-framework force-include (it conflicts with cute::Tensor etc.).
     # cuda_plugin_kernels.cu already #include "cuda_kernel_adapter.h" directly.
     # Op-registration .cc files do not include it directly, so they need it here.
+    # Suppress NVCC cudafe warnings:
+    #   550  - variable set but never used (in adapter headers)
+    #   2810 - [[nodiscard]] false positive on Status assignments in op_kernel.h / kernel_registry.h
     "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-Xcudafe;--diag_suppress=550>"
+    "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:-Xcudafe --diag_suppress=2810>"
     "$<$<COMPILE_LANGUAGE:CXX>:-include;${REPO_ROOT}/include/onnxruntime/ep/adapters.h>"
     "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${CUDA_PLUGIN_EP_DIR}/cuda_kernel_adapter.h>"
 )
