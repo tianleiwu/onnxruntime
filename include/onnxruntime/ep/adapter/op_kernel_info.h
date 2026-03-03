@@ -27,7 +27,7 @@ namespace ep {
 namespace adapter {
 
 /// <summary>
-/// An adapter class partially implementing the facade of `onnxruntime::OpKernelInfo`.
+/// An adapter class partially implementing the interface of `onnxruntime::OpKernelInfo`.
 /// </summary>
 struct OpKernelInfo {
   //
@@ -47,7 +47,7 @@ struct OpKernelInfo {
         int is_constant = 0;
         Ort::ConstValue const_input = info.GetTensorConstantInput(i, &is_constant);
         if (is_constant && const_input != nullptr && const_input.IsTensor()) {
-          constant_input_tensors[i] = CreateTensorFromApiValue(const_input);
+          constant_input_tensors[i] = CreateTensorFromApiValue(const_cast<OrtValue*>(static_cast<const OrtValue*>(const_input)));
         }
       }
     }

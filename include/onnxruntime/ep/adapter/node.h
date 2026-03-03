@@ -12,22 +12,22 @@ namespace ep {
 namespace adapter {
 
 /// <summary>
-/// An adapter class partially implementing the facade of `onnxruntime::Node`.
+/// An adapter class partially implementing the interface of `onnxruntime::Node`.
 /// </summary>
 struct Node {
   explicit Node(const OrtKernelInfo* kernel_info) : kernel_info_{kernel_info} {}
   /** Gets the Node's name. */
-  const std::string Name() const noexcept {
+  std::string Name() const noexcept {
     return kernel_info_.GetNodeName();
   }
 
   /** Gets the Node's operator type. */
-  const std::string OpType() const noexcept {
+  std::string OpType() const noexcept {
     return kernel_info_.GetOperatorType();
   }
 
   /** Gets the Node's domain. */
-  const std::string Domain() const {
+  std::string Domain() const {
     return kernel_info_.GetOperatorDomain();
   }
 
