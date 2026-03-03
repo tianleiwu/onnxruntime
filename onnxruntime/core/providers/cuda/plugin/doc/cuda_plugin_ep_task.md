@@ -423,111 +423,429 @@ Additional modifications needed to compile existing kernel files with the adapte
 
 ## Stage 5: Remove Private Bridge & Excluded Ops
 
-> **Goal**: Sever all `provider_api.h` / `ProviderHost_impl.h` dependencies. Bring excluded ops into plugin.
+> **Goal**: Bring excluded ops into the plugin build. Sever remaining `provider_api.h` / `ProviderHost_impl.h` dependencies for plugin-compiled files.
+>
+> Stage 5 is split into **6 sub-stages** ordered by dependency pattern — from easiest stream fixes to hardest refactors. Each sub-stage is independently buildable and testable.
+>
+> **Two recurring incompatibility patterns** block most excluded ops:
+> 1. `ctx->GetComputeStream()` — the framework `OpKernelContext::GetComputeStream()` returns `onnxruntime::Stream*`. The adapter has `GetGPUComputeStream()` → `void*`. Fix: use `CudaKernel::GetComputeStream(ctx)` which returns `void*`, or `Stream(ctx)` for `cudaStream_t`.
+> 2. **CPU base class inheritance** — many CUDA tensor ops inherit from CPU base classes (`SliceBase`, `PadBase`, `ConcatBase`, etc.) for shape validation/attribute parsing. Fix: inline the base class logic under `#ifdef BUILD_CUDA_EP_AS_PLUGIN`.
 
-### 5.1 Control Flow Ops
+### Current Excluded Ops Inventory (CMake exclusions)
 
-- [ ] **5.1.1** Implement `If` kernel wrapper for plugin EP
-  - Create a kernel class that overrides `CreateControlFlowKernelImpl()`
-  - Calls `OrtEpApi::CreateIfKernel(info, out)` to create the implementation
-  - Register with the adapter `KernelRegistry`
+| Category | Files | Root Cause |
+|----------|-------|-----------|
+| Infrastructure (replaced) | `cuda_execution_provider.cc`, `cuda_provider_factory.cc`, `cuda_provider_interface.cc`, `cuda_stream_handle.cc`, `cuda_execution_provider_info.cc`, `cuda_graph.cc`, `cuda_mempool_arena.cc`, `cuda_common.cc` | Plugin equivalents exist |
+| Registration tables | `cuda_nhwc_kernels.cc`, `cuda_contrib_kernels.cc` | Self-registration via `PluginKernelCollector` |
+| Stream fix only | `reshape.cc`, `split.cc`, `concat.cc` | `ctx->GetComputeStream()` |
+| Single CPU utility | `cumsum.cc`, `tile.cc`, `gather.cc`, `unsqueeze.cc` | One function from CPU provider |
+| CPU base class | `pad.cc`, `slice.cc`, `space_depth_ops.cc`, `constant_of_shape.cc`, `upsample.cc`, `resize.cc` | Multiple inheritance from CPU base |
+| Missing adapter API | `variadic_elementwise_ops.cc` | `RequiredInput/RequiredOutput`, `InputArgCount` |
+| API gap / complex | `rnn/*`, `tunable/*`, `einsum.cc`, `einsum_utils/*`, `object_detection/*`, `identity_op.cc`, `sequence_op.cc` | Deferred |
+| CPU ops (permanent) | `shape_op.cc`, `size.cc` | Pure CPU class; handled by `GetCpuPreferredNodes` |
+| Control flow | `controlflow/*` | ✅ Already replaced by `plugin/cuda_controlflow_plugin.cc` |
+| Contrib: GetComputeStream | 13 bert ops, `group_norm.cc`, `fused_conv.cc`, `inverse.cc`, `bias_dropout.cc`, `fft_ops.cc`, `moe.cc`, `sparse_attention.cc`, `crop.cc`, `dynamic_time_warping.cc`, `dynamicslice.cc` | `ctx->GetComputeStream()` pattern |
+| Contrib: quantization | `attention_quantization.cc`, `matmul_bnb4.cc`, `matmul_nbits.cc`, `moe_quantization.cc`, `qordered_ops/*` | `GetComputeStream` / `GetScratchBuffer(Stream*)` |
+| Contrib: complex deps | `transformers/*`, `llm/*`, `aten_ops/*`, `collective/*`, `gemm_float8.cc/.cu`, `shrunken_gather.cc` | Deferred |
 
-- [ ] **5.1.2** Implement `Loop` kernel wrapper (same pattern as `If`)
+---
 
-- [ ] **5.1.3** Implement `Scan` kernel wrapper (same pattern as `If`)
+### Stage 5A: Stream Fix Ops (~1 day, 4 tasks)
 
-- [ ] **5.1.4** Remove CMake exclusion for `controlflow/` directory
-  - Or create new wrapper files in `plugin/` rather than modifying original controlflow code
+These ops have **only** `ctx->GetComputeStream()` issues — no CPU base class problems.
 
-### 5.2 RNN Ops
+- [ ] **5A.0** Add `CudaAsyncBuffer::CopyToGpu(void*)` overload (if not present)
+  - Search for `CudaAsyncBuffer` class definition (likely in `cuda_utils.h` or `cuda_common.h`)
+  - Add `#ifdef BUILD_CUDA_EP_AS_PLUGIN` overload: `Status CopyToGpu(void* stream)` that casts `stream` to `cudaStream_t` and calls `cudaMemcpyAsync`
+  - This unblocks all `CopyToGpu(ctx->GetComputeStream())` fixes below
+  - If `CopyToGpu` already accepts `void*`, skip this task
 
-- [ ] **5.2.1** Update RNN ops to remove `dynamic_cast<CudaStream*>`
-  - Files in `rnn/` directory (`cudnn_rnn_base.cc`, `rnn_impl.cu`, etc.)
-  - Replace with `CudaKernel::GetCudnnHandle(ctx)` which routes through `CudaSyncStream::GetCudnnHandle()`
-  - cuDNN RNN handle already held by `CudaSyncStream`
+- [ ] **5A.1** Fix [tensor/reshape.cc](../../tensor/reshape.cc) — 2 lines at L50–L51
+  - L50: `ORT_ENFORCE(ctx->GetComputeStream())` → `ORT_ENFORCE(GetComputeStream(ctx))`
+  - L51: `cuda_kernel->CopyTensor(*X, *Y, *ctx->GetComputeStream())` → replace with `cudaMemcpyAsync(Y->MutableDataRaw(), X->DataRaw(), X->SizeInBytes(), cudaMemcpyDeviceToDevice, Stream(ctx))` or add `CopyTensor(Tensor&, Tensor&, cudaStream_t)` overload
+  - Gate changes with `#ifdef BUILD_CUDA_EP_AS_PLUGIN`
+  - Remove CMake exclusion: `.*/tensor/reshape\\.cc$` (line ~L137)
 
-- [ ] **5.2.2** Remove CMake exclusion for `rnn/` directory
+- [ ] **5A.2** Fix [tensor/split.cc](../../tensor/split.cc) — 5 lines at L132, L138, L140, L146, L148
+  - All are `buf.CopyToGpu(ctx->GetComputeStream())` → `buf.CopyToGpu(GetComputeStream(ctx))`
+  - `SplitKernel` inherits `SplitBase` — verify `SplitBase` compiles in plugin (it stores `split_sizes_` attribute parsed from `OpKernelInfo`; adapter's `GetAttrs<int64_t>` should work). If not, inline `split_sizes_` attribute reading under `#ifdef BUILD_CUDA_EP_AS_PLUGIN`.
+  - Remove CMake exclusion: `.*/tensor/split\\.cc$` (line ~L140)
 
-### 5.3 Tunable Ops
+- [ ] **5A.3** Fix [tensor/concat.cc](../../tensor/concat.cc) — stream + `InputArgCount` + `PrepareForCompute`
+  - L36: `Node().InputArgCount().front()` → `ctx->InputCount()` (adapter provides `InputCount()`)
+  - L46: `PrepareForCompute(ctx, ...)` — `ConcatBase::PrepareForCompute` expects framework `OpKernelContext*`. Check if template variant exists; if not, inline (~30 LOC: iterate inputs, validate axis, collect shapes) under `#ifdef BUILD_CUDA_EP_AS_PLUGIN`
+  - L79, L92–L95: 5× `CopyToGpu(ctx->GetComputeStream())` → `CopyToGpu(GetComputeStream(ctx))`
+  - `Concat` inherits `ConcatBase` — verify base class compiles with adapter (constructor parses `axis` attribute)
+  - Remove CMake exclusion: `.*/tensor/concat\\.cc$` (line ~L124)
 
-- [ ] **5.3.1** Assess tunable op infrastructure requirements
-  - Depends on `CudaTuningContext` and `CUDAExecutionProvider`
-  - Options: port, stub, or document deferral with rationale
+- [ ] **5A.4** Validate Stage 5A
+  ```bash
+  ./cuda_plugin.sh --build --test --test_plugin
+  ./cuda.sh --build --test  # non-plugin regression
+  ```
 
-### 5.4 Einsum
+---
 
-- [ ] **5.4.1** Remove `cuda_execution_provider.h` dependency from `math/einsum.cc`
-  - Factor out the compute logic from EP-specific code
-  - Remove CMake exclusion
+### Stage 5B: Single-Function CPU Dependency Ops (~2 days, 7 tasks)
 
-### 5.5 Remaining Excluded Ops
+These ops call a **single** utility function defined in the CPU provider. Fix by inlining the function body.
 
-- [ ] **5.5.1** `identity_op.cc` / `sequence_op.cc` — provide `TensorSeq` adapter or exclude
-- [ ] **5.5.2** `scatter_nd.cc` — port CPU validation logic inline
-- [ ] **5.5.3** `size.cc` — port CPU compute logic or exclude
-- [ ] **5.5.4** `integer_gemm.cc` — update to use `CudaSyncStream` instead of `CudaStream`
-- [ ] **5.5.5** `object_detection/` — port CPU base class logic or document deferral
-- [ ] **5.5.6** `cuda_common.cc` — resolve `HalfGemmOptions` conflict
+- [ ] **5B.1** Fix [math/cumsum.cc](../../math/cumsum.cc) — 1 call at L56
+  - `cumsum_op::GetAxis(axis_tensor, rank, axis)` — inline this function (~5 LOC: reads scalar from 1-element tensor, validates `-rank ≤ axis < rank`, wraps negative)
+  - Add `#ifdef BUILD_CUDA_EP_AS_PLUGIN` block with inlined helper, else include original header
+  - Remove CMake exclusion: `.*/math/cumsum\\.cc$` (line ~L166)
 
-### 5.6 Audit Remaining Internal Includes
+- [ ] **5B.2** Fix [tensor/tile.cc](../../tensor/tile.cc) — 1 call at L106
+  - `TileOp::IsTileMemcpy(input_shape, repeats, rank, ...)` — inline this static method (~30 LOC: iterates dims, checks if all repeats==1 except one)
+  - Add `#ifdef BUILD_CUDA_EP_AS_PLUGIN` block with function duplicate, or extract into a shared header
+  - Remove CMake exclusion: `.*/tensor/tile\\.cc$` (line ~L169)
 
-- [ ] **5.6.1** Run audit:
+- [ ] **5B.3** Fix [tensor/gather.cc](../../tensor/gather.cc) — 1 call at L49
+  - `PrepareForCompute(context, p)` from `GatherBase` — [gatherbase.h](../../../cpu/tensor/gatherbase.h) has a **template method** `PrepareForComputeImpl<KernelContextType>` at L21 that uses only `context->Input<Tensor>()` and shapes
+  - Replace `PrepareForCompute(context, p)` → `PrepareForComputeImpl(context, p)` (context-type agnostic)
+  - Verify `GatherBase` template constructor `GatherBase(const KernelInfoType& info)` works with adapter `OpKernelInfo`
+  - Remove CMake exclusion: `.*/tensor/gather\\.cc$` (line ~L128)
+
+- [ ] **5B.4** Fix [tensor/unsqueeze.cc](../../tensor/unsqueeze.cc) — 1 call at L66
+  - `PrepareCompute(ctx, p)` from `UnsqueezeBase` — body is ~10 LOC: reads input shape, computes output axes, calls `ctx->Output()`
+  - Inline `PrepareCompute` under `#ifdef BUILD_CUDA_EP_AS_PLUGIN`
+  - `UnsqueezeBase` constructor parses `axes` attribute — inline that too (~5 LOC)
+  - Remove CMake exclusion: `.*/tensor/unsqueeze\\.cc$` (line ~L159)
+
+- [ ] **5B.5** Permanently exclude [tensor/shape_op.cc](../../tensor/shape_op.cc) and [tensor/size.cc](../../tensor/size.cc)
+  - Both reuse CPU classes directly (no CUDA compute — they just read tensor metadata)
+  - `Shape` and `Size` ops land on CPU via `GetCpuPreferredNodes` anyway
+  - Add permanent exclusion comment in CMake:
+    ```cmake
+    # Permanently excluded — pure CPU ops, handled by GetCpuPreferredNodes.
+    ```
+  - Document rationale in this task doc
+
+- [ ] **5B.6** Add adapter `RequiredInput<T>()` and `RequiredOutput()` to [op_kernel.h](../../../../../../include/onnxruntime/ep/adapter/op_kernel.h)
+  - In `struct OpKernelContext`:
+    ```cpp
+    template <typename T, typename = std::enable_if_t<std::is_same_v<T, Tensor>>>
+    const T& RequiredInput(int index) const {
+      auto* p = Input<T>(index);
+      ORT_ENFORCE(p != nullptr, "Required input ", index, " is null");
+      return *p;
+    }
+    Tensor& RequiredOutput(int index, const TensorShape& shape) {
+      auto* p = Output(index, shape);
+      ORT_ENFORCE(p != nullptr, "Required output ", index, " is null");
+      return *p;
+    }
+    ```
+  - These are convenience wrappers needed by `variadic_elementwise_ops.cc` (Stage 5C.1)
+
+- [ ] **5B.7** Validate Stage 5B
+  ```bash
+  ./cuda_plugin.sh --build --test --test_plugin
+  ./cuda.sh --build --test  # non-plugin regression (adapter changes affect both builds)
+  ```
+
+---
+
+### Stage 5C: CPU Base Class & Adapter API Gap Ops (~3 days, 8 tasks)
+
+These ops inherit from CPU base classes or use missing adapter APIs. Strategy: inline base class logic for the plugin build using `#ifdef BUILD_CUDA_EP_AS_PLUGIN`.
+
+- [ ] **5C.1** Fix [math/variadic_elementwise_ops.cc](../../math/variadic_elementwise_ops.cc) — 3 missing APIs
+  - L161: `Node().InputArgCount().front()` → `context->InputCount()` (all variadic inputs are same type, so `InputCount()` is equivalent)
+  - L169: `context->RequiredInput<Tensor>(i)` → uses adapter `RequiredInput<T>()` from 5B.6
+  - L179, L197, L217: `context->RequiredOutput(0, shape)` → uses adapter `RequiredOutput()` from 5B.6
+  - Remove CMake exclusion: `.*/math/variadic_elementwise_ops\\.cc$` (line ~L115)
+
+- [ ] **5C.2** Fix [tensor/pad.cc](../../tensor/pad.cc) — 3 `PadBase` static calls at L114, L117, L164
+  - `PadBase::ComputePads(*ctx, ndim, pads_data, pads)` at L114 — reads pads from tensor inputs. Uses `ctx.Input<Tensor>(1)`, `ctx.Input<Tensor>(2)`. Create a plugin-local templated version: `ComputePadsPlugin(ctx, ndim, pads_data, pads)` that uses adapter's `Input<Tensor>()`. Gate with `#ifdef BUILD_CUDA_EP_AS_PLUGIN`.
+  - `PadBase::SeparateNegativeToSlices(pads, slices)` at L117 — pure data manipulation (no context). Works if `PadBase` header is included. If not, inline (~10 LOC).
+  - `PadBase::HandleDimValueZero(mode_, input_shape, output_shape)` at L164 — static, no context. Same as above.
+  - `Pad` inherits `PadBase` for `mode_` attribute: inline `mode_` parsing in `Pad` constructor under `#ifdef BUILD_CUDA_EP_AS_PLUGIN` (reads "mode" string attribute).
+  - Remove CMake exclusion: `.*/tensor/pad\\.cc$` (line ~L134)
+
+- [ ] **5C.3** Fix [tensor/slice.cc](../../tensor/slice.cc) — `SliceBase` calls at L175, L180, L182, L264
+  - `SliceBase::PrepareForCompute(starts, ends, axes, steps, compute_metadata)` at L180 — shape validation ~60 LOC
+  - `SliceBase::FlattenOutputDims(...)` at L264 — dimension optimization ~30 LOC
+  - Both are pure shape computation (no CUDA, no context). Create plugin-local inline versions under `#ifdef BUILD_CUDA_EP_AS_PLUGIN`.
+  - `Slice` inherits `SliceBase` for `starts_/ends_/axes_` attributes: inline attribute parsing (~10 LOC).
+  - `SliceOp::PrepareForComputeMetadata` at L175 is a POD struct — should compile as-is.
+  - Remove CMake exclusion: `.*/tensor/slice\\.cc$` (line ~L118)
+
+- [ ] **5C.4** Fix [tensor/space_depth_ops.cc](../../tensor/space_depth_ops.cc)
+  - Inherited `SpaceDepthBase` provides `blocksize_` (int64) and `is_dcr_` (bool) members: used at L188–L198, L239, L243
+  - `SpaceDepthBase` is small: constructor reads `blocksize` attribute + `mode` attribute for DCR/CRD (~5 LOC)
+  - Inline the constructor logic and member fields under `#ifdef BUILD_CUDA_EP_AS_PLUGIN` by adding a plugin-local `SpaceDepthPlugin` mixin or by adding the fields directly to the classes:
+    ```cpp
+    #ifdef BUILD_CUDA_EP_AS_PLUGIN
+    int64_t blocksize_;  bool is_dcr_;   // parsed from OpKernelInfo in ctor
+    #endif
+    ```
+  - Remove CMake exclusion: `.*/tensor/space_depth_ops\\.cc$` (line ~L121)
+
+- [ ] **5C.5** Fix [generator/constant_of_shape.cc](../../generator/constant_of_shape.cc) — L24, L26
+  - `PrepareCompute(ctx, &output_tensor)` from `ConstantOfShapeBase<>` — reads shape input, creates output tensor (~15 LOC)
+  - `GetValuePtr()` from `ConstantOfShapeBase<>` — returns pointer to stored `value` attribute (~5 LOC)
+  - `ConstantOfShapeBase` constructor parses `value` TensorProto attribute (~20 LOC)
+  - Inline all under `#ifdef BUILD_CUDA_EP_AS_PLUGIN`: store parsed value tensor directly in the class
+  - Remove CMake exclusion: `.*/generator/constant_of_shape\\.cc$` (line ~L106)
+
+- [ ] **5C.6** Fix [tensor/upsample.cc](../../tensor/upsample.cc) — L48, L108, L277 + `UpsampleBase`
+  - L48: `info.GetAllocator(OrtMemTypeDefault)` — not in adapter. Replace with `GetScratchBuffer<T>()` at compute time (already used at L108, L277)
+  - `UpsampleBase` is a **large** base class (~200 LOC): parses `mode`, `coordinate_transform_mode`, `scales`, `roi`, `exclude_outside`, etc.
+  - **Approach**: Try to include the `UpsampleBase` header directly (it's in `core/providers/cpu/tensor/upsample.h`). If the constructor compiles with adapter `OpKernelInfo` (it uses `GetAttr`/`GetAttrs`), this may just work.
+  - If `UpsampleBase` doesn't compile: **defer** to a later iteration — document rationale.
+  - Remove CMake exclusion: `.*/tensor/upsample\\.cc$` (line ~L148) — or keep if deferred
+
+- [ ] **5C.7** Fix [tensor/resize.cc](../../tensor/resize.cc)
+  - Inherits from `Upsample<T>` which inherits `UpsampleBase + CudaKernel`
+  - Blocked until 5C.6 (upsample) is resolved
+  - Remove CMake exclusion: `.*/tensor/resize\\.cc$` (line ~L151) — same timeline as 5C.6
+
+- [ ] **5C.8** Validate Stage 5C
+  ```bash
+  ./cuda_plugin.sh --build --test --test_plugin
+  ./cuda.sh --build --test  # non-plugin regression
+  ```
+
+---
+
+### Stage 5D: Contrib Ops — GetComputeStream Batch (~3–5 days, 5 tasks)
+
+All excluded contrib ops share the same `ctx->GetComputeStream()` pattern. Fix systematically.
+
+> **Note**: Some excluded contrib ops (e.g., `fast_gelu.cc`, `embed_layer_norm.cc`) may only use `Stream(context)` (the CudaKernel member), not `ctx->GetComputeStream()`. Try removing their CMake exclusions first — they may compile without changes.
+
+- [ ] **5D.1** Create systematic `GetComputeStream` fix infrastructure
+  - The root pattern is: `context->GetComputeStream()` returns `onnxruntime::Stream*` in the framework, but `adapter::OpKernelContext` doesn't have this method (it has `GetGPUComputeStream()` returning `void*`)
+  - Three sub-patterns to fix:
+    1. `buf.CopyToGpu(ctx->GetComputeStream())` — fix via `CopyToGpu(void*)` overload (task 5A.0)
+    2. `GetScratchBuffer<T>(bytes, ctx->GetComputeStream())` — fix: use `GetScratchBuffer<T>(bytes, GetComputeStream(ctx))` where `CudaKernel::GetComputeStream(ctx)` returns `void*`
+    3. `QkvToContext(... context->GetComputeStream() ...)` — function signature takes `Stream*`: add `#ifdef BUILD_CUDA_EP_AS_PLUGIN` overload or change to accept `cudaStream_t`
+  - Add a macro/helper in [cuda_kernel_adapter.h](../cuda_kernel_adapter.h):
+    ```cpp
+    // Helper for contrib ops that pass stream to downstream functions
+    #define CUDA_STREAM_FROM_CTX(ctx) static_cast<cudaStream_t>(GetComputeStream(ctx))
+    ```
+
+- [ ] **5D.2** Fix contrib bert ops (13 files)
+  - **Try compile first** — remove exclusion, build, see what fails. Some ops may only use `Stream(context)`:
+    - [bert/fast_gelu.cc](../../../../contrib_ops/cuda/bert/fast_gelu.cc) — uses `Stream(context)` at L55, **likely compiles**
+    - [bert/embed_layer_norm.cc](../../../../contrib_ops/cuda/bert/embed_layer_norm.cc) — uses `Stream(context)` at L67, **likely compiles**
+  - Ops that use `context->GetComputeStream()`:
+    - [bert/attention.cc](../../../../contrib_ops/cuda/bert/attention.cc) — also inherits `AttentionBase` (contrib base, should compile). ComputeInternal uses stream via attention helpers.
+    - [bert/decoder_attention.cc](../../../../contrib_ops/cuda/bert/decoder_attention.cc)
+    - [bert/decoder_masked_self_attention.cc](../../../../contrib_ops/cuda/bert/decoder_masked_self_attention.cc)
+    - [bert/group_query_attention.cc](../../../../contrib_ops/cuda/bert/group_query_attention.cc)
+    - [bert/longformer_attention.cc](../../../../contrib_ops/cuda/bert/longformer_attention.cc)
+    - [bert/multihead_attention.cc](../../../../contrib_ops/cuda/bert/multihead_attention.cc)
+    - [bert/packed_attention.cc](../../../../contrib_ops/cuda/bert/packed_attention.cc)
+    - [bert/packed_multihead_attention.cc](../../../../contrib_ops/cuda/bert/packed_multihead_attention.cc)
+    - [bert/paged_attention.cc](../../../../contrib_ops/cuda/bert/paged_attention.cc)
+    - [bert/relative_attn_bias.cc](../../../../contrib_ops/cuda/bert/relative_attn_bias.cc)
+    - [bert/remove_padding.cc](../../../../contrib_ops/cuda/bert/remove_padding.cc)
+  - For each: replace `ctx->GetComputeStream()` with `GetComputeStream(ctx)` or `Stream(ctx)` depending on what the callee expects (`void*` vs `cudaStream_t`)
+  - If attention helpers take `Stream*`: add `#ifdef BUILD_CUDA_EP_AS_PLUGIN` overloads or change to `cudaStream_t`
+  - Remove corresponding CMake exclusions (13 lines)
+
+- [ ] **5D.3** Fix other contrib ops (10 files)
+  - [diffusion/group_norm.cc](../../../../contrib_ops/cuda/diffusion/group_norm.cc) — L211, L215: `context->GetComputeStream()`
+  - [fused_conv.cc](../../../../contrib_ops/cuda/fused_conv.cc)
+  - [inverse.cc](../../../../contrib_ops/cuda/inverse.cc)
+  - [math/bias_dropout.cc](../../../../contrib_ops/cuda/math/bias_dropout.cc) — L127: `context->GetComputeStream()`, L139: `Stream(context)` (mixed)
+  - [math/fft_ops.cc](../../../../contrib_ops/cuda/math/fft_ops.cc)
+  - [moe/moe.cc](../../../../contrib_ops/cuda/moe/moe.cc) — L52: `context->GetComputeStream()`, L107/L119: `Stream(context)` (mixed)
+  - [sparse/sparse_attention.cc](../../../../contrib_ops/cuda/sparse/sparse_attention.cc)
+  - [tensor/crop.cc](../../../../contrib_ops/cuda/tensor/crop.cc)
+  - [tensor/dynamic_time_warping.cc](../../../../contrib_ops/cuda/tensor/dynamic_time_warping.cc)
+  - [tensor/dynamicslice.cc](../../../../contrib_ops/cuda/tensor/dynamicslice.cc)
+  - Same fix pattern: `ctx->GetComputeStream()` → `GetComputeStream(ctx)` with `#ifdef` guards
+  - Remove corresponding CMake exclusions (10+ lines)
+
+- [ ] **5D.4** Fix contrib quantization ops (5 entries)
+  - [quantization/attention_quantization.cc](../../../../contrib_ops/cuda/quantization/attention_quantization.cc)
+  - [quantization/matmul_bnb4.cc](../../../../contrib_ops/cuda/quantization/matmul_bnb4.cc)
+  - [quantization/matmul_nbits.cc](../../../../contrib_ops/cuda/quantization/matmul_nbits.cc) — L307: `static_cast<cudaStream_t>(ctx->GetComputeStream()->GetHandle())`, L355/L397: `GetScratchBuffer<T>(bytes, ctx->GetComputeStream())`
+  - [quantization/moe_quantization.cc](../../../../contrib_ops/cuda/quantization/moe_quantization.cc)
+  - [quantization/qordered_ops/\*](../../../../contrib_ops/cuda/quantization/qordered_ops/)
+  - Fix pattern: replace `ctx->GetComputeStream()` and `ctx->GetComputeStream()->GetHandle()` with adapter equivalents
+  - For `matmul_nbits.cc` L307: `static_cast<cudaStream_t>(ctx->GetComputeStream()->GetHandle())` → `Stream(ctx)` (CudaKernel member)
+  - Remove corresponding CMake exclusions (~5 lines)
+
+- [ ] **5D.5** Validate Stage 5D
+  ```bash
+  ./cuda_plugin.sh --build --test --test_plugin
+  ./cuda.sh --build --test  # non-plugin regression
+  ```
+
+---
+
+### Stage 5E: Deferred Ops (no code changes — documented exclusion)
+
+> These ops have dependencies that cannot be resolved with simple fixes. Each has a documented rationale for deferral.
+
+- [x] **5E.1** Control flow ops (`controlflow/*`) — **Already resolved**
+  - Plugin has its own wrappers in `plugin/cuda_controlflow_plugin.cc` using `OrtEpApi::CreateIfKernel`/`CreateLoopKernel`/`CreateScanKernel`
+  - CMake exclusion for `controlflow/*` is **deliberate** — plugin files replace originals
+
+- [ ] **5E.2** RNN ops (`rnn/*`) — **Deferred: missing ORT C API**
+  - Blocker: [rnn.h L21](../../rnn/rnn.h) calls `info.GetAttrs("activations", activations_)` — this requires `KernelInfoGetAttributeArray_string` in the ORT C API, which is **not implemented**
+  - All other RNN deps are resolved: `GetComputeStream(ctx)`, `GetCudnnHandle(ctx)`, `Stream(ctx)`, `GetScratchBuffer` — all route through `CudaKernel` → `CudaSyncStream`
+  - No `dynamic_cast<CudaStream*>` exists in any RNN file
+  - **Action**: File ORT C API extension request for `KernelInfoGetAttributeArray_string`
+  - **Files**: `cudnn_rnn_base.cc/.h`, `rnn.cc/.h`, `gru.cc/.h`, `lstm.cc/.h`, `rnn_impl.cu/.h`
+
+- [ ] **5E.3** Tunable ops (`tunable/*`) — **Deferred: non-critical**
+  - Depends on `CudaTuningContext` + `CUDAExecutionProvider*`
+  - Plugin has `PluginTuningContextStub` returning `IsTunableOpEnabled() → false`
+  - Tuning is a performance optimization, not functional — safe to defer
+
+- [ ] **5E.4** Einsum (`math/einsum.cc` + `einsum_utils/*`) — **Deferred: hard-coupled**
+  - [einsum.h L10](../../math/einsum.h): `#include "core/providers/cuda/cuda_execution_provider.h"`
+  - [einsum.h L21](../../math/einsum.h): `cuda_ep_ = static_cast<const CUDAExecutionProvider*>(info.GetExecutionProvider())`
+  - The class directly stores `CUDAExecutionProvider*` and uses it for stream/handle access
+  - Also, `einsum_auxiliary_ops.cc` calls `ReductionOps::ReduceCompute` (framework-only path)
+  - Requires major refactoring to decouple from concrete EP class — not worth the effort now
+
+- [ ] **5E.5** Object detection (`object_detection/*`) — **Deferred: complex CPU base classes**
+  - `NonMaxSuppression` inherits `NonMaxSuppressionBase`, `RoiAlign` inherits `RoiAlignBase`
+  - Both base classes have significant CPU compute logic (~100+ LOC each)
+  - 6 files: `non_max_suppression.cc/.h`, `non_max_suppression_impl.cu/.h`, `roialign.cc/.h`, `roialign_impl.cu/.h`
+  - Low model coverage priority — these ops rarely appear in modern inference models
+
+- [ ] **5E.6** Transformers (`contrib_ops/cuda/transformers/*`) — **Deferred: massive deps**
+  - Beam search, greedy search, sampling — depend on subgraph execution, generator state, and deep framework integration
+  - Not portable via simple `GetComputeStream` fixes
+
+- [ ] **5E.7** LLM ops (`core/providers/cuda/llm/*` + `contrib_ops/cuda/llm/*`) — **Deferred: deep Stream\* usage**
+  - `QkvToContext` and related functions pass `onnxruntime::Stream*` through multiple call layers
+  - Requires function signature refactoring across many files
+
+- [ ] **5E.8** TensorSeq ops (`tensor/identity_op.cc`, `tensor/sequence_op.cc`) — **Deferred: incomplete type**
+  - `TensorSeq` is an incomplete type in the plugin build
+  - Adapter doesn't provide `Input<TensorSeq>()` / `Output<TensorSeq>()`
+  - Sequence ops typically land on CPU via `GetCpuPreferredNodes`
+
+- [ ] **5E.9** Training / out-of-scope (`tensor/shrunken_gather.cc`, `aten_ops/*`, `collective/*`) — **Deferred: not applicable**
+  - Training-specific or multi-GPU ops, explicitly out of scope
+
+- [ ] **5E.10** Contrib gemm_float8 (`math/gemm_float8.cc/.cu`) — **Deferred: .cu stream dep**
+  - `GetComputeStream()` used in `.cu` file (NVCC-compiled)
+  - NVCC doesn't get the forced include; needs `cudaStream_t` parameter change in compute kernel signatures
+
+---
+
+### Stage 5F: Audit & Validate (~1 day, 4 tasks)
+
+- [ ] **5F.1** Run audit for remaining `provider_api.h` references
   ```bash
   grep -rn 'provider_api\.h\|ProviderHost_impl\|g_host' \
-    onnxruntime/core/providers/cuda/
+    onnxruntime/core/providers/cuda/plugin/
   ```
-  Create hit list of remaining references in plugin-compiled files.
+  Verify zero code matches (docs excluded).
 
-### 5.7 Validate Stage 5
+- [ ] **5F.2** Create registration parity report
+  - Dump `(domain, op_type, since_version)` tuples from plugin `adapter::KernelRegistry`
+  - Compare against bundled EP registry
+  - Plugin count must equal bundled count minus tracked deferred exclusions
+  - Add diagnostic script or test to `test_cuda_plugin_ep.py`
 
-- [ ] **5.7.1** Verify zero `provider_api.h`/`ProviderHost_impl` references in plugin code
-- [ ] **5.7.2** Verify all excluded ops are included or have documented deferral
-- [ ] **5.7.3** Full CI suite with plugin-only CUDA EP:
+- [ ] **5F.3** Expand test coverage in [test_cuda_plugin_ep.py](../../../../test/python/transformers/test_cuda_plugin_ep.py)
+  - **Standard ops newly included**: Reshape, Split, Concat, Gather, Pad, Slice, Unsqueeze, Tile, CumSum, ConstantOfShape, SpaceToDepth/DepthToSpace
+  - **Variadic ops**: Sum (variadic add), Max (variadic max), Min (variadic min)
+  - **Control flow ops**: If, Loop, Scan (already implemented in plugin but untested)
+  - **Contrib ops**: attention, fast_gelu, bias_dropout, group_norm (as available from 5D)
+  - Each test: build model, run with plugin EP, compare against CPU/PyTorch reference
+
+- [ ] **5F.4** Full CI validation
   ```bash
-  ./cuda.sh --build --test
-  ./cuda_plugin.sh --build --test --test_plugin
+  ./cuda.sh --build --test           # Non-plugin regression (1170+ tests)
+  ./cuda_plugin.sh --build --test --test_plugin  # Plugin build + tests
   ```
 
 ---
 
 ## Stage 6: Advanced Features & Polish
 
-> **Goal**: Profiling, perf validation, packaging.
+> **Goal**: Profiling, perf validation, packaging, CI, documentation.
 
 ### 6.1 NVTX Profiling
 
 - [ ] **6.1.1** Add NVTX range markers around kernel execution in plugin EP
-  - Use NVTX directly (no internal profiler API needed)
-  - Tag with kernel name and op type
+  - Include `nvtx3/nvToolsExt.h` in [cuda_kernel_adapter.h](../cuda_kernel_adapter.h) or in `adapter::KernelImpl::ComputeImpl()`
+  - Wrap `Compute()` calls with `nvtxRangePushA(op_type)` / `nvtxRangePop()`
+  - Kernel name available via `OpKernel::Node().OpType()`
+  - Link against `nvToolsExt` library in CMake
+  - Make profiling opt-in via compile flag or session config
 
 ### 6.2 External Resource Import
 
 - [ ] **6.2.1** Implement `OrtExternalResourceImporterImpl` for CUDA memory/semaphore import
-  - Wire up to factory or EP callbacks
+  - For CUDA memory import (`cudaIpcMemHandle_t` based sharing)
+  - For CUDA semaphore/event import
+  - Wire up to `CudaEpFactory` callbacks
+  - Test with multi-process inference scenario
 
 ### 6.3 Performance Regression Testing
 
-- [ ] **6.3.1** Create benchmark suite: plugin EP vs bundled EP
-  - Models: BERT-base, ResNet-50, GPT-2, Stable Diffusion
-  - Measure latency (target: within 2% of bundled EP)
-  - Measure GPU memory (target: within 5% of bundled EP)
+- [ ] **6.3.1** Create benchmark harness: [test/python/transformers/test_cuda_plugin_perf.py](../../../../test/python/transformers/test_cuda_plugin_perf.py)
+  - Framework: `pytest-benchmark` or custom timing loop
+  - Models to benchmark:
+    | Model | Size | Notes |
+    |-------|------|-------|
+    | BERT-base | ~110M params | Attention + LayerNorm heavy |
+    | ResNet-50 | ~25M params | Conv + BatchNorm heavy; tests NHWC path |
+    | GPT-2 | ~117M params | MatMul + Softmax heavy |
+    | Stable Diffusion (UNet) | ~860M params | Conv + Attention + GroupNorm |
+  - Metric targets:
+    | Metric | Target | Measurement |
+    |--------|--------|-------------|
+    | Latency | < 2% regression vs bundled EP | Median of 100 runs after 10 warmup |
+    | GPU memory peak | < 5% increase vs bundled EP | `torch.cuda.max_memory_allocated()` equivalent |
+    | First-run latency | < 10% regression | Includes plugin DLL load + warm-up |
+  - Output: CSV report + pass/fail gate for CI
+
+- [ ] **6.3.2** Run initial performance comparison
+  - Identify any latency regressions and root-cause them
+  - Likely sources: adapter layer overhead (virtual dispatch), missed optimizations, memory layout
 
 ### 6.4 Python Packaging
 
-- [ ] **6.4.1** `onnxruntime-gpu` pip package includes plugin DLL
-  - Update setup.py / packaging scripts to include `libonnxruntime_providers_cuda_plugin.so`
+- [ ] **6.4.1** Update [setup.py](../../../../../setup.py) to include plugin DLL
+  - Add `libonnxruntime_providers_cuda_plugin.so` to package data
+  - Gate on `BUILD_CUDA_EP_AS_PLUGIN=ON` build flag
+  - Update `onnxruntime-gpu` wheel spec
+- [ ] **6.4.2** Verify end-to-end pip install + plugin load
+  ```python
+  pip install onnxruntime-gpu
+  import onnxruntime as ort
+  ort.register_execution_provider_library("CUDAExecutionProvider", "/path/to/plugin.so")
+  sess = ort.InferenceSession("model.onnx", providers=["CUDAExecutionProvider"])
+  ```
 
 ### 6.5 CI Pipeline
 
-- [ ] **6.5.1** Create dedicated CI jobs for plugin mode
-  - Build + test with `onnxruntime_BUILD_CUDA_EP_AS_PLUGIN=ON`
-  - Run both `onnxruntime_test_all` and `test_cuda_plugin_ep.py`
+- [ ] **6.5.1** Create dedicated CI job for plugin mode
+  - Build with `onnxruntime_BUILD_CUDA_EP_AS_PLUGIN=ON`
+  - Run `onnxruntime_test_all` + `test_cuda_plugin_ep.py`
+  - Add to PR gate checks (at least nightly initially)
+- [ ] **6.5.2** Add performance regression CI (nightly)
+  - Run `test_cuda_plugin_perf.py` on dedicated GPU machine
+  - Alert on > 2% regression
 
 ### 6.6 Documentation
 
-- [ ] **6.6.1** Write API migration guide for third-party CUDA kernels
+- [ ] **6.6.1** Write API migration guide: [plugin/doc/migration_guide.md](doc/migration_guide.md)
   - How to port existing `ONNX_OPERATOR_*_KERNEL_EX` based kernels
-  - How to use the adapter framework
+  - How the `ep/adapters.h` forced-include works
+  - How the `PluginKernelCollector` self-registration pattern works
+  - Step-by-step example: porting a single kernel from bundled to plugin
+- [ ] **6.6.2** Document deferred ops and exclusion rationale
+  - Reference 5E.1–5E.10 with permanent vs temporary classification
+  - Include migration path for each deferred category when blockers are resolved
+- [ ] **6.6.3** Update [cuda_plugin_ep_plan.md](cuda_plugin_ep_plan.md)
+  - Mark Stages 5 & 6 as complete
+  - Update timeline with actual durations
+  - Add lessons learned section
 
 ---
 
@@ -539,11 +857,11 @@ Additional modifications needed to compile existing kernel files with the adapte
 |------|-------|--------|-------------|
 | `plugin/provider_host_bridge.cc` | 1.10 | ✅ Deleted | N/A (legacy bridge) |
 | `plugin/provider_api_shims.cc` | 1.10 | ✅ Simplified | Standalone implementations (kept; `g_host` calls removed) |
-| `plugin/cuda_plugin_adapter_registry.cc` | 2.5 | Pending | Adapter-based `RegisterCudaKernels()` |
+| `plugin/cuda_plugin_adapter_registry.cc` | 2.5 | ✅ Deleted | `PluginKernelCollector` self-registration |
 | Legacy `AdapterKernelImpl` in `cuda_plugin_kernels.cu` | 1.10 | ✅ Removed | `ep::adapter::KernelImpl` |
 | `AdapterKernelImpl`/`PluginRegistry`/macro overrides in `cuda_kernel_adapter.h` | 1.11 | ✅ Removed | `ep::adapter::KernelImpl`/`KernelRegistry` |
 
-### Files Modified (completed)
+### Files Modified (completed — Stages 1–4)
 
 | File | Stage | Changes |
 |------|-------|---------|
@@ -570,24 +888,44 @@ Additional modifications needed to compile existing kernel files with the adapte
 | `plugin/cuda_plugin_adapter_registry.cc` | 1.11 | Uses `ResolvePluginKernelCreateFn` instead of `PluginRegistry` |
 | `plugin/cuda_plugin_kernels.cu` | 1.11 | Commented out `matmul_nbits.h` include |
 | `plugin/cuda_plugin_utils.h` | 1.11 | Removed `RETURN_IF_ERROR`/`RETURN_IF` macros |
+| `plugin/cuda_ep.h/.cc` | 3.1, 4.1–4.3 | Added `ShouldConvertDataLayoutForOp`; CUDA graph state; `OnRunStartImpl`/`OnRunEndImpl` with capture state machine; `GetAnnotationId()` using `gpu_graph_id` key |
+| `plugin/cuda_ep_factory.h/.cc` | 2.1, 4.1 | Use `adapter::KernelRegistry`; added `GetComputeStream()` and `compute_stream_` member; reads CUDA graph session config |
+| `test/python/transformers/test_cuda_plugin_ep.py` | 3.3, 4.6 | NHWC tests; CUDA graph tests with IO binding; `gpu_graph_id` run config key |
 
-### Files to Modify (remaining stages)
+### Files to Modify (remaining — Stages 5–6)
 
 | File | Stage | Changes |
 |------|-------|---------|
-| `cmake/onnxruntime_providers_cuda_plugin.cmake` | 2.5 | Remove manual registry entry; progressively remove exclusion filters |
-| `plugin/cuda_ep.h` / `cuda_ep.cc` | 3.1, 4.1–4.3 | Added `ShouldConvertDataLayoutForOp`; CUDA graph state (`cuda_graph_enabled_`, `cuda_graph_manager_`, `graph_id_to_run_count_`, `is_capturing_`); `OnRunStartImpl`/`OnRunEndImpl` with capture state machine; `GetAnnotationId()` using `gpu_graph_id` key; `IsGraphCaptureAllowed()` |
-| `plugin/cuda_ep_factory.h` / `cuda_ep_factory.cc` | 2.1, 4.1 | Use `adapter::KernelRegistry`; added `GetComputeStream()` and `compute_stream_` member; reads `enable_cuda_graph` and `min_num_runs_before_cuda_graph_capture` from session config |
-| `test/python/transformers/test_cuda_plugin_ep.py` | 4.6 | Moved CUDA graph tests to `test_cuda_plugin_cuda_graph()`; IO binding + OrtValue pattern; `gpu_graph_id` run config key |
+| `cmake/onnxruntime_providers_cuda_plugin.cmake` | 5A–5D | Progressively remove CMake exclusion filters as ops are fixed |
+| `cuda/tensor/reshape.cc` | 5A.1 | `#ifdef BUILD_CUDA_EP_AS_PLUGIN` block for `GetComputeStream` |
+| `cuda/tensor/split.cc` | 5A.2 | Replace 5× `CopyToGpu(ctx->GetComputeStream())` with `CopyToGpu(GetComputeStream(ctx))` |
+| `cuda/tensor/concat.cc` | 5A.3 | Replace `InputArgCount`, `PrepareForCompute`, `CopyToGpu` stream calls |
+| `cuda/math/cumsum.cc` | 5B.1 | Inline `cumsum_op::GetAxis` under `#ifdef` |
+| `cuda/tensor/tile.cc` | 5B.2 | Inline `TileOp::IsTileMemcpy` under `#ifdef` |
+| `cuda/tensor/gather.cc` | 5B.3 | `PrepareForCompute` → `PrepareForComputeImpl` (template) |
+| `cuda/tensor/unsqueeze.cc` | 5B.4 | Inline `UnsqueezeBase::PrepareCompute` under `#ifdef` |
+| `include/onnxruntime/ep/adapter/op_kernel.h` | 5B.6 | Add `RequiredInput<T>()` and `RequiredOutput()` |
+| `cuda/math/variadic_elementwise_ops.cc` | 5C.1 | `InputArgCount()` → `InputCount()`; use `RequiredInput`/`RequiredOutput` |
+| `cuda/tensor/pad.cc` | 5C.2 | Inline 3× `PadBase::` methods + `mode_` attribute |
+| `cuda/tensor/slice.cc` | 5C.3 | Inline `SliceBase::PrepareForCompute` + `FlattenOutputDims` |
+| `cuda/tensor/space_depth_ops.cc` | 5C.4 | Inline `SpaceDepthBase` members |
+| `cuda/generator/constant_of_shape.cc` | 5C.5 | Inline `ConstantOfShapeBase` methods |
+| `cuda/tensor/upsample.cc` | 5C.6 | Fix `GetAllocator`; attempt `UpsampleBase` inclusion |
+| `cuda/tensor/resize.cc` | 5C.7 | Dependent on upsample fix |
+| `plugin/cuda_kernel_adapter.h` | 5D.1 | Add `GetComputeStream` macro/helper for contrib ops |
+| ~25 contrib ops `.cc` files | 5D.2–5D.4 | Stream fix `#ifdef` blocks |
+| `test/python/transformers/test_cuda_plugin_ep.py` | 5F.3, 6.3.1 | Add tests for newly-included ops + perf benchmarks |
 
 ### New Files to Create
 
-| File | Stage | Purpose |
-|------|-------|---------|
+| File | Stage | Status | Purpose |
+|------|-------|--------|---------|
 | `plugin/cuda_graph_plugin.h/.cc` | 4.1 | ✅ Created | Plugin-compatible CUDA graph manager |
-| Control flow wrappers | 5.1 | Pending | `If`/`Loop`/`Scan` kernel wrappers using `OrtEpApi` |
+| `plugin/cuda_controlflow_plugin.h/.cc/.cu` | 5E.1 | ✅ Created | Plugin control flow wrappers |
+| `test/python/transformers/test_cuda_plugin_perf.py` | 6.3.1 | Pending | Performance regression benchmarks |
+| `plugin/doc/migration_guide.md` | 6.6.1 | Pending | Third-party kernel migration guide |
 
-### Verification Command
+### Verification Commands
 
 ```bash
 # Full build + test cycle
@@ -596,11 +934,40 @@ Additional modifications needed to compile existing kernel files with the adapte
 # Quick rebuild + plugin test only
 ./cuda_plugin.sh --build --test_plugin
 
-# If you change files except those under onnxruntime/core/providers/cuda/plugin (This directory are excluded from non-plugin build),
-# you need run non plugin build and test to ensure backward compatibility
+# If you change files except those under onnxruntime/core/providers/cuda/plugin
+# (this directory is excluded from non-plugin build),
+# you need to run non-plugin build and test to ensure backward compatibility
 ./cuda.sh --build --test
 
 # Audit for legacy references
 grep -rn 'provider_api\.h\|SHARED_PROVIDER\|g_host' \
   onnxruntime/core/providers/cuda/plugin/
+
+# Count registered kernels (diagnostic)
+python -c "
+import onnxruntime as ort
+ort.register_execution_provider_library('CUDAExecutionProvider', '/path/to/plugin.so')
+# ... load a model and check GetCapability output
+"
 ```
+
+### Excluded Op Tracking Summary
+
+| Category | Files | Status | Blocker |
+|----------|-------|--------|---------|
+| Stream fix (standard) | reshape, split, concat | 5A: **Pending** | `ctx->GetComputeStream()` |
+| CPU utility (standard) | cumsum, tile, gather, unsqueeze | 5B: **Pending** | Single function from CPU provider |
+| CPU base class (standard) | pad, slice, space_depth_ops, constant_of_shape, variadic_elementwise_ops | 5C: **Pending** | Multiple inheritance / missing adapter API |
+| CPU base class (complex) | upsample, resize | 5C: **Pending** | Large `UpsampleBase` class (~200 LOC) |
+| Stream fix (contrib) | 13 bert + 10 other + 5 quant | 5D: **Pending** | `ctx->GetComputeStream()` |
+| Permanent CPU exclusion | shape_op, size | 5B: **Permanent** | CPU ops handled by `GetCpuPreferredNodes` |
+| Control flow | If, Loop, Scan | 5E: ✅ **Resolved** | Plugin wrappers using `OrtEpApi` |
+| RNN | 6 files | 5E: **Deferred** | Missing `KernelInfoGetAttributeArray_string` C API |
+| Tunable | tunable/* | 5E: **Deferred** | Non-critical; stub returns disabled |
+| Einsum | einsum.cc + einsum_utils/* | 5E: **Deferred** | Hard-coupled to `CUDAExecutionProvider*` |
+| Object detection | 8 files | 5E: **Deferred** | Complex CPU base classes (~100+ LOC each) |
+| Transformers | transformers/* | 5E: **Deferred** | Subgraph execution / generator deps |
+| LLM | llm/* | 5E: **Deferred** | Deep `onnxruntime::Stream*` usage |
+| TensorSeq | identity_op, sequence_op | 5E: **Deferred** | Incomplete type; lands on CPU anyway |
+| Training/scope | shrunken_gather, aten_ops, collective | 5E: **Deferred** | Out of scope |
+| gemm_float8 | gemm_float8.cc/.cu | 5E: **Deferred** | `GetComputeStream` in .cu file |
