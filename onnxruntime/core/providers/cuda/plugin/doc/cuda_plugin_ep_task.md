@@ -493,38 +493,38 @@ These ops have **only** `ctx->GetComputeStream()` issues — no CPU base class p
 
 These ops call a **single** utility function defined in the CPU provider. Fix by inlining the function body.
 
-- [ ] **5B.1** Fix [math/cumsum.cc](../../math/cumsum.cc) — 1 call at L56
+- [x] **5B.1** Fix [math/cumsum.cc](../../math/cumsum.cc) — 1 call at L56
   - `cumsum_op::GetAxis(axis_tensor, rank, axis)` — inline this function (~5 LOC: reads scalar from 1-element tensor, validates `-rank ≤ axis < rank`, wraps negative)
   - Add `#ifdef BUILD_CUDA_EP_AS_PLUGIN` block with inlined helper, else include original header
   - Remove CMake exclusion: `.*/math/cumsum\\.cc$` (line ~L166)
 
-- [ ] **5B.2** Fix [tensor/tile.cc](../../tensor/tile.cc) — 1 call at L106
+- [x] **5B.2** Fix [tensor/tile.cc](../../tensor/tile.cc) — 1 call at L106
   - `TileOp::IsTileMemcpy(input_shape, repeats, rank, ...)` — inline this static method (~30 LOC: iterates dims, checks if all repeats==1 except one)
   - Add `#ifdef BUILD_CUDA_EP_AS_PLUGIN` block with function duplicate, or extract into a shared header
   - Remove CMake exclusion: `.*/tensor/tile\\.cc$` (line ~L169)
 
-- [ ] **5B.3** Fix [tensor/gather.cc](../../tensor/gather.cc) — 1 call at L49
+- [x] **5B.3** Fix [tensor/gather.cc](../../tensor/gather.cc) — 1 call at L49
   - `PrepareForCompute(context, p)` from `GatherBase` — [gatherbase.h](../../../cpu/tensor/gatherbase.h) has a **template method** `PrepareForComputeImpl<KernelContextType>` at L21 that uses only `context->Input<Tensor>()` and shapes
   - Replace `PrepareForCompute(context, p)` → `PrepareForComputeImpl(context, p)` (context-type agnostic)
   - Verify `GatherBase` template constructor `GatherBase(const KernelInfoType& info)` works with adapter `OpKernelInfo`
   - Remove CMake exclusion: `.*/tensor/gather\\.cc$` (line ~L128)
 
-- [ ] **5B.4** Fix [tensor/unsqueeze.cc](../../tensor/unsqueeze.cc) — 1 call at L66
+- [x] **5B.4** Fix [tensor/unsqueeze.cc](../../tensor/unsqueeze.cc) — 1 call at L66
   - `PrepareCompute(ctx, p)` from `UnsqueezeBase` — body is ~10 LOC: reads input shape, computes output axes, calls `ctx->Output()`
   - Inline `PrepareCompute` under `#ifdef BUILD_CUDA_EP_AS_PLUGIN`
   - `UnsqueezeBase` constructor parses `axes` attribute — inline that too (~5 LOC)
   - Remove CMake exclusion: `.*/tensor/unsqueeze\\.cc$` (line ~L159)
 
-- [ ] **5B.5** Permanently exclude [tensor/shape_op.cc](../../tensor/shape_op.cc) and [tensor/size.cc](../../tensor/size.cc)
+- [x] **5B.5** Permanently exclude [tensor/shape_op.cc](../../tensor/shape_op.cc) and [tensor/size.cc](../../tensor/size.cc)
   - Both reuse CPU classes directly (no CUDA compute — they just read tensor metadata)
   - `Shape` and `Size` ops land on CPU via `GetCpuPreferredNodes` anyway
-  - Add permanent exclusion comment in CMake:
+  - Added permanent exclusion comment in CMake:
     ```cmake
     # Permanently excluded — pure CPU ops, handled by GetCpuPreferredNodes.
     ```
-  - Document rationale in this task doc
+  - Rationale documented in this task doc and reflected in `onnxruntime_providers_cuda_plugin.cmake`
 
-- [ ] **5B.6** Add adapter `RequiredInput<T>()` and `RequiredOutput()` to [op_kernel.h](../../../../../../include/onnxruntime/ep/adapter/op_kernel.h)
+- [x] **5B.6** Add adapter `RequiredInput<T>()` and `RequiredOutput()` to [op_kernel.h](../../../../../../include/onnxruntime/ep/adapter/op_kernel.h)
   - In `struct OpKernelContext`:
     ```cpp
     template <typename T, typename = std::enable_if_t<std::is_same_v<T, Tensor>>>
@@ -541,11 +541,16 @@ These ops call a **single** utility function defined in the CPU provider. Fix by
     ```
   - These are convenience wrappers needed by `variadic_elementwise_ops.cc` (Stage 5C.1)
 
-- [ ] **5B.7** Validate Stage 5B
+- [x] **5B.7** Validate Stage 5B
   ```bash
   ./cuda_plugin.sh --build --test --test_plugin
   ./cuda.sh --build --test  # non-plugin regression (adapter changes affect both builds)
   ```
+  - Progress:
+    - `./cuda_plugin.sh --build` passed with Stage 5B inclusions (`gather`, `cumsum`, `tile`, `unsqueeze`)
+    - `./cuda_plugin.sh --test_plugin` passed
+    - `./cuda.sh --build` passed
+    - `./cuda.sh --test` passed (`onnxruntime_test_all`: 1180 passed)
 
 ---
 
@@ -553,10 +558,10 @@ These ops call a **single** utility function defined in the CPU provider. Fix by
 
 These ops inherit from CPU base classes or use missing adapter APIs. Strategy: inline base class logic for the plugin build using `#ifdef BUILD_CUDA_EP_AS_PLUGIN`.
 
-- [ ] **5C.1** Fix [math/variadic_elementwise_ops.cc](../../math/variadic_elementwise_ops.cc) — 3 missing APIs
-  - L161: `Node().InputArgCount().front()` → `context->InputCount()` (all variadic inputs are same type, so `InputCount()` is equivalent)
-  - L169: `context->RequiredInput<Tensor>(i)` → uses adapter `RequiredInput<T>()` from 5B.6
-  - L179, L197, L217: `context->RequiredOutput(0, shape)` → uses adapter `RequiredOutput()` from 5B.6
+- [x] **5C.1** Fix [math/variadic_elementwise_ops.cc](../../math/variadic_elementwise_ops.cc) — 3 missing APIs
+  - L161: `Node().InputArgCount().front()` → `context->InputCount()`
+  - L169: `context->RequiredInput<Tensor>(i)` uses adapter `RequiredInput<T>()` added in 5B.6
+  - L179, L197, L217: `context->RequiredOutput(0, shape)` uses adapter `RequiredOutput()` added in 5B.6
   - Remove CMake exclusion: `.*/math/variadic_elementwise_ops\\.cc$` (line ~L115)
 
 - [ ] **5C.2** Fix [tensor/pad.cc](../../tensor/pad.cc) — 3 `PadBase` static calls at L114, L117, L164
@@ -609,6 +614,10 @@ These ops inherit from CPU base classes or use missing adapter APIs. Strategy: i
   ./cuda_plugin.sh --build --test --test_plugin
   ./cuda.sh --build --test  # non-plugin regression
   ```
+  - Progress:
+    - `./cuda_plugin.sh --build` passed after 5C.1 inclusion (`variadic_elementwise_ops.cc`)
+    - `./cuda_plugin.sh --test_plugin` passed
+    - `./cuda.sh --build` passed
 
 ---
 

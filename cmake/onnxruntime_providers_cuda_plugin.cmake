@@ -94,8 +94,9 @@ list(FILTER CUDA_PLUGIN_EP_CU_SRCS EXCLUDE REGEX ".*/rnn/.*")
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/identity_op\\.cc$")
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/sequence_op\\.cc$")
 
-# Exclude size.cc — registers onnxruntime::Size (CPU op) whose Compute() body
-# lives in the CPU provider and is not linked into the plugin.
+# Permanently excluded — pure CPU ops, handled by GetCpuPreferredNodes.
+# size.cc registers onnxruntime::Size (CPU op) whose Compute() body lives
+# in the CPU provider and is not linked into the plugin.
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/size\\.cc$")
 
 # scatter_nd.cc: ValidateShapes inlined for plugin, GetComputeStream fixed.
@@ -116,9 +117,8 @@ list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/generator/constant_of_shape
 # matmul.cc: GetComputeStream fixed, GetTuningContext guarded.
 # list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/matmul\.cc$")  # REMOVED in Stage 5
 
-# Exclude variadic_elementwise_ops.cc — uses InputArgCount/RequiredInput/RequiredOutput
-# which are not in the adapter Node/OpKernelContext.
-list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/variadic_elementwise_ops\\.cc$")
+# variadic_elementwise_ops.cc: adapter InputCount/RequiredInput/RequiredOutput supported.
+# list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/variadic_elementwise_ops\\.cc$")  # REMOVED in Stage 5C
 
 # Exclude slice — inherits from SliceBase (CPU provider) not linked into the plugin.
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/slice\\.cc$")
@@ -129,9 +129,8 @@ list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/space_depth_ops\\.cc
 # concat.cc: InputArgCount/GetComputeStream usage fixed for adapter.
 # list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/concat\\.cc$")  # REMOVED in Stage 5A
 
-# Exclude gather.cc — passes adapter OpKernelContext* to framework PrepareForCompute
-# which expects onnxruntime::OpKernelContext*.
-list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/gather\\.cc$")
+# gather.cc: switched to GatherBase::PrepareForComputeImpl for adapter context.
+# list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/gather\\.cc$")  # REMOVED in Stage 5B
 
 # gather_nd.cc: PrepareCompute signature changed to void*/cudaStream_t, GetComputeStream fixed.
 # list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/gather_nd\\.cc$")  # REMOVED in Stage 5
@@ -162,19 +161,19 @@ list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/resize\\.cc$")
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/einsum_utils/.*")
 list(FILTER CUDA_PLUGIN_EP_CU_SRCS EXCLUDE REGEX ".*/math/einsum_utils/.*")
 
-# Exclude unsqueeze.cc — passes adapter OpKernelContext* to framework
-# FlattenHelper/CopyTensor which expects onnxruntime::OpKernelContext*.
-list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/unsqueeze\\.cc$")
+# unsqueeze.cc: plugin-local PrepareCompute path added for adapter context.
+# list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/unsqueeze\\.cc$")  # REMOVED in Stage 5B
 
-# Exclude shape_op.cc — Shape inherits from onnxruntime::OpKernel (framework)
+# Permanently excluded — pure CPU ops, handled by GetCpuPreferredNodes.
+# shape_op.cc inherits from onnxruntime::OpKernel (framework)
 # which cannot convert to ep::adapter::OpKernel in the plugin build.
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/shape_op\\.cc$")
 
-# Exclude cumsum.cc — cumsum_op::GetAxis is defined in framework CPU provider.
-list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/cumsum\\.cc$")
+# cumsum.cc: axis parsing helper inlined for plugin build.
+# list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/cumsum\\.cc$")  # REMOVED in Stage 5B
 
-# Exclude tile.cc — TileOp::IsTileMemcpy is defined in framework CPU provider.
-list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/tile\\.cc$")
+# tile.cc: plugin-local IsTileMemcpy helper added.
+# list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/tile\\.cc$")  # REMOVED in Stage 5B
 
 # --- Contrib op exclusions ---
 # Exclude contrib ops that have dependencies not available in the plugin build.
