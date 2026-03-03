@@ -135,8 +135,8 @@ list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/space_depth_ops\\.cc
 # gather_nd.cc: PrepareCompute signature changed to void*/cudaStream_t, GetComputeStream fixed.
 # list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/gather_nd\\.cc$")  # REMOVED in Stage 5
 
-# Exclude pad.cc — passes adapter OpKernelContext to framework PadBase::HandleDimension.
-list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/pad\\.cc$")
+# pad.cc: plugin-local wrappers added for PadBase static helpers.
+# list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/pad\\.cc$")  # REMOVED in Stage 5C.2
 
 # reshape.cc: GetComputeStream/CopyTensor framework dependency fixed for adapter.
 # list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/reshape\\.cc$")  # REMOVED in Stage 5A

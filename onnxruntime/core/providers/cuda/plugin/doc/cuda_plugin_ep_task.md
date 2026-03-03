@@ -564,12 +564,15 @@ These ops inherit from CPU base classes or use missing adapter APIs. Strategy: i
   - L179, L197, L217: `context->RequiredOutput(0, shape)` uses adapter `RequiredOutput()` added in 5B.6
   - Remove CMake exclusion: `.*/math/variadic_elementwise_ops\\.cc$` (line ~L115)
 
-- [ ] **5C.2** Fix [tensor/pad.cc](../../tensor/pad.cc) — 3 `PadBase` static calls at L114, L117, L164
-  - `PadBase::ComputePads(*ctx, ndim, pads_data, pads)` at L114 — reads pads from tensor inputs. Uses `ctx.Input<Tensor>(1)`, `ctx.Input<Tensor>(2)`. Create a plugin-local templated version: `ComputePadsPlugin(ctx, ndim, pads_data, pads)` that uses adapter's `Input<Tensor>()`. Gate with `#ifdef BUILD_CUDA_EP_AS_PLUGIN`.
-  - `PadBase::SeparateNegativeToSlices(pads, slices)` at L117 — pure data manipulation (no context). Works if `PadBase` header is included. If not, inline (~10 LOC).
-  - `PadBase::HandleDimValueZero(mode_, input_shape, output_shape)` at L164 — static, no context. Same as above.
-  - `Pad` inherits `PadBase` for `mode_` attribute: inline `mode_` parsing in `Pad` constructor under `#ifdef BUILD_CUDA_EP_AS_PLUGIN` (reads "mode" string attribute).
-  - Remove CMake exclusion: `.*/tensor/pad\\.cc$` (line ~L134)
+- [x] **5C.2** Fix [tensor/pad.cc](../../tensor/pad.cc) — 3 `PadBase` static calls at L114, L117, L164
+  - `PadBase::ComputePads(*ctx, ...)` replaced with plugin-safe `ComputePadsLocal(*ctx, ...)`
+    - Plugin build path uses `PadBase::ComputePadsImpl(ctx, ...)` (templated context support)
+    - Non-plugin path keeps `PadBase::ComputePads(ctx, ...)`
+  - `PadBase::SeparateNegativeToSlices(pads, slices)` kept as-is (header-inline, context-free)
+  - `PadBase::HandleDimValueZero(...)` replaced with plugin-safe `HandleDimValueZeroLocal(...)`
+    - Plugin build path inlines CPU-equivalent validation for `Constant`/`Edge`/`Reflect`
+    - Non-plugin path keeps `PadBase::HandleDimValueZero(...)`
+  - Removed CMake exclusion: `.*/tensor/pad\\.cc$` (line ~L134)
 
 - [ ] **5C.3** Fix [tensor/slice.cc](../../tensor/slice.cc) — `SliceBase` calls at L175, L180, L182, L264
   - `SliceBase::PrepareForCompute(starts, ends, axes, steps, compute_metadata)` at L180 — shape validation ~60 LOC
@@ -618,6 +621,9 @@ These ops inherit from CPU base classes or use missing adapter APIs. Strategy: i
     - `./cuda_plugin.sh --build` passed after 5C.1 inclusion (`variadic_elementwise_ops.cc`)
     - `./cuda_plugin.sh --test_plugin` passed
     - `./cuda.sh --build` passed
+    - `./cuda_plugin.sh --build` passed after 5C.2 inclusion (`pad.cc`)
+    - `./cuda_plugin.sh --test_plugin` passed after 5C.2 inclusion
+    - `./cuda.sh --build` passed after 5C.2 inclusion
 
 ---
 
