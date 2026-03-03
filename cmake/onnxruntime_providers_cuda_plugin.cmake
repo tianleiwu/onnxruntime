@@ -126,8 +126,8 @@ list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/slice\\.cc$")
 # Exclude space_depth_ops — inherits from SpaceDepthBase (CPU provider).
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/space_depth_ops\\.cc$")
 
-# Exclude concat.cc — uses InputArgCount and OpKernelContext::GetComputeStream() with CopyToGpu.
-list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/concat\\.cc$")
+# concat.cc: InputArgCount/GetComputeStream usage fixed for adapter.
+# list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/concat\\.cc$")  # REMOVED in Stage 5A
 
 # Exclude gather.cc — passes adapter OpKernelContext* to framework PrepareForCompute
 # which expects onnxruntime::OpKernelContext*.
@@ -139,11 +139,11 @@ list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/gather\\.cc$")
 # Exclude pad.cc — passes adapter OpKernelContext to framework PadBase::HandleDimension.
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/pad\\.cc$")
 
-# Exclude reshape.cc/reshape.h — uses GetComputeStream() and CopyTensor with framework types.
-list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/reshape\\.cc$")
+# reshape.cc: GetComputeStream/CopyTensor framework dependency fixed for adapter.
+# list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/reshape\\.cc$")  # REMOVED in Stage 5A
 
-# Exclude split.cc — uses GetComputeStream() with CopyToGpu.
-list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/split\\.cc$")
+# split.cc: GetComputeStream usage fixed for adapter via CudaKernel::GetComputeStream.
+# list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/tensor/split\\.cc$")  # REMOVED in Stage 5A
 
 # Exclude object_detection/ — NonMaxSuppression and RoiAlign inherit from CPU
 # base classes (NonMaxSuppressionBase, RoiAlignBase) not linked into the plugin.

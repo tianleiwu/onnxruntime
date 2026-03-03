@@ -454,24 +454,24 @@ Additional modifications needed to compile existing kernel files with the adapte
 
 These ops have **only** `ctx->GetComputeStream()` issues — no CPU base class problems.
 
-- [ ] **5A.0** Add `CudaAsyncBuffer::CopyToGpu(void*)` overload (if not present)
+- [x] **5A.0** Add `CudaAsyncBuffer::CopyToGpu(void*)` overload (if not present)
   - Search for `CudaAsyncBuffer` class definition (likely in `cuda_utils.h` or `cuda_common.h`)
   - Add `#ifdef BUILD_CUDA_EP_AS_PLUGIN` overload: `Status CopyToGpu(void* stream)` that casts `stream` to `cudaStream_t` and calls `cudaMemcpyAsync`
   - This unblocks all `CopyToGpu(ctx->GetComputeStream())` fixes below
-  - If `CopyToGpu` already accepts `void*`, skip this task
+  - `CopyToGpu(void*)` already exists in both framework [`cuda_kernel.h`](../../cuda_kernel.h) and plugin [`cuda_kernel_adapter.h`](../cuda_kernel_adapter.h), so no code change needed
 
-- [ ] **5A.1** Fix [tensor/reshape.cc](../../tensor/reshape.cc) — 2 lines at L50–L51
+- [x] **5A.1** Fix [tensor/reshape.cc](../../tensor/reshape.cc) — 2 lines at L50–L51
   - L50: `ORT_ENFORCE(ctx->GetComputeStream())` → `ORT_ENFORCE(GetComputeStream(ctx))`
   - L51: `cuda_kernel->CopyTensor(*X, *Y, *ctx->GetComputeStream())` → replace with `cudaMemcpyAsync(Y->MutableDataRaw(), X->DataRaw(), X->SizeInBytes(), cudaMemcpyDeviceToDevice, Stream(ctx))` or add `CopyTensor(Tensor&, Tensor&, cudaStream_t)` overload
-  - Gate changes with `#ifdef BUILD_CUDA_EP_AS_PLUGIN`
+  - Also fixed matching legacy path in [`tensor/reshape.h`](../../tensor/reshape.h) (`Reshape_1::ComputeInternal`) to avoid adapter `GetComputeStream()` compile failure
   - Remove CMake exclusion: `.*/tensor/reshape\\.cc$` (line ~L137)
 
-- [ ] **5A.2** Fix [tensor/split.cc](../../tensor/split.cc) — 5 lines at L132, L138, L140, L146, L148
+- [x] **5A.2** Fix [tensor/split.cc](../../tensor/split.cc) — 5 lines at L132, L138, L140, L146, L148
   - All are `buf.CopyToGpu(ctx->GetComputeStream())` → `buf.CopyToGpu(GetComputeStream(ctx))`
   - `SplitKernel` inherits `SplitBase` — verify `SplitBase` compiles in plugin (it stores `split_sizes_` attribute parsed from `OpKernelInfo`; adapter's `GetAttrs<int64_t>` should work). If not, inline `split_sizes_` attribute reading under `#ifdef BUILD_CUDA_EP_AS_PLUGIN`.
   - Remove CMake exclusion: `.*/tensor/split\\.cc$` (line ~L140)
 
-- [ ] **5A.3** Fix [tensor/concat.cc](../../tensor/concat.cc) — stream + `InputArgCount` + `PrepareForCompute`
+- [x] **5A.3** Fix [tensor/concat.cc](../../tensor/concat.cc) — stream + `InputArgCount` + `PrepareForCompute`
   - L36: `Node().InputArgCount().front()` → `ctx->InputCount()` (adapter provides `InputCount()`)
   - L46: `PrepareForCompute(ctx, ...)` — `ConcatBase::PrepareForCompute` expects framework `OpKernelContext*`. Check if template variant exists; if not, inline (~30 LOC: iterate inputs, validate axis, collect shapes) under `#ifdef BUILD_CUDA_EP_AS_PLUGIN`
   - L79, L92–L95: 5× `CopyToGpu(ctx->GetComputeStream())` → `CopyToGpu(GetComputeStream(ctx))`
@@ -483,6 +483,9 @@ These ops have **only** `ctx->GetComputeStream()` issues — no CPU base class p
   ./cuda_plugin.sh --build --test --test_plugin
   ./cuda.sh --build --test  # non-plugin regression
   ```
+  - Progress:
+    - `./cuda_plugin.sh --build` passed after 5A.1–5A.3 changes
+    - `./cuda_plugin.sh --test_plugin` passed (Stage 2/3/4 plugin tests)
 
 ---
 
