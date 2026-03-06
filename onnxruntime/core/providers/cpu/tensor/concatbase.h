@@ -212,6 +212,12 @@ class ConcatBase {
   Status PrepareForCompute(OpKernelContext* ctx, const InlinedTensorsVector& input_tensors,
                            Prepare& p) const;
 
+  template <typename KernelContextType>
+  Status PrepareForCompute(KernelContextType* ctx, const InlinedTensorsVector& input_tensors,
+                           Prepare& p) const {
+    return PrepareForComputeImpl(ctx, input_tensors, p);
+  }
+
  protected:
   template <typename KernelInfoType>
   ConcatBase(const KernelInfoType& info, bool is_sequence_op = false) {

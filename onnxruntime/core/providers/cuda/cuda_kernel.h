@@ -9,6 +9,17 @@
 #include <mutex>
 #include "core/providers/cuda/cuda_stream_handle.h"
 
+#if defined(BUILD_CUDA_EP_AS_PLUGIN)
+
+#include "core/providers/cuda/plugin/cuda_kernel_adapter.h"
+
+#elif defined(ORT_USE_EP_API_ADAPTERS)
+
+// In plugin adapter mode, cuda_kernel_adapter.h is force-included and provides
+// the CudaKernel implementation used by plugin C++ translation units.
+
+#else
+
 namespace onnxruntime {
 namespace cuda {
 
@@ -73,6 +84,11 @@ class CudaKernel : public OpKernel {
 
   const cudaDeviceProp& GetDeviceProp() const { return provider_->GetDeviceProp(); }
 
+  // Compatibility helper used by kernels that need the underlying ORT stream object.
+  inline onnxruntime::Stream* GetComputeStream(OpKernelContext* ctx) const {
+    return ctx ? ctx->GetComputeStream() : nullptr;
+  }
+
   inline cudaStream_t Stream(OpKernelContext* ctx) const {
     auto* stream = ctx->GetComputeStream();
     return stream ? static_cast<cudaStream_t>(stream->GetHandle()) : nullptr;
@@ -86,12 +102,20 @@ class CudaKernel : public OpKernel {
     return stream->cudnn_handle_;
   }
 
+  static inline cudnnHandle_t GetCudnnHandle(onnxruntime::Stream* stream) {
+    return GetCudnnHandle(static_cast<CudaStream*>(stream));
+  }
+
   inline cublasHandle_t GetCublasHandle(OpKernelContext* ctx) const {
     return GetCublasHandle(static_cast<CudaStream*>(ctx->GetComputeStream()));
   }
 
   static inline cublasHandle_t GetCublasHandle(onnxruntime::CudaStream* stream) {
     return stream->cublas_handle_;
+  }
+
+  static inline cublasHandle_t GetCublasHandle(onnxruntime::Stream* stream) {
+    return GetCublasHandle(static_cast<CudaStream*>(stream));
   }
 
   bool UseTF32() const {
@@ -209,3 +233,5 @@ class CudaKernel : public OpKernel {
 
 }  // namespace cuda
 }  // namespace onnxruntime
+
+#endif  // ORT_USE_EP_API_ADAPTERS

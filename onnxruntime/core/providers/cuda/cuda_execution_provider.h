@@ -21,6 +21,13 @@
 #include "contrib_ops/cuda/bert/attention_kernel_options.h"
 #endif
 
+#if defined(ORT_USE_EP_API_ADAPTERS)
+
+// In plugin adapter mode, cuda_kernel_adapter.h provides the lightweight
+// CUDAExecutionProvider shim used by plugin C++ translation units.
+
+#else
+
 namespace onnxruntime {
 
 void RunOnUnload(std::function<void()> function);
@@ -74,7 +81,7 @@ class CUDAExecutionProvider : public IExecutionProvider {
   std::shared_ptr<KernelRegistry> GetKernelRegistry() const override;
   std::unique_ptr<onnxruntime::IDataTransfer> GetDataTransfer() const override;
 
-  std::vector<std::unique_ptr<ComputeCapability>> GetCapability(
+  std::vector<std::unique_ptr<ComputeCapability> > GetCapability(
       const onnxruntime::GraphViewer& graph,
       const IKernelLookup& kernel_lookup,
       const GraphOptimizerRegistry& /* graph_optimizer_registry */,
@@ -217,13 +224,13 @@ class CUDAExecutionProvider : public IExecutionProvider {
     cudnnHandle_t cudnn_handle_ = nullptr;
     cublasLtHandle_t cublas_lt_handle_ = nullptr;
 
-    std::unique_ptr<cuda::IConstantBuffer<float>> constant_ones_float_;
-    std::unique_ptr<cuda::IConstantBuffer<double>> constant_ones_double_;
-    std::unique_ptr<cuda::IConstantBuffer<half>> constant_ones_half_;
-    std::unique_ptr<cuda::IConstantBuffer<BFloat16>> constant_ones_bfloat16_;
+    std::unique_ptr<cuda::IConstantBuffer<float> > constant_ones_float_;
+    std::unique_ptr<cuda::IConstantBuffer<double> > constant_ones_double_;
+    std::unique_ptr<cuda::IConstantBuffer<half> > constant_ones_half_;
+    std::unique_ptr<cuda::IConstantBuffer<BFloat16> > constant_ones_bfloat16_;
 #if !defined(DISABLE_FLOAT8_TYPES)
-    std::unique_ptr<cuda::IConstantBuffer<Float8E4M3FN>> constant_ones_float8e4m3fn_;
-    std::unique_ptr<cuda::IConstantBuffer<Float8E5M2>> constant_ones_float8e5m2_;
+    std::unique_ptr<cuda::IConstantBuffer<Float8E4M3FN> > constant_ones_float8e4m3fn_;
+    std::unique_ptr<cuda::IConstantBuffer<Float8E5M2> > constant_ones_float8e5m2_;
 #endif
 
     // Cuda graph with multi threads will be supported in the future, so cuda_graph_
@@ -239,7 +246,7 @@ class CUDAExecutionProvider : public IExecutionProvider {
     const int min_num_runs_before_cuda_graph_capture_ = 2;  // required min regular runs before graph capture for the necessary memory allocations.
   };
 
-  using PerThreadContextMap = std::unordered_map<const CUDAExecutionProvider*, std::weak_ptr<PerThreadContext>>;
+  using PerThreadContextMap = std::unordered_map<const CUDAExecutionProvider*, std::weak_ptr<PerThreadContext> >;
   // thread local PerThreadContext cache
 
   struct ContextCacheHolder {
@@ -260,12 +267,12 @@ class CUDAExecutionProvider : public IExecutionProvider {
 
   struct PerThreadContextState {
     // contexts that are currently active
-    std::set<std::shared_ptr<PerThreadContext>, std::owner_less<std::shared_ptr<PerThreadContext>>> active_contexts;
+    std::set<std::shared_ptr<PerThreadContext>, std::owner_less<std::shared_ptr<PerThreadContext> > > active_contexts;
     // contexts available for reuse
-    std::vector<std::shared_ptr<PerThreadContext>> retired_context_pool;
+    std::vector<std::shared_ptr<PerThreadContext> > retired_context_pool;
     // weak references to thread local caches from which this CUDAExecutionProvider instance's entry should be removed
     // upon destruction
-    std::set<std::weak_ptr<PerThreadContextMap>, std::owner_less<std::weak_ptr<PerThreadContextMap>>>
+    std::set<std::weak_ptr<PerThreadContextMap>, std::owner_less<std::weak_ptr<PerThreadContextMap> > >
         caches_to_update_on_destruction;
     // synchronizes access to PerThreadContextState members
     std::mutex mutex;
@@ -282,3 +289,5 @@ class CUDAExecutionProvider : public IExecutionProvider {
 };
 
 }  // namespace onnxruntime
+
+#endif  // ORT_USE_EP_API_ADAPTERS

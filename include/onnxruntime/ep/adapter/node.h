@@ -16,6 +16,22 @@ namespace adapter {
 /// </summary>
 struct Node {
   explicit Node(const OrtKernelInfo* kernel_info) : kernel_info_{kernel_info} {}
+  struct ValueInfoList {
+    size_t size() const noexcept {
+      return count_;
+    }
+
+    size_t count_;
+  };
+
+  struct ArgCountList {
+    int front() const noexcept {
+      return count_;
+    }
+
+    int count_;
+  };
+
   /** Gets the Node's name. */
   std::string Name() const noexcept {
     return kernel_info_.GetNodeName();
@@ -26,9 +42,22 @@ struct Node {
     return kernel_info_.GetOperatorType();
   }
 
+  /** Gets the Node's domain. */
+  std::string Domain() const {
+    return kernel_info_.GetOperatorDomain();
+  }
+
   /** Gets the since version of the operator. */
   int SinceVersion() const noexcept {
     return kernel_info_.GetOperatorSinceVersion();
+  }
+
+  ValueInfoList InputDefs() const noexcept {
+    return ValueInfoList{static_cast<size_t>(kernel_info_.GetInputCount())};
+  }
+
+  ArgCountList InputArgCount() const noexcept {
+    return ArgCountList{static_cast<int>(kernel_info_.GetInputCount())};
   }
 
  private:

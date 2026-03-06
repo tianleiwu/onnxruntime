@@ -5,7 +5,9 @@
 
 #include "core/providers/cpu/math/gemm_helper.h"
 #include "core/providers/cuda/shared_inc/fpgeneric.h"
+#if !defined(ORT_USE_EP_API_ADAPTERS)
 #include "core/providers/cuda/tunable/math/gemm.h"
+#endif
 
 namespace onnxruntime {
 namespace cuda {
@@ -72,9 +74,11 @@ Status Gemm<T>::ComputeInternal(OpKernelContext* ctx) const {
   // Bail out early if the output is going to be empty
   if (Y->Shape().Size() == 0) return Status::OK();
 
-  if (GetTuningContext()->IsTunableOpEnabled()) {
+#if !defined(ORT_USE_EP_API_ADAPTERS)
+  if (auto* tuning_ctx = GetTuningContext(); tuning_ctx != nullptr && tuning_ctx->IsTunableOpEnabled()) {
     return tunable::TunableGemm<T>(M, N, K, trans_A_, trans_B_, alpha_, B ? beta_ : 0.0f, this, ctx);
   }
+#endif
 
   return ComputeDefault(ctx, M, N, K);
 }

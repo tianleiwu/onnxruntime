@@ -48,6 +48,11 @@ class GatherBase {
 
   Status PrepareForCompute(OpKernelContext* context, Prepare& p) const;
 
+  template <typename KernelContextType>
+  Status PrepareForCompute(KernelContextType* context, Prepare& p) const {
+    return PrepareForComputeImpl(context, p);
+  }
+
  protected:
   template <typename KernelInfoType>
   GatherBase(const KernelInfoType& info) {

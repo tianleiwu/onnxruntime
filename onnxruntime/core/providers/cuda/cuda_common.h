@@ -35,10 +35,81 @@
 #include "core/common/float8.h"
 #include "core/common/float16.h"
 #include "core/framework/float4.h"
+#include "core/util/math.h"
 #include "core/providers/cuda/cuda_pch.h"
 #include "core/providers/cuda/shared_inc/cuda_call.h"
 #include "core/providers/cuda/shared_inc/fast_divmod.h"
 #include <gsl/gsl>
+
+#if !defined(ORT_USE_EP_API_ADAPTERS)
+// provider_api.h defines logging macros backed by wrapped provider types.
+// Undefine them here so later inclusion of the regular logging macros does not
+// trigger redefinition errors in non-plugin CUDA builds.
+#ifdef CREATE_MESSAGE
+#undef CREATE_MESSAGE
+#endif
+#ifdef LOGS_CATEGORY
+#undef LOGS_CATEGORY
+#endif
+#ifdef LOGS
+#undef LOGS
+#endif
+#ifdef LOGS_DEFAULT_CATEGORY
+#undef LOGS_DEFAULT_CATEGORY
+#endif
+#ifdef LOGS_DEFAULT
+#undef LOGS_DEFAULT
+#endif
+
+#include "core/common/logging/macros.h"
+
+#if defined(SHARED_PROVIDER)
+// provider_api.h wraps logging::Capture and requires the provider-compatible
+// logging macros. Restore those here so CUDA sources using LOGS_DEFAULT keep
+// working in shared-provider builds.
+#ifdef CREATE_MESSAGE
+#undef CREATE_MESSAGE
+#endif
+#define CREATE_MESSAGE(logger, severity, category, datatype) \
+  ::onnxruntime::logging::Capture::Create(logger, ::onnxruntime::logging::Severity::k##severity, category, datatype, ORT_WHERE)
+
+#ifdef LOGS_CATEGORY
+#undef LOGS_CATEGORY
+#endif
+#define LOGS_CATEGORY(logger, severity, category)                                                                        \
+  if ((logger).OutputIsEnabled(::onnxruntime::logging::Severity::k##severity, ::onnxruntime::logging::DataType::SYSTEM)) \
+  CREATE_MESSAGE(logger, severity, category, ::onnxruntime::logging::DataType::SYSTEM)->Stream()
+
+#ifdef LOGS
+#undef LOGS
+#endif
+#define LOGS(logger, severity) \
+  LOGS_CATEGORY(logger, severity, ::onnxruntime::logging::Category::onnxruntime)
+
+#ifdef LOGS_DEFAULT_CATEGORY
+#undef LOGS_DEFAULT_CATEGORY
+#endif
+#define LOGS_DEFAULT_CATEGORY(severity, category) \
+  LOGS_CATEGORY(::onnxruntime::logging::LoggingManager::DefaultLogger(), severity, category)
+
+#ifdef LOGS_DEFAULT
+#undef LOGS_DEFAULT
+#endif
+#define LOGS_DEFAULT(severity) \
+  LOGS_DEFAULT_CATEGORY(severity, ::onnxruntime::logging::Category::onnxruntime)
+#endif
+#endif
+
+#if defined(ORT_USE_EP_API_ADAPTERS)
+
+// In plugin adapter mode, cuda_kernel_adapter.h is force-included before this header
+// for C++ translation units and already provides the CUDA kernel shims and helpers.
+// Include it here as well so CUDA translation units that include cuda_common.h
+// directly get the same macros and helper types.
+
+#include "core/providers/cuda/plugin/cuda_kernel_adapter.h"
+
+#else
 
 namespace onnxruntime {
 namespace cuda {
@@ -205,11 +276,15 @@ class HalfGemmOptions {
 #if defined(USE_CUDA)
     disallow_reduced_precision_reduction_ = (value & 0x02) > 0;
     pedantic_ = (value & 0x04) > 0;
+#if !defined(BUILD_CUDA_EP_AS_PLUGIN) && !defined(SHARED_PROVIDER)
     LOGS_DEFAULT(INFO) << "ORT_CUDA_GEMM_OPTIONS: compute_16f=" << instance.compute_16f_
                        << " disallow_reduced_precision_reduction=" << instance.disallow_reduced_precision_reduction_
                        << " pedantic=" << instance.pedantic_;
+#endif  // !defined(BUILD_CUDA_EP_AS_PLUGIN) && !defined(SHARED_PROVIDER)
 #else
+#if !defined(BUILD_CUDA_EP_AS_PLUGIN) && !defined(SHARED_PROVIDER)
     LOGS_DEFAULT(INFO) << "ORT_CUDA_GEMM_OPTIONS: compute_16f=" << instance.compute_16f_;
+#endif
 #endif
     initialized_ = true;
   }
@@ -242,3 +317,5 @@ cudaDataType_t ToCudaDataType(int32_t element_type);
 
 }  // namespace cuda
 }  // namespace onnxruntime
+
+#endif  // ORT_USE_EP_API_ADAPTERS

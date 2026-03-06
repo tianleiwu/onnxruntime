@@ -3,8 +3,8 @@
 
 #include "cumsum.h"
 #include "cumsum_impl.h"
-#include "core/providers/cpu/math/cumsum.h"
 #include "core/providers/common.h"
+#include "core/providers/cpu/math/cumsum.h"
 
 namespace onnxruntime {
 namespace cuda {

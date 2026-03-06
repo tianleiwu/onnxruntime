@@ -7,6 +7,7 @@
 #error "This header should not be included directly. Include ep/adapters.h instead."
 #endif
 
+#include "core/common/logging/macros.h"
 #include "core/common/logging/logging.h"
 #include "core/common/path_string.h"
 
@@ -105,6 +106,12 @@ inline detail::LoggerCapture CreateMessageCapture(
 #undef LOGS_DEFAULT_CATEGORY
 #define LOGS_DEFAULT_CATEGORY(severity, category) \
   LOGS_CATEGORY(::onnxruntime::ep::adapter::Logger::DefaultLogger(), severity, category)
+
+#ifdef LOGS_DEFAULT
+#undef LOGS_DEFAULT
+#endif
+#define LOGS_DEFAULT(severity) \
+  LOGS_DEFAULT_CATEGORY(severity, ::onnxruntime::logging::Category::onnxruntime)
 
 #undef CREATE_MESSAGE
 #define CREATE_MESSAGE(logger, severity, category, datatype) \
