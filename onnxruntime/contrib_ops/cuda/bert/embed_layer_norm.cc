@@ -2,7 +2,17 @@
 // Licensed under the MIT License.
 
 #include "core/providers/cuda/cuda_common.h"
+#ifdef BUILD_CUDA_EP_AS_PLUGIN
+// Plugin build: SHARED_PROVIDER is defined (from provider_api.h) but we need
+// the inline template version of CheckInputs (the SHARED_PROVIDER path is just
+// a declaration dispatched via g_host_cpu, which is not linked in the plugin).
+#pragma push_macro("SHARED_PROVIDER")
+#undef SHARED_PROVIDER
 #include "contrib_ops/cpu/bert/embed_layer_norm_helper.h"
+#pragma pop_macro("SHARED_PROVIDER")
+#else
+#include "contrib_ops/cpu/bert/embed_layer_norm_helper.h"
+#endif
 #include "embed_layer_norm.h"
 #include "embed_layer_norm_impl.h"
 

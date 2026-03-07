@@ -2,7 +2,9 @@
 // Licensed under the MIT License.
 
 #pragma once
+#ifndef BUILD_CUDA_EP_AS_PLUGIN
 #include "core/providers/shared_library/provider_api.h"
+#endif
 #include "core/providers/cuda/cuda_kernel.h"
 
 namespace onnxruntime {
@@ -15,8 +17,12 @@ class IdentityOp final : public CudaKernel {
   }
 
   Status ComputeInternal(OpKernelContext* context) const override {
+#ifndef BUILD_CUDA_EP_AS_PLUGIN
     auto X_ml_type = context->InputType(0);
     if (X_ml_type->IsTensorType()) {
+#else
+    {
+#endif
       const Tensor* X = context->Input<Tensor>(0);
       if (nullptr == X) {
         return Status(common::ONNXRUNTIME, common::FAIL,
@@ -51,6 +57,7 @@ class IdentityOp final : public CudaKernel {
           CUDA_RETURN_IF_ERROR(cudaMemsetAsync(mask_data, 0, mask->SizeInBytes(), Stream(context)));
         }
       }
+#ifndef BUILD_CUDA_EP_AS_PLUGIN
     } else if (X_ml_type->IsTensorSequenceType()) {
       const TensorSeq* X = context->Input<TensorSeq>(0);
       ORT_ENFORCE(X != nullptr, "IdentityOp cuda: input tensor is missing.");
@@ -83,6 +90,9 @@ class IdentityOp final : public CudaKernel {
       return Status(common::ONNXRUNTIME, common::FAIL,
                     "IdentityOp cuda: unsupported input type.");
     }
+#else
+    }
+#endif  // !BUILD_CUDA_EP_AS_PLUGIN
     return Status::OK();
   }
 };

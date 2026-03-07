@@ -210,8 +210,15 @@ Status GroupNorm::ComputeInternal(OpKernelContext* context) const {
   auto workspace = GetScratchBuffer<void>(GetGroupNormWorkspaceSizeInBytes(batch_size, num_groups_),
                                           context->GetComputeStream());
 
+#ifdef BUILD_CUDA_EP_AS_PLUGIN
+  // Adapter CudaKernel::GetTuningContext() returns ITuningContext*;
+  // DispatchGroupNorm/LaunchGroupNormKernel expect CudaTuningContext*.
+  auto* tuning_ctx = static_cast<CudaTuningContext*>(GetTuningContext());
+#else
+  auto* tuning_ctx = GetTuningContext();
+#endif
   utils::MLTypeCallDispatcher<GROUP_NORM_TYPES> dispatcher(input->GetElementType());
-  return dispatcher.InvokeRet<Status, DispatchGroupNorm>(GetTuningContext(),
+  return dispatcher.InvokeRet<Status, DispatchGroupNorm>(tuning_ctx,
                                                          context->GetComputeStream(), output, add_out, input, skip, bias,
                                                          gamma, beta, workspace.get(),
                                                          epsilon_,

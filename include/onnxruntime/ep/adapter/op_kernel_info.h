@@ -92,6 +92,15 @@ struct OpKernelInfo {
     return cache_->constant_input_tensors;
   }
 
+  AllocatorPtr GetAllocator(OrtMemType mem_type) const {
+    AllocatorPtr allocator;
+    auto* ep = static_cast<const Ep*>(info_.GetEp());
+    ORT_THROW_IF_ERROR(mem_type == OrtMemType::OrtMemTypeCPU
+                           ? ep->GetTempSpaceCPUAllocator(&allocator)
+                           : ep->GetTempSpaceAllocator(&allocator));
+    return allocator;
+  }
+
   bool TryGetConstantInput(int input_index, const Tensor** constant_input_value) const {
     if (input_index < 0 || static_cast<size_t>(input_index) >= cache_->constant_input_tensors.size()) {
       return false;

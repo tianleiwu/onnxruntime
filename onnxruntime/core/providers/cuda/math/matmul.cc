@@ -5,7 +5,9 @@
 
 #include "core/providers/cuda/shared_inc/fpgeneric.h"
 #include "core/providers/cuda/cuda_allocator.h"
+#if !defined(ORT_USE_EP_API_ADAPTERS)
 #include "core/providers/cuda/tunable/math/matmul.h"
+#endif
 
 namespace onnxruntime {
 namespace cuda {
@@ -121,9 +123,11 @@ Status MatMul<T>::ComputeInternal(OpKernelContext* ctx) const {
     return Status::OK();
   }
 
-  if (GetTuningContext()->IsTunableOpEnabled()) {
+#if !defined(ORT_USE_EP_API_ADAPTERS)
+  if (auto* tuning_ctx = GetTuningContext(); tuning_ctx != nullptr && tuning_ctx->IsTunableOpEnabled()) {
     return tunable::TunableMatMul<T>(alpha_, trans_a, trans_b, trans_batch_a_, trans_batch_b_, helper, this, ctx);
   }
+#endif
 
   return ComputeDefault(ctx, helper);
 }

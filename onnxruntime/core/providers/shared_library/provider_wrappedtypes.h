@@ -494,8 +494,10 @@ struct FunctionProto final {
 
 struct OpSchema final {
   const TypeConstraintMap& typeConstraintMap() const { return g_host->OpSchema__typeConstraintMap(this); }
+  size_t inputs_size() const { return g_host->OpSchema__inputs__size(this); }
   const std::string& inputs__GetName(const size_t i) const { return g_host->OpSchema__inputs__GetName(this, i); };
   const std::string& inputs__GetTypeStr(const size_t i) const { return g_host->OpSchema__inputs__GetTypeStr(this, i); };
+  size_t outputs_size() const { return g_host->OpSchema__outputs__size(this); }
   const std::string& outputs__GetName(const size_t i) const { return g_host->OpSchema__outputs__GetName(this, i); };
   const std::string& outputs__GetTypeStr(const size_t i) const { return g_host->OpSchema__outputs__GetTypeStr(this, i); };
   PROVIDER_DISALLOW_ALL(OpSchema)
@@ -1699,6 +1701,8 @@ class ModelMetadefIdGenerator {
   int GenerateId(const GraphViewer& graph_viewer, HashValue& model_hash) const { return g_host->ModelMetadefIdGenerator__GenerateId(this, graph_viewer, model_hash); }
 };
 
+template <>
+inline gsl::span<const int32_t> Tensor::DataAsSpan() const { return g_host->Tensor__DataAsSpan_int32(this); }
 template <>
 inline gsl::span<const int64_t> Tensor::DataAsSpan() const { return g_host->Tensor__DataAsSpan_int64(this); }
 

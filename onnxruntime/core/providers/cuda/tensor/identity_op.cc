@@ -57,7 +57,13 @@ ONNX_OPERATOR_VERSIONED_KERNEL_EX(
     14, 18,
     kCudaExecutionProvider,
     (*KernelDefBuilder::Create())
-        .TypeConstraint("V", DataTypeImpl::AllFixedSizeTensorAndSequenceTensorTypes())
+        .TypeConstraint("V",
+#ifdef BUILD_CUDA_EP_AS_PLUGIN
+                        DataTypeImpl::AllFixedSizeTensorTypes()
+#else
+                        DataTypeImpl::AllFixedSizeTensorAndSequenceTensorTypes()
+#endif
+                            )
         .Alias(0, 0),
     IdentityOp<false>);
 
@@ -67,7 +73,13 @@ ONNX_OPERATOR_KERNEL_EX(
     19,
     kCudaExecutionProvider,
     (*KernelDefBuilder::Create())
-        .TypeConstraint("V", DataTypeImpl::AllFixedSizeTensorAndSequenceTensorTypesIRv9())
+        .TypeConstraint("V",
+#ifdef BUILD_CUDA_EP_AS_PLUGIN
+                        DataTypeImpl::AllFixedSizeTensorTypesIRv9()
+#else
+                        DataTypeImpl::AllFixedSizeTensorAndSequenceTensorTypesIRv9()
+#endif
+                            )
         .Alias(0, 0),
     IdentityOp<false>);
 }  // namespace cuda

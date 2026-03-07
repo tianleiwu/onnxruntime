@@ -629,8 +629,10 @@ struct ProviderHost {
   virtual void RegisterSchema(const std::string& domain, const OrtCustomOp* op) = 0;
   virtual void DeregisterSchema(const std::string& domain, const std::string& op_type, int version) = 0;
   virtual const ONNX_NAMESPACE::OpSchema* GetSchema(const std::string& name, const int maxInclusiveVersion, const std::string& domain) = 0;
+  virtual size_t OpSchema__inputs__size(const ONNX_NAMESPACE::OpSchema* p) = 0;
   virtual const std::string& OpSchema__inputs__GetName(const ONNX_NAMESPACE::OpSchema* p, const size_t i) = 0;
   virtual const std::string& OpSchema__inputs__GetTypeStr(const ONNX_NAMESPACE::OpSchema* p, const size_t i) = 0;
+  virtual size_t OpSchema__outputs__size(const ONNX_NAMESPACE::OpSchema* p) = 0;
   virtual const std::string& OpSchema__outputs__GetName(const ONNX_NAMESPACE::OpSchema* p, const size_t i) = 0;
   virtual const std::string& OpSchema__outputs__GetTypeStr(const ONNX_NAMESPACE::OpSchema* p, const size_t i) = 0;
   virtual const ONNX_NAMESPACE::TypeConstraintMap& OpSchema__typeConstraintMap(const ONNX_NAMESPACE::OpSchema* p) const = 0;
@@ -1292,6 +1294,7 @@ struct ProviderHost {
   virtual const Int2x4* Tensor__Data_Int2x4(const Tensor* p) = 0;
   virtual const UInt2x4* Tensor__Data_UInt2x4(const Tensor* p) = 0;
 
+  virtual gsl::span<const int32_t> Tensor__DataAsSpan_int32(const Tensor* p) = 0;
   virtual gsl::span<const int64_t> Tensor__DataAsSpan_int64(const Tensor* p) = 0;
 
   virtual void* Allocator__AllocateBufferWithOptions(IAllocator& allocator, size_t size, bool use_reserve, Stream* stream, WaitNotificationFn wait_fn) = 0;

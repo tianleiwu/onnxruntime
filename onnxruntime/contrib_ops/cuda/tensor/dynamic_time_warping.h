@@ -9,8 +9,12 @@ namespace onnxruntime {
 namespace contrib {
 namespace cuda {
 
+#ifndef BUILD_CUDA_EP_AS_PLUGIN
+// In the non-plugin build, pull framework types into this namespace.
+// In the plugin build, adapters.h already injects the adapter aliases.
 using onnxruntime::OpKernelContext;
 using onnxruntime::OpKernelInfo;
+#endif
 using onnxruntime::cuda::CudaKernel;
 class DynamicTimeWarping final : public CudaKernel {
  public:

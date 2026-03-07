@@ -844,8 +844,10 @@ struct ProviderHostImpl : ProviderHost {
   const ONNX_NAMESPACE::OpSchema* GetSchema(const std::string& name, const int maxInclusiveVersion, const std::string& domain) override {
     return ONNX_NAMESPACE::OpSchemaRegistry::Instance()->GetSchema(name, maxInclusiveVersion, domain);
   }
+  size_t OpSchema__inputs__size(const ONNX_NAMESPACE::OpSchema* p) override { return p->inputs().size(); }
   const std::string& OpSchema__inputs__GetName(const ONNX_NAMESPACE::OpSchema* p, const size_t i) override { return p->inputs()[i].GetName(); }
   const std::string& OpSchema__inputs__GetTypeStr(const ONNX_NAMESPACE::OpSchema* p, const size_t i) override { return p->inputs()[i].GetTypeStr(); }
+  size_t OpSchema__outputs__size(const ONNX_NAMESPACE::OpSchema* p) override { return p->outputs().size(); }
   const std::string& OpSchema__outputs__GetName(const ONNX_NAMESPACE::OpSchema* p, const size_t i) override { return p->outputs()[i].GetName(); }
   const std::string& OpSchema__outputs__GetTypeStr(const ONNX_NAMESPACE::OpSchema* p, const size_t i) override { return p->outputs()[i].GetTypeStr(); }
   const ONNX_NAMESPACE::TypeConstraintMap& OpSchema__typeConstraintMap(const ONNX_NAMESPACE::OpSchema* p) const override { return p->typeConstraintMap(); }
@@ -1721,6 +1723,7 @@ struct ProviderHostImpl : ProviderHost {
   const Int2x4* Tensor__Data_Int2x4(const Tensor* p) override { return p->Data<Int2x4>(); }
   const UInt2x4* Tensor__Data_UInt2x4(const Tensor* p) override { return p->Data<UInt2x4>(); }
 
+  gsl::span<const int32_t> Tensor__DataAsSpan_int32(const Tensor* p) override { return p->DataAsSpan<int32_t>(); }
   gsl::span<const int64_t> Tensor__DataAsSpan_int64(const Tensor* p) override { return p->DataAsSpan<int64_t>(); }
 
   void* Tensor__MutableDataRaw(Tensor* p, MLDataType type) override { return p->MutableDataRaw(type); }

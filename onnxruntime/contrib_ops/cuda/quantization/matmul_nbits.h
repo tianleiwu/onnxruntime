@@ -49,16 +49,41 @@ class MatMulNBits final : public CudaKernel {
     constexpr size_t kInputIndexGroupIndex = 4;
     constexpr size_t kInputIndexBias = 5;
 
+#ifdef BUILD_CUDA_EP_AS_PLUGIN
+    // In plugin build, adapter Node::InputDefs() doesn't support indexing or
+    // Exists()/TypeAsProto(). Use KernelInfo C API to query input type info instead.
+    auto ki = info.GetKernelInfo();
+    auto input_exists = [&ki](size_t idx) -> bool {
+      try {
+        auto type_info = ki.GetInputTypeInfo(idx);
+        return true;
+      } catch (...) {
+        return false;
+      }
+    };
+    has_zero_points_ = info.GetInputCount() > static_cast<int>(kInputIndexZeroPoints) && input_exists(kInputIndexZeroPoints);
+    has_g_idx_ = info.GetInputCount() > static_cast<int>(kInputIndexGroupIndex) && input_exists(kInputIndexGroupIndex);
+    has_bias_ = info.GetInputCount() > static_cast<int>(kInputIndexBias) && input_exists(kInputIndexBias);
+
+    if (has_zero_points_) {
+      auto zp_type_info = ki.GetInputTypeInfo(kInputIndexZeroPoints);
+      auto scale_type_info = ki.GetInputTypeInfo(kInputIndexScale);
+      int32_t zero_point_type = static_cast<int32_t>(zp_type_info.GetTensorTypeAndShapeInfo().GetElementType());
+      int32_t scale_type = static_cast<int32_t>(scale_type_info.GetTensorTypeAndShapeInfo().GetElementType());
+      is_zero_points_scale_same_type_ = (zero_point_type == scale_type);
+    }
+#else
     has_zero_points_ = info.GetInputCount() > kInputIndexZeroPoints && info.node().InputDefs()[kInputIndexZeroPoints]->Exists();
     has_g_idx_ = info.GetInputCount() > kInputIndexGroupIndex && info.node().InputDefs()[kInputIndexGroupIndex]->Exists();
     has_bias_ = info.GetInputCount() > kInputIndexBias && info.node().InputDefs()[kInputIndexBias]->Exists();
-    sm_ = this->GetDeviceProp().major * 10 + this->GetDeviceProp().minor;
 
     if (has_zero_points_) {
       int32_t zero_point_type = info.node().InputDefs()[kInputIndexZeroPoints]->TypeAsProto()->tensor_type().elem_type();
       int32_t scale_type = info.node().InputDefs()[kInputIndexScale]->TypeAsProto()->tensor_type().elem_type();
       is_zero_points_scale_same_type_ = (zero_point_type == scale_type);
     }
+#endif  // BUILD_CUDA_EP_AS_PLUGIN
+    sm_ = this->GetDeviceProp().major * 10 + this->GetDeviceProp().minor;
 
 #if USE_FPA_INTB_GEMM
     if constexpr (std::is_same<T, MLFloat16>::value || std::is_same<T, BFloat16>::value) {

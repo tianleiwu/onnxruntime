@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "core/framework/allocator.h"
+#include "core/framework/stream_handles.h"
 #include "core/framework/tensor.h"
 
 #include "node.h"
@@ -35,7 +36,7 @@ struct OpKernel {
   explicit OpKernel(const OpKernelInfo& info) : op_kernel_info_{info} {}
   virtual ~OpKernel() {}
 
-  Node Node() const {
+  adapter::Node Node() const {
     return op_kernel_info_.node();
   }
   const OpKernelInfo& Info() const {
@@ -93,6 +94,13 @@ struct OpKernelContext {
     input_tensors_[index] = CreateTensorFromApiValue(const_cast<OrtValue*>(static_cast<const OrtValue*>(input)));
     return &input_tensors_[index];
   }
+  template <typename T,
+            typename = std::enable_if_t<std::is_same_v<T, Tensor>>>
+  const T& RequiredInput(int index) const {
+    auto* input = Input<T>(index);
+    ORT_ENFORCE(input != nullptr, "Required input ", index, " is null");
+    return *input;
+  }
   Tensor* Output(int index, const TensorShape& shape) {
     if (index < 0 || static_cast<size_t>(index) >= output_tensors_.size()) {
       return nullptr;
@@ -108,6 +116,11 @@ struct OpKernelContext {
 
     output_tensors_[index] = CreateTensorFromApiValue(output);
     return &output_tensors_[index];
+  }
+  Tensor& RequiredOutput(int index, const TensorShape& shape) {
+    auto* output = Output(index, shape);
+    ORT_ENFORCE(output != nullptr, "Required output ", index, " is null");
+    return *output;
   }
   Tensor* Output(int index, const std::vector<int64_t>& shape) {
     return Output(index, TensorShape{shape});
@@ -131,22 +144,50 @@ struct OpKernelContext {
     // TODO(fs-eire): Implement GetUseDeterministicCompute().
     return false;
   }
+  onnxruntime::Stream* GetComputeStream() const {
+#if defined(BUILD_CUDA_EP_AS_PLUGIN)
+    if (!compute_stream_shim_) {
+      auto* stream_handle = context_.GetGPUComputeStream();
+      if (stream_handle == nullptr) {
+        return nullptr;
+      }
 
+      compute_stream_shim_ = std::make_unique<PluginCudaComputeStreamShim>(stream_handle);
+    }
+
+    return compute_stream_shim_.get();
+#else
+    return nullptr;
+#endif
+  }
   void* GetGPUComputeStream() const {
     return context_.GetGPUComputeStream();
   }
 
  private:
+#if defined(BUILD_CUDA_EP_AS_PLUGIN)
+  class PluginCudaComputeStreamShim final : public onnxruntime::Stream {
+   public:
+    explicit PluginCudaComputeStreamShim(void* stream_handle)
+        : onnxruntime::Stream(stream_handle,
+                              OrtDevice(OrtDevice::GPU, OrtDevice::MemType::DEFAULT,
+                                        OrtDevice::VendorIds::NVIDIA, 0)) {}
+  };
+#endif
+
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(OpKernelContext);
   Ort::KernelContext context_;
   const OpKernel& op_kernel_;
   const std::vector<Tensor>& constant_input_tensors_;
   mutable std::vector<Tensor> input_tensors_;
   std::vector<Tensor> output_tensors_;
+#if defined(BUILD_CUDA_EP_AS_PLUGIN)
+  mutable std::unique_ptr<onnxruntime::Stream> compute_stream_shim_;
+#endif
 };
 
 /// <summary>
-/// A bridge class between `onnxruntime::ep::adapter::OpKernel` and `::OrtKernelImpl`.
+/// A bridge class between `onnxruntime::ep::adapter::OpKernel` and `onnxruntime::OrtKernelImpl`.
 /// </summary>
 struct KernelImpl : OrtKernelImpl {
   explicit KernelImpl(std::unique_ptr<OpKernel> impl)
