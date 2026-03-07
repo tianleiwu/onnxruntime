@@ -22,6 +22,10 @@ Status DataCopy(const Tensor& input, Tensor& output, void* /*einsum_cuda_assets*
   return Status::OK();
 }
 
+std::unique_ptr<Tensor> CreateTensor(const DataTypeImpl* type, const TensorShape& shape, AllocatorPtr allocator) {
+  return std::make_unique<Tensor>(type, shape, std::move(allocator));
+}
+
 // CPU specific Zero buffer helper
 Status ZeroBuffer(Tensor& input, void* /*einsum_cuda_assets*/) {
   memset(input.MutableDataRaw(), 0, input.SizeInBytes());
@@ -222,7 +226,7 @@ std::unique_ptr<Tensor> Diagonal(const Tensor& input, int64_t dim_1, int64_t dim
 
     // Permutate the input so that the dims from which we need the diagonal forms the innermost dims
     // (Pass in CPU Transpose function here as this Diagonal method will only be used for CPU based diagonal parsing)
-    auto transposed = EinsumOp::Transpose(input, input_dims, permutation, allocator, nullptr, Transpose);
+    auto transposed = EinsumOp::Transpose(input, input_dims, permutation, allocator, nullptr, Transpose, CreateTensor);
 
     // Parse the diagonal from the innermost dims
     output = DiagonalInnermostDims(*transposed, preserve_innermost_dim_val, allocator);
@@ -238,7 +242,7 @@ std::unique_ptr<Tensor> Diagonal(const Tensor& input, int64_t dim_1, int64_t dim
 
     // Permutate using the reverse permutation to get back the original axes ordering
     // (Pass in CPU Transpose function here as this Diagonal method will only be used for CPU based diagonal parsing)
-    output = EinsumOp::Transpose(*output, output->Shape().GetDims(), reverse_permutation, allocator, nullptr, Transpose);
+    output = EinsumOp::Transpose(*output, output->Shape().GetDims(), reverse_permutation, allocator, nullptr, Transpose, CreateTensor);
   } else {
     // No transposing required
     output = DiagonalInnermostDims(input, preserve_innermost_dim_val, allocator);

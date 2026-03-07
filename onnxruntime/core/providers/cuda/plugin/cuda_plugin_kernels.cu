@@ -30,12 +30,16 @@ namespace onnxruntime {
 namespace cuda_plugin {
 
 OrtStatus* CreateCudaKernelRegistry(const OrtEpApi& /*ep_api*/,
-                                    const char* /*ep_name*/,
+                                    const char* ep_name,
                                     void* /*create_kernel_state*/,
                                     OrtKernelRegistry** out_registry) {
   *out_registry = nullptr;
 
   EXCEPTION_TO_STATUS_BEGIN
+
+  // Set the global provider name override for the adapter's KernelDefBuilder.
+  // This ensures all registered kernels use the provider name passed to this factory.
+  ::onnxruntime::ep::adapter::KernelDefBuilder::override_provider_name = ep_name;
 
   // adapter::KernelRegistry wraps OrtKernelRegistry via the Ort C++ API.
   ::onnxruntime::ep::adapter::KernelRegistry registry;
@@ -45,9 +49,15 @@ OrtStatus* CreateCudaKernelRegistry(const OrtEpApi& /*ep_api*/,
   for (auto build_fn : entries) {
     ::onnxruntime::ep::adapter::KernelCreateInfo info = build_fn();
     if (info.kernel_def != nullptr) {  // filter the BuildKernelCreateInfo<void> sentinel
-      (void)registry.Register(std::move(info));
+      Status status = registry.Register(std::move(info));
+      if (!status.IsOK()) {
+        // Log registration failure to stderr if needed (non-critical in release)
+      }
     }
   }
+
+  // Reset the override after registration to avoid affecting other EPs in the same process
+  ::onnxruntime::ep::adapter::KernelDefBuilder::override_provider_name = nullptr;
 
   *out_registry = registry.release();
   return nullptr;

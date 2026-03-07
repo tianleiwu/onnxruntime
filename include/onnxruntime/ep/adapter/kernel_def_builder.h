@@ -43,6 +43,8 @@ inline const OrtDataType* MLDataTypeToOrtDataType(MLDataType ml_type) {
 struct KernelDefBuilder {
   static std::unique_ptr<KernelDefBuilder> Create() { return std::make_unique<KernelDefBuilder>(); }
 
+  static inline const char* override_provider_name = nullptr;
+
   explicit KernelDefBuilder() {}
 
   KernelDefBuilder& SetName(const char* op_name) {
@@ -65,7 +67,7 @@ struct KernelDefBuilder {
   }
 
   KernelDefBuilder& Provider(const char* provider_type) {
-    builder_.SetExecutionProvider(provider_type);
+    builder_.SetExecutionProvider(override_provider_name ? override_provider_name : provider_type);
     return *this;
   }
 
