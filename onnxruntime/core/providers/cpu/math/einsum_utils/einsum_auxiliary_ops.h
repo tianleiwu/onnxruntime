@@ -92,7 +92,16 @@ std::unique_ptr<Tensor> Diagonal(const Tensor& input, int64_t dim_1, int64_t dim
 }  // namespace DeviceHelpers
 
 // This helps decide if we need to apply (and pay the cost) of a Transpose
-bool IsTransposeRequired(size_t input_rank, const gsl::span<const size_t>& permutation);
+inline bool IsTransposeRequired(size_t input_rank, const gsl::span<const size_t>& permutation) {
+  bool is_transpose_required = false;
+  for (size_t i = 0; i < input_rank; ++i) {
+    if (permutation[i] != i) {
+      is_transpose_required = true;
+      break;
+    }
+  }
+  return is_transpose_required;
+}
 
 // Thin wrapper over the Transpose op to be called from Einsum that does some checks and invokes the device specific helper
 std::unique_ptr<Tensor> Transpose(const Tensor& input, const TensorShape& input_shape_override,

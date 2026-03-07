@@ -42,6 +42,7 @@ struct OpKernelInfo {
   struct KernelInfoCache {
     explicit KernelInfoCache(const OrtKernelInfo* kernel_info) : kernel_info_(kernel_info) {
       Ort::ConstKernelInfo info{kernel_info};
+      ep_ = static_cast<const Ep*>(info.GetEp());
       const int input_count = info.GetInputCount();
       constant_input_tensors.resize(input_count);
       for (int i = 0; i < input_count; ++i) {
@@ -53,6 +54,7 @@ struct OpKernelInfo {
       }
     }
     const OrtKernelInfo* kernel_info_;
+    const Ep* ep_ = nullptr;
     std::vector<Tensor> constant_input_tensors;
     ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(KernelInfoCache);
   };
@@ -61,13 +63,13 @@ struct OpKernelInfo {
   }
 
   const DataTransferManager& GetDataTransferManager() const noexcept {
-    return (static_cast<const Ep*>(info_.GetEp()))->GetDataTransferManager();
+    return cache_->ep_->GetDataTransferManager();
   }
   Node node() const noexcept {
     return Node{cache_->kernel_info_};
   }
   const IExecutionProvider* GetExecutionProvider() const noexcept {
-    return (static_cast<const Ep*>(info_.GetEp()))->EpImpl();
+    return cache_->ep_->EpImpl();
   }
 
   KernelDef GetKernelDef() const noexcept {
@@ -94,7 +96,7 @@ struct OpKernelInfo {
 
   AllocatorPtr GetAllocator(OrtMemType mem_type) const {
     AllocatorPtr allocator;
-    auto* ep = static_cast<const Ep*>(info_.GetEp());
+    auto* ep = cache_->ep_;
     ORT_THROW_IF_ERROR(mem_type == OrtMemType::OrtMemTypeCPU
                            ? ep->GetTempSpaceCPUAllocator(&allocator)
                            : ep->GetTempSpaceAllocator(&allocator));

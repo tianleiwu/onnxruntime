@@ -188,6 +188,13 @@ class PluginKernelCollector {
 // These macros mirror the framework's ONNX_OPERATOR_*_KERNEL_EX definitions
 // from core/framework/op_kernel.h, but additionally register each
 // BuildKernelCreateInfoFn into PluginKernelCollector at static init time.
+//
+// Important: the generic adapter macros must preserve the original `provider`
+// argument. Most ported CUDA kernels are still declared with
+// `kCudaExecutionProvider`, and changing that here would globally change kernel
+// ownership for every adapted op. If a specific kernel needs to advertise a
+// different provider name to the runtime (for example, a plugin-only override),
+// do that locally in that kernel's .cc file instead of hard-coding it here.
 
 #define ORT_ADAPTER_CONCAT_IMPL(x, y) x##y
 #define ORT_ADAPTER_CONCAT(x, y) ORT_ADAPTER_CONCAT_IMPL(x, y)

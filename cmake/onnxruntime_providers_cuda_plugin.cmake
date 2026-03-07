@@ -31,6 +31,8 @@ file(GLOB_RECURSE CUDA_CONTRIB_OPS_CU_SRCS CONFIGURE_DEPENDS
 list(APPEND CUDA_PLUGIN_EP_CC_SRCS
      ${CUDA_EP_CC_SRCS}
      ${CUDA_CONTRIB_OPS_CC_SRCS}
+     "${ONNXRUNTIME_ROOT}/core/providers/cpu/math/einsum_utils/einsum_compute_preprocessor.cc"
+     "${ONNXRUNTIME_ROOT}/core/providers/cpu/math/einsum_utils/einsum_typed_compute_processor.cc"
 )
 
 list(APPEND CUDA_PLUGIN_EP_CU_SRCS
@@ -49,7 +51,7 @@ list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX "onnxruntime/contrib_ops/cuda/c
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/cuda_execution_provider\\.cc$")
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/cuda_provider_factory\\.cc$")
 list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/cuda_provider_interface\\.cc$")
-list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/einsum\\.cc$")
+# list(FILTER CUDA_PLUGIN_EP_CC_SRCS EXCLUDE REGEX ".*/math/einsum\\.cc$")
 
 # Exclude the framework controlflow/ subdirectory — these inherit from CPU base
 # classes (If, Loop, Scan). The plugin has its own control flow wrappers in

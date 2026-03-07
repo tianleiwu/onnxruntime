@@ -539,13 +539,24 @@ def _make_simple_model(op_type, inputs_info, outputs_info, attrs=None, opset=13,
 
 
 def _run_model_test(
-    target_device, op_name, model, feed_dict, expected_fn, ep_name="CudaPluginExecutionProvider", rtol=1e-3, atol=1e-3
+    target_device,
+    op_name,
+    model,
+    feed_dict,
+    expected_fn,
+    ep_name="CudaPluginExecutionProvider",
+    rtol=1e-3,
+    atol=1e-3,
+    session_config=None,
 ):
     """Run a single op test: save model, create session, run, compare."""
     model_path = f"temp_{op_name}.onnx"
     try:
         save(model, model_path)
         sess_options = onnxrt.SessionOptions()
+        if session_config:
+            for key, value in session_config.items():
+                sess_options.add_session_config_entry(key, value)
         sess_options.add_provider_for_devices([target_device], {})
         sess = onnxrt.InferenceSession(model_path, sess_options=sess_options)
         active_providers = sess.get_providers()
@@ -555,7 +566,7 @@ def _run_model_test(
         res = sess.run(None, feed_dict)
         expected = expected_fn(feed_dict)
         if isinstance(expected, (list, tuple)):
-            for i, (r, e) in enumerate(zip(res, expected, strict=False)):
+            for r, e in zip(res, expected, strict=False):
                 np.testing.assert_allclose(r, e, rtol=rtol, atol=atol)
         else:
             np.testing.assert_allclose(res[0], expected, rtol=rtol, atol=atol)
@@ -583,10 +594,19 @@ def test_cuda_plugin_stage5_ops():
     failed = 0
     skipped = 0
 
-    def run_test(name, model, feed, expected_fn, rtol=1e-3, atol=1e-3):
+    def run_test(name, model, feed, expected_fn, rtol=1e-3, atol=1e-3, session_config=None):
         nonlocal passed, failed, skipped
         print(f"  {name}...", end=" ", flush=True)
-        ok = _run_model_test(target_device, name, model, feed, expected_fn, rtol=rtol, atol=atol)
+        ok = _run_model_test(
+            target_device,
+            name,
+            model,
+            feed,
+            expected_fn,
+            rtol=rtol,
+            atol=atol,
+            session_config=session_config,
+        )
         if ok:
             passed += 1
             print("PASS")
@@ -594,14 +614,14 @@ def test_cuda_plugin_stage5_ops():
             failed += 1
 
     print("\n==================== Stage 5: Expanded Op Tests ====================", flush=True)
-    F_dtype = TensorProto.FLOAT
+    f_dtype = TensorProto.FLOAT
 
     # ---- 5A/5B: Standard ops ----
     print("\n--- Standard Ops (5A/5B) ---", flush=True)
 
     # Reshape
     model = _make_simple_model(
-        "Reshape", [("X", F_dtype, [2, 3, 4]), ("shape", TensorProto.INT64, [2])], [("Y", F_dtype, [6, 4])]
+        "Reshape", [("X", f_dtype, [2, 3, 4]), ("shape", TensorProto.INT64, [2])], [("Y", f_dtype, [6, 4])]
     )
     # Need shape as initializer; build manually
     shape_init = helper.make_tensor("shape", TensorProto.INT64, [2], [6, 4])
@@ -614,8 +634,8 @@ def test_cuda_plugin_stage5_ops():
     graph = helper.make_graph(
         [node],
         "test-Split",
-        [helper.make_tensor_value_info("X", F_dtype, [6, 4])],
-        [helper.make_tensor_value_info("Y1", F_dtype, [3, 4]), helper.make_tensor_value_info("Y2", F_dtype, [3, 4])],
+        [helper.make_tensor_value_info("X", f_dtype, [6, 4])],
+        [helper.make_tensor_value_info("Y1", f_dtype, [3, 4]), helper.make_tensor_value_info("Y2", f_dtype, [3, 4])],
     )
     opset = onnx.OperatorSetIdProto()
     opset.version = 13
@@ -626,7 +646,7 @@ def test_cuda_plugin_stage5_ops():
 
     # Concat
     model = _make_simple_model(
-        "Concat", [("A", F_dtype, [2, 3]), ("B", F_dtype, [2, 3])], [("Y", F_dtype, [4, 3])], attrs={"axis": 0}
+        "Concat", [("A", f_dtype, [2, 3]), ("B", f_dtype, [2, 3])], [("Y", f_dtype, [4, 3])], attrs={"axis": 0}
     )
     a = np.random.rand(2, 3).astype(np.float32)
     b = np.random.rand(2, 3).astype(np.float32)
@@ -635,8 +655,8 @@ def test_cuda_plugin_stage5_ops():
     # Gather
     gather_model = _make_simple_model(
         "Gather",
-        [("X", F_dtype, [5, 4]), ("indices", TensorProto.INT64, [3])],
-        [("Y", F_dtype, [3, 4])],
+        [("X", f_dtype, [5, 4]), ("indices", TensorProto.INT64, [3])],
+        [("Y", f_dtype, [3, 4])],
         attrs={"axis": 0},
         opset=13,
     )
@@ -649,8 +669,8 @@ def test_cuda_plugin_stage5_ops():
     graph = helper.make_graph(
         [node],
         "test-Unsqueeze",
-        [helper.make_tensor_value_info("X", F_dtype, [3, 4])],
-        [helper.make_tensor_value_info("Y", F_dtype, [1, 3, 4])],
+        [helper.make_tensor_value_info("X", f_dtype, [3, 4])],
+        [helper.make_tensor_value_info("Y", f_dtype, [1, 3, 4])],
     )
     opset = onnx.OperatorSetIdProto()
     opset.version = 13
@@ -665,8 +685,8 @@ def test_cuda_plugin_stage5_ops():
     graph = helper.make_graph(
         [node],
         "test-Tile",
-        [helper.make_tensor_value_info("X", F_dtype, [2, 3])],
-        [helper.make_tensor_value_info("Y", F_dtype, [4, 9])],
+        [helper.make_tensor_value_info("X", f_dtype, [2, 3])],
+        [helper.make_tensor_value_info("Y", f_dtype, [4, 9])],
     )
     opset = onnx.OperatorSetIdProto()
     opset.version = 13
@@ -681,8 +701,8 @@ def test_cuda_plugin_stage5_ops():
     graph = helper.make_graph(
         [node],
         "test-CumSum",
-        [helper.make_tensor_value_info("X", F_dtype, [3, 4])],
-        [helper.make_tensor_value_info("Y", F_dtype, [3, 4])],
+        [helper.make_tensor_value_info("X", f_dtype, [3, 4])],
+        [helper.make_tensor_value_info("Y", f_dtype, [3, 4])],
     )
     opset = onnx.OperatorSetIdProto()
     opset.version = 14
@@ -700,7 +720,7 @@ def test_cuda_plugin_stage5_ops():
         [node],
         "test-ConstantOfShape",
         [helper.make_tensor_value_info("shape", TensorProto.INT64, [2])],
-        [helper.make_tensor_value_info("Y", F_dtype, None)],
+        [helper.make_tensor_value_info("Y", f_dtype, None)],
     )
     opset = onnx.OperatorSetIdProto()
     opset.version = 9
@@ -714,7 +734,7 @@ def test_cuda_plugin_stage5_ops():
 
     # SpaceToDepth
     model = _make_simple_model(
-        "SpaceToDepth", [("X", F_dtype, [1, 2, 4, 4])], [("Y", F_dtype, [1, 8, 2, 2])], attrs={"blocksize": 2}, opset=13
+        "SpaceToDepth", [("X", f_dtype, [1, 2, 4, 4])], [("Y", f_dtype, [1, 8, 2, 2])], attrs={"blocksize": 2}, opset=13
     )
     x = np.random.rand(1, 2, 4, 4).astype(np.float32)
 
@@ -735,8 +755,8 @@ def test_cuda_plugin_stage5_ops():
     graph = helper.make_graph(
         [node],
         "test-Pad",
-        [helper.make_tensor_value_info("X", F_dtype, [2, 3])],
-        [helper.make_tensor_value_info("Y", F_dtype, [4, 5])],
+        [helper.make_tensor_value_info("X", f_dtype, [2, 3])],
+        [helper.make_tensor_value_info("Y", f_dtype, [4, 5])],
     )
     opset = onnx.OperatorSetIdProto()
     opset.version = 13
@@ -751,8 +771,8 @@ def test_cuda_plugin_stage5_ops():
     graph = helper.make_graph(
         [node],
         "test-Slice",
-        [helper.make_tensor_value_info("X", F_dtype, [4, 6])],
-        [helper.make_tensor_value_info("Y", F_dtype, [2, 4])],
+        [helper.make_tensor_value_info("X", f_dtype, [4, 6])],
+        [helper.make_tensor_value_info("Y", f_dtype, [2, 4])],
     )
     opset = onnx.OperatorSetIdProto()
     opset.version = 13
@@ -768,8 +788,8 @@ def test_cuda_plugin_stage5_ops():
     graph = helper.make_graph(
         [node],
         "test-Resize",
-        [helper.make_tensor_value_info("X", F_dtype, [1, 1, 2, 2])],
-        [helper.make_tensor_value_info("Y", F_dtype, [1, 1, 4, 4])],
+        [helper.make_tensor_value_info("X", f_dtype, [1, 1, 2, 2])],
+        [helper.make_tensor_value_info("Y", f_dtype, [1, 1, 4, 4])],
     )
     opset = onnx.OperatorSetIdProto()
     opset.version = 13
@@ -781,14 +801,56 @@ def test_cuda_plugin_stage5_ops():
     # Sum (variadic)
     model = _make_simple_model(
         "Sum",
-        [("A", F_dtype, [3, 4]), ("B", F_dtype, [3, 4]), ("C", F_dtype, [3, 4])],
-        [("Y", F_dtype, [3, 4])],
+        [("A", f_dtype, [3, 4]), ("B", f_dtype, [3, 4]), ("C", f_dtype, [3, 4])],
+        [("Y", f_dtype, [3, 4])],
         opset=13,
     )
     a = np.random.rand(3, 4).astype(np.float32)
     b = np.random.rand(3, 4).astype(np.float32)
     c = np.random.rand(3, 4).astype(np.float32)
     run_test("Sum_variadic", model, {"A": a, "B": b, "C": c}, lambda f: f["A"] + f["B"] + f["C"])
+
+    # Einsum transpose
+    model = _make_simple_model(
+        "Einsum",
+        [("X", f_dtype, [2, 3])],
+        [("Y", f_dtype, [3, 2])],
+        attrs={"equation": "ij->ji"},
+        opset=12,
+    )
+    x = np.random.rand(2, 3).astype(np.float32)
+    # Disable CPU EP fallback so a passing run proves the plugin claimed the Einsum node.
+    no_cpu_fallback = {"session.disable_cpu_ep_fallback": "1"}
+    run_test("Einsum_transpose", model, {"X": x}, lambda f: np.einsum("ij->ji", f["X"]), session_config=no_cpu_fallback)
+
+    # Einsum reduction
+    model = _make_simple_model(
+        "Einsum",
+        [("X", f_dtype, [2, 3, 4])],
+        [("Y", f_dtype, [2])],
+        attrs={"equation": "bij->b"},
+        opset=12,
+    )
+    x = np.random.rand(2, 3, 4).astype(np.float32)
+    run_test("Einsum_reduce", model, {"X": x}, lambda f: np.einsum("bij->b", f["X"]), session_config=no_cpu_fallback)
+
+    # Einsum batched matmul
+    model = _make_simple_model(
+        "Einsum",
+        [("A", f_dtype, [2, 3, 4]), ("B", f_dtype, [2, 4, 5])],
+        [("Y", f_dtype, [2, 3, 5])],
+        attrs={"equation": "bij,bjk->bik"},
+        opset=12,
+    )
+    a = np.random.rand(2, 3, 4).astype(np.float32)
+    b = np.random.rand(2, 4, 5).astype(np.float32)
+    run_test(
+        "Einsum_batched_matmul",
+        model,
+        {"A": a, "B": b},
+        lambda f: np.einsum("bij,bjk->bik", f["A"], f["B"]),
+        session_config=no_cpu_fallback,
+    )
 
     # ---- 5C: CPU base class ops ----
     print("\n--- CPU Base Class Ops (5C) ---", flush=True)
@@ -798,8 +860,8 @@ def test_cuda_plugin_stage5_ops():
     graph = helper.make_graph(
         [node],
         "test-Upsample",
-        [helper.make_tensor_value_info("X", F_dtype, [1, 1, 2, 2])],
-        [helper.make_tensor_value_info("Y", F_dtype, [1, 1, 4, 4])],
+        [helper.make_tensor_value_info("X", f_dtype, [1, 1, 2, 2])],
+        [helper.make_tensor_value_info("Y", f_dtype, [1, 1, 4, 4])],
     )
     opset = onnx.OperatorSetIdProto()
     opset.version = 9
@@ -811,8 +873,8 @@ def test_cuda_plugin_stage5_ops():
     # DepthToSpace
     model = _make_simple_model(
         "DepthToSpace",
-        [("X", F_dtype, [1, 8, 2, 2])],
-        [("Y", F_dtype, [1, 2, 4, 4])],
+        [("X", f_dtype, [1, 8, 2, 2])],
+        [("Y", f_dtype, [1, 2, 4, 4])],
         attrs={"blocksize": 2, "mode": "DCR"},
         opset=13,
     )
@@ -838,8 +900,8 @@ def test_cuda_plugin_stage5_ops():
     graph = helper.make_graph(
         [node],
         "test-FastGelu",
-        [helper.make_tensor_value_info("X", F_dtype, [2, 4])],
-        [helper.make_tensor_value_info("Y", F_dtype, [2, 4])],
+        [helper.make_tensor_value_info("X", f_dtype, [2, 4])],
+        [helper.make_tensor_value_info("Y", f_dtype, [2, 4])],
     )
     opset_onnx = onnx.OperatorSetIdProto()
     opset_onnx.version = 13
@@ -875,16 +937,16 @@ def test_cuda_plugin_stage5_ops():
         [node],
         "test-SkipLayerNorm",
         [
-            helper.make_tensor_value_info("X", F_dtype, [2, hidden_size]),
-            helper.make_tensor_value_info("skip", F_dtype, [2, hidden_size]),
-            helper.make_tensor_value_info("gamma", F_dtype, [hidden_size]),
-            helper.make_tensor_value_info("beta", F_dtype, [hidden_size]),
+            helper.make_tensor_value_info("X", f_dtype, [2, hidden_size]),
+            helper.make_tensor_value_info("skip", f_dtype, [2, hidden_size]),
+            helper.make_tensor_value_info("gamma", f_dtype, [hidden_size]),
+            helper.make_tensor_value_info("beta", f_dtype, [hidden_size]),
         ],
         [
-            helper.make_tensor_value_info("Y", F_dtype, [2, hidden_size]),
-            helper.make_tensor_value_info("mean", F_dtype, None),
-            helper.make_tensor_value_info("inv_std_var", F_dtype, None),
-            helper.make_tensor_value_info("input_skip_bias_sum", F_dtype, None),
+            helper.make_tensor_value_info("Y", f_dtype, [2, hidden_size]),
+            helper.make_tensor_value_info("mean", f_dtype, None),
+            helper.make_tensor_value_info("inv_std_var", f_dtype, None),
+            helper.make_tensor_value_info("input_skip_bias_sum", f_dtype, None),
         ],
     )
     opset_onnx = onnx.OperatorSetIdProto()
