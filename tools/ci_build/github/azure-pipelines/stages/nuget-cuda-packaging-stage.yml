@@ -22,6 +22,7 @@ stages:
   - Windows_Packaging_CUDA
   - Windows_Packaging_TensorRT
   - Linux_C_API_Packaging_GPU
+  - Linux_Packaging_combined_CUDA_aarch64
   #    This is need for Download Linux CustomOp TestData
   - Linux_C_API_Packaging_CPU
   condition: succeeded()
@@ -68,6 +69,22 @@ stages:
       parameters:
         StepName: 'Download Pipeline Artifact - NuGet'
         ArtifactName: 'onnxruntime-linux-x64-tensorrt'
+        TargetPath: '$(Build.BinariesDirectory)/nuget-artifact'
+        SpecificArtifact: ${{ parameters.SpecificArtifact }}
+        BuildId: ${{ parameters.BuildId }}
+
+    - template: ../templates/flex-downloadPipelineArtifact.yml
+      parameters:
+        StepName: 'Download Pipeline Artifact - NuGet'
+        ArtifactName: 'onnxruntime-linux-aarch64-cuda'
+        TargetPath: '$(Build.BinariesDirectory)/nuget-artifact'
+        SpecificArtifact: ${{ parameters.SpecificArtifact }}
+        BuildId: ${{ parameters.BuildId }}
+
+    - template: ../templates/flex-downloadPipelineArtifact.yml
+      parameters:
+        StepName: 'Download Pipeline Artifact - NuGet'
+        ArtifactName: 'onnxruntime-linux-aarch64-tensorrt'
         TargetPath: '$(Build.BinariesDirectory)/nuget-artifact'
         SpecificArtifact: ${{ parameters.SpecificArtifact }}
         BuildId: ${{ parameters.BuildId }}
@@ -182,7 +199,7 @@ stages:
       parameters:
         PackageType: 'nuget'
         PackagePath: '$(Build.ArtifactStagingDirectory)'
-        PlatformsSupported: 'win-x64,linux-x64'
+        PlatformsSupported: 'win-x64,linux-x64,linux-arm64'
         # 1* stands for version number. we use it to filter Gpu.Windows and Gpu.Linux packages
         PackageName: 'Microsoft.ML.OnnxRuntime.Gpu.1*nupkg'
         VerifyNugetSigning: false
@@ -200,7 +217,7 @@ stages:
         PackageType: 'nuget'
         PackagePath: '$(Build.ArtifactStagingDirectory)'
         PackageName: 'Microsoft.ML.OnnxRuntime.Gpu.Linux.*nupkg'
-        PlatformsSupported: 'linux-x64'
+        PlatformsSupported: 'linux-x64,linux-arm64'
         VerifyNugetSigning: false
 
     - task: MSBuild@1

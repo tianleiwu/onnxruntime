@@ -123,6 +123,108 @@ stages:
         libraryName: 'libonnxruntime.so.$(OnnxRuntimeVersion)'
 
     - template: ../templates/clean-agent-build-directory-step.yml
+
+  # Linux aarch64 CUDA Packaging
+  - job: Linux_C_API_Packaging_CUDA_aarch64
+    dependsOn: []
+    workspace:
+      clean: all
+    timeoutInMinutes: 180
+    pool:
+      name: 'onnxruntime-linux-ARM64-CPU-2019'
+      os: linux
+      hostArchitecture: Arm64
+    variables:
+    - name: CUDA_VERSION_MAJOR
+      ${{ if eq(parameters.CudaVersion, '13.0') }}:
+        value: '13'
+      ${{ if eq(parameters.CudaVersion, '12.8') }}:
+        value: '12'
+    - name: CUDA_VERSION
+      value: ${{ parameters.CudaVersion }}
+    steps:
+    - template: ../templates/set-version-number-variables-step.yml
+    - template: ../templates/get-docker-image-steps.yml
+      parameters:
+        Dockerfile: tools/ci_build/github/linux/docker/inference/aarch64/default/cuda${{ variables.CUDA_VERSION_MAJOR }}/Dockerfile
+        Context: tools/ci_build/github/linux/docker/inference/aarch64/default/cuda${{ variables.CUDA_VERSION_MAJOR }}
+        DockerBuildArgs: "--build-arg BUILD_UID=$( id -u )"
+        Repository: onnxruntimecuda${{ variables.CUDA_VERSION_MAJOR }}buildaarch64
+
+    - script: $(Build.SourcesDirectory)/tools/ci_build/github/linux/build_cuda_c_api_package_aarch64.sh
+      workingDirectory: $(Build.SourcesDirectory)
+      displayName: 'Build CUDA C API Package (aarch64)'
+
+    - ${{ if eq(parameters.buildJava, true) }}:
+      - template: ../templates/java-api-artifacts-package-and-publish-steps-posix.yml
+        parameters:
+          arch: 'linux-aarch64'
+          buildConfig: 'Release'
+          artifactName: 'onnxruntime-java-linux-aarch64-cuda'
+          libraryName: 'libonnxruntime.so'
+          nativeLibraryName: 'libonnxruntime4j_jni.so'
+
+    - template: ../templates/c-api-artifacts-package-and-publish-steps-posix.yml
+      parameters:
+        buildConfig: 'Release'
+        artifactName: 'onnxruntime-linux-aarch64-cuda-$(OnnxRuntimeVersion)'
+        artifactNameNoVersionString: 'onnxruntime-linux-aarch64-cuda'
+        libraryName: 'libonnxruntime.so.$(OnnxRuntimeVersion)'
+
+    - template: ../templates/clean-agent-build-directory-step.yml
+
+  # Linux aarch64 CUDA with TensorRT Packaging
+  - job: Linux_C_API_Packaging_TensorRT_aarch64
+    dependsOn: []
+    workspace:
+      clean: all
+    timeoutInMinutes: 210
+    pool:
+      name: 'onnxruntime-linux-ARM64-CPU-2019'
+      os: linux
+      hostArchitecture: Arm64
+    variables:
+    - template: ../templates/common-variables.yml
+    - name: CUDA_VERSION_MAJOR
+      ${{ if eq(parameters.CudaVersion, '13.0') }}:
+        value: '13'
+      ${{ if eq(parameters.CudaVersion, '12.8') }}:
+        value: '12'
+    - name: CUDA_VERSION
+      value: ${{ parameters.CudaVersion }}
+    steps:
+    - checkout: self
+      clean: true
+      submodules: recursive
+    - template: ../templates/get-docker-image-steps.yml
+      parameters:
+        Dockerfile: tools/ci_build/github/linux/docker/inference/aarch64/default/cuda${{ variables.CUDA_VERSION_MAJOR }}/Dockerfile
+        Context: tools/ci_build/github/linux/docker/inference/aarch64/default/cuda${{ variables.CUDA_VERSION_MAJOR }}
+        DockerBuildArgs: "--build-arg TRT_VERSION=${{ variables.cuda13_trt_version }} --build-arg TRT_DOWNLOAD_URL=${{ variables.aarch64_trt_download_url_cuda13 }} --build-arg BUILD_UID=$( id -u )"
+        Repository: onnxruntimecuda${{ variables.CUDA_VERSION_MAJOR }}xtrt86buildaarch64
+    - template: ../templates/set-version-number-variables-step.yml
+
+    - script: $(Build.SourcesDirectory)/tools/ci_build/github/linux/build_tensorrt_c_api_package_aarch64.sh
+      workingDirectory: $(Build.SourcesDirectory)
+      displayName: 'Build TensorRT C API Package (aarch64)'
+
+    - ${{ if eq(parameters.buildJava, true) }}:
+      - template: ../templates/java-api-artifacts-package-and-publish-steps-posix.yml
+        parameters:
+          arch: 'linux-aarch64'
+          buildConfig: 'Release'
+          artifactName: 'onnxruntime-java-linux-aarch64-tensorrt'
+          libraryName: 'libonnxruntime.so'
+          nativeLibraryName: 'libonnxruntime4j_jni.so'
+
+    - template: ../templates/c-api-artifacts-package-and-publish-steps-posix.yml
+      parameters:
+        buildConfig: 'Release'
+        artifactName: 'onnxruntime-linux-aarch64-tensorrt-$(OnnxRuntimeVersion)'
+        artifactNameNoVersionString: 'onnxruntime-linux-aarch64-tensorrt'
+        libraryName: 'libonnxruntime.so.$(OnnxRuntimeVersion)'
+
+    - template: ../templates/clean-agent-build-directory-step.yml
   # Linux CUDA Combined Testing and Publishing
 - stage: Linux_Packaging_combined_CUDA
   dependsOn:
@@ -219,3 +321,73 @@ stages:
       inputs:
         targetPath: '$(Build.ArtifactStagingDirectory)'
         artifactName: 'onnxruntime-linux-x64-gpu'
+
+  # Linux aarch64 CUDA Combined Testing and Publishing
+- stage: Linux_Packaging_combined_CUDA_aarch64
+  dependsOn:
+  - Linux_C_API_Packaging_GPU
+  jobs:
+  - job: Linux_Packaging_combined_CUDA_aarch64
+    condition: succeeded()
+    workspace:
+      clean: all
+    pool:
+      name: 'onnxruntime-linux-ARM64-CPU-2019'
+      os: linux
+      hostArchitecture: Arm64
+    variables:
+    - template: ../templates/common-variables.yml
+    - name: CUDA_VERSION_MAJOR
+      ${{ if eq(parameters.CudaVersion, '13.0') }}:
+        value: '13'
+      ${{ if eq(parameters.CudaVersion, '12.8') }}:
+        value: '12'
+    steps:
+    - checkout: self
+      submodules: false
+
+    - template: ../templates/set-version-number-variables-step.yml
+
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download Pipeline Artifact - aarch64 CUDA'
+      inputs:
+        artifactName: 'onnxruntime-linux-aarch64-cuda'
+        targetPath: '$(Build.BinariesDirectory)/tgz-artifacts'
+
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download Pipeline Artifact - aarch64 TensorRT'
+      inputs:
+        artifactName: 'onnxruntime-linux-aarch64-tensorrt'
+        targetPath: '$(Build.BinariesDirectory)/tgz-artifacts'
+
+    - task: ShellScript@2
+      displayName: 'Extract and bundle aarch64 GPU package'
+      inputs:
+        scriptPath: 'tools/ci_build/github/linux/extract_and_bundle_gpu_package_aarch64.sh'
+        args: '-a $(Build.BinariesDirectory)/tgz-artifacts'
+        workingDirectory: '$(Build.BinariesDirectory)/tgz-artifacts'
+
+    - task: ArchiveFiles@2
+      inputs:
+        rootFolderOrFile: '$(Build.BinariesDirectory)/tgz-artifacts/onnxruntime-linux-aarch64-gpu'
+        includeRootFolder: false
+        archiveType: 'tar'
+        tarCompression: 'gz'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/onnxruntime-linux-aarch64-gpu-$(OnnxRuntimeVersion).tgz'
+        replaceExistingArchive: true
+
+    - template: ../templates/validate-package.yml
+      parameters:
+        PackageType: 'tarball'
+        PackagePath: '$(Build.ArtifactStagingDirectory)'
+        PackageName: 'onnxruntime-linux-aarch64-gpu-$(OnnxRuntimeVersion).tgz'
+        ScriptPath: '$(Build.SourcesDirectory)/tools/nuget/validate_package.py'
+        PlatformsSupported: 'linux-aarch64'
+        VerifyNugetSigning: false
+        IsReleaseBuild: ${{ parameters.IsReleaseBuild }}
+        workingDirectory: '$(Build.ArtifactStagingDirectory)'
+
+    - task: 1ES.PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)'
+        artifactName: 'onnxruntime-linux-aarch64-gpu'
