@@ -54,11 +54,15 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
   using namespace onnxruntime::llm::kernels::cutlass_kernels;
 
   constexpr int kInputIndexFc3Weight = 8;
-  has_fc3_ = op_kernel_info.GetInputCount() > kInputIndexFc3Weight && op_kernel_info.node().InputDefs()[kInputIndexFc3Weight]->Exists();
+  has_fc3_ = op_kernel_info.GetInputCount() > kInputIndexFc3Weight;
 
+#ifdef BUILD_CUDA_EP_AS_PLUGIN
+  auto input_type = op_kernel_info.GetKernelInfo().GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();
+  bool is_fp16 = input_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
+#else
   int32_t input_type = op_kernel_info.node().InputDefs()[0]->TypeAsProto()->tensor_type().elem_type();
-
   bool is_fp16 = input_type == ONNX_NAMESPACE::TensorProto_DataType::TensorProto_DataType_FLOAT16;
+#endif
   is_fp16_ = is_fp16;
 
 #if QUICK_BUILD
@@ -148,7 +152,9 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
       m_moe_runner->setTactic(tactics[0], tactics[0]);
     }
   } else {
-    mGemmProfiler.setAllocator(this->Info().GetAllocator(OrtMemType::OrtMemTypeDefault));
+    AllocatorPtr allocator;
+    ORT_RETURN_IF_ERROR(context->GetTempSpaceAllocator(&allocator));
+    mGemmProfiler.setAllocator(std::move(allocator));
     mGemmProfiler.setProfilerParams(static_cast<int>(moe_params.num_experts), static_cast<int>(k_),
                                     static_cast<int64_t>(moe_params.hidden_size), static_cast<int64_t>(moe_params.inter_size),
                                     static_cast<int64_t>(block_size_), activation_type_,
@@ -204,13 +210,13 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   size_t permutation_bytes = moe_params.num_rows * k_ * sizeof(int);
   size_t total_scratch_bytes = workspace_size + scales_bytes + indices_bytes + permutation_bytes;
 
-  auto work_space = GetScratchBuffer<void>(total_scratch_bytes, context->GetComputeStream());
+  auto work_space = GetScratchBuffer<void>(total_scratch_bytes, GetComputeStream(context));
   char* workspace_ptr = reinterpret_cast<char*>(work_space.get());
   float* expert_scales = reinterpret_cast<float*>(workspace_ptr + workspace_size);
   int* expert_indices = reinterpret_cast<int*>(workspace_ptr + workspace_size + scales_bytes);
   int* unpermuted_row_to_permuted_row = reinterpret_cast<int*>(workspace_ptr + workspace_size + scales_bytes + indices_bytes);
 
-  cudaStream_t stream = static_cast<cudaStream_t>(context->GetComputeStream()->GetHandle());
+  cudaStream_t stream = Stream(context);
 
   // Perform Softmax + TopK
   // Input router_probs is (num_rows, num_experts)
@@ -287,7 +293,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
         size_t batch = scale_shape[0];  // Experts
         size_t bytes = scales->SizeInBytes();
 
-        transposed_scale_holder = GetScratchBuffer<void>(bytes, context->GetComputeStream());
+        transposed_scale_holder = GetScratchBuffer<void>(bytes, GetComputeStream(context));
         eff_scale = transposed_scale_holder.get();
 
         if (scales->IsDataType<MLFloat16>()) {
@@ -313,7 +319,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
           bool is_bf16 = scales->IsDataType<BFloat16>();
           size_t bytes = num_elements * (is_fp16 ? 2 : 4);
 
-          transient_bias = GetScratchBuffer<void>(bytes, context->GetComputeStream());
+          transient_bias = GetScratchBuffer<void>(bytes, GetComputeStream(context));
           eff_zp = transient_bias.get();
 
           const uint8_t* p_zp = static_cast<const uint8_t*>(zeros->DataRaw());
@@ -326,7 +332,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
             size_t cols = shape[2];   // Blocks
             size_t batch = shape[0];  // Experts
             size_t zp_bytes = zeros->SizeInBytes();
-            temp_zp_transposed = GetScratchBuffer<void>(zp_bytes, context->GetComputeStream());
+            temp_zp_transposed = GetScratchBuffer<void>(zp_bytes, GetComputeStream(context));
             LaunchQMoETranspose2D(p_zp, static_cast<uint8_t*>(temp_zp_transposed.get()), batch, rows, cols, stream);
             p_zp = static_cast<const uint8_t*>(temp_zp_transposed.get());
           }
@@ -436,7 +442,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
         if (shape.NumDimensions() == 3 && shape[2] > 1) {
           // Need temporary buffer for transpose
           size_t bytes = zeros->SizeInBytes();
-          transposed_zp_holder = GetScratchBuffer<void>(bytes, context->GetComputeStream());
+          transposed_zp_holder = GetScratchBuffer<void>(bytes, GetComputeStream(context));
           eff_zp = transposed_zp_holder.get();
 
           size_t rows = shape[1];   // N
@@ -583,9 +589,9 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
 
       if (block_size_ > 0) {
         // Block-wise: Compute bias = -ZP * Scale
-        auto type = Info().node().InputDefs()[0]->TypeAsProto()->tensor_type().elem_type();
-        bool is_fp16 = (type == TensorProto_DataType_FLOAT16);
-        size_t bytes = num_elements * (is_fp16 ? 2 : 4);
+        bool is_fp16 = is_fp16_;
+        bool is_bf16 = !is_fp16_;
+        size_t bytes = num_elements * (is_fp16 || is_bf16 ? 2 : 4);
         packed_bias = IAllocator::MakeUniquePtr<void>(alloc, bytes, true);
 
         const void* p_src_zp = tensor.DataRaw();
@@ -612,6 +618,8 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
 
         if (is_fp16) {
           LaunchQMoEPrePackOffsetBias(static_cast<const uint8_t*>(p_zp_for_calc), static_cast<const half*>(packed_scale.get()), static_cast<half*>(packed_bias.get()), num_elements, 128.0f, stream);
+        } else if (is_bf16) {
+          LaunchQMoEPrePackOffsetBias(static_cast<const uint8_t*>(p_zp_for_calc), static_cast<const __nv_bfloat16*>(packed_scale.get()), static_cast<__nv_bfloat16*>(packed_bias.get()), num_elements, 128.0f, stream);
         } else {
           LaunchQMoEPrePackOffsetBias(static_cast<const uint8_t*>(p_zp_for_calc), static_cast<const float*>(packed_scale.get()), static_cast<float*>(packed_bias.get()), num_elements, 128.0f, stream);
         }
@@ -650,9 +658,8 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
       }
 
       // Block-wise 4-bit: packed_bias holds floating-point bias = (8 - ZP) * Scale.
-      auto type = Info().node().InputDefs()[0]->TypeAsProto()->tensor_type().elem_type();
-      bool is_fp16 = (type == TensorProto_DataType_FLOAT16);
-      bool is_bf16 = (type == TensorProto_DataType_BFLOAT16);
+      bool is_fp16 = is_fp16_;
+      bool is_bf16 = !is_fp16_;
 
       // zeros shape for block-wise 4-bit is [E, N, ceil(B/2)] in packed uint4.
       // scales are prepacked to [E, B, N]. We convert zeros to scaled bias [E, B, N].

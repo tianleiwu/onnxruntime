@@ -58,8 +58,8 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
 
   using CudaT = typename OrtToCudaType<T>::type;
 
-  auto stream_obj = context->GetComputeStream();
-  cudaStream_t stream = static_cast<cudaStream_t>(stream_obj->GetHandle());
+  void* stream_obj = GetComputeStream(context);
+  cudaStream_t stream = Stream(context);
 
   auto& device_prop = GetDeviceProp();
   int sm = device_prop.major * 10 + device_prop.minor;
@@ -99,7 +99,9 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
       moe_runner.setTactic(tactics[0], tactics[0]);
     }
   } else {
-    mGemmProfiler.setAllocator(this->Info().GetAllocator(OrtMemType::OrtMemTypeDefault));
+    AllocatorPtr allocator;
+    ORT_RETURN_IF_ERROR(context->GetTempSpaceAllocator(&allocator));
+    mGemmProfiler.setAllocator(std::move(allocator));
     mGemmProfiler.setProfilerParams(static_cast<int>(moe_params.num_experts), static_cast<int>(this->k_),
                                     static_cast<int64_t>(moe_params.hidden_size), static_cast<int64_t>(moe_params.inter_size),
                                     static_cast<int64_t>(this->block_size_), kernel_activation_type,
