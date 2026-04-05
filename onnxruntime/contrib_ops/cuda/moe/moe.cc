@@ -57,6 +57,7 @@ Status MoE<T>::ComputeInternal(OpKernelContext* context) const {
       0));  // no block-wise quantization for regular MoE
 
   using CudaT = typename OrtToCudaType<T>::type;
+
   auto stream_obj = context->GetComputeStream();
   cudaStream_t stream = static_cast<cudaStream_t>(stream_obj->GetHandle());
 

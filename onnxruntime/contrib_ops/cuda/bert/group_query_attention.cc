@@ -63,6 +63,10 @@ REGISTER_KERNEL_TYPED(MLFloat16, MLFloat16)
 REGISTER_KERNEL_TYPED(BFloat16, BFloat16)
 REGISTER_KERNEL_TYPED(MLFloat16, int8_t)
 REGISTER_KERNEL_TYPED(BFloat16, int8_t)
+#ifdef USE_FP8_KV_CACHE
+REGISTER_KERNEL_TYPED(MLFloat16, Float8E4M3FN)
+REGISTER_KERNEL_TYPED(BFloat16, Float8E4M3FN)
+#endif
 #ifdef USE_INT4_KV_CACHE
 REGISTER_KERNEL_TYPED(MLFloat16, uint8_t)
 REGISTER_KERNEL_TYPED(BFloat16, uint8_t)
@@ -138,6 +142,8 @@ GroupQueryAttention<T, U>::GroupQueryAttention(const OpKernelInfo& info)
 // 11. head_sink        (Tensor) - Attention sink for GPT-OSS
 template <typename T, typename U>
 Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) const {
+  auto ort_stream = GetOrtStream(context);
+
   const Tensor* query = context->Input<Tensor>(0);
   const Tensor* key = context->Input<Tensor>(1);
   const Tensor* value = context->Input<Tensor>(2);
@@ -234,7 +240,7 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
   // GQA CUDA uses either flash attention or memory efficient attention. Neither kernel supports returning the QK output.
   ORT_RETURN_IF_ERROR(group_query_attention_helper::CheckNoQKOutput(
       context->OutputCount(),
-      static_cast<int>(Info().GetAttrOrDefault<int64_t>("qk_output", static_cast<int64_t>(QKOutputType::NO_OUTPUT)))));
+      static_cast<int>(Info().template GetAttrOrDefault<int64_t>("qk_output", static_cast<int64_t>(QKOutputType::NO_OUTPUT)))));
 
   if (do_rotary_ && (cos_cache == nullptr || sin_cache == nullptr)) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
@@ -255,8 +261,8 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
       parameters.batch_size, parameters.kv_num_heads, parameters.seqlen_present_kv_cache, dense_head_size};
 
   TensorShape present_shape(present_dims);
-  context->Output(1, present_shape);  // present_key
-  context->Output(2, present_shape);  // present_value
+  Tensor* present_key_output = context->Output(1, present_shape);    // present_key
+  Tensor* present_value_output = context->Output(2, present_shape);  // present_value
 
   IAllocatorUniquePtr<void> k_buffer;
   IAllocatorUniquePtr<void> v_buffer;
@@ -284,14 +290,16 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
   data.past_key = (past_key == nullptr) ? nullptr : reinterpret_cast<const CudaU*>(past_key->Data<U>());
   data.past_value = (past_value == nullptr) ? nullptr : reinterpret_cast<const CudaU*>(past_value->Data<U>());
 
-  data.present_key = reinterpret_cast<CudaU*>(context->Output<Tensor>(1)->MutableData<U>());
-  data.present_value = reinterpret_cast<CudaU*>(context->Output<Tensor>(2)->MutableData<U>());
+  data.present_key = reinterpret_cast<CudaU*>(present_key_output->MutableData<U>());
+  data.present_value = reinterpret_cast<CudaU*>(present_value_output->MutableData<U>());
 
   // Compute past_present_share_buffer early since it's needed for flash attention path selection.
   // This compares the final pointer values after quantization handling.
   parameters.past_present_share_buffer = (data.past_key == data.present_key);
 
   bool is_inputs_quantized = (k_quant_type_ != KVQuantizationType::NONE) || (v_quant_type_ != KVQuantizationType::NONE);
+  constexpr bool is_int8 = std::is_same<U, int8_t>::value;
+  constexpr bool is_fp8 = std::is_same<U, Float8E4M3FN>::value;
 
   // Allocate XQA scratch if needed (only for Flash Decoding path)
   IAllocatorUniquePtr<void> xqa_scratch_buffer;
@@ -315,18 +323,30 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
       parameters.local_window_size == -1) {
     int group_size = parameters.num_heads / parameters.kv_num_heads;
 
-    bool is_int8_quantized_supported = (k_quant_type_ == KVQuantizationType::PER_TENSOR &&
+    bool is_int8_quantized_supported = is_int8 &&
+                                       (k_quant_type_ == KVQuantizationType::PER_TENSOR &&
                                         v_quant_type_ == KVQuantizationType::PER_TENSOR &&
                                         data.k_scale == data.v_scale &&  // XQA requires k_scale and v_scale to be the same. Here requires k_scale and v_scale are same tensor.
-                                        parameters.kv_cache_bit_width == 8 &&
                                         (parameters.head_size == 256 || parameters.head_size == 128 || parameters.head_size == 64) &&
                                         (group_size == 4 || group_size == 8 || group_size == 16 || group_size == 32));
+
+#ifdef USE_FP8_KV_CACHE
+    bool is_fp8_quantized_supported = is_fp8 &&
+                                      (k_quant_type_ == KVQuantizationType::PER_TENSOR &&
+                                       v_quant_type_ == KVQuantizationType::PER_TENSOR &&
+                                       data.k_scale == data.v_scale &&
+                                       (parameters.head_size == 256 || parameters.head_size == 128 || parameters.head_size == 64) &&
+                                       (group_size == 4 || group_size == 8 || group_size == 16 || group_size == 32) &&
+                                       (device_prop.major >= 9 || (device_prop.major == 8 && device_prop.minor == 9)));  // FP8 requires SM89+ (Ada Lovelace)
+#else
+    constexpr bool is_fp8_quantized_supported = false;
+#endif
 
     bool is_non_quantized_supported = !is_inputs_quantized &&
                                       (parameters.head_size == 256 || parameters.head_size == 128 || parameters.head_size == 64) &&
                                       (64 % group_size == 0);
 
-    data.use_xqa = (is_non_quantized_supported || is_int8_quantized_supported);
+    data.use_xqa = (is_non_quantized_supported || is_int8_quantized_supported || is_fp8_quantized_supported);
 
     if (data.use_xqa) {
       size_t xqa_internal_bytes = onnxruntime::contrib::cuda::GetXQAScratchSize(
@@ -336,7 +356,7 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
           parameters.kv_num_heads,
           parameters.head_size,
           parameters.seqlen_present_kv_cache,
-          parameters.k_quant_type != KVQuantizationType::NONE ? XqaQuantType::kInt8 : XqaQuantType::kNone,
+          parameters.k_quant_type != KVQuantizationType::NONE ? (is_fp8 ? XqaQuantType::kFp8 : XqaQuantType::kInt8) : XqaQuantType::kNone,
           std::is_same<T, BFloat16>::value);
       assert(xqa_internal_bytes > 0);
       // Calculate additional scratch needed for manual RoPE/Append in ExtremeDecoding
@@ -352,7 +372,7 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
         xqa_total_bytes += q_bytes + k_bytes;
       }
 
-      xqa_scratch_buffer = this->GetScratchBuffer<void>(xqa_total_bytes, context->GetComputeStream());
+      xqa_scratch_buffer = this->GetScratchBuffer<void>(xqa_total_bytes, GetComputeStream(context));
       data.xqa_buffer = xqa_scratch_buffer.get();
       data.xqa_buffer_bytes = xqa_internal_bytes;
 
@@ -395,11 +415,11 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
       out_accum_bytes = onnxruntime::flash::get_out_accum_size(num_splits, parameters.batch_size, parameters.num_heads, parameters.sequence_length, round_multiple(parameters.head_size, 32));
     }
 
-    softmax_lse_buffer = GetScratchBuffer<void>(softmax_lse_bytes, context->GetComputeStream());
-    softmax_lse_accum_buffer = GetScratchBuffer<void>(softmax_lse_accum_bytes, context->GetComputeStream());
-    out_accum_buffer = GetScratchBuffer<void>(out_accum_bytes, context->GetComputeStream());
+    softmax_lse_buffer = GetScratchBuffer<void>(softmax_lse_bytes, GetComputeStream(context));
+    softmax_lse_accum_buffer = GetScratchBuffer<void>(softmax_lse_accum_bytes, GetComputeStream(context));
+    out_accum_buffer = GetScratchBuffer<void>(out_accum_bytes, GetComputeStream(context));
 
-    auto cuda_stream = static_cast<cudaStream_t>(context->GetComputeStream()->GetHandle());
+    auto cuda_stream = Stream(context);
     if (softmax_lse_accum_bytes > 0) {
       // Initialize to 0 is fine because Flash kernel will write -inf to it if needed.
       // However, the standard Flash kernel often doesn't zero it globally.
@@ -424,8 +444,8 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
   } else {
     // Compute sequence length buffers (past_seq_lens and total_seq_lens).
     // Allocate buffer for both: first half is past_seq_lens, second half is total_seq_lens.
-    seq_lens_buffer = GetScratchBuffer<int>(3 * parameters.batch_size, context->GetComputeStream());
-    auto cuda_stream = static_cast<cudaStream_t>(context->GetComputeStream()->GetHandle());
+    seq_lens_buffer = GetScratchBuffer<int>(3 * parameters.batch_size, GetComputeStream(context));
+    auto cuda_stream = Stream(context);
     data.past_seq_lens = seq_lens_buffer.get();
     data.total_seq_lens = seq_lens_buffer.get() + parameters.batch_size;
     data.padded_seq_lens = data.total_seq_lens + parameters.batch_size;
@@ -462,9 +482,9 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
                                    ? (sizeof(float) * parameters.batch_size * parameters.sequence_length * parameters.num_heads * parameters.head_size)
                                    : 0;
 
-    k_buffer = GetScratchBuffer<void>(kv_buffer_bytes, context->GetComputeStream());
-    v_buffer = GetScratchBuffer<void>(kv_buffer_bytes, context->GetComputeStream());
-    fmha_buffer = GetScratchBuffer<void>(fmha_buffer_bytes, context->GetComputeStream());
+    k_buffer = GetScratchBuffer<void>(kv_buffer_bytes, GetComputeStream(context));
+    v_buffer = GetScratchBuffer<void>(kv_buffer_bytes, GetComputeStream(context));
+    fmha_buffer = GetScratchBuffer<void>(fmha_buffer_bytes, GetComputeStream(context));
 
     data.k = reinterpret_cast<CudaT*>(k_buffer.get());
     data.v = reinterpret_cast<CudaT*>(v_buffer.get());
@@ -483,7 +503,7 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
       data.use_memory_efficient_attention);
 
   if (buffer_req.qkv_buffer_bytes > 0) {
-    unpacked_qkv_buffer = GetScratchBuffer<void>(buffer_req.qkv_buffer_bytes, context->GetComputeStream());
+    unpacked_qkv_buffer = GetScratchBuffer<void>(buffer_req.qkv_buffer_bytes, GetComputeStream(context));
     data.qkv_buffer = reinterpret_cast<CudaT*>(unpacked_qkv_buffer.get());
   }
 
@@ -538,7 +558,7 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
   cublasHandle_t cublas = GetCublasHandle(context);
 
   ORT_RETURN_IF_ERROR((QkvToContext<CudaT, CudaU>(
-      device_prop, cublas, context->GetComputeStream(), parameters, data)));
+      device_prop, cublas, ort_stream.get(), parameters, data)));
   return Status::OK();
 }
 
