@@ -248,6 +248,55 @@ py::array_t<int8_t> PackWeightsForMixedGemm(
 
   return processed_weights;
 }
+
+// Pack FP4 (MXFP4) weights for MoE GEMM kernels.
+//
+// Input:  q_weights in [N, K/2] layout (FP4 packed 2 per byte along K dimension, row-major)
+// Output: Packed weights in [K, N/2] layout (FP4 packed 2 per byte along N dimension, column-major)
+//
+// Unlike INT4 which requires architecture-specific row permutation and interleaving,
+// FP4 (SM90+ TMA path) only needs a simple transpose at the nibble level.
+py::array_t<uint8_t> PackFP4WeightsForMoE(
+    py::array_t<uint8_t> q_weights,
+    int32_t N,
+    int32_t K) {
+  py::buffer_info in_buf = q_weights.request();
+  const uint8_t* src = static_cast<const uint8_t*>(in_buf.ptr);
+
+  if (N % 2 != 0 || K % 2 != 0) {
+    throw std::invalid_argument("N and K must be even for FP4 packing");
+  }
+
+  int K_half = K / 2;
+  int N_half = N / 2;
+  size_t out_size = static_cast<size_t>(K) * static_cast<size_t>(N_half);
+  py::array_t<uint8_t> output({static_cast<pybind11::ssize_t>(out_size)});
+  py::buffer_info out_buf = output.request();
+  uint8_t* dst = static_cast<uint8_t*>(out_buf.ptr);
+  std::memset(dst, 0, out_size);
+
+  // Transpose FP4 nibbles from [N, K] (packed as [N, K/2] bytes) to
+  // [K, N] (packed as [K, N/2] bytes).
+  // Source packing: byte at (n, k/2) has value(n, k&~1) in low nibble, value(n, k|1) in high nibble
+  // Dest packing:   byte at (k, n/2) has value(k, n&~1) in low nibble, value(k, n|1) in high nibble
+  for (int n = 0; n < N; ++n) {
+    for (int k = 0; k < K; ++k) {
+      // Read nibble at logical position (n, k) from src [N, K/2]
+      int src_byte = n * K_half + k / 2;
+      uint8_t nibble = (k % 2 == 0) ? (src[src_byte] & 0x0F) : (src[src_byte] >> 4);
+
+      // Write nibble at logical position (k, n) to dst [K, N/2]
+      int dst_byte = k * N_half + n / 2;
+      if (n % 2 == 0) {
+        dst[dst_byte] |= nibble;  // low nibble
+      } else {
+        dst[dst_byte] |= (nibble << 4);  // high nibble
+      }
+    }
+  }
+
+  return output;
+}
 }  // namespace cuda
 #endif
 
@@ -268,6 +317,9 @@ void CreateQuantPybindModule(py::module& m) {
   m.def("pack_weights_for_cuda_mixed_gemm", &cuda::PackWeightsForMixedGemm,
         "Pack quantized weights for CUDA mixed-precision GEMM (FpA_IntB format)",
         py::arg("q_weights"), py::arg("N"), py::arg("K"), py::arg("bits"), py::arg("force_arch") = -1);
+  m.def("pack_fp4_weights_for_cuda_moe_gemm", &cuda::PackFP4WeightsForMoE,
+        "Pack FP4 (MXFP4) weights for CUDA MoE GEMM: transpose [N,K/2] to column-major [K,N/2]",
+        py::arg("q_weights"), py::arg("N"), py::arg("K"));
 #endif
 }
 

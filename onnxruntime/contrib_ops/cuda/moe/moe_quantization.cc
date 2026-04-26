@@ -38,7 +38,9 @@ namespace cuda {
           .MayInplace(0, 0)                                             \
           .TypeConstraint("T", DataTypeImpl::GetTensorType<T>())        \
           .TypeConstraint("T1", DataTypeImpl::GetTensorType<uint8_t>()) \
-          .TypeConstraint("T2", DataTypeImpl::GetTensorType<T>()),      \
+          .TypeConstraint("T2", DataTypeImpl::GetTensorType<T>())       \
+          .TypeConstraint("T3", DataTypeImpl::GetTensorType<uint8_t>()) \
+          .TypeConstraint("T4", DataTypeImpl::GetTensorType<float>()),  \
       QMoE);
 
 REGISTER_KERNEL_TYPED(MLFloat16)
@@ -50,6 +52,12 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
               "expert_weight_bits must be 4 or 8, but got ", expert_weight_bits_);
 
   this->block_size_ = op_kernel_info.GetAttrOrDefault<int64_t>("block_size", -1);
+  this->quant_type_ = op_kernel_info.GetAttrOrDefault<std::string>("quant_type", "int");
+  ORT_ENFORCE(quant_type_ == "int" || quant_type_ == "fp4",
+              "quant_type must be 'int' or 'fp4', but got '", quant_type_, "'");
+#if !defined(ENABLE_FP4)
+  ORT_ENFORCE(quant_type_ != "fp4", "QMoE quant_type='fp4' requires ENABLE_FP4.");
+#endif
 
   using namespace onnxruntime::llm::kernels::cutlass_kernels;
 
@@ -65,35 +73,50 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
 #endif
   is_fp16_ = is_fp16;
 
-#if QUICK_BUILD
-  if (is_fp16) {
-    if (expert_weight_bits_ == 4) {
-      m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, cutlass::uint4b_t, half>>(
+#if defined(ENABLE_FP4)
+  if (quant_type_ == "fp4") {
+    ORT_ENFORCE(expert_weight_bits_ == 4, "FP4 quantization requires expert_weight_bits=4");
+    if (is_fp16) {
+      m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, __nv_fp4_e2m1, half>>(
           sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
-    } else {  // expert_weight_bits_ == 8
-      m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, uint8_t, half>>(
-          sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
-    }
-  }
-#else
-  if (is_fp16) {
-    if (expert_weight_bits_ == 4) {
-      m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, cutlass::uint4b_t, half>>(
-          sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
-    } else {  // expert_weight_bits_ == 8
-      m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, uint8_t, half>>(
+    } else {  // BFloat16
+      m_moe_runner = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, __nv_fp4_e2m1, __nv_bfloat16>>(
           sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
     }
-  } else {  // BFloat16
-    if (expert_weight_bits_ == 4) {
-      m_moe_runner = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, cutlass::uint4b_t, __nv_bfloat16>>(
-          sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
-    } else {  // expert_weight_bits_ == 8
-      m_moe_runner = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, uint8_t, __nv_bfloat16>>(
-          sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
-    }
-  }
+  } else
 #endif
+  {
+    // Integer quantization (INT4/INT8)
+#if QUICK_BUILD
+    if (is_fp16) {
+      if (expert_weight_bits_ == 4) {
+        m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, cutlass::uint4b_t, half>>(
+            sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
+      } else {  // expert_weight_bits_ == 8
+        m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, uint8_t, half>>(
+            sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
+      }
+    }
+#else
+    if (is_fp16) {
+      if (expert_weight_bits_ == 4) {
+        m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, cutlass::uint4b_t, half>>(
+            sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
+      } else {  // expert_weight_bits_ == 8
+        m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, uint8_t, half>>(
+            sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
+      }
+    } else {  // BFloat16
+      if (expert_weight_bits_ == 4) {
+        m_moe_runner = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, cutlass::uint4b_t, __nv_bfloat16>>(
+            sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
+      } else {  // expert_weight_bits_ == 8
+        m_moe_runner = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, uint8_t, __nv_bfloat16>>(
+            sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
+      }
+    }
+#endif
+  }  // end integer quantization
 }
 
 Status QMoE::ComputeInternal(OpKernelContext* context) const {
@@ -112,6 +135,14 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   const Tensor* fc1_zeros = packed_fc1_bias_ ? nullptr : context->Input<Tensor>(11);
   const Tensor* fc2_zeros = packed_fc2_bias_ ? nullptr : context->Input<Tensor>(12);
   const Tensor* fc3_zeros = context->Input<Tensor>(13);
+
+  // FP4 inputs (indices 15-20)
+  const Tensor* fp4_fc1_block_scales = packed_fp4_fc1_block_scales_ ? nullptr : context->Input<Tensor>(15);
+  const Tensor* fp4_fc1_global_scale = packed_fp4_fc1_global_scale_ ? nullptr : context->Input<Tensor>(16);
+  const Tensor* fp4_fc2_block_scales = packed_fp4_fc2_block_scales_ ? nullptr : context->Input<Tensor>(17);
+  const Tensor* fp4_fc2_global_scale = packed_fp4_fc2_global_scale_ ? nullptr : context->Input<Tensor>(18);
+
+  const bool is_fp4 = (quant_type_ == "fp4");
 
   const bool has_any_zero_point = (fc1_zeros != nullptr || fc2_zeros != nullptr || fc3_zeros != nullptr ||
                                    packed_fc1_bias_ != nullptr || packed_fc2_bias_ != nullptr);
@@ -161,10 +192,14 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
                                     false, false, false, true, parallelism_config, false, sm_);
 
     onnxruntime::llm::nvinfer::DataType dtype = is_fp16_ ? onnxruntime::llm::nvinfer::DataType::kHALF : onnxruntime::llm::nvinfer::DataType::kBF16;
-    // Weight type: INT4 for 4-bit, INT8 for 8-bit quantization
-    onnxruntime::llm::nvinfer::DataType wtype = (expert_weight_bits_ == 4)
-                                                    ? onnxruntime::llm::nvinfer::DataType::kINT4
-                                                    : onnxruntime::llm::nvinfer::DataType::kINT8;
+    // Weight type: FP4 for MXFP4, INT4 for 4-bit integer, INT8 for 8-bit integer
+    onnxruntime::llm::nvinfer::DataType wtype;
+    if (is_fp4) {
+      wtype = onnxruntime::llm::nvinfer::DataType::kFP4;
+    } else {
+      wtype = (expert_weight_bits_ == 4) ? onnxruntime::llm::nvinfer::DataType::kINT4
+                                         : onnxruntime::llm::nvinfer::DataType::kINT8;
+    }
 
     using onnxruntime::llm::kernels::cutlass_kernels::MoeGemmId;
     using onnxruntime::llm::kernels::weight_only::GemmDims;
@@ -462,7 +497,25 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
                    transposed_fc2_scales_holder, transposed_fc2_zp_holder, transient_fc2_bias, p_fc2_scales, p_fc2_zp);
 
   onnxruntime::llm::kernels::cutlass_kernels::QuantParams quant_params;
-  if (block_size_ > 0) {
+  if (is_fp4) {
+    // FP4 quantization: use QuantParams::FP4 with block scales and global scales
+    const void* p_fc1_block_scales = packed_fp4_fc1_block_scales_ ? packed_fp4_fc1_block_scales_.get()
+                                                                  : (fp4_fc1_block_scales ? fp4_fc1_block_scales->DataRaw() : nullptr);
+    const void* p_fc1_global_scale = packed_fp4_fc1_global_scale_ ? packed_fp4_fc1_global_scale_.get()
+                                                                  : (fp4_fc1_global_scale ? fp4_fc1_global_scale->DataRaw() : nullptr);
+    const void* p_fc2_block_scales = packed_fp4_fc2_block_scales_ ? packed_fp4_fc2_block_scales_.get()
+                                                                  : (fp4_fc2_block_scales ? fp4_fc2_block_scales->DataRaw() : nullptr);
+    const void* p_fc2_global_scale = packed_fp4_fc2_global_scale_ ? packed_fp4_fc2_global_scale_.get()
+                                                                  : (fp4_fc2_global_scale ? fp4_fc2_global_scale->DataRaw() : nullptr);
+    using NVFP4ElementSF = onnxruntime::llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF;
+    quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::FP4(
+        nullptr,  // fc1_act_global_scale (no activation quantization for W4A16)
+        static_cast<const NVFP4ElementSF*>(p_fc1_block_scales),
+        static_cast<const float*>(p_fc1_global_scale),
+        nullptr,  // fc2_act_global_scale
+        static_cast<const NVFP4ElementSF*>(p_fc2_block_scales),
+        static_cast<const float*>(p_fc2_global_scale));
+  } else if (block_size_ > 0) {
     quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::GroupWise(
         block_size_,
         p_fc1_scales,
@@ -753,6 +806,41 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
     DUMP_TENSOR("fc2_zeros", tensor);
     compute_bias(packed_fc2_scales_, packed_fc2_bias_);
     DUMP_PACK_TENSOR("packed_fc2_bias", packed_fc2_bias_, tensor);
+  } else if (input_idx >= 15 && input_idx <= 20 && quant_type_ == "fp4") {
+    // FP4 block scales and global scales: simple GPU copy
+    auto CopyToGpu = [&](IAllocatorUniquePtr<void>& packed_buf) {
+      size_t bytes = tensor.SizeInBytes();
+      packed_buf = IAllocator::MakeUniquePtr<void>(alloc, bytes, true);
+      const void* p_src = tensor.DataRaw();
+      if (tensor.Location().device.Type() == OrtDevice::CPU) {
+        cudaMemcpyAsync(packed_buf.get(), p_src, bytes, cudaMemcpyHostToDevice, stream);
+      } else {
+        cudaMemcpyAsync(packed_buf.get(), p_src, bytes, cudaMemcpyDeviceToDevice, stream);
+      }
+      cudaStreamSynchronize(stream);
+      is_packed = true;
+    };
+
+    switch (input_idx) {
+      case 15:
+        CopyToGpu(packed_fp4_fc1_block_scales_);
+        break;
+      case 16:
+        CopyToGpu(packed_fp4_fc1_global_scale_);
+        break;
+      case 17:
+        CopyToGpu(packed_fp4_fc2_block_scales_);
+        break;
+      case 18:
+        CopyToGpu(packed_fp4_fc2_global_scale_);
+        break;
+      case 19:
+        CopyToGpu(packed_fp4_fc3_block_scales_);
+        break;
+      case 20:
+        CopyToGpu(packed_fp4_fc3_global_scale_);
+        break;
+    }
   }
   // TODO: fc3_zeros (13) not handled for now as it's optional and rarely used?
   // Code structure allows adding it easily.

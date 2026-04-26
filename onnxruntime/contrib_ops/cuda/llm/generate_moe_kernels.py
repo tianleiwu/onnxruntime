@@ -9,11 +9,10 @@ import argparse
 import os
 from itertools import product
 
-# CUDA type names - must match template specializations in moe_cute_util.cuh
-# which uses cute::half_t and cute::bfloat16_t, NOT raw CUDA types
+# CUDA type names for SM80 fused kernels.
 CudaTypeName = {
-    "bf16": "cute::bfloat16_t",
-    "f16": "cute::half_t",
+    "bf16": "cutlass::bfloat16_t",
+    "f16": "cutlass::half_t",
     "f32": "float",
 }
 

@@ -17,7 +17,7 @@
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 #include "cutlass/gemm/collective/collective_builder.hpp"
-#include "contrib_ops/cuda/llm/gemm/collective/collective_mma_array_mixed_input.hpp"
+#include "contrib_ops/cuda/llm/cutlass_extensions/gemm/collective/collective_mma_array_mixed_input.hpp"
 
 namespace cutlass::gemm::collective {
 
@@ -36,5 +36,5 @@ struct CollectiveBuilderMixedInput {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-#include "contrib_ops/cuda/llm/gemm/collective/builders/sm90_gmma_builder_mixed_input.inl"
+#include "contrib_ops/cuda/llm/cutlass_extensions/gemm/collective/builders/sm90_gmma_builder_mixed_input.inl"
 /////////////////////////////////////////////////////////////////////////////////////////////////

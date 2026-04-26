@@ -24,7 +24,65 @@
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+namespace cutlass {
+
+template <class SrcType, class DstType, class LayoutIn, class LayoutOut>
+struct OrtLayoutAwareConvertImpl {
+  template <class EngineIn, class EngineOut>
+  CUTLASS_DEVICE static void convert(cute::Tensor<EngineIn, LayoutIn> const& src, cute::Tensor<EngineOut, LayoutOut>& dst) {
+    static_assert(cute::is_same_v<SrcType, typename EngineIn::value_type> &&
+                  cute::is_same_v<DstType, typename EngineOut::value_type>);
+    static_assert(cute::cosize_v<LayoutIn> == cute::cosize_v<LayoutOut>);
+
+    constexpr int kVectorWidth = decltype(cute::max_common_vector(LayoutIn{}, LayoutOut{})){};
+    using SrcArray = cutlass::Array<SrcType, kVectorWidth>;
+    using DstArray = cutlass::Array<DstType, kVectorWidth>;
+    using Converter = cutlass::NumericArrayConverter<DstType,
+                                                     SrcType,
+                                                     kVectorWidth,
+                                                     cutlass::FloatRoundStyle::round_to_nearest>;
+
+    auto&& src_vec = cute::recast<SrcArray>(src);
+    auto&& dst_vec = cute::recast<DstArray>(dst);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < src_vec.size(); ++i) {
+      dst_vec(i) = Converter::convert(src_vec(i));
+    }
+  }
+};
+
+template <class EngineIn, class EngineOut, class LayoutIn, class LayoutOut>
+CUTLASS_DEVICE void OrtLayoutAwareConvert(
+    cute::Tensor<EngineIn, LayoutIn> const& src,
+    cute::Tensor<EngineOut, LayoutOut>&& dst) {
+  OrtLayoutAwareConvert(src, dst);
+}
+
+template <class EngineIn, class EngineOut, class LayoutIn, class LayoutOut>
+CUTLASS_DEVICE void OrtLayoutAwareConvert(
+    cute::Tensor<EngineIn, LayoutIn> const& src,
+    cute::Tensor<EngineOut, LayoutOut>& dst) {
+  using SrcType = typename EngineIn::value_type;
+  using DstType = typename EngineOut::value_type;
+
+  auto src_view = cute::coalesce(src);
+  auto dst_view = cute::coalesce(dst);
+  auto src_layout = src_view.layout();
+  auto dst_layout = dst_view.layout();
+
+  OrtLayoutAwareConvertImpl<SrcType, DstType, decltype(src_layout), decltype(dst_layout)>::convert(src_view, dst_view);
+}
+
+}  // namespace cutlass
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
 namespace cutlass::gemm::collective::detail {
+
+using namespace cute;
+
+constexpr int int4_group_size = 128;
+constexpr int mxfp4_group_size = 32;
 
 template <class Collective>
 struct MixedGroupedGemmInputUtils {
@@ -226,7 +284,7 @@ struct MixedGroupedGemmInputUtils {
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size<1>(dst_vm); ++i) {
-        LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
+        OrtLayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
       }
     } else if constexpr (UseScaleLookupTable) {
       // this path
@@ -278,7 +336,7 @@ struct MixedGroupedGemmInputUtils {
       if constexpr (is_same_v<DstType, ElementScale>) {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size<1>(dst_vm); ++i) {
-          LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
+          OrtLayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
           CUTLASS_PRAGMA_UNROLL
           for (int j = 0; j < size<0>(dst_vm); ++j) {
             dst_vm(j, i) *= scales_vm(j, i);
@@ -288,12 +346,12 @@ struct MixedGroupedGemmInputUtils {
         auto stage = make_tensor_like<ElementScale>(src_vm(_, 0));
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size<1>(dst_vm); ++i) {
-          LayoutAwareConvert(src_vm(_, i), stage);
+          OrtLayoutAwareConvert(src_vm(_, i), stage);
           CUTLASS_PRAGMA_UNROLL
           for (int j = 0; j < size<0>(dst_vm); ++j) {
             stage(j) *= scales_vm(j, i);
           }
-          LayoutAwareConvert(stage, dst_vm(_, i));
+          OrtLayoutAwareConvert(stage, dst_vm(_, i));
         }
       }
     } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
@@ -308,7 +366,7 @@ struct MixedGroupedGemmInputUtils {
       if constexpr (is_same_v<DstType, ElementScale>) {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size<1>(dst_vm); ++i) {
-          LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
+          OrtLayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
           CUTLASS_PRAGMA_UNROLL
           for (int j = 0; j < size<0>(dst_vm); ++j) {
             dst_vm(j, i) = dst_vm(j, i) * scales_vm(j, i) + zeros_vm(j, i);
@@ -318,12 +376,12 @@ struct MixedGroupedGemmInputUtils {
         auto stage = make_tensor_like<ElementScale>(src_vm(_, 0));
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size<1>(dst_vm); ++i) {
-          LayoutAwareConvert(src_vm(_, i), stage);
+          OrtLayoutAwareConvert(src_vm(_, i), stage);
           CUTLASS_PRAGMA_UNROLL
           for (int j = 0; j < size<0>(dst_vm); ++j) {
             stage(j) = stage(j) * scales_vm(j, i) + zeros_vm(j, i);
           }
-          LayoutAwareConvert(stage, dst_vm(_, i));
+          OrtLayoutAwareConvert(stage, dst_vm(_, i));
         }
       }
     } else {
@@ -355,7 +413,7 @@ struct MixedGroupedGemmInputUtils {
     // KernelConversionMode == ConversionMode::DirectConvert
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size<1>(dst_vm); ++i) {
-      LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
+      OrtLayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
     }
   }
 

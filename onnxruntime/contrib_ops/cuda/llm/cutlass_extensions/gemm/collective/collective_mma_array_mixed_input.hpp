@@ -36,5 +36,5 @@ struct CollectiveMmaArrayMixedInput {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-#include "contrib_ops/cuda/llm/gemm/collective/sm90_mma_array_tma_gmma_rs_warpspecialized_mixed_input_.hpp"
+#include "contrib_ops/cuda/llm/cutlass_extensions/gemm/collective/sm90_mma_array_tma_gmma_rs_warpspecialized_mixed_input_.hpp"
 /////////////////////////////////////////////////////////////////////////////////////////////////

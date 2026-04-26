@@ -32,7 +32,7 @@ namespace onnxruntime::llm::kernels::cutlass_kernels {
 template <typename T, typename WeightType, typename EpilogueTag = cutlass_extensions::EpilogueOpDefault,
           TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
 constexpr bool isValidSM120MOESpecialisation() {
-#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)  // TODO Is there a better choice
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) && defined(ENABLE_FP4)  // TODO Is there a better choice
   return cutlass::platform::is_same<T, __nv_fp4_e2m1>::value && cutlass::platform::is_same<T, WeightType>::value && cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value && Fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
 #else
   return false;  // CUTLASS_ARCH_MMA_SM100_SUPPORTED is set when Blackwell kernels are enabled
@@ -43,7 +43,15 @@ template <typename T, typename WeightType, typename EpilogueTag = cutlass_extens
           TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
 constexpr bool isValidBlackwellMOESpecialisation() {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)  // TODO Is there a better choice
-  return !cutlass::platform::is_same<T, float>::value && (cutlass::platform::is_same<T, WeightType>::value || (cutlass::platform::is_same<T, __nv_fp8_e4m3>::value && cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value)) && cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value && Fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
+  return !cutlass::platform::is_same<T, float>::value &&
+         (cutlass::platform::is_same<T, WeightType>::value
+#if defined(ENABLE_FP4)
+          || (cutlass::platform::is_same<T, __nv_fp8_e4m3>::value &&
+              cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value)
+#endif
+              ) &&
+         cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value &&
+         Fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
 #else
   return false;  // CUTLASS_ARCH_MMA_SM100_SUPPORTED is set when Blackwell kernels are enabled
 #endif
@@ -58,7 +66,14 @@ constexpr bool isValidHopperMOESpecialisation() {
   if constexpr (std::is_same_v<std::decay_t<T>, float>) {
     return false;
   }
-  return (cutlass::platform::is_same<T, WeightType>::value || (cutlass::platform::is_same<cutlass::uint4b_t, WeightType>::value && cutlass::platform::is_same<T, __nv_fp8_e4m3>::value))
+  return (cutlass::platform::is_same<T, WeightType>::value ||
+          (cutlass::platform::is_same<cutlass::uint4b_t, WeightType>::value &&
+           cutlass::platform::is_same<T, __nv_fp8_e4m3>::value)
+#ifdef ENABLE_FP4
+          || (cutlass::platform::is_same<__nv_fp4_e2m1, WeightType>::value &&
+              !cutlass::platform::is_same<T, __nv_fp8_e4m3>::value)
+#endif
+              )
 #ifdef ENABLE_FP4
          && !cutlass::platform::is_same<T, __nv_fp4_e2m1>::value
 #endif

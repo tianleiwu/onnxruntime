@@ -430,6 +430,11 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   static constexpr bool weight_fp4 = std::is_same_v<WeightType, __nv_fp4_e2m1>;
   static constexpr bool use_wfp4afp8 = std::is_same_v<T, __nv_fp8_e4m3> && weight_fp4;
   static constexpr bool use_fp4 = act_fp4 && weight_fp4;
+#if defined(ENABLE_BF16)
+  static constexpr bool use_wfp4a16 = weight_fp4 && (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>);
+#else
+  static constexpr bool use_wfp4a16 = weight_fp4 && std::is_same_v<T, half>;
+#endif
   static_assert(!std::is_same_v<BackBoneType, __nv_fp4_e2m1>, "Current logic requires backbone type to be >=16-bits");
   static_assert(!std::is_same_v<OutputType, __nv_fp4_e2m1>, "Current logic requires output type to be >=16-bits");
 #else
@@ -437,6 +442,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   static constexpr bool weight_fp4 = false;
   static constexpr bool use_wfp4afp8 = false;
   static constexpr bool use_fp4 = false;
+  static constexpr bool use_wfp4a16 = false;
 #endif
 
   // Added by ORT
@@ -668,7 +674,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   }
 
   bool mayHaveFinalizeFused() const {
-    return moe_gemm_runner_.supportsTmaWarpSpecialized() && moe_gemm_runner_.getSM() == 90 && !use_deterministic_hopper_reduce_ && !use_w4afp8;
+    return moe_gemm_runner_.supportsTmaWarpSpecialized() && moe_gemm_runner_.getSM() == 90 && !use_deterministic_hopper_reduce_ && !use_w4afp8 && !use_wfp4a16;
   }
 
   // TODO: This should eventually take the quant params to give more flexibility

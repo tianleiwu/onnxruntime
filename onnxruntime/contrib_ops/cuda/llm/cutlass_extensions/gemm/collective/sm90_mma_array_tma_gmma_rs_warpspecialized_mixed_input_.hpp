@@ -30,8 +30,6 @@
 #include "cute/atom/mma_atom.hpp"
 #include "cute/numeric/arithmetic_tuple.hpp"
 
-#define GROUP_SIZE 128
-
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::gemm::collective {
@@ -138,6 +136,10 @@ struct CollectiveMmaArrayMixedInput<
 
   static_assert(cutlass::gemm::detail::is_mn_major<NonVoidStrideScale>(),
                 "Scale must be MN major [Col Major if A is scaled, Row Major if B is scaled].");
+
+  static constexpr bool IsMXFP4 = cute::is_same_v<ElementA, cutlass::float_e2m1_t>;
+  // Group size 128 for int4 weights, 32 for mxfp4 weights
+  static constexpr int ScalingGroupSize = IsMXFP4 ? detail::mxfp4_group_size : detail::int4_group_size;
 
   using CtaShape_MNK = decltype(shape_div(TileShape{}, ClusterShape{}));
   using TiledMma = TiledMma_;
@@ -609,7 +611,7 @@ struct CollectiveMmaArrayMixedInput<
     } else if constexpr (ModeHasScales) {
       // The real scale_k that actually works
       // auto scale_k = K / mainloop_params.chunk_size;
-      auto scale_k = K / GROUP_SIZE;
+      auto scale_k = K / ScalingGroupSize;
 
       Tensor mS_mkl = mainloop_params.tma_load_scale.get_tma_tensor(make_shape(M, scale_k, L));  // (m,scale_k,l)
       Tensor gS_mkl = local_tile(mS_mkl, ScaleTileShape{}, make_coord(_, _));                    // (BLK_M,BLK_Scale_K,m,scale_k,l)
@@ -870,8 +872,8 @@ struct CollectiveMmaArrayMixedInput<
 
     multiply_add<ElementAccumulator> fma;
 
-    constexpr int NumMMAsPerChunk = GROUP_SIZE / cute::get<0, 1>(tCsB.shape())();
-    constexpr int NumChunksPerTileK = cute::size<1>(sA.shape())() / GROUP_SIZE;
+    constexpr int NumMMAsPerChunk = ScalingGroupSize / cute::get<0, 1>(tCsB.shape())();
+    constexpr int NumChunksPerTileK = cute::size<1>(sA.shape())() / ScalingGroupSize;
     cute::array<decltype(make_fragment_like(accum)), NumChunksPerTileK> intermediate_array;
 
     constexpr int K_BLOCK_MAX = size<2>(tCrA_load);
@@ -1250,7 +1252,7 @@ struct CollectiveMmaArrayMixedInput<
     if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
       NonVoidElementScale const* ptr_S = nullptr;
       // auto scale_k = K / mainloop_params.chunk_size;
-      auto scale_k = K / GROUP_SIZE;
+      auto scale_k = K / ScalingGroupSize;
       Tensor tensor_scale = make_tensor(
           detail::get_logical_ptr(ptr_S), make_shape(M, scale_k, Int<1>{}), mainloop_params.dS[next_group]);
       cute::detail::fill_tma_gmem_shape_stride(
@@ -1258,7 +1260,7 @@ struct CollectiveMmaArrayMixedInput<
     } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
       ElementZero const* ptr_Z = nullptr;
       // auto scale_k = K / mainloop_params.chunk_size;
-      auto scale_k = K / GROUP_SIZE;
+      auto scale_k = K / ScalingGroupSize;
       Tensor tensor_zero = make_tensor(
           detail::get_logical_ptr(ptr_Z), make_shape(M, scale_k, Int<1>{}), mainloop_params.dS[next_group]);
       cute::detail::fill_tma_gmem_shape_stride(

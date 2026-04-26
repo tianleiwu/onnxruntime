@@ -139,6 +139,13 @@ The primary test scripts are located in `onnxruntime/test/python/transformers/`.
 
 > **Note**: The general quantization format and kernel expectations align with TensorRT-LLM specifications.
 
+### 5.4 Limitations
+*   **Row-wise Quantization**: Row-wise quantization (`block_size <= 0`) does not currently support zero points in the QMoE operator.
+*   **Block Size**: Asymmetric zero points are currently supported only when `block_size >= 64`.
+
+**Weight Conversion**:
+When exporting a model to ONNX with SwiGLU, the weights for the Gate and Value projections (typically FC1 and Gate_Proj) are often merged. To use **Interleaved** mode, these weights must be interleaved at the output channel dimension during the export/packing phase so that the GEMM output naturally results in `[G, V, G, V...]`.
+
 ## 6. Weight Packing Details (`pack_weights_for_cuda_mixed_gemm`)
 
 The `pack_weights_for_cuda_mixed_gemm` function is a critical offline preprocessing step required to format weights for Cutlass Mixed Input GEMM kernels. The source code is distributed across:
@@ -204,18 +211,30 @@ While weight packing is architecture-aware, many architectures share the same la
 *   **Group A (Universal)**: SM75, SM80, SM86, SM89, SM120. Weights packed on any of these can be used on any other in this group.
 *   **Group B (Hopper)**: SM90. Weights packed for SM90 are unique to SM90.
 
-## 7. SwiGLU Details
+## 7. FP4 (MXFP4) Quantization Support
+
+The QMoE operator has been extended to support **MXFP4 quantized weights** (W4A16: FP4 weights + FP16/BF16 activations) via the `quant_type="fp4"` attribute. This uses the mixed-input TMA warp-specialized CUTLASS kernel path on SM90+ with CUDA 12.8+.
+
+Key additions:
+- **`quant_type` attribute**: `"int"` (default, backward compatible) or `"fp4"` for MXFP4 mode
+- **New inputs (indices 15–20)**: FP4 block scales (`uint8`, FP8 e4m3 encoded) and per-expert global scales (`float`) for FC1/FC2/FC3
+- **Template instantiations**: `MoeGemmRunner<half, __nv_fp4_e2m1, half>` and `MoeGemmRunner<__nv_bfloat16, __nv_fp4_e2m1, __nv_bfloat16>`
+- **CUTLASS generalization**: Group size is type-dependent (32 for MXFP4 vs 128 for INT4), scale element type is `float_ue8m0_t` for FP4
+
+For full design details, implementation status, and remaining work, see [qmoe_fp4.md](qmoe_fp4.md).
+
+## 8. SwiGLU Details
 
 The operator supports **SwiGLU** activation with support for interleaved inputs, which is critical for performance in certain model architectures (e.g., GPT-OSS).
 
-### 7.1 Formula
+### 8.1 Formula
 The SwiGLU activation is computed as:
 ```
 SwiGLU(x) = Gate * Sigmoid(alpha * Gate) * (Value + beta)
 ```
 Where the input `x` contains both `Gate` and `Value` components.
 
-### 7.2 MoE (Float16/BFloat16) Runtime Fusion
+### 8.2 MoE (Float16/BFloat16) Runtime Fusion
 For the standard **MoE** operator (non-quantized), the `Compute` method includes logic to automatically fuse split weight tensors at runtime.
 
 *   **Trigger**: If the optional `fc3_experts_weights` input is provided.
@@ -228,7 +247,7 @@ For the standard **MoE** operator (non-quantized), the `Compute` method includes
 
 > **Note**: This runtime packing is specific to **standard MoE**. The **QMoE** operator does **not** perform runtime fusion; correct packing must be done offline (see Section 6).
 
-### 7.3 Fusion Modes (`swiglu_fusion`)
+### 8.3 Fusion Modes (`swiglu_fusion`)
 The operator handles three distinct modes for SwiGLU, controlled by the `swiglu_fusion` attribute:
 
 1.  **No Fusion (`swiglu_fusion=0`)**:
@@ -247,14 +266,7 @@ The operator handles three distinct modes for SwiGLU, controlled by the `swiglu_
     *   **Memory Layout**: `[Gate_0 ... Gate_N | Value_0 ... Value_N]` (Concatenated).
     *   **Logic**: The kernel processes the first half as Gate and the second half as Value.
 
-### 5.4 Limitations
-*   **Row-wise Quantization**: Row-wise quantization (`block_size <= 0`) does not currently support zero points in the QMoE operator.
-*   **Block Size**: Asymmetric zero points are currently supported only when `block_size >= 64`.
-
-**Weight Conversion**:
-When exporting a model to ONNX with SwiGLU, the weights for the Gate and Value projections (typically FC1 and Gate_Proj) are often merged. To use **Interleaved** mode, these weights must be interleaved at the output channel dimension during the export/packing phase so that the GEMM output naturally results in `[G, V, G, V...]`.
-
-## 8. Summary of Kernel Changes from TensorRT-LLM
+## 9. Summary of Kernel Changes from TensorRT-LLM
 
 The Cutlass kernels in this implementation are derived from TensorRT-LLM but have been significantly enhanced to support broader ONNX Runtime requirements and fix specific issues.
 
@@ -274,6 +286,6 @@ The Cutlass kernels in this implementation are derived from TensorRT-LLM but hav
     *   Added support for Sparse Mixer architectures (controlled by `use_sparse_mixer`).
     *   *Commit*: "add sparse mixer"
 
-## 9. Test Status
+## 10. Test Status
 As of the latest validation:
 *   **All tests in `test_moe_cuda.py` pass**, verifying correctness for FP16, Int8, and 4-bit configurations, including SwiGLU and standard activations.

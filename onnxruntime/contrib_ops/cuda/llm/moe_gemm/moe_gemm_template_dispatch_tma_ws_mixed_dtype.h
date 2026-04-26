@@ -72,6 +72,7 @@ void sm90_dispatch_mainloop_schedules(GroupedGemmInput<T, WeightType, GemmOutput
   ORT_LLM_LOG_ENTRY();
 #ifdef COMPILE_HOPPER_TMA_GROUPED_GEMMS
   switch (inputs.gemm_config.mainloop_schedule) {
+#ifndef ORT_QUICK_BUILD
     case tkc::MainloopScheduleType::COOPERATIVE:
       if constexpr (get<0>(CTAShape{}) < 128) {
         ORT_THROW("COOPERATIVE is only enabled when tile M >= 128.");
@@ -92,7 +93,10 @@ void sm90_dispatch_mainloop_schedules(GroupedGemmInput<T, WeightType, GemmOutput
       }
 
       break;
+#endif  // !ORT_QUICK_BUILD
     case tkc::MainloopScheduleType::PINGPONG:
+      // fallthrough — AUTO uses PINGPONG which works for all tile sizes including M < 128.
+    case tkc::MainloopScheduleType::AUTO:
       sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, GemmOutputType, EpilogueTag, CTAShape, ClusterShape,
                                                  cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::TmaWarpSpecializedCooperative,
                                                  cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(inputs, hopper_inputs, sm_count_, workspace_size);
@@ -118,6 +122,7 @@ void sm90_dispatch_moe_mixed_dtype_gemm_config(GroupedGemmInput<T, WeightType, G
       sm90_dispatch_mainloop_schedules<T, WeightType, GemmOutputType, EpilogueTag, CTAShape, Shape<_1, _1, _1>>(
           inputs, hopper_inputs, sm_count_, workspace_size);
       break;
+#ifndef ORT_QUICK_BUILD
     case tkc::ClusterShape::ClusterShape_2x1x1:
       sm90_dispatch_mainloop_schedules<T, WeightType, GemmOutputType, EpilogueTag, CTAShape, Shape<_2, _1, _1>>(
           inputs, hopper_inputs, sm_count_, workspace_size);
@@ -130,6 +135,7 @@ void sm90_dispatch_moe_mixed_dtype_gemm_config(GroupedGemmInput<T, WeightType, G
       sm90_dispatch_mainloop_schedules<T, WeightType, GemmOutputType, EpilogueTag, CTAShape, Shape<_2, _2, _1>>(
           inputs, hopper_inputs, sm_count_, workspace_size);
       break;
+#endif  // !ORT_QUICK_BUILD
     default:
       ORT_THROW("[Mixed dtype MoE GEMM][dispatch_CGA_config] Config is invalid for mixed type GEMM.");
       break;
@@ -144,11 +150,19 @@ void sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass(
   // We also only instantiate configs here where threadblockShapeM == warpShapeM since those usually perform the best
   // for mixed type gemms.
 
-  constexpr int Ktile = 128 * PackedScalesNum / sizeof(T);
-  ORT_ENFORCE(sizeof(T) == 1);
+#if defined(ENABLE_FP4)
+  constexpr bool is_wfp4a16 = std::is_same_v<WeightType, __nv_fp4_e2m1>;
+#else
+  constexpr bool is_wfp4a16 = false;
+#endif
+  constexpr int Ntile = is_wfp4a16 ? 64 : 128;
+  constexpr int Ktile = is_wfp4a16 ? 128 : 128 * PackedScalesNum / sizeof(T);
+  ORT_ENFORCE(sizeof(T) == (is_wfp4a16 ? 2 : 1));
 
+  using _Ntile = Int<Ntile>;
   using _Ktile = Int<Ktile>;
   switch (inputs.gemm_config.tile_config_sm90) {
+#ifndef ORT_QUICK_BUILD
     case tkc::CutlassTileConfigSM90::CtaShape64x16x128B:
       sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, Shape<_64, _16, _Ktile>>(
           inputs, hopper_inputs, sm_count_, workspace_size);
@@ -162,9 +176,10 @@ void sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass(
           inputs, hopper_inputs, sm_count_, workspace_size);
       break;
     case tkc::CutlassTileConfigSM90::CtaShape64x128x128B:
-      sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, Shape<_64, _128, _Ktile>>(
+      sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, Shape<_64, _Ntile, _Ktile>>(
           inputs, hopper_inputs, sm_count_, workspace_size);
       break;
+#endif  // !ORT_QUICK_BUILD
     // case tkc::CutlassTileConfigSM90::CtaShape64x256x128B:
     //     sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, Shape<_64, _256,
     //     _Ktile>>(inputs, hopper_inputs, sm_count_, workspace_size); break;
@@ -214,10 +229,16 @@ template <typename T, typename WeightType, typename OutputType>
 size_t calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput(int num_experts, int sm_count_) {
   size_t count = 0;
 #ifdef COMPILE_HOPPER_TMA_GROUPED_GEMMS
+  constexpr int Ktile =
+#if defined(ENABLE_FP4)
+      (std::is_same_v<WeightType, __nv_fp4_e2m1>) ? 256 :
+#endif
+                                                  512;
+  using _Ktile = Int<Ktile>;
   GroupedGemmInput<T, WeightType, OutputType, OutputType> inputs{};
   inputs.num_experts = num_experts;
   sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, OutputType,
-                                             onnxruntime::llm::cutlass_extensions::EpilogueOpDefault, Shape<_128, _64, _512>, Shape<_1, _1, _1>,
+                                             onnxruntime::llm::cutlass_extensions::EpilogueOpDefault, Shape<_128, _64, _Ktile>, Shape<_1, _1, _1>,
                                              cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::TmaWarpSpecializedCooperative,
                                              cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(
       inputs, TmaWarpSpecializedGroupedGemmInput{}, sm_count_, &count);

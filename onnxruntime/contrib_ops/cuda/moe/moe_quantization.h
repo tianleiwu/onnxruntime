@@ -27,6 +27,7 @@ class QMoE final : public CudaKernel, public MoEBase {
   int64_t block_size_;
   bool has_fc3_;
   bool is_fp16_;
+  std::string quant_type_;  // "int" or "fp4"
 
   std::unique_ptr<onnxruntime::llm::kernels::cutlass_kernels::CutlassMoeFCRunnerInterface> m_moe_runner;
 
@@ -41,6 +42,14 @@ class QMoE final : public CudaKernel, public MoEBase {
   IAllocatorUniquePtr<void> packed_fc2_bias_;
   IAllocatorUniquePtr<void> packed_fc3_scales_;
   IAllocatorUniquePtr<void> packed_fc3_bias_;
+
+  // FP4 pre-packed buffers
+  IAllocatorUniquePtr<void> packed_fp4_fc1_block_scales_;
+  IAllocatorUniquePtr<void> packed_fp4_fc1_global_scale_;
+  IAllocatorUniquePtr<void> packed_fp4_fc2_block_scales_;
+  IAllocatorUniquePtr<void> packed_fp4_fc2_global_scale_;
+  IAllocatorUniquePtr<void> packed_fp4_fc3_block_scales_;
+  IAllocatorUniquePtr<void> packed_fp4_fc3_global_scale_;
 
   mutable onnxruntime::llm::kernels::cutlass_kernels::MoeGemmProfiler mGemmProfiler;
   mutable onnxruntime::llm::kernels::cutlass_kernels::MoeGemmId mGemmId1;

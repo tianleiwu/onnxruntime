@@ -272,12 +272,21 @@ struct genericMoeGemmKernelLauncher {
                                                                                                                                                                                                                                               // kernel.. (only support
                                                                                                                                                                                                                                               // fp16 or bf16)
     {
-      sm80_generic_fused_moe_gemm_kernelLauncher<ElementType, CutlassWeightType, ThreadblockShape::kM,
-                                                 ThreadblockShape::kN, ThreadblockShape::kK, Stages, EpilogueTag>(
-          reinterpret_cast<ElementType const*>(inputs.A), reinterpret_cast<CutlassWeightType const*>(inputs.B),
-          reinterpret_cast<ElementType const*>(inputs.biases), inputs.bias_is_broadcast,
-          reinterpret_cast<ElementType*>(inputs.C), inputs.total_tokens_including_expert, inputs.num_rows,
-          inputs.n, inputs.k, inputs.num_experts, sm_count_, inputs.stream, inputs.occupancy);
+#ifdef ORT_QUICK_BUILD
+      // Under QUICK_BUILD, BF16 fused MoE SM80 kernels are not instantiated.
+      if constexpr (std::is_same_v<ElementType, cute::bfloat16_t>) {
+        ORT_THROW("BF16 fused MoE SM80 kernels are not available under ORT_QUICK_BUILD.");
+      } else {
+#endif
+        sm80_generic_fused_moe_gemm_kernelLauncher<ElementType, CutlassWeightType, ThreadblockShape::kM,
+                                                   ThreadblockShape::kN, ThreadblockShape::kK, Stages, EpilogueTag>(
+            reinterpret_cast<ElementType const*>(inputs.A), reinterpret_cast<CutlassWeightType const*>(inputs.B),
+            reinterpret_cast<ElementType const*>(inputs.biases), inputs.bias_is_broadcast,
+            reinterpret_cast<ElementType*>(inputs.C), inputs.total_tokens_including_expert, inputs.num_rows,
+            inputs.n, inputs.k, inputs.num_experts, sm_count_, inputs.stream, inputs.occupancy);
+#ifdef ORT_QUICK_BUILD
+      }
+#endif
     }
   }
 };
@@ -353,12 +362,14 @@ template <typename T, typename WeightType, typename GemmOutputType, typename arc
 void dispatchGemmConfig(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs, int sm_count_) {
   ORT_LLM_LOG_ENTRY();
   switch (inputs.gemm_config.stages) {
+#ifndef ORT_QUICK_BUILD
     case 2:
       dispatch<T, WeightType, GemmOutputType, arch, EpilogueTag, ThreadblockShape, WarpShape, 2>(inputs, sm_count_);
       break;
     case 3:
       dispatch<T, WeightType, GemmOutputType, arch, EpilogueTag, ThreadblockShape, WarpShape, 3>(inputs, sm_count_);
       break;
+#endif
     case 4:
       dispatch<T, WeightType, GemmOutputType, arch, EpilogueTag, ThreadblockShape, WarpShape, 4>(inputs, sm_count_);
       break;
@@ -695,6 +706,8 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
       ORT_ENFORCE(sm_ == 89, "For sm >= 80 and < 90, fp8 is only supported with sm == 89");
       dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm89, EpilogueTag>(
           inputs, multi_processor_count_);
+    } else if constexpr (use_wfp4a16) {
+      ORT_THROW("wfp4a16 (FP4 weights with FP16/BF16 activations) requires SM90+");
     } else {
       dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm80, EpilogueTag>(
           inputs, multi_processor_count_);
@@ -709,7 +722,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
       }
     }
 
-    if constexpr (!std::is_same_v<std::decay_t<T>, float> && kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType, EpilogueTag>() && !use_w4afp8) {
+    if constexpr (!std::is_same_v<std::decay_t<T>, float> && kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType, EpilogueTag>() && !use_w4afp8 && !use_wfp4a16) {
       // We allow both tma warp specialized and SM80 configurations to coexist because for some cases with small
       // numbers of tokens SM80 is faster. We check here to see which is selected
       if (inputs.gemm_config.sm_version >= 90) {
@@ -769,10 +782,32 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
     }
 #endif
 
+#if defined(ENABLE_FP4)
+    // Hopper W4A16 (FP4 weights + FP16/BF16 activations) WS grouped GEMM
+    if constexpr (use_wfp4a16) {
+#ifdef ORT_QUICK_BUILD
+      // Quick build only instantiates FP16+FP4 kernels; BF16+FP4 is not available.
+      if constexpr (!std::is_same_v<T, half>) {
+        ORT_THROW("BF16+FP4 MoE GEMM is not available under ORT_QUICK_BUILD. Use FP16 activations instead.");
+      } else {
+#endif
+        ORT_ENFORCE(inputs.gemm_config.is_tma_warp_specialized,
+                    "wfp4a16 is only supported for TMA warp specialization");
+        // EpilogueTag is ignored
+        sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
+                                                      cutlass_extensions::EpilogueOpDefault, 1>(
+            inputs, hopper_inputs, multi_processor_count_, nullptr);
+        return;
+#ifdef ORT_QUICK_BUILD
+      }
+#endif
+    }
+#endif
+
     // Do Ampere case instead
     if constexpr (kernels::cutlass_kernels::isValidAmpereMOESpecialisation<T, WeightType, EpilogueTag>()) {
       ORT_ENFORCE(!use_fp8, "No fallback FP8 implementation available");
-      ORT_ENFORCE(use_w4afp8 || !hopper_inputs.isValid(),
+      ORT_ENFORCE(use_w4afp8 || use_wfp4a16 || !hopper_inputs.isValid(),
                   "Non-specialized Hopper implementation is being rerouted to fallback implementation so input "
                   "information is not required");
       ORT_ENFORCE(!inputs.gemm_config.is_tma_warp_specialized,
@@ -806,14 +841,14 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getMaxWorkspaceS
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspaceSize(int num_experts) const {
-  if constexpr (use_w4afp8) {
+  if constexpr (use_w4afp8 || use_wfp4a16) {
     return calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput<T, WeightType, OutputType>(
         num_experts, multi_processor_count_);
   }
   if (!supportsTmaWarpSpecialized()) {
     return 0;
   }
-  if constexpr (!std::is_same_v<std::decay_t<T>, float> && kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType>() && !use_w4afp8) {
+  if constexpr (!std::is_same_v<std::decay_t<T>, float> && kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType>() && !use_w4afp8 && !use_wfp4a16) {
     auto configs = getTmaWarpSpecializedConfigs(sm_);
     auto fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
     if constexpr (use_wfp4afp4) {

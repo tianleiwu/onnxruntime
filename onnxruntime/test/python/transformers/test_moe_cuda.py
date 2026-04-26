@@ -2028,7 +2028,7 @@ class TestSparseMixer(unittest.TestCase):
         )
 
         sess_options = onnxruntime.SessionOptions()
-        sess = onnxruntime.InferenceSession(onnx_model.SerializeToString(), sess_options, providers=ort_provider)
+        sess = onnxruntime.InferenceSession(onnx_model.SerializeToString(), sess_options, providers=get_ort_provider())
 
         inputs = {
             "input": input_data.cpu().numpy(),
@@ -2081,7 +2081,7 @@ class TestSparseMixer(unittest.TestCase):
             onnx_dtype,
         )
         sess_options = onnxruntime.SessionOptions()
-        sess = onnxruntime.InferenceSession(onnx_model.SerializeToString(), sess_options, providers=ort_provider)
+        sess = onnxruntime.InferenceSession(onnx_model.SerializeToString(), sess_options, providers=get_ort_provider())
 
         ort_inputs = {
             "input": input_data.cpu().numpy(),

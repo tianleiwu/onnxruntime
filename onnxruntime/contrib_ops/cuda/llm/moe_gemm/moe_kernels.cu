@@ -40,6 +40,7 @@
 #include "cutlass/epilogue/thread/activation.h"
 #include "cutlass/numeric_conversion.h"
 #include "cutlass/numeric_types.h"
+#include "contrib_ops/cuda/llm/cutlass_extensions/detail/collective/mixed_input_utils.hpp"
 #include "contrib_ops/cuda/llm/cutlass_extensions/epilogue/thread/fused_activations.h"
 
 #ifdef __GNUC__
@@ -837,7 +838,8 @@ __device__ void setupFP4BlockScalingFactors(TmaWarpSpecializedGroupedGemmInput& 
 }
 
 __device__ void computeTmaWarpSpecializedInputStrides(
-    TmaWarpSpecializedGroupedGemmInput& layout_info, int gemm_m, int gemm_n, int gemm_k, int64_t out_idx) {
+    TmaWarpSpecializedGroupedGemmInput& layout_info, int gemm_m, int gemm_n, int gemm_k, int64_t out_idx,
+    int groupwise_scale_group_size) {
   layout_info.stride_a[out_idx] = cutlass::make_cute_packed_stride(
       TmaWarpSpecializedGroupedGemmInput::StrideA{}, cute::make_shape(gemm_m, gemm_k, 1));
   int stride_b_n = gemm_n;
@@ -862,8 +864,9 @@ __device__ void computeTmaWarpSpecializedInputStrides(
         TmaWarpSpecializedGroupedGemmInput::DefaultEpilogue::StrideD{}, cute::make_shape(stride_d_n, gemm_m, 1));
   }
   if (layout_info.int4_groupwise_params.enabled) {
+    assert(groupwise_scale_group_size > 0);
     layout_info.int4_groupwise_params.stride_s_a[out_idx] = cutlass::make_cute_packed_stride(TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::StrideSFA{},
-                                                                                             cute::make_shape(gemm_n, gemm_k / 128, 1));
+                                                                                             cute::make_shape(gemm_n, gemm_k / groupwise_scale_group_size, 1));
   }
 }
 
@@ -871,6 +874,8 @@ template <class T, class WeightType, class OutputType, class ScaleBiasType>
 __device__ void computeTmaWarpSpecializedInputPointers(TmaWarpSpecializedGroupedGemmInput& layout_info, int64_t gemm_m,
                                                        int64_t gemm_n, int64_t gemm_k, int num_tokens_before_expert, int64_t expert, T const* in,
                                                        WeightType const* weights, TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const* w4a8_weight_scale,
+                                                       TmaWarpSpecializedGroupedGemmInput::ElementSF const* mxfp4_weight_scale,
+                                                       int groupwise_scale_group_size,
                                                        ScaleBiasType const* bias, OutputType* output, int64_t const out_idx) {
   // The input prior to this contains K elements per token, with `num_tokens_before_expert` tokens
   layout_info.ptr_a[out_idx] = safe_inc_ptr(in, num_tokens_before_expert * gemm_k);
@@ -888,7 +893,16 @@ __device__ void computeTmaWarpSpecializedInputPointers(TmaWarpSpecializedGrouped
     layout_info.default_epilogue.ptr_d[out_idx] = safe_inc_ptr(output, num_tokens_before_expert * ptr_d_n);
   }
   if (layout_info.int4_groupwise_params.enabled) {
-    layout_info.int4_groupwise_params.ptr_s_a[out_idx] = safe_inc_ptr(w4a8_weight_scale, expert * (gemm_n * gemm_k / 128));
+    assert(groupwise_scale_group_size > 0);
+    assert(mxfp4_weight_scale || w4a8_weight_scale);
+    auto const scale_offset = expert * (gemm_n * gemm_k / groupwise_scale_group_size);
+    if (mxfp4_weight_scale) {
+      layout_info.int4_groupwise_params.ptr_s_a[out_idx] =
+          reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const*>(
+              safe_inc_ptr(mxfp4_weight_scale, scale_offset));
+    } else {
+      layout_info.int4_groupwise_params.ptr_s_a[out_idx] = safe_inc_ptr(w4a8_weight_scale, scale_offset);
+    }
   }
 }
 
@@ -937,6 +951,12 @@ __global__ void computeStridesTmaWarpSpecializedKernel(int64_t const* expert_fir
     layout_info2.alpha_scale_ptr_array[expert] = alpha_scale_flat2 + expert;
   }
 
+  constexpr int groupwise_scale_group_size =
+#if defined(ENABLE_FP4)
+      std::is_same_v<WeightType, __nv_fp4_e2m1> ? cutlass::gemm::collective::detail::mxfp4_group_size :
+#endif
+                                                cutlass::gemm::collective::detail::int4_group_size;
+
   auto setupIfSelected = [&](auto bs_config, auto quant_type) {
     if (quant_type.fc1.weight_block_scale) {
       setupFP4BlockScalingFactors<decltype(bs_config)>(layout_info1, expert, gemm_m, gemm1_n, gemm1_k,
@@ -948,7 +968,13 @@ __global__ void computeStridesTmaWarpSpecializedKernel(int64_t const* expert_fir
     }
   };
 
+#if defined(ENABLE_FP4)
+  if constexpr (!std::is_same_v<WeightType, __nv_fp4_e2m1>) {
+    setupIfSelected(TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaledConfig{}, quant_params.fp4);
+  }
+#else
   setupIfSelected(TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaledConfig{}, quant_params.fp4);
+#endif
   setupIfSelected(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaledConfig{}, quant_params.fp8_mxfp4);
   setupIfSelected(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaledConfig{}, quant_params.mxfp8_mxfp4);
 
@@ -960,18 +986,22 @@ __global__ void computeStridesTmaWarpSpecializedKernel(int64_t const* expert_fir
   assert(gemm1_k > 0 && gemm1_k <= INT32_MAX);
   assert(gemm2_n > 0 && gemm2_n <= INT32_MAX);
   assert(gemm2_k > 0 && gemm2_k <= INT32_MAX);
-  computeTmaWarpSpecializedInputStrides(layout_info1, gemm_m, gemm1_n, gemm1_k, expert);
-  computeTmaWarpSpecializedInputStrides(layout_info2, gemm_m, gemm2_n, gemm2_k, expert);
+  computeTmaWarpSpecializedInputStrides(layout_info1, gemm_m, gemm1_n, gemm1_k, expert, groupwise_scale_group_size);
+  computeTmaWarpSpecializedInputStrides(layout_info2, gemm_m, gemm2_n, gemm2_k, expert, groupwise_scale_group_size);
 
   computeTmaWarpSpecializedInputPointers(layout_info1, gemm_m, gemm1_n, gemm1_k, num_tokens_before_expert, expert,
                                          gemm1_in, weights1,
                                          reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const*>(
                                              quant_params.groupwise.fc1.weight_scales),
+                                         quant_params.fp4.fc1.weight_block_scale,
+                                         groupwise_scale_group_size,
                                          bias1, gemm1_output, expert);
   computeTmaWarpSpecializedInputPointers(layout_info2, gemm_m, gemm2_n, gemm2_k, num_tokens_before_expert, expert,
                                          gemm2_in, weights2,
                                          reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const*>(
                                              quant_params.groupwise.fc2.weight_scales),
+                                         quant_params.fp4.fc2.weight_block_scale,
+                                         groupwise_scale_group_size,
                                          bias2, gemm2_output, expert);
 }
 
@@ -1056,8 +1086,10 @@ __global__ void computeStridesTmaWarpSpecializedLowLatencyKernel(TmaWarpSpeciali
   assert(gemm1_k > 0 && gemm1_k <= INT32_MAX);
   assert(gemm2_n > 0 && gemm2_n <= INT32_MAX);
   assert(gemm2_k > 0 && gemm2_k <= INT32_MAX);
-  computeTmaWarpSpecializedInputStrides(layout_info1, gemm_m, gemm1_n, gemm1_k, expert);
-  computeTmaWarpSpecializedInputStrides(layout_info2, gemm_m, gemm2_n, gemm2_k, expert);
+  computeTmaWarpSpecializedInputStrides(layout_info1, gemm_m, gemm1_n, gemm1_k, expert,
+                                        cutlass::gemm::collective::detail::int4_group_size);
+  computeTmaWarpSpecializedInputStrides(layout_info2, gemm_m, gemm2_n, gemm2_k, expert,
+                                        cutlass::gemm::collective::detail::int4_group_size);
 
   if (is_active_expert) {
     // Note: under low latency mode, we use the same input for all experts
@@ -2898,8 +2930,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>:
     layout_info2.alpha_scale_ptr_array = nullptr;
   }
 
-  layout_info1.int4_groupwise_params.enabled = use_w4afp8 || quant_params.groupwise.group_size > 0;
-  layout_info2.int4_groupwise_params.enabled = use_w4afp8 || quant_params.groupwise.group_size > 0;
+  layout_info1.int4_groupwise_params.enabled = use_w4afp8 || use_wfp4a16 || quant_params.groupwise.group_size > 0;
+  layout_info2.int4_groupwise_params.enabled = use_w4afp8 || use_wfp4a16 || quant_params.groupwise.group_size > 0;
 
   layout_info1.fpX_block_scaling_type = getScalingType();
   layout_info2.fpX_block_scaling_type = getScalingType();

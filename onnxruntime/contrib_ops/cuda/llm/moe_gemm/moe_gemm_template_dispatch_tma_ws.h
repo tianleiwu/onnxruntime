@@ -113,17 +113,21 @@ void dispatchMoeGemmSelectBiasTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmIn
 #endif
     else {
       auto getFunc = [&]() {
+#if defined(ENABLE_FP4)
         if constexpr (std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>) {
           ORT_ENFORCE(hopper_input.fpX_block_scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
                       "MXFPX is the only supported scaling type for WFP4AFP8");
           return &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
                                                                                                  WeightType, OutputType, EpilogueTag, FUSION, TileShape, ClusterShape, true, false>;
         } else {
+#endif
           ORT_ENFORCE(hopper_input.fpX_block_scaling_type != TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
                       "MXFPX is not supported for the selected weight combination");
           return &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
                                                                                                  WeightType, OutputType, EpilogueTag, FUSION, TileShape, ClusterShape, false, false>;
+#if defined(ENABLE_FP4)
         }
+#endif
       };
       getFunc()(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size);
     }

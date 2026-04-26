@@ -193,7 +193,7 @@
     # Note: The minimum required CUDA version is greater than 11.3.
     # CUDA 11.3+ supports parallel compilation
     # https://docs.nvidia.com/cuda/cuda-compiler-driver-nvcc/index.html#options-for-guiding-compiler-driver-threads
-    set(onnxruntime_NVCC_THREADS "1" CACHE STRING "Number of threads that NVCC can use for compilation.")
+    set(onnxruntime_NVCC_THREADS "4" CACHE STRING "Number of threads that NVCC can use for compilation.")
     target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:--threads \"${onnxruntime_NVCC_THREADS}\">")
 
     # suppress warnings like this:
@@ -210,6 +210,8 @@
       endif()
       # skip diagnosis error caused by cuda header files
       target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=221>")
+      # CUDA 12.8 also reports deprecated implicit by-copy 'this' captures from CUTLASS headers.
+      target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=2908>")
     endif()
 
     if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
