@@ -1499,6 +1499,12 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
               "Otherwise, there is no blocking and a whole column shares one scaling factor. ",
               AttributeProto::INT,
               OPTIONAL_VALUE)
+        .Attr("quant_type",
+              "Quantization type: 'int' for integer quantization (default), 'fp4' for MXFP4 quantization. "
+              "When quant_type is 'fp4', weights are stored in MXFP4 format (2 values per byte) and "
+              "fp4_fc*_block_scales and fp4_fc*_global_scale inputs must be provided.",
+              AttributeProto::STRING,
+              std::string("int"))
         .Input(0,
                "input",
                "2D tensor with shape (num_tokens, hidden_size), or "
@@ -1579,6 +1585,42 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
                "(backward compatible).",
                "T",
                OpSchema::Optional)
+        .Input(15,
+               "fp4_fc1_block_scales",
+               "3D optional tensor with shape (num_experts, fusion_size * inter_size, hidden_size / fp4_block_size). "
+               "Block scale factors for FC1 FP4 weights, stored as uint8 (FP8 e4m3). Required when quant_type is 'fp4'.",
+               "T3",
+               OpSchema::Optional)
+        .Input(16,
+               "fp4_fc1_global_scale",
+               "1D optional tensor with shape (num_experts,). "
+               "Per-expert global scale for FC1 FP4 weights. Required when quant_type is 'fp4'.",
+               "T4",
+               OpSchema::Optional)
+        .Input(17,
+               "fp4_fc2_block_scales",
+               "3D optional tensor with shape (num_experts, hidden_size, inter_size / fp4_block_size). "
+               "Block scale factors for FC2 FP4 weights, stored as uint8 (FP8 e4m3). Required when quant_type is 'fp4'.",
+               "T3",
+               OpSchema::Optional)
+        .Input(18,
+               "fp4_fc2_global_scale",
+               "1D optional tensor with shape (num_experts,). "
+               "Per-expert global scale for FC2 FP4 weights. Required when quant_type is 'fp4'.",
+               "T4",
+               OpSchema::Optional)
+        .Input(19,
+               "fp4_fc3_block_scales",
+               "3D optional tensor with shape (num_experts, inter_size, hidden_size / fp4_block_size). "
+               "Block scale factors for FC3 FP4 weights, stored as uint8 (FP8 e4m3). Required when quant_type is 'fp4'.",
+               "T3",
+               OpSchema::Optional)
+        .Input(20,
+               "fp4_fc3_global_scale",
+               "1D optional tensor with shape (num_experts,). "
+               "Per-expert global scale for FC3 FP4 weights. Required when quant_type is 'fp4'.",
+               "T4",
+               OpSchema::Optional)
         .Output(0,
                 "output",
                 "output tensor with same shape of input",
@@ -1586,6 +1628,8 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
         .TypeConstraint("T", {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"}, "Constrain input and output types to float tensors.")
         .TypeConstraint("T1", {"tensor(uint8)"}, "Constrain weights type to uint8 tensors.")
         .TypeConstraint("T2", {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"}, "Constrain scales type to float tensors.")
+        .TypeConstraint("T3", {"tensor(uint8)"}, "Constrain FP4 block scale type to uint8 tensors.")
+        .TypeConstraint("T4", {"tensor(float)"}, "Constrain FP4 global scale type to float32 tensors.")
         .TypeAndShapeInferenceFunction(ONNX_NAMESPACE::propagateShapeAndTypeFromFirstInput));
 
 ONNX_MS_OPERATOR_SET_SCHEMA(SampleOp, 1,

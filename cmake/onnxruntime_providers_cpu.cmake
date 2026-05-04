@@ -34,6 +34,9 @@ if(onnxruntime_QUICK_BUILD)
   list(FILTER onnxruntime_cuda_contrib_ops_cu_srcs EXCLUDE REGEX "flash_fwd.*hdim(32|64|96|192|256)")
 endif()
 
+# Exclude SM90 mixed FP4 launcher: incompatible with cutlass 4.4.2 mainloop and not exercised by current tests.
+list(FILTER onnxruntime_cuda_contrib_ops_cu_srcs EXCLUDE REGEX "moe_gemm_tma_ws_sm90_mixed_fp4\\.generated\\.cu")
+
 file(GLOB_RECURSE onnxruntime_js_contrib_ops_cc_srcs CONFIGURE_DEPENDS
   "${ONNXRUNTIME_ROOT}/contrib_ops/js/*.h"
   "${ONNXRUNTIME_ROOT}/contrib_ops/js/*.cc"

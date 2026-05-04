@@ -785,8 +785,8 @@ if (onnxruntime_USE_CUDA)
     endif()
 
     if (onnxruntime_QUICK_BUILD)
-        message( STATUS "Quick build mode: Flash attention limited to head dimension 128 only")
-        list(APPEND ORT_PROVIDER_FLAGS -DORT_QUICK_BUILD=1)
+      message( STATUS "Quick build mode: reducing selected CUDA/CUTLASS kernel instantiations")
+      list(APPEND ORT_PROVIDER_FLAGS -DORT_QUICK_BUILD=1)
     endif()
 
     if (onnxruntime_USE_INT4_KV_CACHE)
@@ -1469,6 +1469,23 @@ if (onnxruntime_USE_CUDA)
   if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
     add_definitions("-DENABLE_FP4")
     message(STATUS "CUDA Toolkit version is greater or equal than 12.8, enable -DENABLE_FP4 flag")
+    # Check if any target architecture supports FP4 kernels (sm_100+).
+    # If not, define PLACEHOLDER_KERNELS so that stub implementations are used
+    # instead of compiling the full CUTLASS sm_100/sm_120 kernel templates,
+    # which are extremely slow to compile for unsupported architectures.
+    set(_has_sm100_plus FALSE)
+    foreach(_arch ${CMAKE_CUDA_ARCHITECTURES})
+      # Strip suffixes like "-real" or "-virtual"
+      string(REGEX REPLACE "[-].*" "" _arch_num "${_arch}")
+      if(_arch_num MATCHES "^[0-9]+$" AND _arch_num GREATER_EQUAL 100)
+        set(_has_sm100_plus TRUE)
+        break()
+      endif()
+    endforeach()
+    if(NOT _has_sm100_plus)
+      add_definitions("-DPLACEHOLDER_KERNELS")
+      message(STATUS "No sm_100+ target architecture found, using placeholder FP4 kernels")
+    endif()
   endif()
 
   if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0")
