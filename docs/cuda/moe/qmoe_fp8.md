@@ -13,10 +13,11 @@ onward has hardware FP8 GEMM support, and Hopper (SM90, H100/H200) has Tensor
 Core FP8 fast-accumulate mode. This document specifies how to add three FP8-related
 modes to the QMoE operator, in priority order, and why W8A16-fp8 is implemented first.
 
-A fourth future mode — **WFP4AFP8** (FP4 weight + FP8 activation) — targets
+**WFP4AFP8** (FP4 weight + FP8 activation), planned as Phase 2, targets
 Blackwell (SM100+, RTX 5090) where both FP4 and FP8 tensor ops are native and
 can be combined in a single block-scaled GEMM. The schema and dispatch design
-are specified here so the operator interface does not need to change later.
+for all three modes are specified here so the operator interface does not need
+to change later.
 
 ---
 
@@ -41,8 +42,9 @@ are specified here so the operator interface does not need to change later.
 
 3. **WFP4AFP8 before W4AFP8.** WFP4AFP8 targets Blackwell (SM100+, RTX 5090)
    where FP4+FP8 block-scaled ops are native. It reuses the existing MXFP4
-   weight infrastructure (inputs 15–20) and only adds activation scales, making
-   the incremental work modest. W4AFP8 by contrast has a narrower hardware
+   weight infrastructure (block scales in input 3/6/9, global scales in 15–17)
+   and only adds activation scales, making the incremental work modest. W4AFP8
+   by contrast has a narrower hardware
    target (SM89 fast path only) and requires a new runtime activation
    quantization kernel with no reuse from existing paths.
 
@@ -106,9 +108,9 @@ struct QuantParams {
   } mxfp8_mxfp4;
 
   static QuantParams FP8(float const* dequant_fc1, float const* quant_fc2,
-                         float const* dequant_fc2, ...);        // Phase 1, 2
-  static QuantParams FP8MXFP4(...);   // Phase 3 variant A
-  static QuantParams MXFP8MXFP4(...); // Phase 3 variant B
+                         float const* dequant_fc2, ...);        // Phase 1, Future (W4AFP8)
+  static QuantParams FP8MXFP4(...);   // Phase 2 variant A (WFP4AFP8 global-scaled)
+  static QuantParams MXFP8MXFP4(...); // Phase 2 variant B (WFP4AFP8 block-scaled)
 };
 ```
 
@@ -152,9 +154,9 @@ required by that combination is a Blackwell-only primitive).
 | `moe_gemm_kernels_fp8_uint4.cu` | `MoeGemmRunner<fp8_e4m3, uint4b_t, half/bf16>` | Future |
 | `moe_gemm_kernels_fp8_fp8.cu` | `MoeGemmRunner<fp8_e4m3, fp8_e4m3, bf16>` (W8A8-fp8, future) | — |
 | `moe_gemm_kernels_fp8_fp4.cu` | `MoeGemmRunner<fp8_e4m3, fp4_e2m1, half/bf16>` (WFP4AFP8) | 2 |
-| `contrib_defs.cc` | Schema inputs 21–28; new `quant_type` values | 1–3 |
-| `moe_quantization.cc` / `.h` | Runner selection, ComputeInternal wiring, PrePack | 1–3 |
-| `test_qmoe_fp8_cuda.py` | Python correctness tests | 1–3 |
+| `contrib_defs.cc` | Rework inputs 3–21, expand T2, new `quant_type` values | 1, 2, Future |
+| `moe_quantization.cc` / `.h` | Runner selection, ComputeInternal wiring, PrePack | 1, 2, Future |
+| `test_qmoe_fp8_cuda.py` | Python correctness tests | 1, 2, Future |
 
 ---
 
@@ -180,118 +182,155 @@ quant_type (string, default "int"):
 
 ### 4.2 Attribute: `expert_weight_bits`
 
-For `quant_type='fp8'`, `expert_weight_bits` must be `8`. The validator in
-`moe_quantization.cc` already accepts `8`; add a check that rejects `4` when
-`quant_type='fp8'`.
+- `quant_type='int'`: `expert_weight_bits` = 4 or 8 (INT4 or INT8 weights)
+- `quant_type='fp8'`: `expert_weight_bits` = 8 (FP8 e4m3 weights)
+- `quant_type='fp4'` or `'wfp4afp8'`: `expert_weight_bits` = 4 (MXFP4 weights)
+- `quant_type='w4afp8'`: `expert_weight_bits` = 4 (INT4 weights, FP8 activations)
 
-For `quant_type='w4afp8'`, `expert_weight_bits` must be `4` (INT4 weights).
+### 4.3 Schema Redesign: Unified Scale Inputs
 
-For `quant_type='wfp4afp8'`, `expert_weight_bits` must be `4` (MXFP4 weights,
-same storage format as `"fp4"`). The FP4 weight block scales (inputs 15–20)
-are reused directly; only the activation scales are new.
+**Key design principle:** scale inputs are named generically per GEMM layer
+(`fc1_scales`, `fc1_global_scale`, `fc1_act_scale`) rather than per quant type.
+The `quant_type` attribute determines interpretation. Since FP4 has not shipped,
+we merge the FP4-specific inputs (old 15–20) into the existing layout.
 
-### 4.3 New Inputs (W8A16-fp8 — Phase 1)
+**Changes from current schema:**
+1. **T2 type expanded:** `{tensor(float), tensor(float16), tensor(bfloat16)}`
+   → `{tensor(float), tensor(float16), tensor(bfloat16), tensor(uint8)}`
+2. **Inputs 3/6/9** (`fc1/fc2/fc3_scales`): become optional in schema, validated
+   per `quant_type` at runtime. Carry INT4 per-group float scales OR FP4/WFP4AFP8
+   uint8 block scales depending on `quant_type`.
+3. **Inputs 15–20** (old `fp4_fc*_block_scales` / `fp4_fc*_global_scale`):
+   **removed** — block scales merged into 3/6/9, global scales compacted to
+   new positions 15–17.
+4. **New inputs 15–21** added for global weight scales and activation scales.
 
-Append after the existing 21 inputs (indices 0–20). All three are **optional**
-at the schema level but **required** at runtime when `quant_type='fp8'`.
+### 4.4 Full Input Layout
 
-| Index | Name | Type | Shape | Description |
-|-------|------|------|-------|-------------|
-| 21 | `fp8_fc1_dequant_scale` | T4 (float32) | `(num_experts,)` | Per-expert weight dequant scale for FC1. `weight_fp32 ≈ weight_fp8 × scale`. |
-| 22 | `fp8_fc2_dequant_scale` | T4 (float32) | `(num_experts,)` | Per-expert weight dequant scale for FC2. |
-| 23 | `fp8_fc3_dequant_scale` | T4 (float32) | `(num_experts,)` | Per-expert weight dequant scale for FC3 (optional; needed only when FC3 is present). |
+| Idx | Name | Type | Shape | Used by `quant_type` |
+|-----|------|------|-------|---------------------|
+| 0 | `input` | T | `(num_tokens, hidden_size)` | all |
+| 1 | `router_probs` | T | `(num_tokens, num_experts)` | all |
+| 2 | `fc1_experts_weights` | T1 | `(E, fusion×inter, hidden/pack)` | all |
+| 3 | `fc1_scales` | T2 | varies (see below) | int, fp4, w4afp8, wfp4afp8 |
+| 4 | `fc1_experts_bias` | T | `(E, fusion×inter)` | optional |
+| 5 | `fc2_experts_weights` | T1 | `(E, hidden, inter/pack)` | all |
+| 6 | `fc2_scales` | T2 | varies | int, fp4, w4afp8, wfp4afp8 |
+| 7 | `fc2_experts_bias` | T | `(E, hidden)` | optional |
+| 8 | `fc3_experts_weights` | T1 | `(E, inter, hidden/pack)` | optional |
+| 9 | `fc3_scales` | T2 | varies | optional |
+| 10 | `fc3_experts_bias` | T | `(E, inter)` | optional |
+| 11 | `fc1_zero_points` | T1 | varies | int only |
+| 12 | `fc2_zero_points` | T1 | varies | int only |
+| 13 | `fc3_zero_points` | T1 | varies | optional |
+| 14 | `router_weights` | T | `(num_tokens, num_experts)` | optional |
+| **15** | **`fc1_global_scale`** | T4 | `(E,)` | fp4, fp8, wfp4afp8 |
+| **16** | **`fc2_global_scale`** | T4 | `(E,)` | fp4, fp8, wfp4afp8 |
+| **17** | **`fc3_global_scale`** | T4 | `(E,)` | optional |
+| **18** | **`fc1_act_scale`** | T4 | `(1,)` or `(E,)` | w4afp8, wfp4afp8(A) |
+| **19** | **`fc2_act_scale`** | T4 | `(1,)` or `(E,)` | w4afp8, wfp4afp8(A) |
+| **20** | **`fc1_act_block_scale`** | T2 | `(E, M_pad, K/32)` | wfp4afp8(B) |
+| **21** | **`fc2_act_block_scale`** | T2 | `(E, M_pad, inter/32)` | wfp4afp8(B) |
 
-These map directly to `QuantParams::FP8::dequant_fc1` and
-`QuantParams::FP8::dequant_fc2` in `moe_kernels.h`.
+`E` = `num_experts`. Bold rows are new/modified from original INT4-only schema.
 
-### 4.4 Additional Input (W4AFP8 — Future Work)
+### 4.5 Input 3/6/9 Interpretation by `quant_type`
 
-| Index | Name | Type | Shape | Description |
-|-------|------|------|-------|-------------|
-| 24 | `fp8_activation_quant_scale` | T4 (float32) | `(1,)` or `(num_experts,)` | Scale for on-the-fly quantization of BF16 activations to FP8 before GEMM. Maps to `QuantParams::FP8::quant_fc2`. |
+| `quant_type` | dtype of `fc1_scales` | Shape | Semantics |
+|---|---|---|---|
+| `"int"` | float / fp16 / bf16 | `(E, N)` or `(E, N, K/block_size)` | Per-group dequant scale. `w_float = w_int × scale`. |
+| `"fp4"` | float8e8m0 | `(E, N, K/32)` | MXFP4 block scales (`float_ue8m0_t`). Group size 32. |
+| `"fp8"` | — (not provided) | — | Not needed; per-expert global scale is in input 15. |
+| `"w4afp8"` | float / fp16 / bf16 | `(E, N)` or `(E, N, K/block_size)` | Same as `"int"` — INT4 weight per-group scales. |
+| `"wfp4afp8"` | float8e8m0 | `(E, N, K/32)` | Same as `"fp4"` — MXFP4 block scales. |
 
-> **Note:** For W4AFP8 the `quant_type` attribute value will be `"w4afp8"`.
-> `expert_weight_bits` remains `4` (INT4 weights). Inputs 3/6/9 (INT4 scales)
-> are still required. Implementation is deferred — see Section 7.
+### 4.6 Input 15/16/17 — Global Weight Scale
 
-### 4.5 New Inputs (WFP4AFP8 — Phase 2)
+`fc1_global_scale` at position 15 is a per-expert scalar dequant scale. Its
+semantic meaning is the same regardless of quant type:
+`weight_float ≈ quantized_weight × block_or_group_scale × global_scale`
 
-WFP4AFP8 reuses the existing MXFP4 weight inputs (indices 15–20, already
-defined for `quant_type='fp4'`). Only the FP8 activation scales are new.
+For `quant_type='fp8'` (which has no block/group scales), it simplifies to:
+`weight_float ≈ weight_fp8 × global_scale`
 
-Two sub-variants are supported, controlled at runtime based on which inputs
-are provided:
+This is the same quantity as what was previously called `fp8_fc1_dequant_scale`.
 
-**Variant A — `FP8MXFP4`**: global-scaled FP8 activation (simpler, lower
-overhead). Activation is quantized with a single per-expert or per-tensor
-float scale.
+### 4.7 Inputs 18–21 — Activation Scales
 
-| Index | Name | Type | Shape | Description |
-|-------|------|------|-------|-------------|
-| 25 | `wfp4afp8_fc1_act_global_scale` | T4 (float32) | `(1,)` or `(num_experts,)` | FP8 activation quantization scale for FC1. Maps to `FP8MXFP4Inputs::act_global_scale`. |
-| 26 | `wfp4afp8_fc2_act_global_scale` | T4 (float32) | `(1,)` or `(num_experts,)` | FP8 activation quantization scale for FC2. |
+Required only for modes with FP8 activations (`w4afp8`, `wfp4afp8`).
 
-**Variant B — `MXFP8MXFP4`**: MXFP8 block-scaled activation (higher accuracy,
-required when activation dynamic range varies significantly across the K
-dimension). Activation block scales have the same group size (32) as MXFP4.
-The block scales are pre-computed offline or by a quantization prologue kernel.
+**Inputs 18/19** (`fc1_act_scale`, `fc2_act_scale`): per-expert or per-tensor
+float32 scale used to quantize BF16 activations to FP8 at runtime.
+- Used by W4AFP8 and WFP4AFP8 variant A (global-scaled).
+- `fp8_activation = bf16_activation / act_scale`
 
-| Index | Name | Type | Shape | Description |
-|-------|------|------|-------|-------------|
-| 27 | `wfp4afp8_fc1_act_block_scale` | T3 (uint8) | `(num_experts, M_padded, K/32)` | MXFP8 activation block scales for FC1, stored as `float_ue8m0_t`. Shape uses padded M aligned to `MinMDimAlignmentMXFPX=32`. |
-| 28 | `wfp4afp8_fc2_act_block_scale` | T3 (uint8) | `(num_experts, M_padded, inter_size/32)` | MXFP8 activation block scales for FC2. |
+**Inputs 20/21** (`fc1_act_block_scale`, `fc2_act_block_scale`): MXFP8 block
+scale tensors for WFP4AFP8 variant B. Stored as `float8e8m0` (`float_ue8m0_t`,
+same type as MXFP4 weight block scales), group size 32 along K dimension.
+Shape depends on runtime token count M.
+- When 20/21 are present, `QuantParams::MXFP8MXFP4` is used.
+- When only 18/19 are present, `QuantParams::FP8MXFP4` is used.
 
-When inputs 27–28 are present, `QuantParams::MXFP8MXFP4` is used; otherwise
-`QuantParams::FP8MXFP4` is used with inputs 25–26. Both variants also require
-the MXFP4 weight inputs 15–20.
+> **Note on M dimension:** activation block scales depend on the runtime token
+> count. For offline export (fixed-batch), M is known. For dynamic shapes,
+> block scales must be computed by a quantization prologue kernel at each step.
 
-> **Note on M dimension:** Unlike weight block scales (static shape), activation
-> block scales for MXFP8 depend on the runtime token count M. For offline
-> export scenarios (e.g., compiling a fixed-batch model), M is known and shapes
-> can be pre-allocated. For dynamic shapes, block scales must be computed by a
-> quantization prologue kernel at each inference step and are not model inputs.
-
-### 4.5 Weight Tensor Format for `quant_type='fp8'`
+### 4.8 Weight Tensor Format for `quant_type='fp8'`
 
 - **`fc1_experts_weights` (index 2), `fc2_experts_weights` (index 5),
   `fc3_experts_weights` (index 8):** stored as `uint8_t`, reinterpreted as
-  `__nv_fp8_e4m3` (1 byte per value). No packing (`pack_size = 1`).
+  `__nv_fp8_e4m3` (1 byte per value, E4M3 format, max value 448.0).
+  No packing (`pack_size = 1`).
 - **Shapes** (no change from INT8 format):
   - FC1: `(num_experts, fusion_size × inter_size, hidden_size)`
   - FC2: `(num_experts, hidden_size, inter_size)`
   - FC3: `(num_experts, inter_size, hidden_size)` (if FC3 present)
-- **Zero points:** not applicable (FP8 e4m3 is a symmetric format). Inputs
-  11–13 (`fc*_zero_points`) must be absent when `quant_type='fp8'`.
-- **Block scales (inputs 3, 6, 9, `T2`):** not used for W8A16-fp8. Can be
-  omitted. The per-expert global dequant scales are in inputs 21–23 instead.
+- **Zero points (inputs 11–13):** not applicable (FP8 e4m3 is symmetric). Must
+  be absent when `quant_type='fp8'`.
+- **Block scales (inputs 3/6/9):** not used for W8A16-fp8 — omit them.
+  The per-expert global dequant scale is at inputs 15/16/17.
 
-### 4.6 Full Schema Diff Summary
+### 4.9 TypeConstraint Changes
+
+```
+T2: {tensor(float), tensor(float16), tensor(bfloat16), tensor(float8e8m0)}  ← add float8e8m0
+```
+
+`float8e8m0` (ONNX data type 24) = `float_ue8m0_t` = 8 exponent bits, 0
+mantissa bits. Represents power-of-2 scale factors for MXFP block scaling.
+Already registered in ORT (`TensorProto_DataType_FLOAT8E8M0 = 24`).
+
+T, T1, T3, T4 remain unchanged. T3 (`{tensor(uint8)}`) is now used only for
+zero points (inputs 11–13).
+
+### 4.10 Full Schema Diff Summary
 
 ```
 Attribute quant_type: add "fp8", "w4afp8", "wfp4afp8" as valid values.
 
-# Phase 1 — W8A16-fp8
-Input 21 (optional):  fp8_fc1_dequant_scale        T4 float32 (num_experts,)
-Input 22 (optional):  fp8_fc2_dequant_scale        T4 float32 (num_experts,)
-Input 23 (optional):  fp8_fc3_dequant_scale        T4 float32 (num_experts,)
+TypeConstraint T2: add tensor(float8e8m0) to allowed set.
 
-# Phase 2 — W4AFP8
-Input 24 (optional):  fp8_activation_quant_scale   T4 float32 (1,)|(num_experts,)
+Input  3 (fc1_scales):    make Optional, update description for multi-type support.
+Input  6 (fc2_scales):    make Optional, update description.
+Input  9 (fc3_scales):    make Optional (already optional), update description.
 
-# Phase 3 — WFP4AFP8 (reuses FP4 weight inputs 15–20)
-Input 25 (optional):  wfp4afp8_fc1_act_global_scale  T4 float32 (1,)|(num_experts,)  [variant A]
-Input 26 (optional):  wfp4afp8_fc2_act_global_scale  T4 float32 (1,)|(num_experts,)  [variant A]
-Input 27 (optional):  wfp4afp8_fc1_act_block_scale   T3 uint8   (num_experts, M_pad, K/32)  [variant B]
-Input 28 (optional):  wfp4afp8_fc2_act_block_scale   T3 uint8   (num_experts, M_pad, inter/32)  [variant B]
+Remove inputs 15–20 (old fp4_fc*_block_scales / fp4_fc*_global_scale).
 
-TypeConstraints T3 (uint8) and T4 (float32) unchanged.
+Add new inputs 15–21:
+Input 15 (optional):  fc1_global_scale       T4 float32       (num_experts,)
+Input 16 (optional):  fc2_global_scale       T4 float32       (num_experts,)
+Input 17 (optional):  fc3_global_scale       T4 float32       (num_experts,)
+Input 18 (optional):  fc1_act_scale          T4 float32       (1,)|(num_experts,)
+Input 19 (optional):  fc2_act_scale          T4 float32       (1,)|(num_experts,)
+Input 20 (optional):  fc1_act_block_scale    T2 float8e8m0    (num_experts, M_pad, K/32)
+Input 21 (optional):  fc2_act_block_scale    T2 float8e8m0    (num_experts, M_pad, inter/32)
 ```
 
 Files to edit:
-- `onnxruntime/core/graph/contrib_ops/contrib_defs.cc` — add `Input(21..24)`,
-  extend `quant_type` docs
+- `onnxruntime/core/graph/contrib_ops/contrib_defs.cc` — rework inputs 3–21,
+  expand T2, add new `quant_type` values
 - `onnxruntime/contrib_ops/cuda/moe/moe_quantization.cc` — validate new
-  attribute values, wire scales into `QuantParams::FP8`
+  attribute values, wire scales into `QuantParams`
 
 ---
 
@@ -334,10 +373,12 @@ endif()
 ### 5.2 `moe_quantization.h` — New Member Variables
 
 ```cpp
-// FP8 per-expert dequant scales (pre-packed to GPU)
-IAllocatorUniquePtr<void> packed_fp8_fc1_dequant_scale_;
-IAllocatorUniquePtr<void> packed_fp8_fc2_dequant_scale_;
-IAllocatorUniquePtr<void> packed_fp8_fc3_dequant_scale_;
+// Per-expert global weight scale (pre-packed to GPU) — inputs 15/16/17
+// Used by quant_type='fp8' as FP8 dequant scale,
+// and by quant_type='fp4'/'wfp4afp8' as MXFP4 weight global scale.
+IAllocatorUniquePtr<void> packed_fc1_global_scale_;
+IAllocatorUniquePtr<void> packed_fc2_global_scale_;
+IAllocatorUniquePtr<void> packed_fc3_global_scale_;
 ```
 
 ### 5.3 `moe_quantization.cc` — Constructor
@@ -363,23 +404,23 @@ if (quant_type_ == "fp8") {
 
 ### 5.4 `moe_quantization.cc` — `ComputeInternal`
 
-Read the new scale inputs:
+Read the global scale inputs (positions 15/16):
 ```cpp
-const Tensor* fp8_fc1_dequant = packed_fp8_fc1_dequant_scale_
-    ? nullptr : context->Input<Tensor>(21);
-const Tensor* fp8_fc2_dequant = packed_fp8_fc2_dequant_scale_
-    ? nullptr : context->Input<Tensor>(22);
+const Tensor* fc1_global_scale = packed_fc1_global_scale_
+    ? nullptr : context->Input<Tensor>(15);
+const Tensor* fc2_global_scale = packed_fc2_global_scale_
+    ? nullptr : context->Input<Tensor>(16);
 ```
 
 Wire into `QuantParams`:
 ```cpp
 if (quant_type_ == "fp8") {
-  const float* p1 = packed_fp8_fc1_dequant_scale_
-      ? static_cast<const float*>(packed_fp8_fc1_dequant_scale_.get())
-      : (fp8_fc1_dequant ? fp8_fc1_dequant->Data<float>() : nullptr);
-  const float* p2 = packed_fp8_fc2_dequant_scale_
-      ? static_cast<const float*>(packed_fp8_fc2_dequant_scale_.get())
-      : (fp8_fc2_dequant ? fp8_fc2_dequant->Data<float>() : nullptr);
+  const float* p1 = packed_fc1_global_scale_
+      ? static_cast<const float*>(packed_fc1_global_scale_.get())
+      : (fc1_global_scale ? fc1_global_scale->Data<float>() : nullptr);
+  const float* p2 = packed_fc2_global_scale_
+      ? static_cast<const float*>(packed_fc2_global_scale_.get())
+      : (fc2_global_scale ? fc2_global_scale->Data<float>() : nullptr);
   quant_params = QuantParams::FP8(
       /*dequant_fc1=*/ p1,
       /*quant_fc2=*/   nullptr,   // no activation quantization in W8A16-fp8
@@ -392,17 +433,128 @@ local must be set to `1` when `quant_type_ == "fp8"`.
 
 ### 5.5 `moe_quantization.cc` — `PrePack`
 
-Add cases for inputs 21, 22, 23 using the same `CopyToGpu` lambda already used
-for FP4 global scales (indices 16, 18, 20):
+Add cases for inputs 15, 16, 17. The same `CopyToGpu` lambda already exists
+for pre-packing constant tensors to GPU memory:
 
 ```cpp
-} else if (input_idx >= 21 && input_idx <= 23 && quant_type_ == "fp8") {
+} else if (input_idx >= 15 && input_idx <= 17 &&
+           (quant_type_ == "fp8" || quant_type_ == "fp4" || quant_type_ == "wfp4afp8")) {
   switch (input_idx) {
-    case 21: CopyToGpu(packed_fp8_fc1_dequant_scale_); break;
-    case 22: CopyToGpu(packed_fp8_fc2_dequant_scale_); break;
-    case 23: CopyToGpu(packed_fp8_fc3_dequant_scale_); break;
+    case 15: CopyToGpu(packed_fc1_global_scale_); break;
+    case 16: CopyToGpu(packed_fc2_global_scale_); break;
+    case 17: CopyToGpu(packed_fc3_global_scale_); break;
   }
 }
+```
+
+### 5.6 `contrib_defs.cc` — Schema Registration
+
+Replace old inputs 15–20 (FP4-specific) with the new unified inputs 15–17:
+
+```cpp
+.Input(15,
+       "fc1_global_scale",
+       "1D optional tensor with shape (num_experts,). "
+       "Per-expert weight global/dequant scale for FC1. "
+       "For quant_type='fp8': weight_bf16 ≈ weight_fp8 × scale. "
+       "For quant_type='fp4'/'wfp4afp8': MXFP4 global scale factor.",
+       "T4",
+       OpSchema::Optional)
+.Input(16,
+       "fc2_global_scale",
+       "1D optional tensor with shape (num_experts,). "
+       "Per-expert weight global/dequant scale for FC2.",
+       "T4",
+       OpSchema::Optional)
+.Input(17,
+       "fc3_global_scale",
+       "1D optional tensor with shape (num_experts,). "
+       "Per-expert weight global/dequant scale for FC3. Optional.",
+       "T4",
+       OpSchema::Optional)
+```
+
+Also expand T2 type constraint to include float8e8m0:
+```cpp
+.TypeConstraint("T2", {"tensor(float)", "tensor(float16)", "tensor(bfloat16)", "tensor(float8e8m0)"},
+                "Constrain scales type. Float types for INT4 per-group scales, "
+                "float8e8m0 for FP4/WFP4AFP8 block scales (MXFP format).")
+```
+
+And make inputs 3/6 optional (input 9 already is):
+```cpp
+.Input(3,
+       "fc1_scales",
+       "Optional weight scales. "
+       "For quant_type='int'/'w4afp8': float/fp16/bf16 per-group scales, shape (E, N) or (E, N, K/block_size). "
+       "For quant_type='fp4'/'wfp4afp8': float8e8m0 MXFP4 block scales, shape (E, N, K/32). "
+       "Not used for quant_type='fp8'.",
+       "T2",
+       OpSchema::Optional)
+```
+
+### 5.7 GEMM Scale Wiring — How `dequant_fc1/fc2` Flows to CUTLASS
+
+The W8A16-fp8 GEMM path (`use_fp8 == true`) in `moe_kernels.cu` line 2132
+follows this sequence:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ QuantParams::FP8::dequant_fc1  (float*, num_experts)            │
+│              │                                                  │
+│              ▼                                                  │
+│ computeFP8DequantScale()  →  alpha_scale_ptr_array              │
+│   Builds: alpha_scale_ptr_array[e] = &dequant_fc1[e]            │
+│   (one pointer per expert into the dequant scale buffer)        │
+│              │                                                  │
+│              ▼                                                  │
+│ GroupedGemmInput { ..., alpha_scale_ptr_array, ... }            │
+│              │                                                  │
+│              ▼                                                  │
+│ SM80 Ampere CUTLASS GEMM with EpilogueOpDefault                 │
+│   epilogue: output[i] = fp8_to_bf16(gemm_accum[i])              │
+│                          × (*alpha_scale_ptr_array[expert_id])  │
+│              │                                                  │
+│              ▼                                                  │
+│ Result: bf16 output with correct magnitude                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Key assertions enforced at runtime for `use_fp8`:
+```cpp
+ORT_ENFORCE(!config.is_tma_warp_specialized);  // SM80 Ampere path only
+ORT_ENFORCE(!use_block_scaling);                // no MXFP block scaling
+```
+
+The same pattern applies to FC2 (line 2259):
+```cpp
+alpha_scale_ptr_array = computeFP8DequantScale(
+    alpha_scale_ptr_array, num_experts_per_node, quant_params.fp8.dequant_fc2, stream);
+```
+
+**No new kernel code is needed** — `computeFP8DequantScale` and the Ampere
+epilogue already exist. Phase 1 only needs the `.cu` instantiation files and
+the operator plumbing to pass the scales from model inputs to `QuantParams`.
+
+### 5.8 End-to-End Data Flow (Phase 1)
+
+```
+Model input (BF16)
+    │
+    ▼
+Router → top-k expert selection → token permutation
+    │
+    ▼  (still BF16, no activation quantization)
+FC1 GEMM: bf16_activation × fp8_weight → bf16_output  (via dequant_fc1 epilogue scale)
+    │
+    ▼
+Activation function (SwiGLU / ReLU / etc.)
+    │
+    ▼  (still BF16)
+FC2 GEMM: bf16_activation × fp8_weight → bf16_output  (via dequant_fc2 epilogue scale)
+    │
+    ▼
+Un-permute → weighted sum → final BF16 output
 ```
 
 ---
@@ -453,12 +605,12 @@ endif()
 ### 6.3 `moe_quantization.h` — New Member Variables
 
 ```cpp
-// WFP4AFP8 activation scales (pre-packed to GPU)
-IAllocatorUniquePtr<void> packed_wfp4afp8_fc1_act_global_scale_;
-IAllocatorUniquePtr<void> packed_wfp4afp8_fc2_act_global_scale_;
+// WFP4AFP8 activation scales (pre-packed to GPU) — inputs 18/19
+IAllocatorUniquePtr<void> packed_fc1_act_scale_;
+IAllocatorUniquePtr<void> packed_fc2_act_scale_;
 ```
 
-MXFP8 activation block scales (inputs 27–28) are dynamic-shape tensors and
+MXFP8 activation block scales (inputs 20/21) are dynamic-shape tensors and
 are therefore **not** pre-packed — they are read directly from `context->Input`
 at runtime each step.
 
@@ -482,39 +634,39 @@ if (quant_type_ == "wfp4afp8") {
 
 ### 6.5 `moe_quantization.cc` — `ComputeInternal`
 
-WFP4AFP8 reuses the existing MXFP4 weight block scale pointers (inputs 15–20)
-plus the new activation scale inputs (25–28). The key decision is which
-`QuantParams` factory to use:
+WFP4AFP8 uses the weight block scales from input 3/6 (uint8, merged) and
+the global weight scales from input 15/16. Activation scales come from inputs
+18–21. The key decision is which `QuantParams` factory to use:
 
 ```cpp
 if (quant_type_ == "wfp4afp8") {
-  const Tensor* act_block_scale_fc1 = context->Input<Tensor>(27);
-  const Tensor* act_block_scale_fc2 = context->Input<Tensor>(28);
+  const Tensor* act_block_scale_fc1 = context->Input<Tensor>(20);
+  const Tensor* act_block_scale_fc2 = context->Input<Tensor>(21);
 
   if (act_block_scale_fc1 != nullptr) {
     // Variant B: MXFP8 block-scaled activations
     quant_params = QuantParams::MXFP8MXFP4(
-        /*fc1_weight_block_scale=*/ p_fp4_fc1_block_scales,
-        /*fc1_global_scale=*/       p_fp4_fc1_global_scale,
-        /*fc2_weight_block_scale=*/ p_fp4_fc2_block_scales,
-        /*fc2_global_scale=*/       p_fp4_fc2_global_scale);
+        /*fc1_weight_block_scale=*/ p_fc1_block_scales,
+        /*fc1_global_scale=*/       p_fc1_global_scale,
+        /*fc2_weight_block_scale=*/ p_fc2_block_scales,
+        /*fc2_global_scale=*/       p_fc2_global_scale);
     // Set activation block scales on hopper_input separately
     // (via TmaWarpSpecializedGroupedGemmInput::fpX_block_scaling_factors_A)
   } else {
     // Variant A: global-scaled FP8 activations
-    const float* p_act1 = packed_wfp4afp8_fc1_act_global_scale_
-        ? static_cast<const float*>(packed_wfp4afp8_fc1_act_global_scale_.get())
-        : context->Input<Tensor>(25)->Data<float>();
-    const float* p_act2 = packed_wfp4afp8_fc2_act_global_scale_
-        ? static_cast<const float*>(packed_wfp4afp8_fc2_act_global_scale_.get())
-        : context->Input<Tensor>(26)->Data<float>();
+    const float* p_act1 = packed_fc1_act_scale_
+        ? static_cast<const float*>(packed_fc1_act_scale_.get())
+        : context->Input<Tensor>(18)->Data<float>();
+    const float* p_act2 = packed_fc2_act_scale_
+        ? static_cast<const float*>(packed_fc2_act_scale_.get())
+        : context->Input<Tensor>(19)->Data<float>();
     quant_params = QuantParams::FP8MXFP4(
         /*fc1_act_global_scale=*/   p_act1,
-        /*fc1_weight_block_scale=*/ p_fp4_fc1_block_scales,
-        /*fc1_global_scale=*/       p_fp4_fc1_global_scale,
+        /*fc1_weight_block_scale=*/ p_fc1_block_scales,
+        /*fc1_global_scale=*/       p_fc1_global_scale,
         /*fc2_act_global_scale=*/   p_act2,
-        /*fc2_weight_block_scale=*/ p_fp4_fc2_block_scales,
-        /*fc2_global_scale=*/       p_fp4_fc2_global_scale);
+        /*fc2_weight_block_scale=*/ p_fc2_block_scales,
+        /*fc2_global_scale=*/       p_fc2_global_scale);
   }
 }
 ```
@@ -524,16 +676,136 @@ tensor must be quantized to FP8 before `runMoe()`, using either a per-tensor
 scale (Variant A) or a block-quantization prologue (Variant B). The `input_sf`
 parameter of `runMoe()` carries the resulting scale-factor pointer array.
 
-### 6.6 Relationship to Existing FP4 Path
+### 6.6 `moe_quantization.cc` — `PrePack`
+
+Pre-pack global activation scales (inputs 18/19) to GPU. Block scales (20/21)
+are dynamic-shape and read at runtime, not pre-packed.
+
+```cpp
+} else if (input_idx >= 18 && input_idx <= 19 &&
+           (quant_type_ == "wfp4afp8" || quant_type_ == "w4afp8")) {
+  switch (input_idx) {
+    case 18: CopyToGpu(packed_fc1_act_scale_); break;
+    case 19: CopyToGpu(packed_fc2_act_scale_); break;
+  }
+}
+```
+
+### 6.7 `contrib_defs.cc` — Schema Inputs 18–21
+
+```cpp
+.Input(18,
+       "fc1_act_scale",
+       "1D optional tensor with shape (1,) or (num_experts,). "
+       "FP8 activation quantization scale for FC1. Required when quant_type is "
+       "'w4afp8' or 'wfp4afp8' (variant A, when block-scaled inputs 20-21 are not provided).",
+       "T4",
+       OpSchema::Optional)
+.Input(19,
+       "fc2_act_scale",
+       "1D optional tensor with shape (1,) or (num_experts,). "
+       "FP8 activation quantization scale for FC2.",
+       "T4",
+       OpSchema::Optional)
+.Input(20,
+       "fc1_act_block_scale",
+       "3D optional tensor with shape (num_experts, M_padded, K/32). "
+       "MXFP8 activation block scales for FC1 (float8e8m0 / float_ue8m0_t). "
+       "Required for MXFP8 block-scaled variant of wfp4afp8.",
+       "T2",
+       OpSchema::Optional)
+.Input(21,
+       "fc2_act_block_scale",
+       "3D optional tensor with shape (num_experts, M_padded, inter_size/32). "
+       "MXFP8 activation block scales for FC2 (float8e8m0 / float_ue8m0_t). "
+       "Required for MXFP8 block-scaled variant of wfp4afp8.",
+       "T2",
+       OpSchema::Optional)
+```
+
+### 6.8 Runtime Activation Quantization Kernel
+
+WFP4AFP8 requires converting BF16 activations to FP8 before the GEMM (unlike
+W8A16-fp8 where activations remain in BF16). The quantization happens after
+token permutation, on the expanded activation buffer.
+
+**Variant A (global-scaled):**
+```cpp
+// New kernel: LaunchFP8QuantizeActivations
+// Input:  bf16 activations (num_expanded_tokens, K)
+// Output: fp8 activations  (num_expanded_tokens, K)
+// Scale:  single float per tensor (or per expert)
+//
+// Pseudocode per element:
+//   fp8_out[i] = cast_to_fp8(bf16_in[i] / act_global_scale)
+//
+// This kernel must be launched BEFORE runMoe().
+```
+
+**Variant B (MXFP8 block-scaled):**
+Block quantization uses a group size of 32 along the K dimension. For each
+group of 32 consecutive elements, a single `float_ue8m0_t` block scale is
+computed and written to the activation block scale tensor. The Blackwell
+block-scaled GEMM reads both the FP8 data and the block scales via TMA.
+
+```
+Quantize pipeline:
+  BF16 input → [permute] → BF16 expanded (M_exp × K)
+     │
+     ▼
+  Block quantize kernel (group=32):
+    For each block of 32 elements along K:
+      block_max = max(abs(block[0:32]))
+      block_scale = ceil_log2(block_max)     →  float_ue8m0_t
+      fp8[0:32] = block[0:32] / 2^block_scale  →  cast to fp8_e4m3
+     │
+     ├── fp8 activation buffer (M_exp × K)
+     └── block scale buffer   (M_exp × K/32)  →  input_sf for TMA
+```
+
+The `TmaWarpSpecializedGroupedGemmInput::fpX_block_scaling_factors_A` field
+carries the activation block scale pointer array to the Blackwell kernel.
+
+### 6.9 End-to-End Data Flow (Phase 2)
+
+```
+Model input (BF16)
+    │
+    ▼
+Router → top-k expert selection → token permutation
+    │
+    ▼  (BF16 expanded activations)
+Quantize to FP8:
+  Variant A: fp8_act = bf16_act / global_scale
+  Variant B: fp8_act, block_scales = mxfp8_block_quantize(bf16_act)
+    │
+    ▼  (FP8 expanded activations + scales)
+FC1 GEMM: fp8_activation × fp4_weight → bf16_output
+    (Blackwell block-scaled TMA WS, CUTLASS SM100 kernel)
+    │
+    ▼
+Activation function (SwiGLU / ReLU / etc.)
+    │
+    ▼  (BF16 intermediate)
+Quantize to FP8 again (for FC2):
+    │
+    ▼
+FC2 GEMM: fp8_activation × fp4_weight → bf16_output
+    │
+    ▼
+Un-permute → weighted sum → final BF16 output
+```
+
+### 6.10 Relationship to Existing FP4 Path
 
 WFP4AFP8 reuses almost all of the existing FP4 weight infrastructure:
 - The MXFP4 weight block scale format (group_size=32, `float_ue8m0_t` elements)
   is identical to `quant_type='fp4'`.
-- Inputs 15–20 (`fp4_fc*_block_scales`, `fp4_fc*_global_scale`) are reused
-  without any change.
-- The `PrePack` logic for inputs 15–20 (copy to GPU) applies unchanged.
+- Inputs 3/6/9 (weight block scales, now `float8e8m0`) and inputs 15/16/17
+  (global scales) are shared with `quant_type='fp4'` unchanged.
+- The `PrePack` logic for inputs 3/6/9 and 15/16/17 applies unchanged.
 
-The only additions are the activation scale inputs (25–28) and switching the
+The only additions are the activation scale inputs (18–21) and switching the
 runner type from `<bf16/half, fp4_e2m1>` to `<fp8_e4m3, fp4_e2m1>`.
 
 ---
@@ -566,8 +838,8 @@ template class MoeGemmRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16>;
 W4AFP8 requires quantizing BF16 activations to FP8 before each GEMM.
 This needs a new kernel `LaunchFP8QuantizeActivations` applied to the
 expanded (post-permutation) activation buffer before calling `runMoe()`.
-The scale (`fp8_activation_quant_scale`, input 24) and resulting FP8 buffer
-are passed as `input_sf` and the first argument to `runMoe()`.
+The scale (`fc1_act_scale`/`fc2_act_scale`, inputs 18/19) and resulting FP8
+buffer are passed as `input_sf` and the first argument to `runMoe()`.
 
 The `runMoe` interface already has an `input_sf` parameter (second argument,
 currently `nullptr` for all non-FP8 modes).
@@ -635,19 +907,19 @@ Same as existing INT4 weight format (see `qmoe_int4_format.md`):
 ### WFP4AFP8 Weight Format
 
 Same as existing MXFP4 weight format (see `qmoe_fp4.md`):
-two FP4 values packed per byte, with MXFP4 block scales stored as `uint8_t`
-(`float_ue8m0_t` bit patterns). Inputs 15–20 are reused unchanged.
+two FP4 values packed per byte, with MXFP4 block scales stored as `float8e8m0`
+(`float_ue8m0_t` bit patterns) in inputs 3/6/9.
 
 Activation format for WFP4AFP8:
 ```
 Variant A (global-scaled):
   Activation dtype:   __nv_fp8_e4m3 (computed at runtime from BF16 input)
-  Scale dtype:        float32
+  Scale dtype:        float32 (inputs 18/19)
   Scale shape:        (1,) per-tensor  OR  (num_experts,) per-expert
 
 Variant B (MXFP8 block-scaled):
   Activation dtype:   __nv_fp8_e4m3 with MXFP8 block scales
-  Block scale dtype:  uint8 (float_ue8m0_t, same format as MXFP4 weight scales)
+  Block scale dtype:  float8e8m0 (inputs 20/21, same format as MXFP4 weight scales)
   Block scale shape:  (num_experts, M_padded, K/32) — M_padded is runtime-dependent
   Block group size:   32 (same as MXFP4 weight)
 ```
@@ -692,7 +964,7 @@ def fp8_moe_reference(input_bf16, experts_weights_fp8, dequant_scales, ...):
 |------|---------------------|-------------------|-----------------|
 | New `.cu` files | `moe_gemm_kernels_{bf16,fp16}_fp8.cu` | `moe_gemm_kernels_fp8_fp4.cu` | `moe_gemm_kernels_fp8_uint4.cu` |
 | Schema `quant_type` | `"fp8"` | `"wfp4afp8"` | `"w4afp8"` |
-| New schema inputs | 21–23 (weight dequant) | 25–28 (act scales); reuses 15–20 for weights | 24 (act quant scale) |
+| Schema inputs used | 15–17 (global scale, shared) | 3/6/9 (block scales) + 15–17 + 18–21 (act scales) | 3/6/9 (INT4 scales) + 15–17 + 18/19 (act scales) |
 | New runtime kernels | none | `LaunchFP8QuantizeActivations` (+ optional MXFP8 block quant prologue) | `LaunchFP8QuantizeActivations` |
 | SM support | SM80+, SM89/SM90 recommended | SM100+ only | SM89 fast; SM80+ dequant |
 | CUTLASS path | SM80 Ampere GEMM (weight dequant) | SM100 block-scaled TMA WS | SM89 Ampere (mixed FP8+INT4) |
