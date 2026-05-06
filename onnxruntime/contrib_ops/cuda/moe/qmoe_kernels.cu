@@ -647,6 +647,87 @@ void LaunchQMoEDequantizeFp4Weights(
   LaunchQMoEDequantizeFp4WeightsImpl(packed_weights, block_scales, global_scales, output, num_experts, n, k, stream);
 }
 
+__device__ __forceinline__ float DecodeFloat8E4M3FN(uint8_t code) {
+  // ONNX float8e4m3fn has no infinities. The only NaN payloads are 0x7F/0xFF;
+  // finite values, including the max finite code 0x7E, use the normal E4M3 formula.
+  const int sign = code & 0x80;
+  const int exponent = (code >> 3) & 0x0F;
+  const int mantissa = code & 0x07;
+
+  if ((code & 0x7F) == 0) {
+    return sign ? -0.0f : 0.0f;
+  }
+  if (exponent == 0x0F && mantissa == 0x07) {
+    return __int_as_float(0x7fffffff);
+  }
+
+  float value = 0.0f;
+  if (exponent == 0) {
+    value = ldexpf(static_cast<float>(mantissa), -9);
+  } else {
+    value = ldexpf(1.0f + static_cast<float>(mantissa) * 0.125f, exponent - 7);
+  }
+  return sign ? -value : value;
+}
+
+template <typename T>
+__global__ void QMoEDequantizeFp8WeightsKernel(
+    const uint8_t* weights,
+    const float* global_scales,
+    T* output,
+    int num_experts,
+    int n,
+    int k) {
+  int64_t total = static_cast<int64_t>(num_experts) * n * k;
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= total) {
+    return;
+  }
+
+  int64_t expert_stride = static_cast<int64_t>(n) * k;
+  int expert = static_cast<int>(index / expert_stride);
+  float value = DecodeFloat8E4M3FN(weights[index]) * global_scales[expert];
+  output[index] = static_cast<T>(value);
+}
+
+template <typename T>
+void LaunchQMoEDequantizeFp8WeightsImpl(
+    const uint8_t* weights,
+    const float* global_scales,
+    T* output,
+    int num_experts,
+    int n,
+    int k,
+    cudaStream_t stream) {
+  int64_t total = static_cast<int64_t>(num_experts) * n * k;
+  constexpr int block = 256;
+  int grid = static_cast<int>((total + block - 1) / block);
+  QMoEDequantizeFp8WeightsKernel<<<grid, block, 0, stream>>>(
+      weights, global_scales, output, num_experts, n, k);
+}
+
+void LaunchQMoEDequantizeFp8Weights(
+    const uint8_t* weights,
+    const float* global_scales,
+    half* output,
+    int num_experts,
+    int n,
+    int k,
+    cudaStream_t stream) {
+  LaunchQMoEDequantizeFp8WeightsImpl(weights, global_scales, output, num_experts, n, k, stream);
+}
+
+void LaunchQMoEDequantizeFp8Weights(
+    const uint8_t* weights,
+    const float* global_scales,
+    __nv_bfloat16* output,
+    int num_experts,
+    int n,
+    int k,
+    cudaStream_t stream) {
+  LaunchQMoEDequantizeFp8WeightsImpl(weights, global_scales, output, num_experts, n, k, stream);
+}
+
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime

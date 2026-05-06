@@ -207,6 +207,24 @@ void LaunchQMoEDequantizeFp4Weights(
     int k,
     cudaStream_t stream);
 
+void LaunchQMoEDequantizeFp8Weights(
+    const uint8_t* weights,
+    const float* global_scales,
+    half* output,
+    int num_experts,
+    int n,
+    int k,
+    cudaStream_t stream);
+
+void LaunchQMoEDequantizeFp8Weights(
+    const uint8_t* weights,
+    const float* global_scales,
+    __nv_bfloat16* output,
+    int num_experts,
+    int n,
+    int k,
+    cudaStream_t stream);
+
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime

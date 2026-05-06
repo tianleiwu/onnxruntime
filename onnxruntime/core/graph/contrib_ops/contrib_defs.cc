@@ -1641,7 +1641,8 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
                 "output tensor with same shape of input",
                 "T")
         .TypeConstraint("T", {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"}, "Constrain input and output types to float tensors.")
-        .TypeConstraint("T1", {"tensor(uint8)"}, "Constrain weights type to uint8 tensors.")
+        .TypeConstraint("T1", {"tensor(uint8)", "tensor(float8e4m3fn)"},
+                        "Constrain quantized weight types. Integer and FP4 weights use uint8. FP8 weights use float8e4m3fn.")
         .TypeConstraint("T2", {"tensor(float)", "tensor(float16)", "tensor(bfloat16)", "tensor(uint8)"},
                         "Constrain scale types. Float tensors are used for integer quantization scales. "
                         "Uint8 tensors are used for MXFP block scales.")

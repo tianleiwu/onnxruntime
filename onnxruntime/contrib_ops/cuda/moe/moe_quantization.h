@@ -28,7 +28,9 @@ class QMoE final : public CudaKernel, public MoEBase {
   bool has_fc3_;
   bool is_fp16_;
   bool use_fp4_dequant_fallback_ = false;
-  std::string quant_type_;  // "int" or "fp4"
+  // Dequantizes FP8 weights to FP16/BF16 scratch buffers before invoking the A16 MoE runner.
+  bool use_fp8_dequant_fallback_ = false;
+  std::string quant_type_;  // "int", "fp4", or "fp8"
 
   std::unique_ptr<onnxruntime::llm::kernels::cutlass_kernels::CutlassMoeFCRunnerInterface> m_moe_runner;
 
@@ -46,11 +48,13 @@ class QMoE final : public CudaKernel, public MoEBase {
 
   // FP4 pre-packed buffers
   IAllocatorUniquePtr<void> packed_fp4_fc1_block_scales_;
-  IAllocatorUniquePtr<void> packed_fp4_fc1_global_scale_;
   IAllocatorUniquePtr<void> packed_fp4_fc2_block_scales_;
-  IAllocatorUniquePtr<void> packed_fp4_fc2_global_scale_;
   IAllocatorUniquePtr<void> packed_fp4_fc3_block_scales_;
-  IAllocatorUniquePtr<void> packed_fp4_fc3_global_scale_;
+
+  // Per-expert global weight scales used by FP4 and FP8 modes.
+  IAllocatorUniquePtr<void> packed_fc1_global_scale_;
+  IAllocatorUniquePtr<void> packed_fc2_global_scale_;
+  IAllocatorUniquePtr<void> packed_fc3_global_scale_;
 
   mutable onnxruntime::llm::kernels::cutlass_kernels::MoeGemmProfiler mGemmProfiler;
   mutable onnxruntime::llm::kernels::cutlass_kernels::MoeGemmId mGemmId1;
