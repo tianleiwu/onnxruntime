@@ -895,12 +895,23 @@ __device__ void computeTmaWarpSpecializedInputPointers(TmaWarpSpecializedGrouped
   if (layout_info.int4_groupwise_params.enabled) {
     assert(groupwise_scale_group_size > 0);
     assert(mxfp4_weight_scale || w4a8_weight_scale);
-    auto const scale_offset = expert * (gemm_n * gemm_k / groupwise_scale_group_size);
     if (mxfp4_weight_scale) {
+      constexpr int scale_cols_alignment = 4;
+      auto const scale_rows = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+          gemm_n, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX);
+      auto const scale_cols = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+          gemm_k / groupwise_scale_group_size, scale_cols_alignment);
+      auto const scale_offset = expert * scale_rows * scale_cols;
       layout_info.int4_groupwise_params.ptr_s_a[out_idx] =
           reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const*>(
               safe_inc_ptr(mxfp4_weight_scale, scale_offset));
     } else {
+      constexpr int scale_element_size_adjustment =
+#if defined(ENABLE_FP4)
+          std::is_same_v<WeightType, __nv_fp4_e2m1> ? 2 :
+#endif
+                                                     1;
+      auto const scale_offset = expert * (gemm_n * gemm_k / (groupwise_scale_group_size * scale_element_size_adjustment));
       layout_info.int4_groupwise_params.ptr_s_a[out_idx] = safe_inc_ptr(w4a8_weight_scale, scale_offset);
     }
   }
@@ -3080,6 +3091,14 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
                                     static_cast<float const*>(quant_3), static_cast<float const*>(quant_4),
                                     static_cast<TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF const*>(quant_5),
                                     static_cast<float const*>(quant_6));
+  } else if (mWType == nvinfer::DataType::kFP4 || mWType == nvinfer::DataType::kINT64) {
+    // W4A16: FP4 weights with FP16/BF16 activations (no activation quantization)
+    ORT_ENFORCE(quant_2 && quant_3 && quant_5 && quant_6);
+    mQuantParams = QuantParams::FP4(nullptr,
+                                    static_cast<TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF const*>(quant_2),
+                                    static_cast<float const*>(quant_3), nullptr,
+                                    static_cast<TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF const*>(quant_5),
+                                    static_cast<float const*>(quant_6));
   }
 }
 
@@ -3141,7 +3160,8 @@ void GemmProfilerBackend::prepareTmaWsInputs(
 
       bool apply_bias = true;
       bool use_w4afp8 = (mDType == nvinfer::DataType::kFP8 && mWType == nvinfer::DataType::kINT4);
-      bool using_fused_finalize = !mInterface->use_deterministic_hopper_reduce_ && mSM == 90 && !use_w4afp8;
+      bool use_wfp4a16 = (mDType != nvinfer::DataType::kFP4 && mDType != nvinfer::DataType::kINT64 && mDType != nvinfer::DataType::kFP8) && (mWType == nvinfer::DataType::kFP4 || mWType == nvinfer::DataType::kINT64);
+      bool using_fused_finalize = !mInterface->use_deterministic_hopper_reduce_ && mSM == 90 && !use_w4afp8 && !use_wfp4a16;
       if (using_fused_finalize) {
         gemm2_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
         gemm2_tma_ws_input.setFinalizeFusionParams(output, token_topk_unpermuted_scales,

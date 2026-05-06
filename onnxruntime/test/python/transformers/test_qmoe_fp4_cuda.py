@@ -436,7 +436,19 @@ class TestQMoEFP4(unittest.TestCase):
         iobinding.bind_output("output", "cuda", 0, onnx_elem, output_tensor.shape, output_tensor.data_ptr())
 
         iobinding.synchronize_inputs()
-        session.run_with_iobinding(iobinding)
+        try:
+            session.run_with_iobinding(iobinding)
+        except Exception as e:
+            msg = str(e)
+            if (
+                "FP4" in msg
+                or "MXFP4" in msg
+                or "ENABLE_FP4" in msg
+                or "stubbed out" in msg
+                or "not supported in this build" in msg
+            ):
+                self.skipTest(f"FP4 kernel not available in this build: {e}")
+            raise
         iobinding.synchronize_outputs()
 
         ort_output = output_tensor.clone()

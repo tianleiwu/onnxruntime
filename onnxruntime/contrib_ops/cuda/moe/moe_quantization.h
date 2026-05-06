@@ -27,6 +27,7 @@ class QMoE final : public CudaKernel, public MoEBase {
   int64_t block_size_;
   bool has_fc3_;
   bool is_fp16_;
+  bool use_fp4_dequant_fallback_ = false;
   std::string quant_type_;  // "int" or "fp4"
 
   std::unique_ptr<onnxruntime::llm::kernels::cutlass_kernels::CutlassMoeFCRunnerInterface> m_moe_runner;

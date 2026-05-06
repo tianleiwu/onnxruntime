@@ -584,7 +584,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   // TODO: This should eventually take the quant params to give more flexibility
   static auto getScalingType() {
     return use_wfp4afp8 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
-           : use_fp4    ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+           : use_fp4      ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+           : use_wfp4a16  ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
                         : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
   }
 
@@ -655,8 +656,10 @@ struct GemmProfilerBackend {
     mScalingType = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
     if (dtype == nvinfer::DataType::kFP8 && (wtype == nvinfer::DataType::kFP4 || wtype == nvinfer::DataType::kINT64)) {
       mScalingType = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
-    } else if ((dtype == nvinfer::DataType::kFP4 || dtype == nvinfer::DataType::kINT64) && (wtype == nvinfer::DataType::kFP4 || wtype == nvinfer::DataType::kINT64)) {
+    } else if (dtype == nvinfer::DataType::kFP4 && (wtype == nvinfer::DataType::kFP4 || wtype == nvinfer::DataType::kINT64)) {
       mScalingType = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
+    } else if ((wtype == nvinfer::DataType::kFP4 || wtype == nvinfer::DataType::kINT64)) {
+      mScalingType = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
     }
   }
 

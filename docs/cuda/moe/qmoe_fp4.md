@@ -1,4 +1,4 @@
-# QMoE FP4 (MXFP4) Support — Design, Implementation & Plan
+# QMoE FP4 (MXFP4) Support — Design, Implementation & Verification
 
 ## 1. Overview
 
@@ -42,7 +42,70 @@ Extend the existing QMoE CUDA operator to support **MXFP4 quantized weights** wi
 | 4 | QMoE operator implementation (constructor, ComputeInternal, PrePack) | ✅ Done |
 | 5 | FP4 weight packing utility | ✅ Done |
 | 6 | Python tests (`test_qmoe_fp4_cuda.py`) | ✅ Done |
-| 7 | End-to-end verification & GPT-OSS smoke test | ❌ Not started |
+| 7 | End-to-end verification & GPT-OSS smoke test | 🔄 CUDA provider build verified; runtime parity and GPT-OSS smoke pending |
+
+### 2.1 Native SM90 Launcher Status
+
+**Status:** The native SM90 mixed-input PtrArray FP4 GEMM path has been
+restored and aligned with TensorRT-LLM's WFP4A16 implementation. The CUDA
+provider target builds successfully with CUDA 13.0 after enabling the generated
+launcher set. The fallback stub remains in tree as an emergency compile-time
+safety net, but the active build now uses generated launchers instead of the
+stub.
+
+**What changed from the earlier crash investigation:**
+
+- The mixed-input collective now keeps MXFP4's logical scale group at
+  `detail::mxfp4_group_size = 32` instead of collapsing the scale dimension to
+  `TileK`.
+- For `TileK = 256`, each tile carries eight raw MXFP4 scale lanes through
+  `PackedScalesNum = TileK / 32` and
+  `ElementScalePacked = Array<float_ue8m0_t, 8>`.
+- The INT4 `UseScaleLookupTable` path is INT4-only again. FP4 BF16 conversion
+  uses a separate `UseFP4ToBF16LookupTable` path that converts FP4 values to
+  BF16 in registers before applying the existing scale flow.
+- QMoE FP4 block scales are prepacked with a TRT-LLM-style
+  `block_scale_interleave` layout: rows padded to 128, scale columns padded to
+  4, then swizzled into the one-byte UE8M0 scale buffer used by the TMA
+  mainloop.
+- W4A16 scale stride setup now describes the raw scale-group shape
+  `[N, K / 32]`; pointer offsets account for the padded interleaved prepack
+  layout when constant initializers are available.
+
+**Current verification state:**
+
+- ✅ `onnxruntime_providers_cuda` build passes on the CUDA 13.0 SM90 build.
+- 🔄 Python parity tests are implemented and no longer intentionally skip the
+  native path, but still need to be run on an SM90/SM100 machine.
+- 🔄 GPT-OSS-sized smoke coverage is still pending.
+
+### 2.2 Verification Plan
+
+The implementation is in place; the remaining work is runtime validation and
+guard coverage.
+
+| # | Test | Method | Status |
+|---|------|--------|--------|
+| 1 | CUDA provider build | `cmake --build ... --target onnxruntime_providers_cuda --parallel 2` on CUDA 13.0 / SM90 target | ✅ Passed |
+| 2 | FP4 FP16 correctness | `test_qmoe_fp4_cuda.py::TestQMoEFP4::test_fp4_fp16_*` against dequant-then-matmul reference | 🔄 Pending |
+| 3 | FP4 BF16 correctness | `test_qmoe_fp4_cuda.py::TestQMoEFP4::test_fp4_bf16_*` against dequant-then-matmul reference | 🔄 Pending |
+| 4 | INT4/INT8 regression | Existing `test_qmoe_cuda.py` coverage | 🔄 Pending |
+| 5 | Non-FP4 build guard | CUDA build without `ENABLE_FP4` rejects `quant_type="fp4"` clearly | 🔄 Pending |
+| 6 | GPT-OSS smoke test | hidden=2880, top_k=4, experts=128, block_size=32 | 🔄 Pending |
+
+Recommended execution order:
+
+1. Run the FP16 and BF16 parity tests on H100/H200 first; these cover the
+   restored native W4A16 path directly.
+2. Run `compute-sanitizer --tool memcheck` on `test_fp4_bf16_silu_basic` if any
+   runtime fault reappears.
+3. Run existing INT4/INT8 QMoE tests to confirm the groupwise INT path was not
+   regressed by the shared mixed-input collective changes.
+4. Validate one non-FP4 CUDA build to confirm the constructor guard and
+   `ENABLE_FP4` aliases are sufficient.
+5. Add a GPT-OSS-shaped smoke once the small parity cases pass.
+
+
 
 ### Review Follow-up Notes
 
@@ -76,7 +139,7 @@ The initial review found two blocking integration issues, which are now addresse
 | `cutlass_extensions/detail/collective/mixed_input_utils.hpp` | Added `int4_group_size=128` and `mxfp4_group_size=32` constants |
 | `cutlass_extensions/gemm/collective/sm90_mma_array_..._mixed_input_.hpp` | Added `IsMXFP4`, `ScalingGroupSize`; replaced `#define GROUP_SIZE 128` macro with type-dependent group size |
 | `moe_gemm/launchers/moe_gemm_tma_ws_mixed_input_launcher.inl` | Generalized `ElementA`/`ElementB` from template params; conditional scale type (`float_ue8m0_t` for FP4), group size, epilogue alpha |
-| `moe_gemm/moe_gemm_template_dispatch_tma_ws_mixed_dtype.h` | Added FP4 tile configs (Ntile=64, Ktile=128); updated workspace calculation |
+| `moe_gemm/moe_gemm_template_dispatch_tma_ws_mixed_dtype.h` | Added FP4 tile configs (Ntile=64, Ktile=256); updated workspace calculation |
 | `moe_gemm/moe_gemm_template_dispatch.h` | Added `use_wfp4a16` dispatch branch; updated `calcMaxWorkspaceSize` |
 
 ### Phase 3: QMoE ONNX Operator Schema Extension — ✅ Done
@@ -101,13 +164,14 @@ The initial review found two blocking integration issues, which are now addresse
 ```
 CutlassMoeFCRunner<half, __nv_fp4_e2m1, half>::dispatchToArch()
   └─ use_wfp4a16 == true
-     └─ sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<..., PackedScalesNum=1>()
-        └─ Ntile=64, Ktile=128 (vs INT4: Ntile=128, Ktile=128*PSN/sizeof(T))
+    └─ sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<..., PackedScalesNum=8>()
+      └─ Ntile=64, Ktile=256 (vs INT4: Ntile=128, Ktile=128*PSN/sizeof(T))
            └─ sm90_generic_mixed_moe_gemm_kernelLauncher()
               ├─ ElementA = cutlass::half_t  (activation)
               ├─ ElementB = cutlass::float_e2m1_t  (weight)
-              ├─ group_size = 32 (mxfp4_group_size)
-              ├─ ElementScale = cutlass::float_ue8m0_t
+                ├─ raw MXFP4 group size = 32
+                ├─ PackedScalesNum = 8 for Ktile=256
+                ├─ ElementScalePacked = cutlass::Array<cutlass::float_ue8m0_t, 8>
               └─ CollectiveBuilderMixedInput<..., tuple<ElementB, ElementScalePacked>, ...>
 ```
 
@@ -117,22 +181,23 @@ CutlassMoeFCRunner<half, __nv_fp4_e2m1, half>::dispatchToArch()
 |----------|-------------|-------------|
 | ElementA | `half_t` / `bfloat16_t` | `float_e4m3_t` |
 | ElementB | `float_e2m1_t` | `int4b_t` |
-| Group size | 32 (MXFP4) | 128 (INT4) |
-| ElementScale | `float_ue8m0_t` | `__nv_bfloat16` (SFA) |
+| Logical scale group size | 32 (MXFP4) | 128 (INT4) |
+| Packed scale lanes per Ktile | 8 for `Ktile=256` | 1 for the common INT4 path |
+| ElementScalePacked | `Array<float_ue8m0_t, 8>` | `__nv_bfloat16` (SFA) |
 | Epilogue alpha | `1` (no per-group scaling) | `0` (uses `alpha_ptr_array`) |
 | Ntile | 64 | 128 |
-| Ktile | 128 | 128 × PackedScalesNum / sizeof(T) |
+| Ktile | 256 | 128 × PackedScalesNum / sizeof(T) |
 
 ### 3.3 Mainloop Modifications
 
-The CUTLASS collective mainloop (`sm90_mma_array_tma_gmma_rs_warpspecialized_mixed_input_.hpp`) was updated to use a type-dependent group size:
+The TRT-LLM-aligned CUTLASS collective mainloop keeps MXFP4's logical group size at 32:
 
 ```cpp
 static constexpr bool IsMXFP4 = cute::is_same_v<ElementA, cutlass::float_e2m1_t>;
 static constexpr int ScalingGroupSize = IsMXFP4 ? detail::mxfp4_group_size : detail::int4_group_size;
 ```
 
-This affects `scale_k = K / ScalingGroupSize`, `NumMMAsPerChunk`, and `NumChunksPerTileK` calculations throughout the mainloop.
+This affects `scale_k = K / ScalingGroupSize`, `NumMMAsPerChunk`, and `NumChunksPerTileK` calculations throughout the mainloop. ORT now follows the TRT-LLM behavior above for W4A16 MXFP4.
 
 ---
 
@@ -196,7 +261,11 @@ Weight type set to `kFP4` for tactic profiling, which triggers the mixed-input d
 
 ### 5.4 PrePack
 
-FP4 block scales and global scales are simply copied to GPU memory. No transpose or bias computation needed (FP4 is symmetric quantization).
+FP4 global scales are copied to GPU memory. FP4 block scales are repacked from
+the ONNX input layout `[E, N, K/32]` into the TRT-LLM-style interleaved layout
+used by the SM90 mixed-input TMA kernel: N rows padded to 128, scale columns
+padded to 4, then swizzled as one-byte UE8M0 scale elements. No zero-point or
+bias computation is needed because MXFP4 is symmetric quantization.
 
 ---
 
@@ -337,16 +406,19 @@ Created `onnxruntime/test/python/transformers/test_qmoe_fp4_cuda.py`.
 - `TestQMoEFP4`: End-to-end parity tests (ORT vs dequant-then-matmul reference)
 - `TestFP4PackingUtility`: Unit tests for packing, quantization, ue8m0 encoding
 
-### 8.3 Phase 7: Verification & Smoke Test — ❌ Not Started
+### 8.3 Phase 7: Verification & Smoke Test — 🔄 In Progress
 
-| # | Test | Method |
-|---|------|--------|
-| 1 | Build compiles | CUDA 12.8+ with SM90/SM100 targets, plus a non-FP4 CUDA build to validate guards |
-| 2 | FP4 FP16 correctness | Dequant-then-matmul reference, atol ~1e-2 |
-| 3 | FP4 BF16 correctness | Same with BF16 dtype |
-| 4 | INT4/INT8 regression | Existing `test_qmoe_cuda.py` unchanged |
-| 5 | GPT-OSS smoke test | hidden=2880, top_k=4, experts=128, block_size=32 |
-| 6 | Architecture/build guard | FP4 path raises a clear error on SM < 90 or when `ENABLE_FP4` is not defined |
+The CUDA provider build has passed with the native generated FP4 launchers
+enabled. Runtime verification remains open.
+
+| # | Test | Method | Status |
+|---|------|--------|--------|
+| 1 | Build compiles | CUDA 12.8+ with SM90/SM100 targets | ✅ CUDA 13.0 SM90-target build passed |
+| 2 | FP4 FP16 correctness | Dequant-then-matmul reference, atol ~1e-1 | 🔄 Pending |
+| 3 | FP4 BF16 correctness | Same with BF16 dtype | 🔄 Pending |
+| 4 | INT4/INT8 regression | Existing `test_qmoe_cuda.py` unchanged | 🔄 Pending |
+| 5 | GPT-OSS smoke test | hidden=2880, top_k=4, experts=128, block_size=32 | 🔄 Pending |
+| 6 | Architecture/build guard | FP4 path raises a clear error on SM < 90 or when `ENABLE_FP4` is not defined | 🔄 Pending |
 
 ---
 

@@ -81,8 +81,68 @@ namespace cutlass::gemm::collective::detail {
 
 using namespace cute;
 
+using __nv_fp4x8_storage_t = uint32_t;
+using __nv_fp8x4_storage_t = uint32_t;
+using __nv_bf16x2_storage_t = uint32_t;
+using __nv_bf16x8_storage_t = cutlass::uint128_t;
+
 constexpr int int4_group_size = 128;
 constexpr int mxfp4_group_size = 32;
+
+inline __device__ unsigned prmt(unsigned hi, unsigned lo, unsigned select_code) {
+  unsigned result = 0;
+  asm volatile(
+      "{\n"
+      "  prmt.b32 %0, %1, %2, %3;\n"
+      "}\n"
+      : "=r"(result)
+      : "r"(lo), "r"(hi), "r"(select_code));
+  return result;
+}
+
+__device__ __inline__ __nv_fp8x4_storage_t cvt_lut_bf16(unsigned const index) {
+  const __nv_fp8x4_storage_t h4b_lut = 0x03020100U;
+  const __nv_fp8x4_storage_t l4b_lut = 0xFFFEFC00U;
+  return prmt(h4b_lut, l4b_lut, index);
+}
+
+__device__ __inline__ __nv_bf16x8_storage_t psx_cvt_lut_prmt_fp4x8_to_bf16x8(
+    const __nv_fp4x8_storage_t fp4x8) {
+  __nv_bf16x8_storage_t bf16x8_raw = {0, 0};
+  __nv_bf16x2_storage_t* bf16x2_raw = reinterpret_cast<__nv_bf16x2_storage_t*>(&bf16x8_raw);
+
+  unsigned zero_padding = 0x00000000U;
+  unsigned h4b_em_fp4x4 = (fp4x8 & 0x77770000U) >> 16U;
+  unsigned l4b_em_fp4x4 = (fp4x8 & 0x00007777U);
+
+  __nv_fp8x4_storage_t h4b_2to9_bits = cvt_lut_bf16(h4b_em_fp4x4);
+  __nv_fp8x4_storage_t l4b_2to9_bits = cvt_lut_bf16(l4b_em_fp4x4);
+
+  bf16x2_raw[0] = prmt(zero_padding, l4b_2to9_bits, 0x1707U) >> 2U;
+  bf16x2_raw[1] = prmt(zero_padding, l4b_2to9_bits, 0x3727U) >> 2U;
+  bf16x2_raw[2] = prmt(h4b_2to9_bits, zero_padding, 0x5040U) >> 2U;
+  bf16x2_raw[3] = prmt(h4b_2to9_bits, zero_padding, 0x7060U) >> 2U;
+
+  __nv_bf16x2_storage_t bf16x2_0to1_bits;
+
+  __nv_fp8x4_storage_t h_fp8x2_0to1_bits = (fp4x8 & 0x0000C0C0U);
+  __nv_fp8x4_storage_t l_fp8x2_0to1_bits = (fp4x8 & 0x00000C0CU) << 4U;
+
+  bf16x2_0to1_bits = prmt(h_fp8x2_0to1_bits, l_fp8x2_0to1_bits, 0x4707U);
+  bf16x2_raw[0] = bf16x2_raw[0] | bf16x2_0to1_bits;
+  bf16x2_0to1_bits = prmt(h_fp8x2_0to1_bits, l_fp8x2_0to1_bits, 0x5717U);
+  bf16x2_raw[1] = bf16x2_raw[1] | bf16x2_0to1_bits;
+
+  h_fp8x2_0to1_bits = (fp4x8 & 0xC0C00000U);
+  l_fp8x2_0to1_bits = (fp4x8 & 0x0C0C0000U) << 4U;
+
+  bf16x2_0to1_bits = prmt(h_fp8x2_0to1_bits, l_fp8x2_0to1_bits, 0x6020U);
+  bf16x2_raw[2] = bf16x2_raw[2] | bf16x2_0to1_bits;
+  bf16x2_0to1_bits = prmt(h_fp8x2_0to1_bits, l_fp8x2_0to1_bits, 0x7030U);
+  bf16x2_raw[3] = bf16x2_raw[3] | bf16x2_0to1_bits;
+
+  return bf16x8_raw;
+}
 
 template <class Collective>
 struct MixedGroupedGemmInputUtils {
@@ -102,6 +162,7 @@ struct MixedGroupedGemmInputUtils {
   static constexpr auto KernelConversionMode = Collective::KernelConversionMode;
   static constexpr auto ModeHasScales = Collective::ModeHasScales;
   static constexpr auto UseScaleLookupTable = Collective::UseScaleLookupTable;
+  static constexpr auto UseFP4ToBF16LookupTable = Collective::UseFP4ToBF16LookupTable;
 
  public:
   static constexpr auto elements_per_smem_scale() {
@@ -314,6 +375,7 @@ struct MixedGroupedGemmInputUtils {
         for (int i = 0; i < size(scales_neg_vm_.layout()); ++i) {
           auto&& scale_neg_ = reinterpret_cast<cutlass::Array<uint32_t, 2> const&>(scales_neg_vm_(i));
           auto&& scale_pos_ = reinterpret_cast<cutlass::Array<uint32_t, 2>&>(scales_pos_vm_(i));
+
           constexpr uint32_t immLut = (0xf0 & 0xcc) ^ 0xaa;
           asm volatile(
               "{\n"
@@ -389,6 +451,20 @@ struct MixedGroupedGemmInputUtils {
     }
   }
 
+  template <class EngineIn, class LayoutIn, class EngineOut, class LayoutOut>
+  CUTLASS_DEVICE static void fp4tobf16_lookup_table_convert(
+      Tensor<EngineIn, LayoutIn> const& src, Tensor<EngineOut, LayoutOut>&& dst) {
+    fp4tobf16_lookup_table_convert(src, dst);
+  }
+
+  template <class EngineIn, class LayoutIn, class EngineOut, class LayoutOut>
+  CUTLASS_DEVICE static void fp4tobf16_lookup_table_convert(
+      Tensor<EngineIn, LayoutIn> const& src, Tensor<EngineOut, LayoutOut>& dst) {
+    auto&& src_reg = cute::recast<__nv_fp4x8_storage_t>(src)(0);
+    auto&& dst_reg = cute::recast<__nv_bf16x8_storage_t>(dst)(0);
+    dst_reg = psx_cvt_lut_prmt_fp4x8_to_bf16x8(src_reg);
+  }
+
   template <class EngineIn, class EngineOut, class LayoutIn, class LayoutOut, class... Ts>
   CUTLASS_DEVICE static void convert_A_kblock(
       Tensor<EngineIn, LayoutIn> const& tCrA_load, Tensor<EngineOut, LayoutOut>& tCrA_mma, int const k_block) {
@@ -413,7 +489,11 @@ struct MixedGroupedGemmInputUtils {
     // KernelConversionMode == ConversionMode::DirectConvert
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size<1>(dst_vm); ++i) {
-      OrtLayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
+      if constexpr (UseFP4ToBF16LookupTable) {
+        fp4tobf16_lookup_table_convert(src_vm(_, i), dst_vm(_, i));
+      } else {
+        OrtLayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
+      }
     }
   }
 
@@ -466,9 +546,10 @@ struct MixedGroupedGemmInputUtils {
       Tensor sS = make_tensor(
           make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScale{});  // (BLK_M,BLK_SCALE_K,PIPE)
       Tensor tCsS = mma_thread_slice.partition_A(sS);
-      Tensor tCrS = make_tensor<ElementScale>(mma_thread_slice.partition_fragment_A(sS(_, _, Int<0>{})).layout());
+      Tensor tCrS_neg = make_tensor<ElementScale>(mma_thread_slice.partition_fragment_A(sS(_, _, Int<0>{})).layout());
+      Tensor tCrS_pos = make_tensor<ElementScale>(mma_thread_slice.partition_fragment_A(sS(_, _, Int<0>{})).layout());
 
-      return cute::make_tuple(tCsS, tCrS);
+      return cute::make_tuple(tCsS, tCrS_neg, tCrS_pos);
     } else if constexpr (ModeHasScales) {
       Tensor sS = make_tensor(
           make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScale{});  // (BLK_M,BLK_SCALE_K,PIPE)

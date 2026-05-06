@@ -4,6 +4,7 @@
 #include "contrib_ops/cuda/llm/moe_gemm/moe_kernels.h"
 #include <cuda_bf16.h>
 #include <cub/cub.cuh>
+#include <algorithm>
 #include <limits>
 
 namespace onnxruntime {
@@ -513,6 +514,137 @@ void LaunchQMoETranspose2D(
   dim3 block(32, 32);
   dim3 grid((cols + block.x - 1) / block.x, (rows + block.y - 1) / block.y, batch_size);
   QMoETranspose2DKernel<uint8_t><<<grid, block, 0, stream>>>(input, output, rows * cols, rows, cols);
+}
+
+__device__ __forceinline__ int64_t QMoEBlockScaleInterleaveOffset(
+    int batch, int row, int col, int rows_padded, int cols_padded) {
+  int64_t num_k_tiles = (cols_padded + 3) / 4;
+  int64_t m_tile_idx = row / 128;
+  int64_t k_tile_idx = col / 4;
+  int64_t tile_offset = ((m_tile_idx * num_k_tiles) + k_tile_idx) * 512;
+  int64_t intra_tile_offset = (row % 32) * 16 + ((row % 128) / 32) * 4 + (col % 4);
+  int64_t batch_stride = ((rows_padded + 127) / 128) * num_k_tiles * 512;
+  return static_cast<int64_t>(batch) * batch_stride + tile_offset + intra_tile_offset;
+}
+
+__global__ void QMoEBlockScaleInterleaveKernel(
+    const uint8_t* input,
+    uint8_t* output,
+    int batch_size,
+    int rows,
+    int cols,
+    int rows_padded,
+    int cols_padded) {
+  for (int row = blockIdx.x; row < rows_padded; row += gridDim.x) {
+    for (int batch = 0; batch < batch_size; ++batch) {
+      for (int col = threadIdx.x; col < cols_padded; col += blockDim.x) {
+        uint8_t scale = 0;
+        if (row < rows && col < cols) {
+          scale = input[static_cast<int64_t>(batch) * rows * cols + row * cols + col];
+        }
+        output[QMoEBlockScaleInterleaveOffset(batch, row, col, rows_padded, cols_padded)] = scale;
+      }
+    }
+  }
+}
+
+void LaunchQMoEBlockScaleInterleave(
+    const uint8_t* input,
+    uint8_t* output,
+    int batch_size,
+    int rows,
+    int cols,
+    int rows_padded,
+    int cols_padded,
+    int multi_processor_count,
+    cudaStream_t stream) {
+  dim3 block(std::min(cols_padded, 1024));
+  int num_blocks_per_sm = std::max(1, 4096 / static_cast<int>(block.x));
+  dim3 grid(std::min(rows_padded, multi_processor_count * num_blocks_per_sm));
+  QMoEBlockScaleInterleaveKernel<<<grid, block, 0, stream>>>(
+      input, output, batch_size, rows, cols, rows_padded, cols_padded);
+}
+
+__device__ __forceinline__ float DecodeFp4E2M1(uint8_t code) {
+  constexpr float kValues[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+  float value = kValues[code & 0x7];
+  return (code & 0x8) ? -value : value;
+}
+
+__device__ __forceinline__ float DecodeUE8M0(uint8_t code) {
+  return code == 0 ? 0.0f : exp2f(static_cast<int>(code) - 127);
+}
+
+template <typename T>
+__global__ void QMoEDequantizeFp4WeightsKernel(
+    const uint8_t* packed_weights,
+    const uint8_t* block_scales,
+    const float* global_scales,
+    T* output,
+    int num_experts,
+    int n,
+    int k) {
+  int64_t total = static_cast<int64_t>(num_experts) * n * k;
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= total) {
+    return;
+  }
+
+  int64_t expert_stride = static_cast<int64_t>(n) * k;
+  int expert = static_cast<int>(index / expert_stride);
+  int64_t offset = index - static_cast<int64_t>(expert) * expert_stride;
+  int row = static_cast<int>(offset / k);
+  int col = static_cast<int>(offset - static_cast<int64_t>(row) * k);
+
+  int packed_n = n / 2;
+  uint8_t packed = packed_weights[(static_cast<int64_t>(expert) * k + col) * packed_n + row / 2];
+  uint8_t fp4_code = (row & 1) == 0 ? (packed & 0x0F) : (packed >> 4);
+
+  int scale_k = k / 32;
+  uint8_t scale_code = block_scales[(static_cast<int64_t>(expert) * n + row) * scale_k + col / 32];
+  float value = DecodeFp4E2M1(fp4_code) * DecodeUE8M0(scale_code) * global_scales[expert];
+  output[index] = static_cast<T>(value);
+}
+
+template <typename T>
+void LaunchQMoEDequantizeFp4WeightsImpl(
+    const uint8_t* packed_weights,
+    const uint8_t* block_scales,
+    const float* global_scales,
+    T* output,
+    int num_experts,
+    int n,
+    int k,
+    cudaStream_t stream) {
+  int64_t total = static_cast<int64_t>(num_experts) * n * k;
+  constexpr int block = 256;
+  int grid = static_cast<int>((total + block - 1) / block);
+  QMoEDequantizeFp4WeightsKernel<<<grid, block, 0, stream>>>(
+      packed_weights, block_scales, global_scales, output, num_experts, n, k);
+}
+
+void LaunchQMoEDequantizeFp4Weights(
+    const uint8_t* packed_weights,
+    const uint8_t* block_scales,
+    const float* global_scales,
+    half* output,
+    int num_experts,
+    int n,
+    int k,
+    cudaStream_t stream) {
+  LaunchQMoEDequantizeFp4WeightsImpl(packed_weights, block_scales, global_scales, output, num_experts, n, k, stream);
+}
+
+void LaunchQMoEDequantizeFp4Weights(
+    const uint8_t* packed_weights,
+    const uint8_t* block_scales,
+    const float* global_scales,
+    __nv_bfloat16* output,
+    int num_experts,
+    int n,
+    int k,
+    cudaStream_t stream) {
+  LaunchQMoEDequantizeFp4WeightsImpl(packed_weights, block_scales, global_scales, output, num_experts, n, k, stream);
 }
 
 }  // namespace cuda

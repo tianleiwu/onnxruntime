@@ -176,6 +176,37 @@ void LaunchQMoETranspose2D(
     int cols,
     cudaStream_t stream);
 
+void LaunchQMoEBlockScaleInterleave(
+    const uint8_t* input,
+    uint8_t* output,
+    int batch_size,
+    int rows,
+    int cols,
+    int rows_padded,
+    int cols_padded,
+    int multi_processor_count,
+    cudaStream_t stream);
+
+void LaunchQMoEDequantizeFp4Weights(
+    const uint8_t* packed_weights,
+    const uint8_t* block_scales,
+    const float* global_scales,
+    half* output,
+    int num_experts,
+    int n,
+    int k,
+    cudaStream_t stream);
+
+void LaunchQMoEDequantizeFp4Weights(
+    const uint8_t* packed_weights,
+    const uint8_t* block_scales,
+    const float* global_scales,
+    __nv_bfloat16* output,
+    int num_experts,
+    int n,
+    int k,
+    cudaStream_t stream);
+
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime

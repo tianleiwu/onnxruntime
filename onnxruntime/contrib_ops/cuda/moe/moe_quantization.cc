@@ -76,11 +76,12 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
 #if defined(ENABLE_FP4)
   if (quant_type_ == "fp4") {
     ORT_ENFORCE(expert_weight_bits_ == 4, "FP4 quantization requires expert_weight_bits=4");
+    use_fp4_dequant_fallback_ = true;
     if (is_fp16) {
-      m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, __nv_fp4_e2m1, half>>(
+      m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, half, half>>(
           sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
     } else {  // BFloat16
-      m_moe_runner = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, __nv_fp4_e2m1, __nv_bfloat16>>(
+      m_moe_runner = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16>>(
           sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
     }
   } else
@@ -207,7 +208,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
     // Weight type: FP4 for MXFP4, INT4 for 4-bit integer, INT8 for 8-bit integer
     onnxruntime::llm::nvinfer::DataType wtype;
     if (is_fp4) {
-      wtype = onnxruntime::llm::nvinfer::DataType::kFP4;
+      wtype = use_fp4_dequant_fallback_ ? dtype : onnxruntime::llm::nvinfer::DataType::kFP4;
     } else {
       wtype = (expert_weight_bits_ == 4) ? onnxruntime::llm::nvinfer::DataType::kINT4
                                          : onnxruntime::llm::nvinfer::DataType::kINT8;
@@ -519,14 +520,16 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
                                                                   : (fp4_fc2_block_scales ? fp4_fc2_block_scales->DataRaw() : nullptr);
     const void* p_fc2_global_scale = packed_fp4_fc2_global_scale_ ? packed_fp4_fc2_global_scale_.get()
                                                                   : (fp4_fc2_global_scale ? fp4_fc2_global_scale->DataRaw() : nullptr);
-    using NVFP4ElementSF = onnxruntime::llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF;
-    quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::FP4(
+    if (!use_fp4_dequant_fallback_) {
+      using NVFP4ElementSF = onnxruntime::llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF;
+      quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::FP4(
         nullptr,  // fc1_act_global_scale (no activation quantization for W4A16)
         static_cast<const NVFP4ElementSF*>(p_fc1_block_scales),
         static_cast<const float*>(p_fc1_global_scale),
         nullptr,  // fc2_act_global_scale
         static_cast<const NVFP4ElementSF*>(p_fc2_block_scales),
         static_cast<const float*>(p_fc2_global_scale));
+    }
   } else if (block_size_ > 0) {
     quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::GroupWise(
         block_size_,
@@ -545,15 +548,67 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
 
   Tensor* output = context->Output(0, input->Shape());
 
+  const void* fc1_weight_data = fc1_experts_weights->DataRaw();
+  const void* fc2_weight_data = fc2_experts_weights->DataRaw();
+  IAllocatorUniquePtr<void> dequant_fc1_weights;
+  IAllocatorUniquePtr<void> dequant_fc2_weights;
+  if (is_fp4 && use_fp4_dequant_fallback_) {
+    const void* p_fc1_block_scales = packed_fp4_fc1_block_scales_ ? packed_fp4_fc1_block_scales_.get()
+                                                                  : (fp4_fc1_block_scales ? fp4_fc1_block_scales->DataRaw() : nullptr);
+    const void* p_fc1_global_scale = packed_fp4_fc1_global_scale_ ? packed_fp4_fc1_global_scale_.get()
+                                                                  : (fp4_fc1_global_scale ? fp4_fc1_global_scale->DataRaw() : nullptr);
+    const void* p_fc2_block_scales = packed_fp4_fc2_block_scales_ ? packed_fp4_fc2_block_scales_.get()
+                                                                  : (fp4_fc2_block_scales ? fp4_fc2_block_scales->DataRaw() : nullptr);
+    const void* p_fc2_global_scale = packed_fp4_fc2_global_scale_ ? packed_fp4_fc2_global_scale_.get()
+                                                                  : (fp4_fc2_global_scale ? fp4_fc2_global_scale->DataRaw() : nullptr);
+    ORT_RETURN_IF_NOT(p_fc1_block_scales && p_fc1_global_scale && p_fc2_block_scales && p_fc2_global_scale,
+                      "QMoE FP4 dequant fallback requires block and global scales for fc1 and fc2.");
+
+    AllocatorPtr allocator;
+    ORT_RETURN_IF_ERROR(context->GetTempSpaceAllocator(&allocator));
+    int fc1_n = static_cast<int>(is_fused_swiglu ? moe_params.inter_size * 2 : moe_params.inter_size);
+    int fc1_k = static_cast<int>(moe_params.hidden_size);
+    int fc2_n = static_cast<int>(moe_params.hidden_size);
+    int fc2_k = static_cast<int>(moe_params.inter_size);
+    int num_experts = static_cast<int>(moe_params.num_experts);
+    size_t element_size = is_fp16_ ? sizeof(half) : sizeof(__nv_bfloat16);
+    size_t fc1_bytes = SafeInt<size_t>(num_experts) * fc1_n * fc1_k * element_size;
+    size_t fc2_bytes = SafeInt<size_t>(num_experts) * fc2_n * fc2_k * element_size;
+    dequant_fc1_weights = IAllocator::MakeUniquePtr<void>(allocator, fc1_bytes, false, GetComputeStream(context));
+    dequant_fc2_weights = IAllocator::MakeUniquePtr<void>(allocator, fc2_bytes, false, GetComputeStream(context));
+
+    if (is_fp16_) {
+      LaunchQMoEDequantizeFp4Weights(static_cast<const uint8_t*>(fc1_experts_weights->DataRaw()),
+                                     static_cast<const uint8_t*>(p_fc1_block_scales),
+                                     static_cast<const float*>(p_fc1_global_scale),
+                                     static_cast<half*>(dequant_fc1_weights.get()), num_experts, fc1_n, fc1_k, stream);
+      LaunchQMoEDequantizeFp4Weights(static_cast<const uint8_t*>(fc2_experts_weights->DataRaw()),
+                                     static_cast<const uint8_t*>(p_fc2_block_scales),
+                                     static_cast<const float*>(p_fc2_global_scale),
+                                     static_cast<half*>(dequant_fc2_weights.get()), num_experts, fc2_n, fc2_k, stream);
+    } else {
+      LaunchQMoEDequantizeFp4Weights(static_cast<const uint8_t*>(fc1_experts_weights->DataRaw()),
+                                     static_cast<const uint8_t*>(p_fc1_block_scales),
+                                     static_cast<const float*>(p_fc1_global_scale),
+                                     static_cast<__nv_bfloat16*>(dequant_fc1_weights.get()), num_experts, fc1_n, fc1_k, stream);
+      LaunchQMoEDequantizeFp4Weights(static_cast<const uint8_t*>(fc2_experts_weights->DataRaw()),
+                                     static_cast<const uint8_t*>(p_fc2_block_scales),
+                                     static_cast<const float*>(p_fc2_global_scale),
+                                     static_cast<__nv_bfloat16*>(dequant_fc2_weights.get()), num_experts, fc2_n, fc2_k, stream);
+    }
+    fc1_weight_data = dequant_fc1_weights.get();
+    fc2_weight_data = dequant_fc2_weights.get();
+  }
+
   m_moe_runner->runMoe(
       input->DataRaw(),
       nullptr,
       expert_indices,
       expert_scales,
-      fc1_experts_weights->DataRaw(),
+      fc1_weight_data,
       fc1_experts_bias_optional ? fc1_experts_bias_optional->DataRaw() : nullptr,
       activation_type_,
-      fc2_experts_weights->DataRaw(),
+      fc2_weight_data,
       fc2_experts_bias_optional ? fc2_experts_bias_optional->DataRaw() : nullptr,
       quant_params,
       moe_params.num_rows,
@@ -810,7 +865,7 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
     compute_bias(packed_fc2_scales_, packed_fc2_bias_);
     DUMP_PACK_TENSOR("packed_fc2_bias", packed_fc2_bias_, tensor);
   } else if (input_idx >= 15 && input_idx <= 20 && quant_type_ == "fp4") {
-    // FP4 block scales and global scales: simple GPU copy
+    // FP4 block scales and global scales.
     auto CopyToGpu = [&](IAllocatorUniquePtr<void>& packed_buf) {
       size_t bytes = tensor.SizeInBytes();
       packed_buf = IAllocator::MakeUniquePtr<void>(alloc, bytes, true);
