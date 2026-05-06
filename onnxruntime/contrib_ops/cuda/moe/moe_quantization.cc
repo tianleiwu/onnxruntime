@@ -81,14 +81,31 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
       use_fp4_dequant_fallback_ = true;
     } else {
       ORT_ENFORCE(expert_weight_bits_ == 8, "FP8 quantization requires expert_weight_bits=8");
-      use_fp8_dequant_fallback_ = true;
+      // Use native W8A16-FP8 on SM90+ (Hopper/H200), fallback to dequant on older GPUs
+      if (sm_ >= 90) {
+        use_fp8_dequant_fallback_ = false;
+      } else {
+        use_fp8_dequant_fallback_ = true;
+      }
     }
-    if (is_fp16) {
-      m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, half, half>>(
-          sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
-    } else {  // BFloat16
-      m_moe_runner = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16>>(
-          sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
+    if (quant_type_ == "fp8" && !use_fp8_dequant_fallback_) {
+      // Native W8A16-FP8: activations are half/bf16, weights are __nv_fp8_e4m3
+      if (is_fp16) {
+        m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, __nv_fp8_e4m3, half>>(
+            sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
+      } else {
+        m_moe_runner = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, __nv_fp8_e4m3, __nv_bfloat16>>(
+            sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
+      }
+    } else {
+      // FP4 dequant fallback or FP8 dequant fallback: use A16 runner
+      if (is_fp16) {
+        m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, half, half>>(
+            sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
+      } else {  // BFloat16
+        m_moe_runner = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16>>(
+            sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
+      }
     }
   } else {
     // Integer quantization (INT4/INT8)
@@ -621,6 +638,21 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
           static_cast<const NVFP4ElementSF*>(p_fc2_block_scales),
           static_cast<const float*>(p_fc2_global_scale));
     }
+  } else if (is_fp8 && !use_fp8_dequant_fallback_) {
+    // Native W8A16-FP8: per-expert global scale applied via alpha_scale_ptr_array in the epilogue.
+    const void* p_fc1_global_scale = packed_fc1_global_scale_ ? packed_fc1_global_scale_.get()
+                                                              : (fc1_global_scale ? fc1_global_scale->DataRaw() : nullptr);
+    const void* p_fc2_global_scale = packed_fc2_global_scale_ ? packed_fc2_global_scale_.get()
+                                                              : (fc2_global_scale ? fc2_global_scale->DataRaw() : nullptr);
+    ORT_RETURN_IF_NOT(p_fc1_global_scale && p_fc2_global_scale,
+                      "QMoE native W8A16-FP8 requires fc1_global_scale and fc2_global_scale.");
+    quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::FP8(
+        static_cast<const float*>(p_fc1_global_scale),  // dequant_fc1 = per-expert weight global scale
+        nullptr,                                        // quant_fc2 (not used for W8A16)
+        static_cast<const float*>(p_fc2_global_scale),  // dequant_fc2 = per-expert weight global scale
+        nullptr,                                        // quant_final
+        nullptr,                                        // dequant_input
+        false);                                         // fc2_use_per_expert_act_scale
   } else if (block_size_ > 0) {
     quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::GroupWise(
         block_size_,

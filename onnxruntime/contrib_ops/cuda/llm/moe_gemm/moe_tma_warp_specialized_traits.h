@@ -69,6 +69,12 @@ constexpr bool isValidHopperMOESpecialisation() {
   return (cutlass::platform::is_same<T, WeightType>::value ||
           (cutlass::platform::is_same<cutlass::uint4b_t, WeightType>::value &&
            cutlass::platform::is_same<T, __nv_fp8_e4m3>::value)
+#ifdef ENABLE_FP8
+          // W8A16-FP8: half/bf16 activations with FP8 e4m3 weights
+          || (cutlass::platform::is_same<__nv_fp8_e4m3, WeightType>::value &&
+              !cutlass::platform::is_same<T, __nv_fp8_e4m3>::value &&
+              !cutlass::platform::is_same<T, __nv_fp8_e5m2>::value)
+#endif
 #ifdef ENABLE_FP4
           || (cutlass::platform::is_same<__nv_fp4_e2m1, WeightType>::value &&
               !cutlass::platform::is_same<T, __nv_fp8_e4m3>::value)
@@ -94,7 +100,14 @@ constexpr bool isValidTmaWarpSpecializedMOESpecialisation() {
 template <typename T, typename WeightType, typename EpilogueTag = cutlass_extensions::EpilogueOpDefault,
           TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
 constexpr bool isValidAmpereMOESpecialisation() {
-#ifdef ENABLE_FP4
+#if defined(ENABLE_FP8) && defined(ENABLE_FP4)
+  // W8A16-FP8 (FP8 weights with non-FP8 activations) is SM90-only, not valid for Ampere.
+  constexpr bool is_wfp8a16 = std::is_same_v<WeightType, __nv_fp8_e4m3> && !std::is_same_v<T, __nv_fp8_e4m3> && !std::is_same_v<T, __nv_fp8_e5m2>;
+  return !std::is_same_v<T, __nv_fp4_e2m1> && !std::is_same_v<WeightType, __nv_fp4_e2m1> && !is_wfp8a16;
+#elif defined(ENABLE_FP8)
+  constexpr bool is_wfp8a16 = std::is_same_v<WeightType, __nv_fp8_e4m3> && !std::is_same_v<T, __nv_fp8_e4m3> && !std::is_same_v<T, __nv_fp8_e5m2>;
+  return !is_wfp8a16;
+#elif defined(ENABLE_FP4)
   return !std::is_same_v<T, __nv_fp4_e2m1> && !std::is_same_v<WeightType, __nv_fp4_e2m1>;
 #else
   return true;  // Default to true

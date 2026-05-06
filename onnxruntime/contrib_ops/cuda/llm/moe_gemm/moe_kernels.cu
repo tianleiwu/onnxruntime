@@ -2101,6 +2101,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     if (use_w4afp8) {
       alpha_scale_ptr_array = computeFP8DequantScale(
           alpha_scale_ptr_array, num_experts_per_node, quant_params.groupwise.fc1.alpha, stream);
+    } else if constexpr (use_wfp8a16) {
+      // W8A16-FP8: apply per-expert global scale via alpha in the epilogue
+      alpha_scale_ptr_array = computeFP8DequantScale(
+          alpha_scale_ptr_array, num_experts_per_node, quant_params.fp8.dequant_fc1, stream);
     }
 
     auto universal_input = GroupedGemmInput<T, WeightType, OutputType, OutputType>{input, total_tokens_including_expert,
@@ -2261,6 +2265,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
   if (use_w4afp8) {
     alpha_scale_ptr_array = computeFP8DequantScale(
         alpha_scale_ptr_array, num_experts_per_node, quant_params.groupwise.fc2.alpha, stream);
+  } else if constexpr (use_wfp8a16) {
+    // W8A16-FP8: apply per-expert fc2 global scale via alpha in the epilogue
+    alpha_scale_ptr_array = computeFP8DequantScale(
+        alpha_scale_ptr_array, num_experts_per_node, fc2_fp8_dequant, stream);
   }
 
   ActivationParameters activation_params;  // Here assume gemm2 has no activation
@@ -2391,9 +2399,13 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
   } else if (fp8_scales_required) {
     ORT_ENFORCE(
         fc1_fp8_dequant != nullptr, "FP8 scales expected but dequant scale for FC1 is a null pointer");
-    ORT_ENFORCE(fc2_fp8_quant != nullptr, "FP8 scales expected but quant scale for FC2 is a null pointer");
+    if constexpr (!use_wfp8a16) {
+      // Pure FP8 (T == WeightType == FP8) needs quant_fc2 to quantize intermediate activations.
+      // W8A16-FP8 does NOT need quant_fc2 since activations stay in FP16/BF16.
+      ORT_ENFORCE(fc2_fp8_quant != nullptr, "FP8 scales expected but quant scale for FC2 is a null pointer");
+    }
     ORT_ENFORCE(
-        fc2_fp8_dequant != nullptr, "FP8 scales expected but quant scale for FC2 is a null pointer");
+        fc2_fp8_dequant != nullptr, "FP8 scales expected but dequant scale for FC2 is a null pointer");
 
     ORT_ENFORCE(
         fc1_int_scales == nullptr && fc2_int_scales == nullptr, "Integer scales are provided for FP8 quantization");
@@ -3332,6 +3344,14 @@ template class CutlassMoeFCRunner<half, cutlass::uint4b_t>;
 template class CutlassMoeFCRunner<half, __nv_fp4_e2m1>;
 #ifdef ENABLE_BF16
 template class CutlassMoeFCRunner<__nv_bfloat16, __nv_fp4_e2m1>;
+#endif
+#endif
+
+#ifdef ENABLE_FP8
+// W8A16-FP8: FP8 e4m3 weights with FP16/BF16 activations (native SM90)
+template class CutlassMoeFCRunner<half, __nv_fp8_e4m3>;
+#ifdef ENABLE_BF16
+template class CutlassMoeFCRunner<__nv_bfloat16, __nv_fp8_e4m3>;
 #endif
 #endif
 

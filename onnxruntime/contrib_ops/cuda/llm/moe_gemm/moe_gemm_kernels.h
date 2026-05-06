@@ -262,9 +262,16 @@ class MoeGemmRunner {
 #endif
       ;
   static constexpr bool use_w4afp8 = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, cutlass::uint4b_t>;
+  // W8A16-FP8: FP8 e4m3 weights with FP16/BF16 activations (native SM90 mixed-type GEMM)
+#if defined(ENABLE_BF16)
+  static constexpr bool use_wfp8a16 = std::is_same_v<WeightType, __nv_fp8_e4m3> && (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>);
+#else
+  static constexpr bool use_wfp8a16 = std::is_same_v<WeightType, __nv_fp8_e4m3> && std::is_same_v<T, half>;
+#endif
 #else
   static constexpr bool use_fp8 = false;
   static constexpr bool use_w4afp8 = false;
+  static constexpr bool use_wfp8a16 = false;
   static constexpr bool use_wfp4afp4 = false;
 #endif
 

@@ -336,11 +336,18 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 #if defined(ENABLE_FP8)
   static constexpr bool use_fp8 = (std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>) && !std::is_same_v<WeightType, cutlass::uint4b_t>;
   static constexpr bool use_w4afp8 = std::is_same_v<WeightType, cutlass::uint4b_t> && std::is_same_v<T, __nv_fp8_e4m3>;
+  // W8A16-FP8: FP8 e4m3 weights with FP16/BF16 activations
+#if defined(ENABLE_BF16)
+  static constexpr bool use_wfp8a16 = std::is_same_v<WeightType, __nv_fp8_e4m3> && (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>);
+#else
+  static constexpr bool use_wfp8a16 = std::is_same_v<WeightType, __nv_fp8_e4m3> && std::is_same_v<T, half>;
+#endif
   static_assert(!std::is_same_v<BackBoneType, __nv_fp8_e4m3>, "Current logic requires backbone type to be >=16-bits");
   static_assert(!std::is_same_v<OutputType, __nv_fp8_e4m3>, "Current logic requires output type to be >=16-bits");
 #else
   static constexpr bool use_fp8 = false;
   static constexpr bool use_w4afp8 = false;
+  static constexpr bool use_wfp8a16 = false;
 #endif
 #if defined(ENABLE_FP4)
   static constexpr bool act_fp4 = std::is_same_v<T, __nv_fp4_e2m1>;

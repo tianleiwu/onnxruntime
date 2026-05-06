@@ -306,6 +306,16 @@ struct genericMoeGemmKernelLauncher<__nv_bfloat16, __nv_fp8_e4m3, GemmOutputType
   }
 };
 
+// W8A16-FP8: half activations with FP8 weights — SM80 path is not supported, only SM90 TMA WS.
+template <typename GemmOutputType, typename arch, cutlass::WeightOnlyQuantOp QuantOp, typename EpilogueTag,
+          typename ThreadblockShape, typename WarpShape, int Stages>
+struct genericMoeGemmKernelLauncher<half, __nv_fp8_e4m3, GemmOutputType, arch, QuantOp, EpilogueTag,
+                                    ThreadblockShape, WarpShape, Stages> {
+  static void call(
+      GroupedGemmInput<half, __nv_fp8_e4m3, GemmOutputType, GemmOutputType> inputs, int sm_count_) {
+  }
+};
+
 template <typename T, typename WeightType, typename GemmOutputType, typename Arch, typename EpilogueTag,
           typename ThreadblockShape, typename WarpShape, int Stages>
 static void dispatch(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs, int sm_count_) {
@@ -727,6 +737,8 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
           inputs, multi_processor_count_);
     } else if constexpr (use_wfp4a16) {
       ORT_THROW("wfp4a16 (FP4 weights with FP16/BF16 activations) requires SM90+");
+    } else if constexpr (use_wfp8a16) {
+      ORT_THROW("wfp8a16 (FP8 weights with FP16/BF16 activations) requires SM90+");
     } else {
       dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm80, EpilogueTag>(
           inputs, multi_processor_count_);
@@ -741,7 +753,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
       }
     }
 
-    if constexpr (!std::is_same_v<std::decay_t<T>, float> && kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType, EpilogueTag>() && !use_w4afp8 && !use_wfp4a16) {
+    if constexpr (!std::is_same_v<std::decay_t<T>, float> && kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType, EpilogueTag>() && !use_w4afp8 && !use_wfp4a16 && !use_wfp8a16) {
       // We allow both tma warp specialized and SM80 configurations to coexist because for some cases with small
       // numbers of tokens SM80 is faster. We check here to see which is selected
       if (inputs.gemm_config.sm_version >= 90) {
@@ -823,10 +835,37 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
     }
 #endif
 
+#if defined(ENABLE_FP8)
+    // Hopper W8A16 (FP8 weights + FP16/BF16 activations) TMA WS grouped GEMM
+    // Uses the same-type TMA WS path with mixed-precision CollectiveBuilder.
+    // Per-expert global scale is applied via alpha_scale_ptr_array in the epilogue.
+    if constexpr (use_wfp8a16) {
+      ORT_ENFORCE(inputs.gemm_config.is_tma_warp_specialized,
+                  "wfp8a16 is only supported for TMA warp specialization on SM90");
+      // Route through the same-type TMA WS dispatch which handles mixed <half/bf16, fp8_e4m3> via CollectiveBuilder
+      auto select_function = [&]() {
+        switch (hopper_inputs.fusion) {
+          case TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE:
+            return &dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType, OutputType, EpilogueTag,
+                                                                     TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE>;
+          case TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE:
+            return &dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType, OutputType, EpilogueTag,
+                                                                     TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>;
+          default:
+            ORT_THROW("Unimplemented fusion %d requested for wfp8a16", (int)hopper_inputs.fusion);
+        };
+      };
+      auto selected_func = select_function();
+      selected_func(hopper_inputs, inputs.num_experts, inputs.gemm_config, multi_processor_count_,
+                    inputs.stream, inputs.occupancy, nullptr);
+      return;
+    }
+#endif
+
     // Do Ampere case instead
     if constexpr (kernels::cutlass_kernels::isValidAmpereMOESpecialisation<T, WeightType, EpilogueTag>()) {
       ORT_ENFORCE(!use_fp8, "No fallback FP8 implementation available");
-      ORT_ENFORCE(use_w4afp8 || use_wfp4a16 || !hopper_inputs.isValid(),
+      ORT_ENFORCE(use_w4afp8 || use_wfp4a16 || use_wfp8a16 || !hopper_inputs.isValid(),
                   "Non-specialized Hopper implementation is being rerouted to fallback implementation so input "
                   "information is not required");
       ORT_ENFORCE(!inputs.gemm_config.is_tma_warp_specialized,
