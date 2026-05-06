@@ -129,7 +129,7 @@ The MoE/QMoE operators dispatch between two CUTLASS kernel families at runtime, 
 
 | Path | Arch | Condition |
 |------|------|-----------|
-| **TMA Warp-Specialized** (SM90+) | SM90 (Hopper) | `T == WeightType` (fp16×fp16, bf16×bf16) |
+| **TMA Warp-Specialized** (SM90+) | SM90 (Hopper) | `T == WeightType` (fp16×fp16, bf16×bf16), plus W4A16 FP4 dispatch when enabled |
 |  | SM100–119 (Blackwell) | Valid Blackwell MoE specialisation |
 |  | SM120–121 | FP4×FP4 only (`isValidSM120MOESpecialisation`) |
 | **Ampere GemmGrouped** (fallback) | SM80/86/89 | All types |
@@ -162,7 +162,7 @@ The MoE/QMoE operators dispatch between two CUTLASS kernel families at runtime, 
 *   **Row-wise Quantization**: Row-wise quantization (`block_size <= 0`) does not currently support zero points in the QMoE operator.
 *   **Block Size**: Asymmetric zero points are currently supported only when `block_size >= 64`.
 *   **Minimum Dimension**: `hidden_size` and `inter_size` must be ≥ 16. Alignment to 128 bits is enforced separately. See Section 5.1.
-*   **FP4 on SM120**: Only MXFP4×MXFP4 (W4A4) uses TMA WS on SM120. W4A16 FP4 with fp16/bf16 activations falls back to Ampere GemmGrouped on SM120.
+*   **FP4 W4A16 availability**: QMoE FP4 (`quant_type="fp4"`) requires CUDA 12.8+ (`ENABLE_FP4`) and SM90+. The current build excludes the full SM90 mixed-input FP4 launcher and links stub instantiations that throw if the W4A16 path reaches them.
 *   **Float32**: Always forced to SM80 kernel path regardless of actual hardware SM version.
 
 **Weight Conversion**:
@@ -236,11 +236,13 @@ While weight packing is architecture-aware, many architectures share the same la
 
 ## 7. FP4 (MXFP4) Quantization Support
 
-The QMoE operator has been extended to support **MXFP4 quantized weights** (W4A16: FP4 weights + FP16/BF16 activations) via the `quant_type="fp4"` attribute. This uses the mixed-input TMA warp-specialized CUTLASS kernel path on SM90+ with CUDA 12.8+.
+The QMoE operator has been extended to describe **MXFP4 quantized weights** (W4A16: FP4 weights + FP16/BF16 activations) via the `quant_type="fp4"` attribute. The intended execution path is the mixed-input TMA warp-specialized CUTLASS kernel path on SM90+ with CUDA 12.8+.
+
+Current build caveat: the full SM90 mixed-input FP4 launcher (`moe_gemm_tma_ws_sm90_mixed_fp4.generated.cu`) is excluded from the build because it is incompatible with the bundled CUTLASS 4.4.2 mainloop. The build uses `moe_gemm_tma_ws_sm90_mixed_fp4_stub.cu` for link completeness; those stubs throw if reached at runtime.
 
 Key additions:
 - **`quant_type` attribute**: `"int"` (default, backward compatible) or `"fp4"` for MXFP4 mode
-- **New inputs (indices 15–20)**: FP4 block scales (`uint8`, FP8 e4m3 encoded) and per-expert global scales (`float`) for FC1/FC2/FC3
+- **New inputs (indices 15-20)**: FP4 block scales (`uint8`, `float_ue8m0_t`/ue8m0 encoded) and per-expert global scales (`float`) for FC1/FC2/FC3
 - **Template instantiations**: `MoeGemmRunner<half, __nv_fp4_e2m1, half>` and `MoeGemmRunner<__nv_bfloat16, __nv_fp4_e2m1, __nv_bfloat16>`
 - **CUTLASS generalization**: Group size is type-dependent (32 for MXFP4 vs 128 for INT4), scale element type is `float_ue8m0_t` for FP4
 
@@ -323,7 +325,7 @@ The following TRT-LLM features were **removed** as not needed for MoE/QMoE:
 - Deep Gemm, FP4 standalone gemm, FP8 blockscale gemm, fused gated gemm directories
 
 ## 10. Test Status
-As of 2026-04-30 (branch `tlwu/20260429/moe_v10`):
-*   **MoE** (`test_moe_cuda.py`): **59/59 passed** — FP16, BF16 configurations with SiLU/GeLU/SwiGLU.
-*   **QMoE INT** (`test_qmoe_cuda.py`): **56/57 passed** — INT4 and INT8, symmetric and asymmetric. One pre-existing BF16 parity test failure (unrelated to this PR).
-*   **QMoE FP4** (`test_qmoe_fp4_cuda.py`): **4/4 passed**, 11 skipped (SM-gated: require SM90+ with CUDA 12.8).
+As of the current branch (`tlwu/20260503/qmoe_fp4`):
+*   **MoE** (`test_moe_cuda.py`): existing CUDA MoE coverage should be used for FP16/BF16 SiLU/GeLU/SwiGLU regression.
+*   **QMoE INT** (`test_qmoe_cuda.py`): existing INT4/INT8 QMoE coverage should remain the primary regression signal for the production QMoE path.
+*   **QMoE FP4** (`test_qmoe_fp4_cuda.py`): the test file covers MXFP4 quantization utilities, packing, model construction, FP16/BF16, SiLU/SwiGLU, top-k, and expert-count variants. End-to-end runtime execution is not currently available because the SM90 mixed-input FP4 launcher is stubbed; tests that hit an unavailable FP4 build/path skip or raise a clear FP4/launcher error.
