@@ -219,17 +219,15 @@ def create_fp4_moe_onnx_graph(
     fc2_bias=None,
 ):
     """Build ONNX model with QMoE operator in FP4 (MXFP4) mode."""
-    fc1_inter = 2 * inter_size if use_swiglu else inter_size
-
-    # QMoE op has 21 inputs (indices 0-20)
+    # QMoE op uses unified scale inputs: block scales at 3/6, global scales at 15/16.
     inputs = [
         "input",  # 0
         "router_probs",  # 1
         "fc1_weights",  # 2: uint8 packed FP4
-        "fc1_scales_dummy",  # 3: required by schema, unused for FP4
+        "fc1_scales",  # 3: uint8 MXFP4 block scales
         "fc1_bias" if fc1_bias is not None else "",  # 4
         "fc2_weights",  # 5: uint8 packed FP4
-        "fc2_scales_dummy",  # 6: required by schema, unused for FP4
+        "fc2_scales",  # 6: uint8 MXFP4 block scales
         "fc2_bias" if fc2_bias is not None else "",  # 7
         "",  # 8:  fc3_weights
         "",  # 9:  fc3_scales
@@ -238,12 +236,8 @@ def create_fp4_moe_onnx_graph(
         "",  # 12: fc2_zero_points
         "",  # 13: fc3_zero_points
         "",  # 14: router_weights
-        "fp4_fc1_block_scales",  # 15
-        "fp4_fc1_global_scale",  # 16
-        "fp4_fc2_block_scales",  # 17
-        "fp4_fc2_global_scale",  # 18
-        "",  # 19: fp4_fc3_block_scales
-        "",  # 20: fp4_fc3_global_scale
+        "fc1_global_scale",  # 15
+        "fc2_global_scale",  # 16
     ]
 
     activation = "swiglu" if use_swiglu else "silu"
@@ -275,23 +269,18 @@ def create_fp4_moe_onnx_graph(
         arr = numpy.ascontiguousarray(tensor.cpu().numpy().astype(numpy.uint8))
         initializers.append(helper.make_tensor(name, TensorProto.UINT8, list(tensor.shape), arr.tobytes(), raw=True))
 
-    # Dummy INT-style scales (T2 = onnx_dtype) — required by schema but unused for FP4
-    for name, n_out in [("fc1_scales_dummy", fc1_inter), ("fc2_scales_dummy", hidden_size)]:
-        vals = [1.0] * (num_experts * n_out)
-        initializers.append(helper.make_tensor(name, onnx_dtype, [num_experts, n_out], vals, raw=False))
-
     # FP4 block scales [E, N, K//32] uint8
     for name, tensor in [
-        ("fp4_fc1_block_scales", fc1_block_scales),
-        ("fp4_fc2_block_scales", fc2_block_scales),
+        ("fc1_scales", fc1_block_scales),
+        ("fc2_scales", fc2_block_scales),
     ]:
         arr = numpy.ascontiguousarray(tensor.cpu().numpy().astype(numpy.uint8))
         initializers.append(helper.make_tensor(name, TensorProto.UINT8, list(tensor.shape), arr.tobytes(), raw=True))
 
     # FP4 global scales [E] float32 (T4)
     for name, tensor in [
-        ("fp4_fc1_global_scale", fc1_global_scale),
-        ("fp4_fc2_global_scale", fc2_global_scale),
+        ("fc1_global_scale", fc1_global_scale),
+        ("fc2_global_scale", fc2_global_scale),
     ]:
         vals = tensor.cpu().float().flatten().tolist()
         initializers.append(helper.make_tensor(name, TensorProto.FLOAT, [num_experts], vals, raw=False))

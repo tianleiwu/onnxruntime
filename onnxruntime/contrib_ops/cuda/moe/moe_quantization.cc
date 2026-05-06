@@ -27,20 +27,20 @@ namespace onnxruntime {
 namespace contrib {
 namespace cuda {
 
-#define REGISTER_KERNEL_TYPED(T)                                        \
-  ONNX_OPERATOR_TYPED_KERNEL_EX(                                        \
-      QMoE,                                                             \
-      kMSDomain,                                                        \
-      1,                                                                \
-      T,                                                                \
-      kCudaExecutionProvider,                                           \
-      (*KernelDefBuilder::Create())                                     \
-          .MayInplace(0, 0)                                             \
-          .TypeConstraint("T", DataTypeImpl::GetTensorType<T>())        \
-          .TypeConstraint("T1", DataTypeImpl::GetTensorType<uint8_t>()) \
-          .TypeConstraint("T2", DataTypeImpl::GetTensorType<T>())       \
-          .TypeConstraint("T3", DataTypeImpl::GetTensorType<uint8_t>()) \
-          .TypeConstraint("T4", DataTypeImpl::GetTensorType<float>()),  \
+#define REGISTER_KERNEL_TYPED(T)                                          \
+  ONNX_OPERATOR_TYPED_KERNEL_EX(                                          \
+      QMoE,                                                               \
+      kMSDomain,                                                          \
+      1,                                                                  \
+      T,                                                                  \
+      kCudaExecutionProvider,                                             \
+      (*KernelDefBuilder::Create())                                       \
+          .MayInplace(0, 0)                                               \
+          .TypeConstraint("T", DataTypeImpl::GetTensorType<T>())          \
+          .TypeConstraint("T1", DataTypeImpl::GetTensorType<uint8_t>())   \
+          .TypeConstraint("T2", {DataTypeImpl::GetTensorType<T>(),        \
+                                 DataTypeImpl::GetTensorType<uint8_t>()}) \
+          .TypeConstraint("T4", DataTypeImpl::GetTensorType<float>()),    \
       QMoE);
 
 REGISTER_KERNEL_TYPED(MLFloat16)
@@ -121,29 +121,30 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
 }
 
 Status QMoE::ComputeInternal(OpKernelContext* context) const {
+  const bool is_fp4 = (quant_type_ == "fp4");
   const Tensor* input = context->Input<Tensor>(0);
   const Tensor* router_probs = context->Input<Tensor>(1);
   const Tensor* fc1_experts_weights = context->Input<Tensor>(2);
-  const Tensor* fc1_scales = packed_fc1_scales_ ? nullptr : context->Input<Tensor>(3);
+  const Tensor* fc1_scales = (!is_fp4 && !packed_fc1_scales_) ? context->Input<Tensor>(3) : nullptr;
   const Tensor* fc1_experts_bias_optional = context->Input<Tensor>(4);
   const Tensor* fc2_experts_weights = context->Input<Tensor>(5);
-  const Tensor* fc2_scales = packed_fc2_scales_ ? nullptr : context->Input<Tensor>(6);
+  const Tensor* fc2_scales = (!is_fp4 && !packed_fc2_scales_) ? context->Input<Tensor>(6) : nullptr;
   const Tensor* fc2_experts_bias_optional = context->Input<Tensor>(7);
   const Tensor* fc3_experts_weights_optional = context->Input<Tensor>(8);
-  const Tensor* fc3_scales_optional = context->Input<Tensor>(9);
+  const Tensor* fc3_scales_optional = is_fp4 ? nullptr : context->Input<Tensor>(9);
   const Tensor* fc3_experts_bias_optional = context->Input<Tensor>(10);
 
   const Tensor* fc1_zeros = packed_fc1_bias_ ? nullptr : context->Input<Tensor>(11);
   const Tensor* fc2_zeros = packed_fc2_bias_ ? nullptr : context->Input<Tensor>(12);
   const Tensor* fc3_zeros = context->Input<Tensor>(13);
 
-  // FP4 inputs (indices 15-20)
-  const Tensor* fp4_fc1_block_scales = packed_fp4_fc1_block_scales_ ? nullptr : context->Input<Tensor>(15);
-  const Tensor* fp4_fc1_global_scale = packed_fp4_fc1_global_scale_ ? nullptr : context->Input<Tensor>(16);
-  const Tensor* fp4_fc2_block_scales = packed_fp4_fc2_block_scales_ ? nullptr : context->Input<Tensor>(17);
-  const Tensor* fp4_fc2_global_scale = packed_fp4_fc2_global_scale_ ? nullptr : context->Input<Tensor>(18);
-
-  const bool is_fp4 = (quant_type_ == "fp4");
+  // Unified FP4 inputs: block scales in fc*_scales (3/6/9), global scales in 15/16/17.
+  const Tensor* fp4_fc1_block_scales = (is_fp4 && !packed_fp4_fc1_block_scales_) ? context->Input<Tensor>(3) : nullptr;
+  const Tensor* fp4_fc2_block_scales = (is_fp4 && !packed_fp4_fc2_block_scales_) ? context->Input<Tensor>(6) : nullptr;
+  const Tensor* fp4_fc3_block_scales = (is_fp4 && !packed_fp4_fc3_block_scales_) ? context->Input<Tensor>(9) : nullptr;
+  const Tensor* fp4_fc1_global_scale = (is_fp4 && !packed_fp4_fc1_global_scale_) ? context->Input<Tensor>(15) : nullptr;
+  const Tensor* fp4_fc2_global_scale = (is_fp4 && !packed_fp4_fc2_global_scale_) ? context->Input<Tensor>(16) : nullptr;
+  const Tensor* fp4_fc3_global_scale = (is_fp4 && !packed_fp4_fc3_global_scale_) ? context->Input<Tensor>(17) : nullptr;
 
   const bool has_any_zero_point = (fc1_zeros != nullptr || fc2_zeros != nullptr || fc3_zeros != nullptr ||
                                    packed_fc1_bias_ != nullptr || packed_fc2_bias_ != nullptr);
@@ -170,6 +171,50 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
       fc2_experts_weights, fc2_experts_bias_optional, fc2_scales, fc2_zeros,
       fc3_experts_weights_optional, fc3_experts_bias_optional, fc3_scales_optional, fc3_zeros,
       pack_size, is_fused_swiglu, block_size_));
+
+  if (is_fp4) {
+    constexpr int64_t fp4_block_size = 32;
+    const int64_t fc1_out_size = is_fused_swiglu ? moe_params.inter_size * 2 : moe_params.inter_size;
+    auto check_fp4_block_scale = [](const Tensor* tensor, const char* name, int64_t num_experts,
+                                    int64_t n, int64_t k) -> Status {
+      ORT_RETURN_IF_NOT(tensor != nullptr, "QMoE quant_type='fp4' requires ", name, ".");
+      ORT_RETURN_IF_NOT(tensor->IsDataType<uint8_t>(), name, " must be a uint8 MXFP block-scale tensor.");
+      const auto& dims = tensor->Shape().GetDims();
+      ORT_RETURN_IF_NOT(dims.size() == 3 && dims[0] == num_experts && dims[1] == n && dims[2] == k,
+                        name, " must have shape (", num_experts, ", ", n, ", ", k, "), got ", tensor->Shape().ToString(), ".");
+      return Status::OK();
+    };
+    auto check_fp4_global_scale = [](const Tensor* tensor, const char* name, int64_t num_experts) -> Status {
+      ORT_RETURN_IF_NOT(tensor != nullptr, "QMoE quant_type='fp4' requires ", name, ".");
+      ORT_RETURN_IF_NOT(tensor->IsDataType<float>(), name, " must be a float tensor.");
+      const auto& dims = tensor->Shape().GetDims();
+      ORT_RETURN_IF_NOT(dims.size() == 1 && dims[0] == num_experts,
+                        name, " must have shape (", num_experts, "), got ", tensor->Shape().ToString(), ".");
+      return Status::OK();
+    };
+
+    if (fp4_fc1_block_scales) {
+      ORT_RETURN_IF_ERROR(check_fp4_block_scale(fp4_fc1_block_scales, "fc1_scales", moe_params.num_experts,
+                                                fc1_out_size, moe_params.hidden_size / fp4_block_size));
+    }
+    if (fp4_fc2_block_scales) {
+      ORT_RETURN_IF_ERROR(check_fp4_block_scale(fp4_fc2_block_scales, "fc2_scales", moe_params.num_experts,
+                                                moe_params.hidden_size, moe_params.inter_size / fp4_block_size));
+    }
+    if (fp4_fc3_block_scales) {
+      ORT_RETURN_IF_ERROR(check_fp4_block_scale(fp4_fc3_block_scales, "fc3_scales", moe_params.num_experts,
+                                                moe_params.inter_size, moe_params.hidden_size / fp4_block_size));
+    }
+    if (fp4_fc1_global_scale) {
+      ORT_RETURN_IF_ERROR(check_fp4_global_scale(fp4_fc1_global_scale, "fc1_global_scale", moe_params.num_experts));
+    }
+    if (fp4_fc2_global_scale) {
+      ORT_RETURN_IF_ERROR(check_fp4_global_scale(fp4_fc2_global_scale, "fc2_global_scale", moe_params.num_experts));
+    }
+    if (fp4_fc3_global_scale) {
+      ORT_RETURN_IF_ERROR(check_fp4_global_scale(fp4_fc3_global_scale, "fc3_global_scale", moe_params.num_experts));
+    }
+  }
 
   // Validate minimum dimensions for CUTLASS kernels.
   // SM >= 90 TMA WarpSpecialized: smallest tile is 128x16x128B (N=16 for FP16). K < tile_K handled by TMA.
@@ -520,6 +565,8 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
                                                                   : (fp4_fc2_block_scales ? fp4_fc2_block_scales->DataRaw() : nullptr);
     const void* p_fc2_global_scale = packed_fp4_fc2_global_scale_ ? packed_fp4_fc2_global_scale_.get()
                                                                   : (fp4_fc2_global_scale ? fp4_fc2_global_scale->DataRaw() : nullptr);
+    ORT_RETURN_IF_NOT(p_fc1_block_scales && p_fc1_global_scale && p_fc2_block_scales && p_fc2_global_scale,
+                      "QMoE quant_type='fp4' requires fc1_scales, fc2_scales, fc1_global_scale, and fc2_global_scale.");
     if (!use_fp4_dequant_fallback_) {
       using NVFP4ElementSF = onnxruntime::llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF;
       quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::FP4(
@@ -844,18 +891,43 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
 #define DUMP_PACK_TENSOR(name, packed_scales, scales)
 #endif
 
+  auto CopyToGpu = [&](IAllocatorUniquePtr<void>& packed_buf) {
+    size_t bytes = tensor.SizeInBytes();
+    packed_buf = IAllocator::MakeUniquePtr<void>(alloc, bytes, true);
+    const void* p_src = tensor.DataRaw();
+    if (tensor.Location().device.Type() == OrtDevice::CPU) {
+      cudaMemcpyAsync(packed_buf.get(), p_src, bytes, cudaMemcpyHostToDevice, stream);
+    } else {
+      cudaMemcpyAsync(packed_buf.get(), p_src, bytes, cudaMemcpyDeviceToDevice, stream);
+    }
+    cudaStreamSynchronize(stream);
+    is_packed = true;
+  };
+
   if (input_idx == 3) {  // fc1_scales
     DUMP_TENSOR("fc1_scales", tensor);
-    TransposeAndPack(packed_fc1_scales_);
-    DUMP_PACK_TENSOR("packed_fc1_scales", packed_fc1_scales_, tensor);
+    if (quant_type_ == "fp4") {
+      CopyToGpu(packed_fp4_fc1_block_scales_);
+    } else {
+      TransposeAndPack(packed_fc1_scales_);
+      DUMP_PACK_TENSOR("packed_fc1_scales", packed_fc1_scales_, tensor);
+    }
   } else if (input_idx == 6) {  // fc2_scales
     DUMP_TENSOR("fc2_scales", tensor);
-    TransposeAndPack(packed_fc2_scales_);
-    DUMP_PACK_TENSOR("packed_fc2_scales", packed_fc2_scales_, tensor);
+    if (quant_type_ == "fp4") {
+      CopyToGpu(packed_fp4_fc2_block_scales_);
+    } else {
+      TransposeAndPack(packed_fc2_scales_);
+      DUMP_PACK_TENSOR("packed_fc2_scales", packed_fc2_scales_, tensor);
+    }
   } else if (input_idx == 9 && has_fc3_) {  // fc3_scales
     DUMP_TENSOR("fc3_scales", tensor);
-    TransposeAndPack(packed_fc3_scales_);
-    DUMP_PACK_TENSOR("packed_fc3_scales", packed_fc3_scales_, tensor);
+    if (quant_type_ == "fp4") {
+      CopyToGpu(packed_fp4_fc3_block_scales_);
+    } else {
+      TransposeAndPack(packed_fc3_scales_);
+      DUMP_PACK_TENSOR("packed_fc3_scales", packed_fc3_scales_, tensor);
+    }
   } else if (input_idx == 11) {  // fc1_zeros
     DUMP_TENSOR("fc1_zeros", tensor);
     compute_bias(packed_fc1_scales_, packed_fc1_bias_);
@@ -864,38 +936,16 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
     DUMP_TENSOR("fc2_zeros", tensor);
     compute_bias(packed_fc2_scales_, packed_fc2_bias_);
     DUMP_PACK_TENSOR("packed_fc2_bias", packed_fc2_bias_, tensor);
-  } else if (input_idx >= 15 && input_idx <= 20 && quant_type_ == "fp4") {
-    // FP4 block scales and global scales.
-    auto CopyToGpu = [&](IAllocatorUniquePtr<void>& packed_buf) {
-      size_t bytes = tensor.SizeInBytes();
-      packed_buf = IAllocator::MakeUniquePtr<void>(alloc, bytes, true);
-      const void* p_src = tensor.DataRaw();
-      if (tensor.Location().device.Type() == OrtDevice::CPU) {
-        cudaMemcpyAsync(packed_buf.get(), p_src, bytes, cudaMemcpyHostToDevice, stream);
-      } else {
-        cudaMemcpyAsync(packed_buf.get(), p_src, bytes, cudaMemcpyDeviceToDevice, stream);
-      }
-      cudaStreamSynchronize(stream);
-      is_packed = true;
-    };
-
+  } else if (input_idx >= 15 && input_idx <= 17 && quant_type_ == "fp4") {
+    // FP4 global scales.
     switch (input_idx) {
       case 15:
-        CopyToGpu(packed_fp4_fc1_block_scales_);
-        break;
-      case 16:
         CopyToGpu(packed_fp4_fc1_global_scale_);
         break;
-      case 17:
-        CopyToGpu(packed_fp4_fc2_block_scales_);
-        break;
-      case 18:
+      case 16:
         CopyToGpu(packed_fp4_fc2_global_scale_);
         break;
-      case 19:
-        CopyToGpu(packed_fp4_fc3_block_scales_);
-        break;
-      case 20:
+      case 17:
         CopyToGpu(packed_fp4_fc3_global_scale_);
         break;
     }
