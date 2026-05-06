@@ -910,7 +910,7 @@ __device__ void computeTmaWarpSpecializedInputPointers(TmaWarpSpecializedGrouped
 #if defined(ENABLE_FP4)
           std::is_same_v<WeightType, __nv_fp4_e2m1> ? 2 :
 #endif
-                                                     1;
+                                                    1;
       auto const scale_offset = expert * (gemm_n * gemm_k / (groupwise_scale_group_size * scale_element_size_adjustment));
       layout_info.int4_groupwise_params.ptr_s_a[out_idx] = safe_inc_ptr(w4a8_weight_scale, scale_offset);
     }

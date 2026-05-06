@@ -77,6 +77,7 @@ cmake_dependent_option(onnxruntime_ENABLE_CUDA_EP_INTERNAL_TESTS "Build with CUD
 
 cmake_dependent_option(onnxruntime_USE_CUDA_NHWC_OPS "Build CUDA with NHWC op support" ON "onnxruntime_USE_CUDA" OFF)
 cmake_dependent_option(onnxruntime_BUILD_CUDA_EP_AS_PLUGIN "Build CUDA EP as a separate plugin shared library" OFF "onnxruntime_USE_CUDA" OFF)
+cmake_dependent_option(onnxruntime_ENABLE_CUDA_FP4_QMOE "Build CUDA QMoE FP4 kernels" OFF "onnxruntime_USE_CUDA" OFF)
 option(onnxruntime_CUDA_MINIMAL "Build CUDA without any operations apart from memcpy ops. Usefuel for a very minial TRT build" OFF)
 option(onnxruntime_ENABLE_CUDA_LINE_NUMBER_INFO "When building with CUDA support, generate device code line number information." OFF)
 option(onnxruntime_USE_OPENVINO "Build with OpenVINO support" OFF)
@@ -1469,6 +1470,10 @@ if (onnxruntime_USE_CUDA)
   if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
     add_definitions("-DENABLE_FP4")
     message(STATUS "CUDA Toolkit version is greater or equal than 12.8, enable -DENABLE_FP4 flag")
+    if(onnxruntime_ENABLE_CUDA_FP4_QMOE)
+      add_definitions("-DENABLE_CUDA_FP4_QMOE")
+      message(STATUS "CUDA FP4 QMoE kernels enabled")
+    endif()
     # Check if any target architecture supports FP4 kernels (sm_100+).
     # If not, define PLACEHOLDER_KERNELS so that stub implementations are used
     # instead of compiling the full CUTLASS sm_100/sm_120 kernel templates,
@@ -1486,6 +1491,8 @@ if (onnxruntime_USE_CUDA)
       add_definitions("-DPLACEHOLDER_KERNELS")
       message(STATUS "No sm_100+ target architecture found, using placeholder FP4 kernels")
     endif()
+  elseif(onnxruntime_ENABLE_CUDA_FP4_QMOE)
+    message(FATAL_ERROR "onnxruntime_ENABLE_CUDA_FP4_QMOE requires CUDA Toolkit version 12.8 or newer")
   endif()
 
   if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0")

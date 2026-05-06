@@ -55,8 +55,8 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
   this->quant_type_ = op_kernel_info.GetAttrOrDefault<std::string>("quant_type", "int");
   ORT_ENFORCE(quant_type_ == "int" || quant_type_ == "fp4",
               "quant_type must be 'int' or 'fp4', but got '", quant_type_, "'");
-#if !defined(ENABLE_FP4)
-  ORT_ENFORCE(quant_type_ != "fp4", "QMoE quant_type='fp4' requires ENABLE_FP4.");
+#if !defined(ENABLE_FP4) || !defined(ENABLE_CUDA_FP4_QMOE)
+  ORT_ENFORCE(quant_type_ != "fp4", "QMoE quant_type='fp4' requires ENABLE_CUDA_FP4_QMOE with CUDA 12.8 or newer.");
 #endif
 
   using namespace onnxruntime::llm::kernels::cutlass_kernels;
@@ -73,7 +73,7 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
 #endif
   is_fp16_ = is_fp16;
 
-#if defined(ENABLE_FP4)
+#if defined(ENABLE_FP4) && defined(ENABLE_CUDA_FP4_QMOE)
   if (quant_type_ == "fp4") {
     ORT_ENFORCE(expert_weight_bits_ == 4, "FP4 quantization requires expert_weight_bits=4");
     use_fp4_dequant_fallback_ = true;
@@ -523,12 +523,12 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
     if (!use_fp4_dequant_fallback_) {
       using NVFP4ElementSF = onnxruntime::llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF;
       quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::FP4(
-        nullptr,  // fc1_act_global_scale (no activation quantization for W4A16)
-        static_cast<const NVFP4ElementSF*>(p_fc1_block_scales),
-        static_cast<const float*>(p_fc1_global_scale),
-        nullptr,  // fc2_act_global_scale
-        static_cast<const NVFP4ElementSF*>(p_fc2_block_scales),
-        static_cast<const float*>(p_fc2_global_scale));
+          nullptr,  // fc1_act_global_scale (no activation quantization for W4A16)
+          static_cast<const NVFP4ElementSF*>(p_fc1_block_scales),
+          static_cast<const float*>(p_fc1_global_scale),
+          nullptr,  // fc2_act_global_scale
+          static_cast<const NVFP4ElementSF*>(p_fc2_block_scales),
+          static_cast<const float*>(p_fc2_global_scale));
     }
   } else if (block_size_ > 0) {
     quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::GroupWise(

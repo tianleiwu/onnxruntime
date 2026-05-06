@@ -636,8 +636,8 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
     tma_ws_configs.erase(
         std::remove_if(tma_ws_configs.begin(), tma_ws_configs.end(), [](auto const& config) {
           return config.sm_version == 90 &&
-                   (config.tile_config_sm90 != cutlass_extensions::CutlassTileConfigSM90::CtaShape128x32x128B ||
-                    config.cluster_shape != cutlass_extensions::ClusterShape::ClusterShape_1x1x1);
+                 (config.tile_config_sm90 != cutlass_extensions::CutlassTileConfigSM90::CtaShape128x32x128B ||
+                  config.cluster_shape != cutlass_extensions::ClusterShape::ClusterShape_1x1x1);
         }),
         tma_ws_configs.end());
   }
@@ -801,7 +801,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
     }
 #endif
 
-#if defined(ENABLE_FP4)
+#if defined(ENABLE_FP4) && defined(ENABLE_CUDA_FP4_QMOE)
     // Hopper W4A16 (FP4 weights + FP16/BF16 activations) WS grouped GEMM
     if constexpr (use_wfp4a16) {
 #ifdef ORT_QUICK_BUILD

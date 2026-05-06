@@ -583,10 +583,10 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 
   // TODO: This should eventually take the quant params to give more flexibility
   static auto getScalingType() {
-    return use_wfp4afp8 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
-           : use_fp4      ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
-           : use_wfp4a16  ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
-                        : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
+    return use_wfp4afp8  ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
+           : use_fp4     ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+           : use_wfp4a16 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
+                         : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
   }
 
   T const* applyPrequantScale(void* smoothed_act, void const* permuted_data, void const* prequant_scales,

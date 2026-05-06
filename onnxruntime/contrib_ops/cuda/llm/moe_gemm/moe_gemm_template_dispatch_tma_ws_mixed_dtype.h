@@ -78,16 +78,16 @@ void sm90_dispatch_mainloop_schedules(GroupedGemmInput<T, WeightType, GemmOutput
         ORT_THROW("COOPERATIVE is only enabled when tile M >= 128.");
       } else {
         if constexpr (
-      #if defined(ENABLE_FP4)
+#if defined(ENABLE_FP4)
             std::is_same_v<WeightType, __nv_fp4_e2m1> &&
-      #else
+#else
             false &&
-      #endif
+#endif
             std::is_same_v<T, half> && get<0>(CTAShape{}) == 128 && get<1>(CTAShape{}) == 32) {
           sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, GemmOutputType, EpilogueTag, CTAShape,
-                       ClusterShape, cutlass::gemm::KernelTmaWarpSpecializedPingpong,
-                       cutlass::epilogue::TmaWarpSpecializedCooperative,
-                       cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(
+                                                     ClusterShape, cutlass::gemm::KernelTmaWarpSpecializedPingpong,
+                                                     cutlass::epilogue::TmaWarpSpecializedCooperative,
+                                                     cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(
               inputs, hopper_inputs, sm_count_, workspace_size);
         } else if constexpr ((get<0>(CTAShape{}) == 128) && get<1>(CTAShape{}) == 128) {
           sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, GemmOutputType, EpilogueTag, CTAShape,
@@ -117,18 +117,18 @@ void sm90_dispatch_mainloop_schedules(GroupedGemmInput<T, WeightType, GemmOutput
 #endif
           std::is_same_v<T, half> && get<0>(CTAShape{}) == 128 && get<1>(CTAShape{}) == 32) {
         sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, GemmOutputType, EpilogueTag, CTAShape, ClusterShape,
-                     cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::TmaWarpSpecializedCooperative,
-                     cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(inputs, hopper_inputs, sm_count_, workspace_size);
+                                                   cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::TmaWarpSpecializedCooperative,
+                                                   cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(inputs, hopper_inputs, sm_count_, workspace_size);
       } else if constexpr (
-    #if defined(ENABLE_FP4)
+#if defined(ENABLE_FP4)
           std::is_same_v<WeightType, __nv_fp4_e2m1> &&
-    #else
+#else
           false &&
-    #endif
+#endif
           get<0>(CTAShape{}) == 128 && (get<1>(CTAShape{}) == 32 || get<1>(CTAShape{}) == 64)) {
         sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, GemmOutputType, EpilogueTag, CTAShape, ClusterShape,
-                       cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::TmaWarpSpecializedCooperative,
-                       cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(inputs, hopper_inputs, sm_count_, workspace_size);
+                                                   cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::TmaWarpSpecializedCooperative,
+                                                   cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(inputs, hopper_inputs, sm_count_, workspace_size);
       } else {
         sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, GemmOutputType, EpilogueTag, CTAShape, ClusterShape,
                                                    cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::TmaWarpSpecializedCooperative,
@@ -273,17 +273,17 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput(int num_experts, int sm_
       (std::is_same_v<WeightType, __nv_fp4_e2m1>) ? 256 :
 #endif
                                                   512;
-    constexpr int Ntile =
-  #if defined(ENABLE_FP4)
-    (std::is_same_v<WeightType, __nv_fp4_e2m1>) ? 32 :
-  #endif
-                   64;
+  constexpr int Ntile =
+#if defined(ENABLE_FP4)
+      (std::is_same_v<WeightType, __nv_fp4_e2m1>) ? 32 :
+#endif
+                                                  64;
   using _Ktile = Int<Ktile>;
-    using _Ntile = Int<Ntile>;
+  using _Ntile = Int<Ntile>;
   GroupedGemmInput<T, WeightType, OutputType, OutputType> inputs{};
   inputs.num_experts = num_experts;
   sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, OutputType,
-                   onnxruntime::llm::cutlass_extensions::EpilogueOpDefault, Shape<_128, _Ntile, _Ktile>, Shape<_1, _1, _1>,
+                                             onnxruntime::llm::cutlass_extensions::EpilogueOpDefault, Shape<_128, _Ntile, _Ktile>, Shape<_1, _1, _1>,
                                              cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::TmaWarpSpecializedCooperative,
                                              cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(
       inputs, TmaWarpSpecializedGroupedGemmInput{}, sm_count_, &count);
