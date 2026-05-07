@@ -9,10 +9,11 @@ Extend the existing QMoE CUDA operator to support **MXFP4 quantized weights** wi
 
 | In Scope | Out of Scope |
 |----------|-------------|
-| W4A16: MXFP4 weights + FP16/BF16 activations | W4A8: FP8 activations (future work) |
-| SM90+ (Hopper and Blackwell via mixed-input path) | W4A4: FP4 activations |
-| Extend existing QMoE op schema | New standalone FP4MoE op |
-| MXFP4 (group_size=32) block scaling | NVFP4 (group_size=16) in W4A16 mode |
+| W4A16: MXFP4 weights + FP16/BF16 activations | W4A4: FP4 activations |
+| W4A8: MXFP4 weights + FP8 activations (`quant_type="wfp4afp8"`) | New standalone FP4MoE op |
+| SM90+ (Hopper and Blackwell via mixed-input path) | NVFP4 (group_size=16) in W4A16 mode |
+| Extend existing QMoE op schema | |
+| MXFP4 (group_size=32) block scaling | |
 
 ### 1.3 Key Architecture Insight
 
@@ -44,6 +45,8 @@ Extend the existing QMoE CUDA operator to support **MXFP4 quantized weights** wi
 | 5 | FP4 weight packing utility | ✅ Done |
 | 6 | Python tests (`test_qmoe_fp4_cuda.py`) | ✅ Done |
 | 7 | End-to-end verification & GPT-OSS smoke test | Not complete |
+| 8 | W4A8 (`quant_type="wfp4afp8"`) build + dequant fallback | ✅ Done (see §12) |
+| 9 | W4A8 native SM100+ runtime validation | Pending Blackwell hardware |
 
 ### Review Follow-up Notes
 
@@ -409,18 +412,21 @@ W4A8 pairs MXFP4 weights with FP8 (e4m3) activations. Unlike W4A16, which uses t
 
 The schema change is minimal — only **activation scale inputs** are needed. All weight-side inputs (15–20) are reused as-is.
 
-#### New optional inputs
+#### Existing optional inputs reused for W4A8
 
 | Index | Name | Type | Shape | Description |
 |-------|------|------|-------|-------------|
-| 21 | `fp4_fc1_act_scale` | T2 (float) | `[E]` or `[1]` | Activation global scale for FC1 (quantize FP16/BF16→FP8 before GEMM1) |
-| 22 | `fp4_fc2_act_scale` | T2 (float) | `[E]` or `[1]` | Activation global scale for FC2 (quantize intermediate→FP8 before GEMM2) |
+| 18 | `fc1_act_scale` | T4 (float) | `[E]` or `[1]` | Activation global scale for FC1 (quantize FP16/BF16->FP8 before GEMM1) |
+| 19 | `fc2_act_scale` | T4 (float) | `[E]` or `[1]` | Activation global scale for FC2 (quantize intermediate->FP8 before GEMM2) |
+
+These inputs are already declared in the schema and validated by the operator. Inputs 20/21
+(`fc1_act_block_scale`, `fc2_act_block_scale`) for the MXFP8 block-scaled "Variant B" remain reserved
+for a future change and are not consumed by the current W4A8 implementation.
 
 #### Mode determination
 
-**Implicit (presence-based, proposed)**: When `quant_type="fp4"` and `fp4_fc1_act_scale` is provided, the operator would use W4A8. When absent, it would use W4A16. This is not implemented in the staged W4A16 change; inputs 21-22 and the constructor/dispatch switch still need to be added.
-
-No new `quant_type` value is needed, keeping the schema simple.
+W4A8 is selected explicitly via `quant_type="wfp4afp8"` (rather than via input presence). This keeps the
+behaviour predictable and avoids surprises when activation scales happen to be `nullptr`.
 
 ### 12.3 CUTLASS Kernel Path Differences
 
@@ -436,33 +442,78 @@ No new `quant_type` value is needed, keeping the schema simple.
 
 ### 12.4 Implementation Checklist
 
+#### Status
+
+The schema, operator plumbing, kernel template instantiations, and runtime dispatch for W4A8
+(`quant_type="wfp4afp8"`) are implemented. The runner selects the path based on SM:
+
+- **SM100+ (Blackwell)**: native FP8 x MXFP4 block-scaled tensor op path. The runner is
+  `CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, half/__nv_bfloat16, half/__nv_bfloat16>` (T=fp8,
+  WeightType=fp4, OutputType=BF16/FP16, InputType=BF16/FP16). The runner accepts BF16/FP16 user input and
+  quantizes it to MXFP8 (FP8 + per-block ue8m0 scales) inside `expandInputRowsKernel` (MXFP8 branch,
+  triggered by `quant_params.mxfp8_mxfp4.fc{1,2}.weight_block_scale` being non-null). `QuantParams::MXFP8MXFP4`
+  carries the MXFP4 weight block scales and per-expert global weight scales.
+
+- **SM<100**: dequantize-then-A16 fallback. MXFP4 weights are decoded with
+  `LaunchQMoEDequantizeFp4Weights` and fed into the dense BF16/FP16 MoE runner. Produces correct results on
+  every SM that supports the existing FP4 W4A16 dequant fallback (SM90+ effectively today).
+
+The build can be verified on any host with CUDA 12.8+ by configuring with
+`onnxruntime_ENABLE_CUDA_FP4_QMOE=ON`. Runtime end-to-end validation of the native path requires SM100+
+hardware; the dequant-fallback path is exercised by the bundled Python parity test on SM90.
+
 #### Prerequisites (from current cleanup)
 
-The standalone FP8 block-scaled GEMM runner (`fp8_blockscale_gemm/`) and `moe_gemm_kernels_fp8_fp4.cu` were removed
-in the MoE cleanup pass because they depended on infrastructure incompatible with CUTLASS 4.4.2 and were not wired
-to any ONNX op. The block-scaled dispatch plumbing (`moe_gemm_template_dispatch_tma_ws.h` `#ifdef ENABLE_FP4` sections)
-and traits (`moe_tma_warp_specialized_traits.h`) remain in tree.
+The standalone FP8 block-scaled GEMM runner (`fp8_blockscale_gemm/`) is unchanged. The W4A8 path uses the
+existing block-scaled dispatch plumbing (`moe_gemm_template_dispatch_tma_ws.h` `#ifdef ENABLE_FP4` sections)
+and traits (`moe_tma_warp_specialized_traits.h`) which already accept `<__nv_fp8_e4m3, __nv_fp4_e2m1>` for
+SM100+ via `isValidBlackwellMOESpecialisation`.
 
-#### Changes needed
+#### Changes implemented
 
-1. **Schema** (`contrib_defs.cc`): Add inputs 21–22 for activation scales.
+1. **Schema** (`contrib_defs.cc`): inputs 18/19 (`fc1_act_scale`, `fc2_act_scale`) are already declared,
+   accepting either `(1,)` or `(num_experts,)` float tensors. No schema change was required.
 
-2. **Kernel instantiation**: Re-add `moe_gemm_kernels_fp8_fp4.cu` with `MoeGemmRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, half>` using CUTLASS 4.4.2 block-scaled tensor op path.
+2. **GEMM kernel instantiation**: `moe_gemm_kernels_fp8_fp4.cu` instantiates
+   `MoeGemmRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, half>` and the `__nv_bfloat16` output variant under
+   `ENABLE_FP4 && ENABLE_CUDA_FP4_QMOE && ENABLE_FP8`. Build gating in
+   `cmake/onnxruntime_providers_cpu.cmake` excludes the file when `onnxruntime_ENABLE_CUDA_FP4_QMOE` is OFF.
 
-3. **Constructor** (`moe_quantization.cc`): When `quant_type="fp4"` and activation scales are provided, instantiate `CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, half>` instead of the W4A16 runner.
+3. **Runner instantiation** (`moe_kernels.cu`): added explicit
+   `CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, half, half>` and the `__nv_bfloat16` variant under
+   `ENABLE_FP4 && ENABLE_FP8`. These specify `InputType` distinct from `T` so the runner can accept
+   BF16/FP16 input and quantize it to FP8 internally.
 
-4. **ComputeInternal** (`moe_quantization.cc`): Pass `act_global_scale` pointers to `QuantParams::FP4()` instead of `nullptr`:
-    ```cpp
-    quant_params = QuantParams::FP4(
-        fc1_act_scale,     // non-null → triggers FP8 activation quantization
-        fc1_block_scales, fc1_global_scale,
-        fc2_act_scale,
-        fc2_block_scales, fc2_global_scale);
-    ```
+4. **Expansion kernel instantiation** (`moe_kernels.cu`): added
+   `INSTANTIATE_EXPAND_INPUT_ROWS(half, __nv_fp8_e4m3)` and the `__nv_bfloat16` variant under
+   `ENABLE_FP8 && ENABLE_FP4`. The MXFP8 quantization branch inside `expandInputRowsKernel` now has the
+   templates it needs to be linked when the W4A8 native path is selected.
 
-5. **PrePack** (`moe_quantization.cc`): Add GPU copy for activation scale inputs (indices 21–22), same pattern as existing global scale handling.
+5. **Constructor** (`moe_quantization.cc`): when `quant_type="wfp4afp8"` and `sm_ >= 100`, the constructor
+   instantiates the native runner. Otherwise the dequant fallback runner is used.
 
-6. **`use_per_expert_act_scale`**: If `act_scale` shape is `[E]` (per-expert), set `FP4Inputs::GemmInputs::use_per_expert_act_scale = true`. If shape is `[1]` (global), set to `false`.
+6. **ComputeInternal** (`moe_quantization.cc`): the W4A8 path validates MXFP4 block scales, per-expert
+   global weight scales (inputs 15/16), and optional FP8 activation global scales (inputs 18/19). When the
+   native path is selected, `QuantParams::MXFP8MXFP4` is built so the activation is quantized BF16/FP16 ->
+   MXFP8 inside `expandInputRowsKernel` and the MXFP4 weight block scales feed the block-scaled tensor op.
+   The act_scale inputs (18/19) are validated and pre-packed for forward compatibility with the
+   global-scaled "Variant A" mode but are not consumed by the current native-path (Variant B) plumbing.
+   When the dequant fallback path is selected (SM<100), MXFP4 weights are decoded with
+   `LaunchQMoEDequantizeFp4Weights` and fed into the dense A16 runner.
+
+7. **PrePack** (`moe_quantization.cc`): inputs 18/19 are pre-packed to GPU memory using the existing
+   `CopyToGpu` helper, mirroring the global weight scale handling.
+
+8. **`use_per_expert_act_scale`**: derived from `act_scale->Shape().Size() == num_experts` for fc1/fc2
+   independently. (Reserved for the future Variant A native path.)
+
+#### Remaining work
+
+- Add a Python parity test that exercises the native path on Blackwell hardware (extending
+  `test_qmoe_wfp4afp8_cuda.py`).
+- Optional: add a Variant A (global-scaled FP8 activation) path that consumes inputs 18/19 directly via
+  `QuantParams::FP8MXFP4`. This would require the QMoE op to accept pre-quantized FP8 input or to wire a
+  separate global-scaled BF16->FP8 prologue.
 
 ### 12.5 Runtime Activation Quantization
 

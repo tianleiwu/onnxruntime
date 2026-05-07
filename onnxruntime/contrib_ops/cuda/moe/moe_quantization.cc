@@ -20,6 +20,9 @@
 #include "contrib_ops/cuda/utils/dump_cuda_tensor.h"
 #include "contrib_ops/cpu/utils/debug_macros.h"
 
+#include <cstring>
+#include <vector>
+
 using namespace onnxruntime::cuda;
 using namespace ::onnxruntime::common;
 using namespace ONNX_NAMESPACE;
@@ -55,10 +58,15 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
 
   this->block_size_ = op_kernel_info.GetAttrOrDefault<int64_t>("block_size", -1);
   this->quant_type_ = op_kernel_info.GetAttrOrDefault<std::string>("quant_type", "int");
-  ORT_ENFORCE(quant_type_ == "int" || quant_type_ == "fp4" || quant_type_ == "fp8",
-              "quant_type must be 'int', 'fp4', or 'fp8', but got '", quant_type_, "'");
+  ORT_ENFORCE(quant_type_ == "int" || quant_type_ == "fp4" || quant_type_ == "fp8" || quant_type_ == "wfp4afp8",
+              "quant_type must be 'int', 'fp4', 'fp8', or 'wfp4afp8', but got '", quant_type_, "'");
 #if !defined(ENABLE_FP4) || !defined(ENABLE_CUDA_FP4_QMOE)
   ORT_ENFORCE(quant_type_ != "fp4", "QMoE quant_type='fp4' requires ENABLE_CUDA_FP4_QMOE with CUDA 12.8 or newer.");
+  ORT_ENFORCE(quant_type_ != "wfp4afp8",
+              "QMoE quant_type='wfp4afp8' requires ENABLE_CUDA_FP4_QMOE with CUDA 12.8 or newer.");
+#endif
+#if !defined(ENABLE_FP8)
+  ORT_ENFORCE(quant_type_ != "wfp4afp8", "QMoE quant_type='wfp4afp8' requires ENABLE_FP8 (CUDA 11.8 or newer).");
 #endif
 
   using namespace onnxruntime::llm::kernels::cutlass_kernels;
@@ -75,13 +83,26 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
 #endif
   is_fp16_ = is_fp16;
 
-  if (quant_type_ == "fp4" || quant_type_ == "fp8") {
+  if (quant_type_ == "fp4" || quant_type_ == "fp8" || quant_type_ == "wfp4afp8") {
     if (quant_type_ == "fp4") {
       ORT_ENFORCE(expert_weight_bits_ == 4, "FP4 quantization requires expert_weight_bits=4");
 #if defined(ENABLE_FP4) && defined(ENABLE_CUDA_FP4_QMOE)
       use_fp4_dequant_fallback_ = sm_ < 120;
 #else
       use_fp4_dequant_fallback_ = true;
+#endif
+    } else if (quant_type_ == "wfp4afp8") {
+      ORT_ENFORCE(expert_weight_bits_ == 4, "WFP4AFP8 (W4A8) quantization requires expert_weight_bits=4");
+#if defined(ENABLE_FP4) && defined(ENABLE_CUDA_FP4_QMOE) && defined(ENABLE_FP8)
+      // The native FP8 x MXFP4 path uses CUTLASS block-scaled tensor ops which require SM100+ (Blackwell).
+      // The activation BF16/FP16 -> FP8 quantization is performed inside the runner's
+      // expandInputRowsKernel using the MXFP8 branch: the runner is constructed with T=__nv_fp8_e4m3,
+      // InputType=half/bf16, and the QuantParams sets mxfp8_mxfp4.fc{1,2}.weight_block_scale to the MXFP4
+      // weight block scales. Activation block scales are written to fc1_fp4_act_scale_ at runtime.
+      // On older GPUs we fall back to dequantizing MXFP4 weights to BF16/FP16 and using the A16 runner.
+      use_wfp4afp8_dequant_fallback_ = sm_ < 100;
+#else
+      use_wfp4afp8_dequant_fallback_ = true;
 #endif
     } else {
       ORT_ENFORCE(expert_weight_bits_ == 8, "FP8 quantization requires expert_weight_bits=8");
@@ -102,6 +123,21 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
             sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
       }
 #endif
+    } else if (quant_type_ == "wfp4afp8" && !use_wfp4afp8_dequant_fallback_) {
+#if defined(ENABLE_FP4) && defined(ENABLE_CUDA_FP4_QMOE) && defined(ENABLE_FP8)
+      // Native W4A8: FP8 e4m3 activations + MXFP4 weights, BF16/FP16 input/output.
+      // Template parameters: <T=fp8, WeightType=fp4, OutputType=BF16/FP16, InputType=BF16/FP16>.
+      // CUTLASS routes this through the SM100+ block-scaled tensor op path. The runner accepts
+      // BF16/FP16 input from the caller and quantizes it to FP8 inside expandInputRowsKernel
+      // (MXFP8 branch, triggered by mxfp8_mxfp4.fc{1,2}.weight_block_scale being non-null).
+      if (is_fp16) {
+        m_moe_runner = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, half, half>>(
+            sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
+      } else {
+        m_moe_runner = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, __nv_bfloat16, __nv_bfloat16>>(
+            sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
+      }
+#endif
     } else if (quant_type_ == "fp8" && !use_fp8_dequant_fallback_) {
       // Native W8A16-FP8: activations are half/bf16, weights are __nv_fp8_e4m3
       if (is_fp16) {
@@ -112,7 +148,7 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
             sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
       }
     } else {
-      // FP4 dequant fallback or FP8 dequant fallback: use A16 runner
+      // FP4/WFP4AFP8 dequant fallback or FP8 dequant fallback: use A16 runner
       if (is_fp16) {
         m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, half, half>>(
             sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
@@ -158,7 +194,12 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
 Status QMoE::ComputeInternal(OpKernelContext* context) const {
   const bool is_fp4 = (quant_type_ == "fp4");
   const bool is_fp8 = (quant_type_ == "fp8");
+  const bool is_wfp4afp8 = (quant_type_ == "wfp4afp8");
   const bool is_int = (quant_type_ == "int");
+  // Modes that consume MXFP4 weight block scales (inputs 3/6/9) and per-expert global weight scales.
+  const bool uses_fp4_weight_scales = is_fp4 || is_wfp4afp8;
+  // Modes that consume per-expert FP-format global weight scales (inputs 15/16/17).
+  const bool uses_global_weight_scales = is_fp4 || is_fp8 || is_wfp4afp8;
   const Tensor* input = context->Input<Tensor>(0);
   const Tensor* router_probs = context->Input<Tensor>(1);
   const Tensor* fc1_experts_weights = context->Input<Tensor>(2);
@@ -192,12 +233,16 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   }
 
   // Unified FP4 inputs: block scales in fc*_scales (3/6/9), global scales in 15/16/17.
-  const Tensor* fp4_fc1_block_scales = (is_fp4 && !packed_fp4_fc1_block_scales_) ? context->Input<Tensor>(3) : nullptr;
-  const Tensor* fp4_fc2_block_scales = (is_fp4 && !packed_fp4_fc2_block_scales_) ? context->Input<Tensor>(6) : nullptr;
-  const Tensor* fp4_fc3_block_scales = (is_fp4 && !packed_fp4_fc3_block_scales_) ? context->Input<Tensor>(9) : nullptr;
-  const Tensor* fc1_global_scale = ((is_fp4 || is_fp8) && !packed_fc1_global_scale_) ? context->Input<Tensor>(15) : nullptr;
-  const Tensor* fc2_global_scale = ((is_fp4 || is_fp8) && !packed_fc2_global_scale_) ? context->Input<Tensor>(16) : nullptr;
-  const Tensor* fc3_global_scale = ((is_fp4 || is_fp8) && !packed_fc3_global_scale_) ? context->Input<Tensor>(17) : nullptr;
+  const Tensor* fp4_fc1_block_scales = (uses_fp4_weight_scales && !packed_fp4_fc1_block_scales_) ? context->Input<Tensor>(3) : nullptr;
+  const Tensor* fp4_fc2_block_scales = (uses_fp4_weight_scales && !packed_fp4_fc2_block_scales_) ? context->Input<Tensor>(6) : nullptr;
+  const Tensor* fp4_fc3_block_scales = (uses_fp4_weight_scales && !packed_fp4_fc3_block_scales_) ? context->Input<Tensor>(9) : nullptr;
+  const Tensor* fc1_global_scale = (uses_global_weight_scales && !packed_fc1_global_scale_) ? context->Input<Tensor>(15) : nullptr;
+  const Tensor* fc2_global_scale = (uses_global_weight_scales && !packed_fc2_global_scale_) ? context->Input<Tensor>(16) : nullptr;
+  const Tensor* fc3_global_scale = (uses_global_weight_scales && !packed_fc3_global_scale_) ? context->Input<Tensor>(17) : nullptr;
+
+  // W4A8 (WFP4AFP8) optional Variant A activation scales (per-tensor or per-expert FP8 global act scale).
+  const Tensor* fc1_act_scale = (is_wfp4afp8 && !packed_fc1_act_scale_) ? context->Input<Tensor>(18) : nullptr;
+  const Tensor* fc2_act_scale = (is_wfp4afp8 && !packed_fc2_act_scale_) ? context->Input<Tensor>(19) : nullptr;
 
   const bool has_any_zero_point = (fc1_zeros != nullptr || fc2_zeros != nullptr || fc3_zeros != nullptr ||
                                    packed_fc1_bias_ != nullptr || packed_fc2_bias_ != nullptr);
@@ -225,12 +270,12 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
       fc3_experts_weights_optional, fc3_experts_bias_optional, fc3_scales_optional, fc3_zeros,
       pack_size, is_fused_swiglu, block_size_));
 
-  if (is_fp4) {
+  if (uses_fp4_weight_scales) {
     constexpr int64_t fp4_block_size = 32;
     const int64_t fc1_out_size = is_fused_swiglu ? moe_params.inter_size * 2 : moe_params.inter_size;
     auto check_fp4_block_scale = [](const Tensor* tensor, const char* name, int64_t num_experts,
                                     int64_t n, int64_t k) -> Status {
-      ORT_RETURN_IF_NOT(tensor != nullptr, "QMoE quant_type='fp4' requires ", name, ".");
+      ORT_RETURN_IF_NOT(tensor != nullptr, "QMoE quant_type='fp4'/'wfp4afp8' requires ", name, ".");
       ORT_RETURN_IF_NOT(tensor->IsDataType<uint8_t>(), name, " must be a uint8 MXFP block-scale tensor.");
       const auto& dims = tensor->Shape().GetDims();
       ORT_RETURN_IF_NOT(dims.size() == 3 && dims[0] == num_experts && dims[1] == n && dims[2] == k,
@@ -259,13 +304,31 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
                                                 moe_params.inter_size, moe_params.hidden_size / fp4_block_size));
     }
     if (fc1_global_scale) {
-      ORT_RETURN_IF_ERROR(check_global_scale(fc1_global_scale, "fc1_global_scale", moe_params.num_experts, "fp4"));
+      ORT_RETURN_IF_ERROR(check_global_scale(fc1_global_scale, "fc1_global_scale", moe_params.num_experts, quant_type_.c_str()));
     }
     if (fc2_global_scale) {
-      ORT_RETURN_IF_ERROR(check_global_scale(fc2_global_scale, "fc2_global_scale", moe_params.num_experts, "fp4"));
+      ORT_RETURN_IF_ERROR(check_global_scale(fc2_global_scale, "fc2_global_scale", moe_params.num_experts, quant_type_.c_str()));
     }
     if (fc3_global_scale) {
-      ORT_RETURN_IF_ERROR(check_global_scale(fc3_global_scale, "fc3_global_scale", moe_params.num_experts, "fp4"));
+      ORT_RETURN_IF_ERROR(check_global_scale(fc3_global_scale, "fc3_global_scale", moe_params.num_experts, quant_type_.c_str()));
+    }
+  }
+
+  if (is_wfp4afp8) {
+    auto check_act_scale = [](const Tensor* tensor, const char* name, int64_t num_experts) -> Status {
+      ORT_RETURN_IF_NOT(tensor != nullptr, "QMoE quant_type='wfp4afp8' Variant A requires ", name, ".");
+      ORT_RETURN_IF_NOT(tensor->IsDataType<float>(), name, " must be a float tensor.");
+      const auto& dims = tensor->Shape().GetDims();
+      ORT_RETURN_IF_NOT(dims.size() == 1 && (dims[0] == 1 || dims[0] == num_experts),
+                        name, " must have shape (1,) or (", num_experts, "), got ", tensor->Shape().ToString(), ".");
+      return Status::OK();
+    };
+    // fc*_act_scale are optional; when absent the runner uses the MXFP8 block-scaled Variant B.
+    if (fc1_act_scale) {
+      ORT_RETURN_IF_ERROR(check_act_scale(fc1_act_scale, "fc1_act_scale", moe_params.num_experts));
+    }
+    if (fc2_act_scale) {
+      ORT_RETURN_IF_ERROR(check_act_scale(fc2_act_scale, "fc2_act_scale", moe_params.num_experts));
     }
   }
 
@@ -323,10 +386,17 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
                                     false, true, parallelism_config, sm_);
 
     onnxruntime::llm::nvinfer::DataType dtype = is_fp16_ ? onnxruntime::llm::nvinfer::DataType::kHALF : onnxruntime::llm::nvinfer::DataType::kBF16;
+    if (is_wfp4afp8 && !use_wfp4afp8_dequant_fallback_) {
+      dtype = onnxruntime::llm::nvinfer::DataType::kFP8;
+    }
     // Weight type: FP4 for MXFP4, INT4 for 4-bit integer, INT8 for 8-bit integer
     onnxruntime::llm::nvinfer::DataType wtype;
     if (is_fp4) {
       wtype = use_fp4_dequant_fallback_ ? dtype : onnxruntime::llm::nvinfer::DataType::kFP4;
+    } else if (is_wfp4afp8) {
+      // Native W4A8 path uses FP8 activation + FP4 weights through the block-scaled dispatch.
+      // Profile against the FP4 weight tactic; fall back to dense dtype when the dequant path is selected.
+      wtype = use_wfp4afp8_dequant_fallback_ ? dtype : onnxruntime::llm::nvinfer::DataType::kFP4;
     } else if (is_fp8) {
       wtype = use_fp8_dequant_fallback_ ? dtype : onnxruntime::llm::nvinfer::DataType::kFP8;
     } else {
@@ -652,6 +722,41 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
           static_cast<const NVFP4ElementSF*>(p_fc2_block_scales),
           static_cast<const float*>(p_fc2_global_scale));
     }
+  } else if (is_wfp4afp8) {
+    // W4A8 (WFP4AFP8): MXFP4 weights + FP8 e4m3 activations.
+    //   - Weight block scales (uint8 MXFPX) are read from fc*_scales (inputs 3/6)
+    //   - Per-expert weight global scales come from inputs 15/16
+    //   - Optional per-expert/per-tensor FP8 activation global scales come from inputs 18/19
+    const void* p_fc1_block_scales = packed_fp4_fc1_block_scales_ ? packed_fp4_fc1_block_scales_.get()
+                                                                  : (fp4_fc1_block_scales ? fp4_fc1_block_scales->DataRaw() : nullptr);
+    const void* p_fc1_global_scale = packed_fc1_global_scale_ ? packed_fc1_global_scale_.get()
+                                                              : (fc1_global_scale ? fc1_global_scale->DataRaw() : nullptr);
+    const void* p_fc2_block_scales = packed_fp4_fc2_block_scales_ ? packed_fp4_fc2_block_scales_.get()
+                                                                  : (fp4_fc2_block_scales ? fp4_fc2_block_scales->DataRaw() : nullptr);
+    const void* p_fc2_global_scale = packed_fc2_global_scale_ ? packed_fc2_global_scale_.get()
+                                                              : (fc2_global_scale ? fc2_global_scale->DataRaw() : nullptr);
+    ORT_RETURN_IF_NOT(p_fc1_block_scales && p_fc1_global_scale && p_fc2_block_scales && p_fc2_global_scale,
+                      "QMoE quant_type='wfp4afp8' requires fc1_scales, fc2_scales, fc1_global_scale, and fc2_global_scale.");
+    if (!use_wfp4afp8_dequant_fallback_) {
+      // Native W4A8 path (SM100+): use QuantParams::MXFP8MXFP4 (Variant B). The activation
+      // is quantized BF16/FP16 -> MXFP8 (FP8 + per-block ue8m0 scales) inside the runner's
+      // expandInputRowsKernel; the activation block scales are written to fc1_fp4_act_scale_
+      // at runtime. The mxfp8_mxfp4 weight_block_scale field holds the MXFP4 weight block
+      // scales (same uint8 ue8m0 element type as MXFP8 activation block scales) and is
+      // checked by the expansion kernel as a marker to take the MXFP8 quantization path.
+      //
+      // Variant A (global-scaled FP8 activation) would consume the per-expert/per-tensor
+      // scale from inputs 18/19 via QuantParams::FP8MXFP4. That path requires the user to
+      // feed FP8 input directly, which the QMoE op does not support (its input is BF16/FP16),
+      // so we use Variant B instead. The act_scale inputs are still validated and pre-packed
+      // for forward compatibility.
+      using MXFPXElementSF = onnxruntime::llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF;
+      quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::MXFP8MXFP4(
+          static_cast<const MXFPXElementSF*>(p_fc1_block_scales),
+          static_cast<const float*>(p_fc1_global_scale),
+          static_cast<const MXFPXElementSF*>(p_fc2_block_scales),
+          static_cast<const float*>(p_fc2_global_scale));
+    }
   } else if (is_fp8 && !use_fp8_dequant_fallback_) {
     // Native W8A16-FP8: per-expert global scale applied via alpha_scale_ptr_array in the epilogue.
     const void* p_fc1_global_scale = packed_fc1_global_scale_ ? packed_fc1_global_scale_.get()
@@ -687,9 +792,15 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
 
   const void* fc1_weight_data = fc1_experts_weights->DataRaw();
   const void* fc2_weight_data = fc2_experts_weights->DataRaw();
+  if (is_wfp4afp8 && !use_wfp4afp8_dequant_fallback_) {
+    fc1_weight_data = packed_fp4_fc1_weights_ ? packed_fp4_fc1_weights_.get() : fc1_weight_data;
+    fc2_weight_data = packed_fp4_fc2_weights_ ? packed_fp4_fc2_weights_.get() : fc2_weight_data;
+  }
   IAllocatorUniquePtr<void> dequant_fc1_weights;
   IAllocatorUniquePtr<void> dequant_fc2_weights;
-  if (is_fp4 && use_fp4_dequant_fallback_) {
+  // FP4 (W4A16) and WFP4AFP8 (W4A8) share the MXFP4 weight format. When the native CUTLASS path
+  // is unavailable on the current SM, dequantize MXFP4 weights to FP16/BF16 and run the dense A16 runner.
+  if ((is_fp4 && use_fp4_dequant_fallback_) || (is_wfp4afp8 && use_wfp4afp8_dequant_fallback_)) {
     const void* p_fc1_block_scales = packed_fp4_fc1_block_scales_ ? packed_fp4_fc1_block_scales_.get()
                                                                   : (fp4_fc1_block_scales ? fp4_fc1_block_scales->DataRaw() : nullptr);
     const void* p_fc1_global_scale = packed_fc1_global_scale_ ? packed_fc1_global_scale_.get()
@@ -1032,9 +1143,110 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
     is_packed = true;
   };
 
-  if (input_idx == 3) {  // fc1_scales
+  auto SwizzleMXFPXBlockScalesToGpu = [&](IAllocatorUniquePtr<void>& packed_buf) {
+    auto shape = tensor.Shape();
+    ORT_ENFORCE(shape.NumDimensions() == 3, "Expected 3D FP4 block scales for WFP4AFP8 native prepack");
+
+    const int64_t experts = shape[0];
+    const int64_t rows = shape[1];
+    const int64_t scale_cols = shape[2];
+    const int64_t padded_rows = ((rows + 127) / 128) * 128;
+    const int64_t padded_scale_cols = ((scale_cols + 3) / 4) * 4;
+    const size_t src_bytes = tensor.SizeInBytes();
+    const size_t dst_bytes = SafeInt<size_t>(experts) * SafeInt<size_t>(padded_rows) *
+                             SafeInt<size_t>(padded_scale_cols) * sizeof(uint8_t);
+
+    std::vector<uint8_t> src(src_bytes);
+    if (tensor.Location().device.Type() == OrtDevice::CPU) {
+      std::memcpy(src.data(), tensor.DataRaw(), src_bytes);
+    } else {
+      CUDA_CALL_THROW(cudaMemcpyAsync(src.data(), tensor.DataRaw(), src_bytes, cudaMemcpyDeviceToHost, stream));
+      CUDA_CALL_THROW(cudaStreamSynchronize(stream));
+    }
+
+    std::vector<uint8_t> dst(dst_bytes, 0);
+    const int64_t num_k_tiles = (scale_cols + 3) / 4;
+    for (int64_t expert = 0; expert < experts; ++expert) {
+      const size_t src_expert_offset = SafeInt<size_t>(expert) * SafeInt<size_t>(rows) * SafeInt<size_t>(scale_cols);
+      const size_t dst_expert_offset = SafeInt<size_t>(expert) * SafeInt<size_t>(padded_rows) *
+                                       SafeInt<size_t>(padded_scale_cols);
+      for (int64_t row = 0; row < rows; ++row) {
+        for (int64_t scale_col = 0; scale_col < scale_cols; ++scale_col) {
+          const int64_t inner_k = scale_col % 4;
+          const int64_t inner_m = (row % 128) / 32;
+          const int64_t outer_m = row % 32;
+          const int64_t k_tile = scale_col / 4;
+          const int64_t m_tile = row / 128;
+          const int64_t swizzled_offset = m_tile * num_k_tiles * 512 + k_tile * 512 +
+                                          outer_m * 16 + inner_m * 4 + inner_k;
+          dst[dst_expert_offset + swizzled_offset] = src[src_expert_offset + row * scale_cols + scale_col];
+        }
+      }
+    }
+
+    packed_buf = IAllocator::MakeUniquePtr<void>(alloc, dst_bytes, true);
+    CUDA_CALL_THROW(cudaMemcpyAsync(packed_buf.get(), dst.data(), dst_bytes, cudaMemcpyHostToDevice, stream));
+    CUDA_CALL_THROW(cudaStreamSynchronize(stream));
+    is_packed = true;
+  };
+
+  auto RepackColumnMajorFP4WeightsToRowMajorGpu = [&](IAllocatorUniquePtr<void>& packed_buf) {
+    auto shape = tensor.Shape();
+    ORT_ENFORCE(shape.NumDimensions() == 3, "Expected 3D FP4 weights for WFP4AFP8 native prepack");
+
+    const int64_t experts = shape[0];
+    const int64_t k = shape[1];
+    const int64_t n = shape[2] * 2;
+    const size_t bytes = tensor.SizeInBytes();
+
+    std::vector<uint8_t> src(bytes);
+    if (tensor.Location().device.Type() == OrtDevice::CPU) {
+      std::memcpy(src.data(), tensor.DataRaw(), bytes);
+    } else {
+      CUDA_CALL_THROW(cudaMemcpyAsync(src.data(), tensor.DataRaw(), bytes, cudaMemcpyDeviceToHost, stream));
+      CUDA_CALL_THROW(cudaStreamSynchronize(stream));
+    }
+
+    std::vector<uint8_t> dst(bytes, 0);
+    const size_t src_expert_stride = SafeInt<size_t>(k) * SafeInt<size_t>(n / 2);
+    const size_t dst_expert_stride = SafeInt<size_t>(n) * SafeInt<size_t>(k / 2);
+    for (int64_t expert = 0; expert < experts; ++expert) {
+      const size_t src_expert_offset = SafeInt<size_t>(expert) * src_expert_stride;
+      const size_t dst_expert_offset = SafeInt<size_t>(expert) * dst_expert_stride;
+      for (int64_t row = 0; row < n; ++row) {
+        for (int64_t col = 0; col < k; ++col) {
+          const uint8_t packed_col_major = src[src_expert_offset + col * (n / 2) + row / 2];
+          const uint8_t code = (row % 2 == 0) ? (packed_col_major & 0x0F) : ((packed_col_major >> 4) & 0x0F);
+          uint8_t& packed_row_major = dst[dst_expert_offset + row * (k / 2) + col / 2];
+          if (col % 2 == 0) {
+            packed_row_major = static_cast<uint8_t>((packed_row_major & 0xF0) | code);
+          } else {
+            packed_row_major = static_cast<uint8_t>((packed_row_major & 0x0F) | (code << 4));
+          }
+        }
+      }
+    }
+
+    packed_buf = IAllocator::MakeUniquePtr<void>(alloc, bytes, true);
+    CUDA_CALL_THROW(cudaMemcpyAsync(packed_buf.get(), dst.data(), bytes, cudaMemcpyHostToDevice, stream));
+    CUDA_CALL_THROW(cudaStreamSynchronize(stream));
+    is_packed = true;
+  };
+
+  if (input_idx == 2 && quant_type_ == "wfp4afp8" && !use_wfp4afp8_dequant_fallback_) {
+    RepackColumnMajorFP4WeightsToRowMajorGpu(packed_fp4_fc1_weights_);
+    is_packed = false;
+  } else if (input_idx == 5 && quant_type_ == "wfp4afp8" && !use_wfp4afp8_dequant_fallback_) {
+    RepackColumnMajorFP4WeightsToRowMajorGpu(packed_fp4_fc2_weights_);
+    is_packed = false;
+  } else if (input_idx == 8 && has_fc3_ && quant_type_ == "wfp4afp8" && !use_wfp4afp8_dequant_fallback_) {
+    RepackColumnMajorFP4WeightsToRowMajorGpu(packed_fp4_fc3_weights_);
+    is_packed = false;
+  } else if (input_idx == 3) {  // fc1_scales
     DUMP_TENSOR("fc1_scales", tensor);
-    if (quant_type_ == "fp4") {
+    if (quant_type_ == "wfp4afp8" && !use_wfp4afp8_dequant_fallback_) {
+      SwizzleMXFPXBlockScalesToGpu(packed_fp4_fc1_block_scales_);
+    } else if (quant_type_ == "fp4" || quant_type_ == "wfp4afp8") {
       CopyToGpu(packed_fp4_fc1_block_scales_);
     } else if (quant_type_ == "int") {
       TransposeAndPack(packed_fc1_scales_);
@@ -1042,7 +1254,9 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
     }
   } else if (input_idx == 6) {  // fc2_scales
     DUMP_TENSOR("fc2_scales", tensor);
-    if (quant_type_ == "fp4") {
+    if (quant_type_ == "wfp4afp8" && !use_wfp4afp8_dequant_fallback_) {
+      SwizzleMXFPXBlockScalesToGpu(packed_fp4_fc2_block_scales_);
+    } else if (quant_type_ == "fp4" || quant_type_ == "wfp4afp8") {
       CopyToGpu(packed_fp4_fc2_block_scales_);
     } else if (quant_type_ == "int") {
       TransposeAndPack(packed_fc2_scales_);
@@ -1050,7 +1264,9 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
     }
   } else if (input_idx == 9 && has_fc3_) {  // fc3_scales
     DUMP_TENSOR("fc3_scales", tensor);
-    if (quant_type_ == "fp4") {
+    if (quant_type_ == "wfp4afp8" && !use_wfp4afp8_dequant_fallback_) {
+      SwizzleMXFPXBlockScalesToGpu(packed_fp4_fc3_block_scales_);
+    } else if (quant_type_ == "fp4" || quant_type_ == "wfp4afp8") {
       CopyToGpu(packed_fp4_fc3_block_scales_);
     } else if (quant_type_ == "int") {
       TransposeAndPack(packed_fc3_scales_);
@@ -1064,8 +1280,9 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
     DUMP_TENSOR("fc2_zeros", tensor);
     compute_bias(packed_fc2_scales_, packed_fc2_bias_);
     DUMP_PACK_TENSOR("packed_fc2_bias", packed_fc2_bias_, tensor);
-  } else if (input_idx >= 15 && input_idx <= 17 && (quant_type_ == "fp4" || quant_type_ == "fp8")) {
-    // FP4/FP8 global scales.
+  } else if (input_idx >= 15 && input_idx <= 17 &&
+             (quant_type_ == "fp4" || quant_type_ == "fp8" || quant_type_ == "wfp4afp8")) {
+    // FP4/FP8/WFP4AFP8 per-expert global weight scales.
     switch (input_idx) {
       case 15:
         CopyToGpu(packed_fc1_global_scale_);
@@ -1076,6 +1293,13 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
       case 17:
         CopyToGpu(packed_fc3_global_scale_);
         break;
+    }
+  } else if ((input_idx == 18 || input_idx == 19) && quant_type_ == "wfp4afp8") {
+    // W4A8 (WFP4AFP8) Variant A FP8 activation global scales.
+    if (input_idx == 18) {
+      CopyToGpu(packed_fc1_act_scale_);
+    } else {
+      CopyToGpu(packed_fc2_act_scale_);
     }
   }
   // TODO: fc3_zeros (13) not handled for now as it's optional and rarely used?

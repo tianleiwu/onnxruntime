@@ -30,7 +30,10 @@ class QMoE final : public CudaKernel, public MoEBase {
   bool use_fp4_dequant_fallback_ = false;
   // Dequantizes FP8 weights to FP16/BF16 scratch buffers before invoking the A16 MoE runner.
   bool use_fp8_dequant_fallback_ = false;
-  std::string quant_type_;  // "int", "fp4", or "fp8"
+  // WFP4AFP8 (W4A8) requires SM100+ (Blackwell) block-scaled tensor ops. On older GPUs we
+  // dequantize MXFP4 weights to FP16/BF16 and run the dense A16 MoE runner.
+  bool use_wfp4afp8_dequant_fallback_ = false;
+  std::string quant_type_;  // "int", "fp4", "fp8", or "wfp4afp8"
 
   std::unique_ptr<onnxruntime::llm::kernels::cutlass_kernels::CutlassMoeFCRunnerInterface> m_moe_runner;
 
@@ -47,6 +50,9 @@ class QMoE final : public CudaKernel, public MoEBase {
   IAllocatorUniquePtr<void> packed_fc3_bias_;
 
   // FP4 pre-packed buffers
+  IAllocatorUniquePtr<void> packed_fp4_fc1_weights_;
+  IAllocatorUniquePtr<void> packed_fp4_fc2_weights_;
+  IAllocatorUniquePtr<void> packed_fp4_fc3_weights_;
   IAllocatorUniquePtr<void> packed_fp4_fc1_block_scales_;
   IAllocatorUniquePtr<void> packed_fp4_fc2_block_scales_;
   IAllocatorUniquePtr<void> packed_fp4_fc3_block_scales_;
@@ -55,6 +61,11 @@ class QMoE final : public CudaKernel, public MoEBase {
   IAllocatorUniquePtr<void> packed_fc1_global_scale_;
   IAllocatorUniquePtr<void> packed_fc2_global_scale_;
   IAllocatorUniquePtr<void> packed_fc3_global_scale_;
+
+  // Per-tensor or per-expert FP8 activation global scales used by W4A8 (WFP4AFP8) Variant A.
+  // Inputs 18/19 in the QMoE schema. Optional; absent for the MXFP8 block-scaled variant.
+  IAllocatorUniquePtr<void> packed_fc1_act_scale_;
+  IAllocatorUniquePtr<void> packed_fc2_act_scale_;
 
   mutable onnxruntime::llm::kernels::cutlass_kernels::MoeGemmProfiler mGemmProfiler;
   mutable onnxruntime::llm::kernels::cutlass_kernels::MoeGemmId mGemmId1;

@@ -13,11 +13,11 @@ onward has hardware FP8 GEMM support, and Hopper (SM90, H100/H200) has Tensor
 Core FP8 fast-accumulate mode. This document specifies how to add three FP8-related
 modes to the QMoE operator, in priority order, and why W8A16-fp8 is implemented first.
 
-**WFP4AFP8** (FP4 weight + FP8 activation), planned as Phase 2, targets
-Blackwell (SM100+, RTX 5090) where both FP4 and FP8 tensor ops are native and
-can be combined in a single block-scaled GEMM. The schema and dispatch design
-for all three modes are specified here so the operator interface does not need
-to change later.
+**WFP4AFP8** (FP4 weight + FP8 activation) is implemented as `quant_type="wfp4afp8"`. The full
+implementation details and current state live in [`qmoe_fp4.md`](qmoe_fp4.md) section 12. The build is
+gated on `onnxruntime_ENABLE_CUDA_FP4_QMOE`. The runtime selects native CUTLASS block-scaled tensor ops on
+SM100+ (Blackwell) and falls back to the MXFP4 dequantize-then-A16 path on older SMs. The schema and
+dispatch design for all three FP8 modes are specified here so the operator interface does not change later.
 
 ---
 
@@ -26,7 +26,7 @@ to change later.
 | Mode | Notation | Activation | Weight | SM support |
 |------|----------|-----------|--------|------------|
 | **Phase 1** | W8A16-fp8 | BF16 / FP16 | FP8 e4m3 | SM80+ (dequant), SM89 (Ada), SM90 (Hopper), SM100 (Blackwell) |
-| **Phase 2** | WFP4AFP8 | FP8 e4m3 (MXFP8) | FP4 e2m1 (MXFP4) | SM100+ (Blackwell) only — requires block-scaled tensor ops |
+| **Phase 2** | WFP4AFP8 | FP8 e4m3 (MXFP8) | FP4 e2m1 (MXFP4) | SM100+ native; SM<100 dequant fallback (see [qmoe_fp4.md](qmoe_fp4.md) §12) |
 | **Future**  | W4AFP8 | FP8 e4m3 | INT4 (uint4b_t) | SM89 (Ada) fast path; SM80+ via dequant fallback |
 
 ### Why W8A16-fp8 First, WFP4AFP8 Second
@@ -65,8 +65,7 @@ for CUDA ≥ 11.8 by `cmake/CMakeLists.txt:1467`).
 // MoeGemmRunner type-level flags (lines 258–284)
 static constexpr bool use_fp8     = (T == fp8_e4m3 || T == fp8_e5m2) && WeightType != uint4b_t && WeightType != fp4_e2m1;
 static constexpr bool use_w4afp8  = T == fp8_e4m3 && WeightType == uint4b_t;
-// Note: confusingly named "use_wfp4afp4" in the source but actually means W=FP4, A=FP8 (WFP4AFP8):
-static constexpr bool use_wfp4afp4 = T == fp8_e4m3 && WeightType == fp4_e2m1;  // = WFP4AFP8
+static constexpr bool use_wfp4afp8 = T == fp8_e4m3 && WeightType == fp4_e2m1;  // = WFP4AFP8
 ```
 `OutputTypeAdaptor_t<T>` maps `fp8_e4m3` → `nv_bfloat16` so the GEMM output
 is always widened to BF16.

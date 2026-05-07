@@ -997,18 +997,29 @@ __global__ void computeStridesTmaWarpSpecializedKernel(int64_t const* expert_fir
   computeTmaWarpSpecializedInputStrides(layout_info1, gemm_m, gemm1_n, gemm1_k, expert, groupwise_scale_group_size);
   computeTmaWarpSpecializedInputStrides(layout_info2, gemm_m, gemm2_n, gemm2_k, expert, groupwise_scale_group_size);
 
+  auto const* fc1_weight_block_scale = quant_params.mxfp8_mxfp4.fc1.weight_block_scale
+                                           ? quant_params.mxfp8_mxfp4.fc1.weight_block_scale
+                                       : quant_params.fp8_mxfp4.fc1.weight_block_scale
+                                           ? quant_params.fp8_mxfp4.fc1.weight_block_scale
+                                           : quant_params.fp4.fc1.weight_block_scale;
+  auto const* fc2_weight_block_scale = quant_params.mxfp8_mxfp4.fc2.weight_block_scale
+                                           ? quant_params.mxfp8_mxfp4.fc2.weight_block_scale
+                                       : quant_params.fp8_mxfp4.fc2.weight_block_scale
+                                           ? quant_params.fp8_mxfp4.fc2.weight_block_scale
+                                           : quant_params.fp4.fc2.weight_block_scale;
+
   computeTmaWarpSpecializedInputPointers(layout_info1, gemm_m, gemm1_n, gemm1_k, num_tokens_before_expert, expert,
                                          gemm1_in, weights1,
                                          reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const*>(
                                              quant_params.groupwise.fc1.weight_scales),
-                                         quant_params.fp4.fc1.weight_block_scale,
+                                         fc1_weight_block_scale,
                                          groupwise_scale_group_size,
                                          bias1, gemm1_output, expert);
   computeTmaWarpSpecializedInputPointers(layout_info2, gemm_m, gemm2_n, gemm2_k, num_tokens_before_expert, expert,
                                          gemm2_in, weights2,
                                          reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const*>(
                                              quant_params.groupwise.fc2.weight_scales),
-                                         quant_params.fp4.fc2.weight_block_scale,
+                                         fc2_weight_block_scale,
                                          groupwise_scale_group_size,
                                          bias2, gemm2_output, expert);
 
@@ -1420,6 +1431,14 @@ INSTANTIATE_EXPAND_INPUT_ROWS(float, float);
 INSTANTIATE_EXPAND_INPUT_ROWS(half, half);
 #ifdef ENABLE_BF16
 INSTANTIATE_EXPAND_INPUT_ROWS(__nv_bfloat16, __nv_bfloat16);
+#endif
+#if defined(ENABLE_FP8) && defined(ENABLE_FP4)
+// W4A8 (WFP4AFP8) native path: BF16/FP16 input is quantized to MXFP8 inside the expansion kernel
+// using the existing MXFP8 branch (gated by quant_params.mxfp8_mxfp4.fc1.weight_block_scale).
+INSTANTIATE_EXPAND_INPUT_ROWS(half, __nv_fp8_e4m3);
+#ifdef ENABLE_BF16
+INSTANTIATE_EXPAND_INPUT_ROWS(__nv_bfloat16, __nv_fp8_e4m3);
+#endif
 #endif
 
 enum class ScaleMode : int {
@@ -2518,11 +2537,15 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>:
   layout_info2.stride_c = nullptr;
 
   auto alpha_scale_flat1 = use_fp4        ? quant_params.fp4.fc1.global_scale
-                           : use_wfp4afp8 ? quant_params.fp8_mxfp4.fc1.global_scale
+                           : use_wfp4afp8 ? (quant_params.fp8_mxfp4.fc1.global_scale
+                                                 ? quant_params.fp8_mxfp4.fc1.global_scale
+                                                 : quant_params.mxfp8_mxfp4.fc1.global_scale)
                            : use_fp8      ? fp8_dequant1
                                           : nullptr;
   auto alpha_scale_flat2 = use_fp4        ? quant_params.fp4.fc2.global_scale
-                           : use_wfp4afp8 ? quant_params.fp8_mxfp4.fc2.global_scale
+                           : use_wfp4afp8 ? (quant_params.fp8_mxfp4.fc2.global_scale
+                                                 ? quant_params.fp8_mxfp4.fc2.global_scale
+                                                 : quant_params.mxfp8_mxfp4.fc2.global_scale)
                            : use_fp8      ? fp8_dequant2
                                           : nullptr;
   if (!alpha_scale_flat1 && !alpha_scale_flat2) {
@@ -3344,6 +3367,15 @@ template class CutlassMoeFCRunner<half, cutlass::uint4b_t>;
 template class CutlassMoeFCRunner<half, __nv_fp4_e2m1>;
 #ifdef ENABLE_BF16
 template class CutlassMoeFCRunner<__nv_bfloat16, __nv_fp4_e2m1>;
+#endif
+#ifdef ENABLE_FP8
+// W4A8 (WFP4AFP8): FP8 e4m3 activations + MXFP4 weights, BF16/FP16 input/output.
+// InputType differs from T (the GEMM activation type) so the runner can accept BF16/FP16 user
+// input and quantize it to FP8 inside expandInputRowsKernel. Native CUTLASS path requires SM100+.
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, half, half>;
+#ifdef ENABLE_BF16
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, __nv_bfloat16, __nv_bfloat16>;
+#endif
 #endif
 #endif
 
