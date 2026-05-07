@@ -620,18 +620,19 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
   static constexpr auto simt_only_flag = std::is_same<T, float>::value ? CutlassGemmConfig::SIMT_ONLY : CutlassGemmConfig::NONE;
   int const max_split_k = 1;
   int const grouped_gemm_flag = CutlassGemmConfig::GROUPED_GEMM;
-  int const enable_blackwell = sm >= 100 ? CutlassGemmConfig::BLACKWELL : CutlassGemmConfig::NONE;
-  int const enable_hopper = sm == 90 ? CutlassGemmConfig::HOPPER : CutlassGemmConfig::NONE;
+  int const config_sm = use_wfp4a16 && sm >= 120 ? 90 : sm;
+  int const enable_blackwell = config_sm >= 100 ? CutlassGemmConfig::BLACKWELL : CutlassGemmConfig::NONE;
+  int const enable_hopper = config_sm == 90 ? CutlassGemmConfig::HOPPER : CutlassGemmConfig::NONE;
   static constexpr auto fp8_only_flag = use_fp8 ? CutlassGemmConfig::FP8_ONLY : CutlassGemmConfig::NONE;
   static constexpr auto fp4_only_flag = (use_fp4 || use_wfp4afp4) ? CutlassGemmConfig::FP4_ONLY : CutlassGemmConfig::NONE;
   auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(weight_only_flag | simt_only_flag | grouped_gemm_flag | enable_blackwell | enable_hopper | fp8_only_flag | fp4_only_flag);
   ORT_ENFORCE(!(enable_blackwell && enable_hopper), "Blackwell and hopper flags are mutually exclusive");
 
-  if (sm >= 100 && sm < 120 && !kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType>()) {
+  if (config_sm >= 100 && config_sm < 120 && !kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType>()) {
     ORT_LLM_LOG_DEBUG("Blackwell is not supported for this configuration, not selecting any TMA WS implementations");
     return {};
   }
-  if ((sm == 120 || sm == 121) && !kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>()) {
+  if ((config_sm == 120 || config_sm == 121) && !kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>()) {
     ORT_LLM_LOG_DEBUG(
         "Blackwell SM120 is not supported for this configuration, not selecting any TMA WS implementations");
     return {};
@@ -641,7 +642,7 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
     return {};
   }
 
-  std::vector<cutlass_extensions::CutlassGemmConfig> tma_ws_configs = kernels::cutlass_kernels::get_candidate_configs(sm, max_split_k, config_type_param);
+  std::vector<cutlass_extensions::CutlassGemmConfig> tma_ws_configs = kernels::cutlass_kernels::get_candidate_configs(config_sm, max_split_k, config_type_param);
   if constexpr (use_wfp4a16) {
     tma_ws_configs.erase(
         std::remove_if(tma_ws_configs.begin(), tma_ws_configs.end(), [](auto const& config) {
@@ -664,6 +665,9 @@ bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::isTmaWarpSpecializ
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsTmaWarpSpecialized() const {
   ORT_LLM_LOG_ENTRY();
+  if constexpr (use_wfp4a16) {
+    return sm_ >= 120 && kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType>();
+  }
   return (sm_ == 90 && kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType>()) ||
          (sm_ >= 100 && sm_ < 120 && kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType>()) ||
          ((sm_ == 120 || sm_ == 121) && kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>());
@@ -736,7 +740,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
       dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm89, EpilogueTag>(
           inputs, multi_processor_count_);
     } else if constexpr (use_wfp4a16) {
-      ORT_THROW("wfp4a16 (FP4 weights with FP16/BF16 activations) requires SM90+");
+      ORT_THROW("wfp4a16 (FP4 weights with FP16/BF16 activations) requires SM120+");
     } else if constexpr (use_wfp8a16) {
       ORT_THROW("wfp8a16 (FP8 weights with FP16/BF16 activations) requires SM90+");
     } else {

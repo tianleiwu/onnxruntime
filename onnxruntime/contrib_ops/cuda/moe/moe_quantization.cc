@@ -78,7 +78,11 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
   if (quant_type_ == "fp4" || quant_type_ == "fp8") {
     if (quant_type_ == "fp4") {
       ORT_ENFORCE(expert_weight_bits_ == 4, "FP4 quantization requires expert_weight_bits=4");
+#if defined(ENABLE_FP4) && defined(ENABLE_CUDA_FP4_QMOE)
+      use_fp4_dequant_fallback_ = sm_ < 120;
+#else
       use_fp4_dequant_fallback_ = true;
+#endif
     } else {
       ORT_ENFORCE(expert_weight_bits_ == 8, "FP8 quantization requires expert_weight_bits=8");
       // Use native W8A16-FP8 on SM90+ (Hopper/H200), fallback to dequant on older GPUs
@@ -88,7 +92,17 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
         use_fp8_dequant_fallback_ = true;
       }
     }
-    if (quant_type_ == "fp8" && !use_fp8_dequant_fallback_) {
+    if (quant_type_ == "fp4" && !use_fp4_dequant_fallback_) {
+#if defined(ENABLE_FP4) && defined(ENABLE_CUDA_FP4_QMOE)
+      if (is_fp16) {
+        m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, __nv_fp4_e2m1, half>>(
+            sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
+      } else {
+        m_moe_runner = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, __nv_fp4_e2m1, __nv_bfloat16>>(
+            sm_, activation_type_, has_fc3_, normalize_routing_weights_, use_sparse_mixer_);
+      }
+#endif
+    } else if (quant_type_ == "fp8" && !use_fp8_dequant_fallback_) {
       // Native W8A16-FP8: activations are half/bf16, weights are __nv_fp8_e4m3
       if (is_fp16) {
         m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, __nv_fp8_e4m3, half>>(

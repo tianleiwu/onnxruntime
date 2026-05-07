@@ -1480,8 +1480,7 @@ if (onnxruntime_USE_CUDA)
     # which are extremely slow to compile for unsupported architectures.
     set(_has_sm100_plus FALSE)
     foreach(_arch ${CMAKE_CUDA_ARCHITECTURES})
-      # Strip suffixes like "-real" or "-virtual"
-      string(REGEX REPLACE "[-].*" "" _arch_num "${_arch}")
+      string(REGEX MATCH "^[0-9]+" _arch_num "${_arch}")
       if(_arch_num MATCHES "^[0-9]+$" AND _arch_num GREATER_EQUAL 100)
         set(_has_sm100_plus TRUE)
         break()
