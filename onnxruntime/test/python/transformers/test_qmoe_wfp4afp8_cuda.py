@@ -133,7 +133,9 @@ def create_wfp4afp8_moe_onnx_graph(
         ("fc2_scales", fc2_block_scales),
     ]:
         arr = numpy.ascontiguousarray(tensor.cpu().numpy().astype(numpy.uint8))
-        initializers.append(helper.make_tensor(name, TensorProto.UINT8, list(tensor.shape), arr.tobytes(), raw=True))
+        initializers.append(
+            helper.make_tensor(name, TensorProto.FLOAT8E8M0, list(tensor.shape), arr.tobytes(), raw=True)
+        )
 
     for name, tensor in [
         ("fc1_global_scale", fc1_global_scale),

@@ -44,7 +44,7 @@ namespace cuda {
           .TypeConstraint("T1", {DataTypeImpl::GetTensorType<uint8_t>(),       \
                                  DataTypeImpl::GetTensorType<Float8E4M3FN>()}) \
           .TypeConstraint("T2", {DataTypeImpl::GetTensorType<T>(),             \
-                                 DataTypeImpl::GetTensorType<uint8_t>()})      \
+                                 DataTypeImpl::GetTensorType<Float8E8M0>()})   \
           .TypeConstraint("T4", DataTypeImpl::GetTensorType<float>()),         \
       QMoE);
 
@@ -276,7 +276,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
     auto check_fp4_block_scale = [](const Tensor* tensor, const char* name, int64_t num_experts,
                                     int64_t n, int64_t k) -> Status {
       ORT_RETURN_IF_NOT(tensor != nullptr, "QMoE quant_type='fp4'/'wfp4afp8' requires ", name, ".");
-      ORT_RETURN_IF_NOT(tensor->IsDataType<uint8_t>(), name, " must be a uint8 MXFP block-scale tensor.");
+      ORT_RETURN_IF_NOT(tensor->IsDataType<Float8E8M0>(), name, " must be a float8e8m0 MXFP block-scale tensor.");
       const auto& dims = tensor->Shape().GetDims();
       ORT_RETURN_IF_NOT(dims.size() == 3 && dims[0] == num_experts && dims[1] == n && dims[2] == k,
                         name, " must have shape (", num_experts, ", ", n, ", ", k, "), got ", tensor->Shape().ToString(), ".");
@@ -955,6 +955,9 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
       } else if (type == DataTypeImpl::GetType<float>()) {
         LaunchQMoETranspose2D(static_cast<const float*>(p_src), static_cast<float*>(packed_buf.get()), batch, rows, cols, stream);
       } else if (type == DataTypeImpl::GetType<uint8_t>()) {
+        LaunchQMoETranspose2D(static_cast<const uint8_t*>(p_src), static_cast<uint8_t*>(packed_buf.get()), batch, rows, cols, stream);
+      } else if (type == DataTypeImpl::GetType<Float8E8M0>()) {
+        // Float8E8M0 is 1 byte, same layout as uint8_t — reuse the uint8_t transpose kernel.
         LaunchQMoETranspose2D(static_cast<const uint8_t*>(p_src), static_cast<uint8_t*>(packed_buf.get()), batch, rows, cols, stream);
       } else {
         ORT_THROW("Unsupported data type for scale transposition");
