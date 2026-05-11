@@ -126,18 +126,14 @@ def create_wfp4afp8_moe_onnx_graph(
 
     for name, tensor in [("fc1_weights", fc1_weights), ("fc2_weights", fc2_weights)]:
         arr = numpy.ascontiguousarray(tensor.cpu().numpy().astype(numpy.uint8))
-        initializers.append(
-            helper.make_tensor(name, TensorProto.UINT8, list(tensor.shape), arr.tobytes(), raw=True)
-        )
+        initializers.append(helper.make_tensor(name, TensorProto.UINT8, list(tensor.shape), arr.tobytes(), raw=True))
 
     for name, tensor in [
         ("fc1_scales", fc1_block_scales),
         ("fc2_scales", fc2_block_scales),
     ]:
         arr = numpy.ascontiguousarray(tensor.cpu().numpy().astype(numpy.uint8))
-        initializers.append(
-            helper.make_tensor(name, TensorProto.UINT8, list(tensor.shape), arr.tobytes(), raw=True)
-        )
+        initializers.append(helper.make_tensor(name, TensorProto.UINT8, list(tensor.shape), arr.tobytes(), raw=True))
 
     for name, tensor in [
         ("fc1_global_scale", fc1_global_scale),
@@ -148,10 +144,14 @@ def create_wfp4afp8_moe_onnx_graph(
 
     if fc1_act_scale is not None:
         vals = fc1_act_scale.cpu().float().flatten().tolist()
-        initializers.append(helper.make_tensor("fc1_act_scale", TensorProto.FLOAT, list(fc1_act_scale.shape), vals, raw=False))
+        initializers.append(
+            helper.make_tensor("fc1_act_scale", TensorProto.FLOAT, list(fc1_act_scale.shape), vals, raw=False)
+        )
     if fc2_act_scale is not None:
         vals = fc2_act_scale.cpu().float().flatten().tolist()
-        initializers.append(helper.make_tensor("fc2_act_scale", TensorProto.FLOAT, list(fc2_act_scale.shape), vals, raw=False))
+        initializers.append(
+            helper.make_tensor("fc2_act_scale", TensorProto.FLOAT, list(fc2_act_scale.shape), vals, raw=False)
+        )
 
     graph_inputs = [
         helper.make_tensor_value_info("input", onnx_dtype, [num_tokens, hidden_size]),
@@ -196,8 +196,18 @@ class TestQMoEWFP4AFP8(unittest.TestCase):
             return 0.40 if torch_dtype == torch.bfloat16 else 0.30
         return 0.15 if torch_dtype == torch.bfloat16 else 0.12
 
-    def _run(self, hidden_size, inter_size, num_experts, top_k, num_tokens,
-             onnx_dtype, use_swiglu=False, with_act_scale=False, per_expert_act_scale=False):
+    def _run(
+        self,
+        hidden_size,
+        inter_size,
+        num_experts,
+        top_k,
+        num_tokens,
+        onnx_dtype,
+        use_swiglu=False,
+        with_act_scale=False,
+        per_expert_act_scale=False,
+    ):
         self._skip_if_no_fp4()
 
         torch.manual_seed(42)
@@ -299,8 +309,9 @@ class TestQMoEWFP4AFP8(unittest.TestCase):
 
         # Reference: dequantize MXFP4 and run BF16/FP16 MoE — matches the operator's
         # current dequant fallback path exactly.
-        ref_output = self._reference(input_tensor, router_logits, fc1_deq_all, fc2_deq_all,
-                                     num_experts, top_k, use_swiglu, torch_dtype)
+        ref_output = self._reference(
+            input_tensor, router_logits, fc1_deq_all, fc2_deq_all, num_experts, top_k, use_swiglu, torch_dtype
+        )
 
         max_diff = (ort_output.float() - ref_output.float()).abs().max().item()
         atol = self._atol(torch_dtype)
