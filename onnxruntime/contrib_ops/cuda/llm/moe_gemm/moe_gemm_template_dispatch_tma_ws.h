@@ -187,7 +187,12 @@ constexpr bool are_tile_shapes_supported_sm120() {
   constexpr auto TileN = size<1>(CtaShape{});
   constexpr auto TileK = size<2>(CtaShape{});
 
-  return (TileM == 128 && TileN == 128 && TileK == 128) || (TileM == 128 && TileN == 128 && TileK == 256) || (TileM == 128 && TileN == 256 && TileK == 128) || (TileM == 256 && TileN == 128 && TileK == 128);
+  // FP4xFP4 element counts: K=128 (64B) or K=256 (128B)
+  // FP8xFP4 element counts: K=128 (128B)
+  // Byte-based: 64B, 128B, 256B tile K supported
+  return (TileM == 128 && TileN == 128 && (TileK == 64 || TileK == 128 || TileK == 256)) ||
+         (TileM == 128 && TileN == 256 && (TileK == 64 || TileK == 128)) ||
+         (TileM == 256 && TileN == 128 && (TileK == 64 || TileK == 128));
 }
 
 /*
@@ -339,8 +344,11 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
       switch (gemm_config.tile_config_sm120) {
         SHAPE_CASE(120, 128, 128, 64)
         SHAPE_CASE(120, 128, 128, 128)
+        SHAPE_CASE(120, 128, 128, 256)
         SHAPE_CASE(120, 128, 256, 64)
+        SHAPE_CASE(120, 128, 256, 128)
         SHAPE_CASE(120, 256, 128, 64)
+        SHAPE_CASE(120, 256, 128, 128)
         DEFAULT_CASE(120)
       }
     }

@@ -42,6 +42,7 @@ if(NOT onnxruntime_ENABLE_CUDA_FP4_QMOE)
   list(FILTER onnxruntime_cuda_contrib_ops_cu_srcs EXCLUDE REGEX "moe_gemm_tma_ws_sm120_fp4_.*\\.generated\\.cu")
   list(FILTER onnxruntime_cuda_contrib_ops_cu_srcs EXCLUDE REGEX "moe_gemm_kernels_(fp16|bf16)_fp4\\.cu")
   list(FILTER onnxruntime_cuda_contrib_ops_cu_srcs EXCLUDE REGEX "moe_gemm_kernels_fp4_fp4\\.cu")
+  list(FILTER onnxruntime_cuda_contrib_ops_cu_srcs EXCLUDE REGEX "moe_gemm_kernels_fp8_fp4\\.cu")
 else()
   # CUDA 13 PTXAS does not complete the FP4 M=128/N=64 pingpong specializations in
   # this build configuration. The dispatcher routes that tile through cooperative

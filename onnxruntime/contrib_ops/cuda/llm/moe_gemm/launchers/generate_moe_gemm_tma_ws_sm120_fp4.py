@@ -11,11 +11,14 @@ INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM macro call.
 
 Supported combinations:
   - FP4xFP4: activation=FP4, weight=FP4, output=fp16/bf16
-    Tile shapes: 128x128x128, 128x128x256, 128x256x128, 256x128x128
+    Tile shapes (element counts): 128x128x128, 128x128x256, 128x256x128, 256x128x128
+    Uses NV-native nv_float4_t with ue4m3 SF (IsMXFPX=false).
 
-NOTE: FP8xFP4 (WFP4AFP8) on SM120 is deferred — it requires swap_ab
-infrastructure (SM120 MMA expects A=FP8, B=FP4) and MX-format element
-pair types (tuple<T, ue8m0>) instead of nv_float4_t<>.
+  - FP8xFP4: activation=FP8 (e4m3), weight=FP4, output=fp16/bf16
+    Tile shapes (element counts): 128x128x128
+    Uses MX-format tuple with ue8m0 SF (IsMXFPX=true).
+    Larger tiles (128x256, 256x128) exceed shared memory for >= 2 pipeline stages.
+    K=64 is not supported (TMA tile size constraint for MXF8F6F4 on SM120).
 
 Cluster shape: 1x1x1 only.
 Fusion: NONE only (isValidSM120MOESpecialisation constraint).
@@ -32,21 +35,20 @@ CLUSTER_M, CLUSTER_N, CLUSTER_K = 1, 1, 1
 
 @dataclass(frozen=True, order=True)
 class Instantiation:
-    act_type_name: str   # "fp4" or "fp8"
-    act_cpp_type: str    # "SafeFP4" or "SafeFP8"
-    wt_cpp_type: str     # "SafeFP4"
-    out_type_name: str   # "fp16" or "bf16"
-    out_cpp_type: str    # "half" or "SafeBF16"
+    act_type_name: str  # "fp4" or "fp8"
+    act_cpp_type: str  # "SafeFP4" or "SafeFP8"
+    wt_cpp_type: str  # "SafeFP4"
+    out_type_name: str  # "fp16" or "bf16"
+    out_cpp_type: str  # "half" or "SafeBF16"
     m: int
     n: int
     k: int
-    is_mxfpx: bool       # True for FP8xFP4
+    is_mxfpx: bool  # True for FP8xFP4
 
     @property
     def file_name(self) -> str:
         return (
-            f"{GENERATED_PREFIX}_{self.act_type_name}_{self.out_type_name}"
-            f"_m{self.m}_n{self.n}_k{self.k}.generated.cu"
+            f"{GENERATED_PREFIX}_{self.act_type_name}_{self.out_type_name}_m{self.m}_n{self.n}_k{self.k}.generated.cu"
         )
 
 
@@ -58,7 +60,7 @@ def get_instantiations() -> list[Instantiation]:
 
     instantiations: set[Instantiation] = set()
 
-    # FP4xFP4: all four tile shapes
+    # FP4xFP4: all four tile shapes (K in FP4 elements)
     fp4_tile_shapes = [
         (128, 128, 128),
         (128, 128, 256),
@@ -67,8 +69,15 @@ def get_instantiations() -> list[Instantiation]:
     ]
     for out_name, out_cpp in out_types:
         for m, n, k in fp4_tile_shapes:
-            instantiations.add(Instantiation(
-                "fp4", "SafeFP4", "SafeFP4", out_name, out_cpp, m, n, k, False))
+            instantiations.add(Instantiation("fp4", "SafeFP4", "SafeFP4", out_name, out_cpp, m, n, k, False))
+
+    # FP8xFP4: only 128x128x128 fits in smem with >= 2 pipeline stages
+    fp8_fp4_tile_shapes = [
+        (128, 128, 128),
+    ]
+    for out_name, out_cpp in out_types:
+        for m, n, k in fp8_fp4_tile_shapes:
+            instantiations.add(Instantiation("fp8", "SafeFP8", "SafeFP4", out_name, out_cpp, m, n, k, True))
 
     return sorted(instantiations)
 
@@ -77,6 +86,9 @@ def render(inst: Instantiation) -> str:
     bf16_open = "#ifdef ENABLE_BF16\n" if inst.out_type_name == "bf16" else ""
     bf16_close = "#endif  // ENABLE_BF16\n" if inst.out_type_name == "bf16" else ""
     mxfpx_str = "true" if inst.is_mxfpx else "false"
+    is_fp8 = inst.act_type_name == "fp8"
+    fp8_open = "#ifdef ENABLE_FP8\n" if is_fp8 else ""
+    fp8_close = "#endif  // ENABLE_FP8\n" if is_fp8 else ""
 
     return f"""/*
  * Copyright (c) Microsoft Corporation. All rights reserved.
@@ -88,7 +100,7 @@ def render(inst: Instantiation) -> str:
 #ifndef EXCLUDE_SM_120
 #ifdef COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS
 #if defined(ENABLE_FP4) && defined(ENABLE_CUDA_FP4_QMOE)
-{bf16_open}
+{fp8_open}{bf16_open}
 #include "contrib_ops/cuda/llm/moe_gemm/launchers/moe_gemm_tma_ws_launcher.inl"
 
 namespace onnxruntime::llm::kernels::cutlass_kernels {{
@@ -97,7 +109,7 @@ INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM(Sm120, {inst.act_cpp_type}, {inst.wt_c
 
 }}  // namespace onnxruntime::llm::kernels::cutlass_kernels
 
-{bf16_close}#endif  // ENABLE_FP4 && ENABLE_CUDA_FP4_QMOE
+{bf16_close}{fp8_close}#endif  // ENABLE_FP4 && ENABLE_CUDA_FP4_QMOE
 #endif  // COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS
 #endif  // EXCLUDE_SM_120
 """
