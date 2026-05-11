@@ -1611,27 +1611,21 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
                "T4",
                OpSchema::Optional)
         .Input(17,
-               "fc3_global_scale",
-               "1D optional tensor with shape (num_experts,). "
-               "Per-expert global weight scale for FC3. Required when FC3 is present and quant_type is 'fp4', 'fp8', or 'wfp4afp8'.",
-               "T4",
-               OpSchema::Optional)
-        .Input(18,
                "fc1_act_scale",
                "1D optional tensor with shape (1,) or (num_experts,). Activation scale for FC1 FP8 activation modes.",
                "T4",
                OpSchema::Optional)
-        .Input(19,
+        .Input(18,
                "fc2_act_scale",
                "1D optional tensor with shape (1,) or (num_experts,). Activation scale for FC2 FP8 activation modes.",
                "T4",
                OpSchema::Optional)
-        .Input(20,
+        .Input(19,
                "fc1_act_block_scale",
                "3D optional float8e8m0 MXFP activation block-scale tensor for FC1 FP8 activation modes.",
                "T2",
                OpSchema::Optional)
-        .Input(21,
+        .Input(20,
                "fc2_act_block_scale",
                "3D optional float8e8m0 MXFP activation block-scale tensor for FC2 FP8 activation modes.",
                "T2",

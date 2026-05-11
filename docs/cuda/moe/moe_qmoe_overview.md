@@ -22,6 +22,8 @@ For Group-wise Quantized MoE (e.g., 4-bit or 8-bit), the weights are **not** sta
     *   `fc2_experts_weights`: Input 5
     *   `fc3_experts_weights`: Input 8 (Optional)
 
+> **FC3 Note**: The underlying CUTLASS `CutlassMoeFCRunner` has no separate FC3 GEMM — its `runMoe()` interface only accepts fc1 and fc2 weight pointers. This mirrors TensorRT-LLM's design, which also has no FC3 concept. For gated activations (SwiGLU), FC1 and FC3 (gate + up projection) weights must be **pre-concatenated** into the fc1 weight tensor with doubled output dimension (`[Experts, 2 × InterSize, HiddenSize / pack_size]`). The `fc3_experts_weights` ONNX input (index 8) is validated for shape consistency in `CheckInputs` but is **not consumed** by the QMoE CUDA compute path. The `has_fc3_` field stored in the runner is never read after construction.
+
 ### 1.2 Scales (QMoE)
 Scaling factors for dequantization.
 
@@ -151,6 +153,7 @@ The MoE/QMoE operators dispatch between two CUTLASS kernel families at runtime, 
 *   **Interleaved**: The operator supports `swiglu_fusion=1`. In this mode, the weights for the Gating and Value projections are interleaved in the `fc1` tensor.
     *   Shape: `[Experts, 2 * InterSize, HiddenSize]`.
     *   The kernel computes the GEMM, then applies SwiGLU activation + gating in the epilogue.
+*   **FC3 handling**: Regardless of the `swiglu_fusion` attribute value, the CUTLASS runner always expects gate and up projection weights to be fused into `fc1` (i.e., `is_fused_swiglu = (activation_type == Swiglu)` is always true in the QMoE compute path). There is no separate FC3 GEMM dispatch. This is consistent with TensorRT-LLM, which validates `w1.N == inter_size * 2` for gated activations and has zero FC3 references in its kernel code.
 
 ### 5.3 Memory Management
 *   **Workspace**: The operator requires a workspace for intermediate results (sorting indices, permuted rows).
@@ -271,6 +274,8 @@ For the standard **MoE** operator (non-quantized), the `Compute` method includes
 *   **Activation Check**: This path is taken implicitly when `fc3` is present, typically used with Gated activations like `SiLU` (Mixtral) or `SwiGLU`.
 
 > **Note**: This runtime packing is specific to **standard MoE**. The **QMoE** operator does **not** perform runtime fusion; correct packing must be done offline (see Section 6).
+
+> **FC3 in QMoE**: Because the CUTLASS `runMoe()` interface only accepts fc1 and fc2 weights (no fc3 parameter), QMoE requires that gate and up projection weights are always pre-concatenated into the fc1 tensor before model export. The `fc3_experts_weights` ONNX input exists for shape validation and backward compatibility with the op schema, but its data is not read during QMoE inference. For FP4/FP8 quantization modes, the same rule applies — block scales and global scales for the fused fc1 tensor cover both gate and up projections, and the fc3-specific scale/zero-point inputs (indices 9, 13, 17) are unused in the compute path.
 
 ### 8.3 Fusion Modes (`swiglu_fusion`)
 The operator handles three distinct modes for SwiGLU, controlled by the `swiglu_fusion` attribute:

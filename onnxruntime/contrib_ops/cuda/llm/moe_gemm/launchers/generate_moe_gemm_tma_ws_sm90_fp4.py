@@ -42,7 +42,7 @@ def add_full_build_configs(instantiations: set[Instantiation], type_name: str, c
     for k in k_tiles:
         for fusion in fusions:
             for m in (64,):
-                for n in (16, 32, 64):
+                for n in (16, 32, 64, 128):
                     for cluster_m, cluster_n in cluster_shapes:
                         instantiations.add(
                             Instantiation(type_name, cpp_type, m, n, k, cluster_m, cluster_n, "pp", fusion)
@@ -59,6 +59,10 @@ def add_full_build_configs(instantiations: set[Instantiation], type_name: str, c
 
             for cluster_m, cluster_n in cluster_shapes:
                 instantiations.add(Instantiation(type_name, cpp_type, 128, 128, k, cluster_m, cluster_n, "pp", fusion))
+
+    # calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput uses the largest FP4 tile
+    # with the cooperative mainloop to compute workspace size.
+    instantiations.add(Instantiation(type_name, cpp_type, 128, 128, 256, 1, 1, "co", "none"))
 
 
 def get_instantiations() -> list[Instantiation]:

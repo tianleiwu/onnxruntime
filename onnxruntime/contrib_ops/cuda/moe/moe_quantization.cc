@@ -198,7 +198,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   const bool is_int = (quant_type_ == "int");
   // Modes that consume MXFP4 weight block scales (inputs 3/6/9) and per-expert global weight scales.
   const bool uses_fp4_weight_scales = is_fp4 || is_wfp4afp8;
-  // Modes that consume per-expert FP-format global weight scales (inputs 15/16/17).
+  // Modes that consume per-expert FP-format global weight scales (inputs 15/16).
   const bool uses_global_weight_scales = is_fp4 || is_fp8 || is_wfp4afp8;
   const Tensor* input = context->Input<Tensor>(0);
   const Tensor* router_probs = context->Input<Tensor>(1);
@@ -211,6 +211,13 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   const Tensor* fc3_experts_weights_optional = context->Input<Tensor>(8);
   const Tensor* fc3_scales_optional = is_int ? context->Input<Tensor>(9) : nullptr;
   const Tensor* fc3_experts_bias_optional = context->Input<Tensor>(10);
+
+  // The CUTLASS MoE runner has no separate FC3 GEMM — gate and up projection weights must be pre-concatenated into fc1
+  // with doubled output dimension. This is consistent with TensorRT-LLM's design.
+  ORT_ENFORCE(fc3_experts_weights_optional == nullptr && fc3_scales_optional == nullptr && fc3_experts_bias_optional == nullptr,
+              "QMoE quant_type='", quant_type_,
+              "' does not support separate fc3. "
+              "Gate and up projection weights must be pre-concatenated into fc1.");
 
   const Tensor* fc1_zeros = packed_fc1_bias_ ? nullptr : context->Input<Tensor>(11);
   const Tensor* fc2_zeros = packed_fc2_bias_ ? nullptr : context->Input<Tensor>(12);
@@ -232,17 +239,15 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
     ORT_RETURN_IF_ERROR(check_weight_type(fc3_experts_weights_optional, "fc3_experts_weights", is_fp8));
   }
 
-  // Unified FP4 inputs: block scales in fc*_scales (3/6/9), global scales in 15/16/17.
+  // Unified FP4 inputs: block scales in fc*_scales (3/6/9), global scales in 15/16.
   const Tensor* fp4_fc1_block_scales = (uses_fp4_weight_scales && !packed_fp4_fc1_block_scales_) ? context->Input<Tensor>(3) : nullptr;
   const Tensor* fp4_fc2_block_scales = (uses_fp4_weight_scales && !packed_fp4_fc2_block_scales_) ? context->Input<Tensor>(6) : nullptr;
   const Tensor* fp4_fc3_block_scales = (uses_fp4_weight_scales && !packed_fp4_fc3_block_scales_) ? context->Input<Tensor>(9) : nullptr;
   const Tensor* fc1_global_scale = (uses_global_weight_scales && !packed_fc1_global_scale_) ? context->Input<Tensor>(15) : nullptr;
   const Tensor* fc2_global_scale = (uses_global_weight_scales && !packed_fc2_global_scale_) ? context->Input<Tensor>(16) : nullptr;
-  const Tensor* fc3_global_scale = (uses_global_weight_scales && !packed_fc3_global_scale_) ? context->Input<Tensor>(17) : nullptr;
-
   // W4A8 (WFP4AFP8) optional Variant A activation scales (per-tensor or per-expert FP8 global act scale).
-  const Tensor* fc1_act_scale = (is_wfp4afp8 && !packed_fc1_act_scale_) ? context->Input<Tensor>(18) : nullptr;
-  const Tensor* fc2_act_scale = (is_wfp4afp8 && !packed_fc2_act_scale_) ? context->Input<Tensor>(19) : nullptr;
+  const Tensor* fc1_act_scale = (is_wfp4afp8 && !packed_fc1_act_scale_) ? context->Input<Tensor>(17) : nullptr;
+  const Tensor* fc2_act_scale = (is_wfp4afp8 && !packed_fc2_act_scale_) ? context->Input<Tensor>(18) : nullptr;
 
   const bool has_any_zero_point = (fc1_zeros != nullptr || fc2_zeros != nullptr || fc3_zeros != nullptr ||
                                    packed_fc1_bias_ != nullptr || packed_fc2_bias_ != nullptr);
@@ -309,9 +314,6 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
     if (fc2_global_scale) {
       ORT_RETURN_IF_ERROR(check_global_scale(fc2_global_scale, "fc2_global_scale", moe_params.num_experts, quant_type_.c_str()));
     }
-    if (fc3_global_scale) {
-      ORT_RETURN_IF_ERROR(check_global_scale(fc3_global_scale, "fc3_global_scale", moe_params.num_experts, quant_type_.c_str()));
-    }
   }
 
   if (is_wfp4afp8) {
@@ -346,9 +348,6 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
     }
     if (fc2_global_scale) {
       ORT_RETURN_IF_ERROR(check_global_scale(fc2_global_scale, "fc2_global_scale", moe_params.num_experts));
-    }
-    if (fc3_global_scale) {
-      ORT_RETURN_IF_ERROR(check_global_scale(fc3_global_scale, "fc3_global_scale", moe_params.num_experts));
     }
   }
 
@@ -1283,23 +1282,17 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
     DUMP_TENSOR("fc2_zeros", tensor);
     compute_bias(packed_fc2_scales_, packed_fc2_bias_);
     DUMP_PACK_TENSOR("packed_fc2_bias", packed_fc2_bias_, tensor);
-  } else if (input_idx >= 15 && input_idx <= 17 &&
+  } else if ((input_idx == 15 || input_idx == 16) &&
              (quant_type_ == "fp4" || quant_type_ == "fp8" || quant_type_ == "wfp4afp8")) {
     // FP4/FP8/WFP4AFP8 per-expert global weight scales.
-    switch (input_idx) {
-      case 15:
-        CopyToGpu(packed_fc1_global_scale_);
-        break;
-      case 16:
-        CopyToGpu(packed_fc2_global_scale_);
-        break;
-      case 17:
-        CopyToGpu(packed_fc3_global_scale_);
-        break;
+    if (input_idx == 15) {
+      CopyToGpu(packed_fc1_global_scale_);
+    } else {
+      CopyToGpu(packed_fc2_global_scale_);
     }
-  } else if ((input_idx == 18 || input_idx == 19) && quant_type_ == "wfp4afp8") {
+  } else if ((input_idx == 17 || input_idx == 18) && quant_type_ == "wfp4afp8") {
     // W4A8 (WFP4AFP8) Variant A FP8 activation global scales.
-    if (input_idx == 18) {
+    if (input_idx == 17) {
       CopyToGpu(packed_fc1_act_scale_);
     } else {
       CopyToGpu(packed_fc2_act_scale_);
