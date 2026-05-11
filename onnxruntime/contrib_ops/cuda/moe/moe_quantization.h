@@ -25,7 +25,6 @@ class QMoE final : public CudaKernel, public MoEBase {
  private:
   int64_t expert_weight_bits_;
   int64_t block_size_;
-  bool has_fc3_;
   bool is_fp16_;
   bool use_fp4_dequant_fallback_ = false;
   // Dequantizes FP8 weights to FP16/BF16 scratch buffers before invoking the A16 MoE runner.
@@ -46,16 +45,12 @@ class QMoE final : public CudaKernel, public MoEBase {
   IAllocatorUniquePtr<void> packed_fc1_bias_;
   IAllocatorUniquePtr<void> packed_fc2_scales_;
   IAllocatorUniquePtr<void> packed_fc2_bias_;
-  IAllocatorUniquePtr<void> packed_fc3_scales_;
-  IAllocatorUniquePtr<void> packed_fc3_bias_;
 
   // FP4 pre-packed buffers
   IAllocatorUniquePtr<void> packed_fp4_fc1_weights_;
   IAllocatorUniquePtr<void> packed_fp4_fc2_weights_;
-  IAllocatorUniquePtr<void> packed_fp4_fc3_weights_;
   IAllocatorUniquePtr<void> packed_fp4_fc1_block_scales_;
   IAllocatorUniquePtr<void> packed_fp4_fc2_block_scales_;
-  IAllocatorUniquePtr<void> packed_fp4_fc3_block_scales_;
 
   // Per-expert global weight scales used by FP4 and FP8 modes.
   IAllocatorUniquePtr<void> packed_fc1_global_scale_;
