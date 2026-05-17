@@ -537,7 +537,6 @@ quant_params = QuantParams::FP4(
 | `moe_gemm/moe_gemm_kernels_bf16_fp4.cu` | `MoeGemmRunner<__nv_bfloat16, __nv_fp4_e2m1, __nv_bfloat16>` |
 | `moe_gemm/launchers/moe_gemm_tma_ws_sm90_fp4_*.generated.cu` | SM90 mixed-input FP4 launcher (built when `onnxruntime_ENABLE_CUDA_FP4_QMOE=ON`) |
 | `moe_gemm/launchers/moe_gemm_tma_ws_sm120_fp4_*.generated.cu` | SM120 mixed-input FP4 launcher |
-| `moe_gemm/launchers/moe_gemm_tma_ws_sm90_mixed_fp4_stub.cu` | Stub — **excluded from the current build**; kept for reference |
 
 > **Build note**: When `onnxruntime_ENABLE_CUDA_FP4_QMOE` is OFF, the stub is also
 > excluded and all `moe_gemm_kernels_*_fp4.cu` / `moe_gemm_tma_ws_sm{90,120}_fp4_*.generated.cu`
