@@ -749,7 +749,6 @@ CMake gates relevant to MoE/QMoE (see [cmake/CMakeLists.txt](cmake/CMakeLists.tx
 | `ENABLE_FP4`  | CUDA ≥ 12.8 | FP4 e2m1 type (`__nv_fp4_e2m1`) and FP4 traits. |
 | `onnxruntime_ENABLE_CUDA_FP4_QMOE` | user opt-in (requires `ENABLE_FP4`) | Enables FP4 / WFP4AFP8 kernel instantiations and CUTLASS launchers. |
 | `EXCLUDE_SM_100`, `EXCLUDE_SM_120` | architecture exclusion | Drops the corresponding generated kernels. |
-| `PLACEHOLDER_KERNELS` | targets do not include SM100+ | For the standalone FP4 GEMM kernels (separate from QMoE FP4 launcher). |
 
 CUDA architecture defaults:
 - CUDA 12.8+ : `60;70;75;80;86;89;90;100;120`
