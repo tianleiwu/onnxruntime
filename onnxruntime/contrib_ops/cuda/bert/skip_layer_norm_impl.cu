@@ -31,6 +31,7 @@ limitations under the License.
 #include "contrib_ops/cuda/bert/skip_layer_norm_impl.h"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cstdlib>
 
 namespace onnxruntime {
 namespace contrib {
@@ -170,11 +171,89 @@ __global__ void SkipLayerNormKernelSmall(
   LayerNormSmall<T, TPB, ILP>(sum_v, thread_data, ld, idx, beta, gamma, epsilon, output);
 }
 
+// TRT-LLM-style kernel: uses shared memory to cache intermediate values,
+// eliminating the extra global memory round-trip present in SkipLayerNormKernel.
+// Instead of writing val to output then reading it back for normalization,
+// values are cached in shared memory and read from there in the second pass.
+template <typename T, unsigned TPB, bool Simplified>
+__global__ void SkipLayerNormKernelShmem(
+    T* output, T* sum_output, const T* input, const T* skip, const T* bias, const T* gamma, const T* beta,
+    float epsilon, const int ld, int skip_size) {
+  // Dynamic shared memory layout: float shmem[ld] for caching intermediate values
+  extern __shared__ float shmem[];
+
+  const float reverse_ld = 1.f / ld;
+  const int offset = blockIdx.x * ld;
+  const bool has_bias = (bias != nullptr);
+  const bool has_sum_output = (sum_output != nullptr);
+
+  // Pass 1: Load data, accumulate stats in fp32, cache values in shared memory.
+  KeyValuePairSum pair_sum;
+  cub::KeyValuePair<float, float> thread_data(0.f, 0.f);
+
+  for (int i = threadIdx.x; i < ld; i += TPB) {
+    const int idx = offset + i;
+
+    T val = input[idx];
+    if (has_bias) {
+      val += bias[i];
+    }
+    val += skip[idx % skip_size];
+
+    const float val_f = static_cast<float>(val);
+    shmem[i] = val_f;  // cache in shared memory instead of writing to global output
+
+    if (has_sum_output) {
+      sum_output[idx] = val;
+    }
+
+    const float rldval = reverse_ld * val_f;
+    thread_data = pair_sum(thread_data, cub::KeyValuePair<float, float>(rldval, rldval * val_f));
+  }
+
+  // Single block-wide reduction for both mean and variance (same as original kernel)
+  using BlockReducePair = cub::BlockReduce<cub::KeyValuePair<float, float>, TPB>;
+  __shared__ typename BlockReducePair::TempStorage temp_storage;
+
+  cub::KeyValuePair<float, float> reduced = BlockReducePair(temp_storage).Reduce(thread_data, pair_sum);
+
+  __shared__ float s_mu;
+  __shared__ float s_rsigma;
+  if (threadIdx.x == 0) {
+    s_mu = reduced.key;  // already divided by ld during accumulation
+    s_rsigma = rsqrtf(reduced.value - reduced.key * reduced.key + epsilon);
+  }
+  __syncthreads();
+
+  // Pass 2: Read from shared memory, apply normalization, write to output.
+  const float mu = s_mu;
+  const float rsigma = s_rsigma;
+
+  for (int i = threadIdx.x; i < ld; i += TPB) {
+    const int idx = offset + i;
+    const float val_f = shmem[i];
+    const float g = static_cast<float>(gamma[i]);
+
+    if (Simplified) {
+      output[idx] = static_cast<T>(g * val_f * rsigma);
+    } else {
+      const float b = (beta != nullptr) ? static_cast<float>(beta[i]) : 0.f;
+      output[idx] = static_cast<T>(g * (val_f - mu) * rsigma + b);
+    }
+  }
+}
+
 template <typename T, bool Simplified>
 void LaunchSkipLayerNormKernel(
     cudaStream_t stream, T* output, T* sum_output,
     const T* input, const T* skip, const T* bias, const T* gamma, const T* beta, float epsilon,
     int ld, int row_count, int skip_size) {
+  // Check environment variable to use TRT-LLM-style shared memory kernel (checked once, cached).
+  static const bool use_shmem_kernel = [] {
+    const char* env = std::getenv("ORT_SKIP_LAYER_NORM_USE_SHMEM_KERNEL");
+    return env != nullptr && env[0] == '1';
+  }();
+
   const int next_size = NextSize(ld);
   const int grid_size = row_count;
   bool can_unroll_vec4 = CanVectorized(output, sum_output, input,
@@ -190,9 +269,15 @@ void LaunchSkipLayerNormKernel(
   SkipLayerNormKernelSmall<T, block_size, num_unroll, Simplified><<<grid_size, block_size, 0, stream>>>( \
       output, sum_output, input, skip, bias, gamma, beta, epsilon, ld, skip_size)
 
-#define LAUNCH_SKIP_LAYER_NORM_KERNEL()                                                 \
-  SkipLayerNormKernel<T, block_size, Simplified><<<grid_size, block_size, 0, stream>>>( \
-      output, sum_output, input, skip, bias, gamma, beta, epsilon, ld, skip_size)
+#define LAUNCH_SKIP_LAYER_NORM_KERNEL()                                                         \
+  if (use_shmem_kernel && ld * static_cast<int>(sizeof(float)) <= 40960) {                      \
+    const int shmem_size = ld * static_cast<int>(sizeof(float));                                \
+    SkipLayerNormKernelShmem<T, block_size, Simplified><<<grid_size, block_size, shmem_size, stream>>>( \
+        output, sum_output, input, skip, bias, gamma, beta, epsilon, ld, skip_size);            \
+  } else {                                                                                      \
+    SkipLayerNormKernel<T, block_size, Simplified><<<grid_size, block_size, 0, stream>>>(       \
+        output, sum_output, input, skip, bias, gamma, beta, epsilon, ld, skip_size);            \
+  }
 
 #define CASE_NEXT_SIZE(next_size_value)                                         \
   case next_size_value: {                                                       \
