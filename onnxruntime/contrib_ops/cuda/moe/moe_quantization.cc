@@ -17,13 +17,16 @@
 #include "contrib_ops/cuda/llm/common/logger.h"
 #include "contrib_ops/cuda/llm/fpA_intB_gemm_adaptor.h"
 #include "contrib_ops/cuda/llm/fpA_intB_gemm_preprocessors.h"
+#include "contrib_ops/cuda/llm/moe_gemm/moe_gemv.h"
 
 #include "contrib_ops/cuda/utils/dump_cuda_tensor.h"
 #include "contrib_ops/cpu/utils/debug_macros.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 using namespace onnxruntime::cuda;
@@ -37,6 +40,68 @@ void LogQMoESwigluFusionRemapOnce() {
     LOGS_DEFAULT(WARNING) << "QMoE swiglu_fusion is 0; assuming interleaved SwiGLU layout "
                              "for backward compatibility.";
   });
+}
+
+bool QMoERouteTuningEnabled() {
+  return onnxruntime::ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_ROUTE_TUNING", 1) == 1;
+}
+
+bool QMoERouteTuningAllRowsEnabled() {
+  return onnxruntime::ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_ROUTE_TUNING_ALL_ROWS", 0) == 1;
+}
+
+bool QMoERouteTuningLogEnabled() {
+  return onnxruntime::ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_ROUTE_TUNING_LOG", 0) == 1;
+}
+
+bool QMoEGemvDisabledByEnv() {
+  char const* value = std::getenv("ORT_DISABLE_MOE_GEMV");
+  return value != nullptr && value[0] == '1';
+}
+
+std::optional<onnxruntime::llm::kernels::cutlass_kernels::MoeRoutePolicy> GetForcedQMoERoutePolicy() {
+  using onnxruntime::llm::kernels::cutlass_kernels::MoeRoutePolicy;
+  char const* value = std::getenv("ORT_QMOE_ROUTE_TUNING_FORCE");
+  if (value == nullptr) {
+    return std::nullopt;
+  }
+  if (std::strcmp(value, "gemm") == 0) {
+    return MoeRoutePolicy::GroupedGemmOnly();
+  }
+  if (std::strcmp(value, "auto") == 0) {
+    return MoeRoutePolicy::Auto();
+  }
+  if (std::strcmp(value, "gemv") == 0 || std::strcmp(value, "gemv_where_supported") == 0) {
+    return MoeRoutePolicy::GemvWhereSupported();
+  }
+  if (std::strcmp(value, "fc1_gemv_fc2_gemm") == 0) {
+    return MoeRoutePolicy::Fc1GemvFc2Gemm();
+  }
+  if (std::strcmp(value, "fc1_gemm_fc2_gemv") == 0) {
+    return MoeRoutePolicy::Fc1GemmFc2Gemv();
+  }
+  return std::nullopt;
+}
+
+const char* QMoERoutePolicyName(
+    const onnxruntime::llm::kernels::cutlass_kernels::MoeRoutePolicy& route_policy) {
+  using onnxruntime::llm::kernels::cutlass_kernels::MoeFcRoute;
+  if (route_policy.fc1_route == MoeFcRoute::kGroupedGemm && route_policy.fc2_route == MoeFcRoute::kGroupedGemm) {
+    return "grouped_gemm";
+  }
+  if (route_policy.fc1_route == MoeFcRoute::kAuto && route_policy.fc2_route == MoeFcRoute::kAuto) {
+    return "auto";
+  }
+  if (route_policy.fc1_route == MoeFcRoute::kGemv && route_policy.fc2_route == MoeFcRoute::kGemv) {
+    return "gemv_where_supported";
+  }
+  if (route_policy.fc1_route == MoeFcRoute::kGemv && route_policy.fc2_route == MoeFcRoute::kGroupedGemm) {
+    return "fc1_gemv_fc2_gemm";
+  }
+  if (route_policy.fc1_route == MoeFcRoute::kGroupedGemm && route_policy.fc2_route == MoeFcRoute::kGemv) {
+    return "fc1_gemm_fc2_gemv";
+  }
+  return "mixed_auto";
 }
 }  // namespace
 
@@ -888,6 +953,14 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   }
 
   Tensor* output = context->Output(0, input->Shape());
+  auto activation_params = [&]() {
+    onnxruntime::llm::kernels::cutlass_kernels::ActivationParams params(activation_type_);
+    params.alpha = activation_alpha_;
+    params.beta = activation_beta_;
+    params.swiglu_fusion = swiglu_fusion;
+    params.limit = swiglu_limit_;
+    return params;
+  }();
 
   const void* fc1_weight_data = fc1_experts_weights ? fc1_experts_weights->DataRaw() : nullptr;
   const void* fc2_weight_data = fc2_experts_weights ? fc2_experts_weights->DataRaw() : nullptr;
@@ -1003,6 +1076,182 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
     fc2_weight_data = dequant_fc2_weights.get();
   }
 
+  using onnxruntime::llm::kernels::cutlass_kernels::MoeRoutePolicy;
+
+  MoeRoutePolicy route_policy = MoeRoutePolicy::Auto();
+  const auto forced_route_policy = GetForcedQMoERoutePolicy();
+  if (forced_route_policy.has_value()) {
+    route_policy = *forced_route_policy;
+  } else if (QMoERouteTuningEnabled() && (moe_params.num_rows > 1 || QMoERouteTuningAllRowsEnabled()) && is_int &&
+             !onnxruntime::llm::common::getEnvForceDeterministicMOE() &&
+             !QMoEGemvDisabledByEnv()) {
+    const int64_t expanded_num_rows = moe_params.num_rows * k_;
+    const int group_size = block_size_ > 0 ? static_cast<int>(block_size_) : 0;
+    const bool has_block_zero_points = block_size_ > 0 && (p_fc1_zp != nullptr || p_fc2_zp != nullptr);
+    const bool fc1_gemv_may_run = is_fused_swiglu && !has_block_zero_points && parallelism_config.ep_size == 1 &&
+                                  onnxruntime::llm::kernels::moe_gemv::is_moe_gemv_supported(
+                                      sm_, expanded_num_rows, moe_params.inter_size * 2, moe_params.hidden_size,
+                                      static_cast<int>(expert_weight_bits_), group_size);
+    const bool fc2_gemv_may_run = !has_block_zero_points && parallelism_config.ep_size == 1 &&
+                                  onnxruntime::llm::kernels::moe_gemv::is_moe_gemv_supported(
+                                      sm_, expanded_num_rows, moe_params.hidden_size, moe_params.inter_size,
+                                      static_cast<int>(expert_weight_bits_), group_size);
+    if (fc1_gemv_may_run || fc2_gemv_may_run) {
+      RouteTuningKey route_key{};
+      route_key.sm = sm_;
+      route_key.dtype = is_fp16_ ? static_cast<int>(onnxruntime::llm::nvinfer::DataType::kHALF)
+                                 : static_cast<int>(onnxruntime::llm::nvinfer::DataType::kBF16);
+      route_key.expert_weight_bits = static_cast<int>(expert_weight_bits_);
+      route_key.block_size = block_size_;
+      route_key.has_zero_points = has_block_zero_points;
+      route_key.row_bucket = onnxruntime::llm::kernels::cutlass_kernels::MoeGemmProfiler::bucketM(moe_params.num_rows);
+      route_key.expanded_row_bucket =
+          onnxruntime::llm::kernels::cutlass_kernels::MoeGemmProfiler::bucketM(expanded_num_rows);
+      route_key.hidden_size = moe_params.hidden_size;
+      route_key.inter_size = moe_params.inter_size;
+      route_key.top_k = static_cast<int>(k_);
+      route_key.num_experts = static_cast<int>(moe_params.num_experts);
+      route_key.activation_type = static_cast<int>(activation_type_);
+      route_key.swiglu_fusion = swiglu_fusion;
+      route_key.ep_size = parallelism_config.ep_size;
+
+      IAllocatorUniquePtr<void> route_tuning_output = GetScratchBuffer<void>(output->SizeInBytes(), GetComputeStream(context));
+      std::lock_guard<std::mutex> profiler_lock(mGemmProfilerMutex);
+      auto cached_route = qmoe_route_tuning_cache_.find(route_key);
+      if (cached_route != qmoe_route_tuning_cache_.end()) {
+        route_policy = cached_route->second.policy;
+      } else {
+        cudaEvent_t start_event = nullptr;
+        cudaEvent_t stop_event = nullptr;
+        CUDA_RETURN_IF_ERROR(cudaEventCreate(&start_event));
+        std::unique_ptr<CUevent_st, decltype(&cudaEventDestroy)> start_event_guard(start_event, cudaEventDestroy);
+        CUDA_RETURN_IF_ERROR(cudaEventCreate(&stop_event));
+        std::unique_ptr<CUevent_st, decltype(&cudaEventDestroy)> stop_event_guard(stop_event, cudaEventDestroy);
+
+        auto run_route = [&](void* final_output, MoeRoutePolicy candidate_policy) {
+          m_moe_runner->setTactic(config1, config2);
+          m_moe_runner->runMoe(
+              input->DataRaw(),
+              nullptr,
+              expert_indices,
+              expert_scales,
+              fc1_weight_data,
+              fc1_experts_bias_optional ? fc1_experts_bias_optional->DataRaw() : nullptr,
+              activation_type_,
+              fc2_weight_data,
+              fc2_experts_bias_optional ? fc2_experts_bias_optional->DataRaw() : nullptr,
+              quant_params,
+              moe_params.num_rows,
+              moe_params.hidden_size,
+              moe_params.inter_size,
+              moe_params.num_experts,
+              k_,
+              workspace_ptr,
+              final_output,
+              unpermuted_row_to_permuted_row,
+              parallelism_config,
+              activation_params,
+              stream,
+              candidate_policy);
+        };
+
+        auto profile_route = [&](MoeRoutePolicy candidate_policy) -> std::optional<float> {
+          constexpr int warmup_iters = 2;
+          constexpr int profile_iters = 5;
+          try {
+            for (int warmup = 0; warmup < warmup_iters; ++warmup) {
+              run_route(route_tuning_output.get(), candidate_policy);
+            }
+            CUDA_CALL_THROW(cudaStreamSynchronize(stream));
+            CUDA_CALL_THROW(cudaEventRecord(start_event, stream));
+            for (int profile_iter = 0; profile_iter < profile_iters; ++profile_iter) {
+              run_route(route_tuning_output.get(), candidate_policy);
+            }
+            CUDA_CALL_THROW(cudaEventRecord(stop_event, stream));
+            CUDA_CALL_THROW(cudaEventSynchronize(stop_event));
+
+            float elapsed_ms = 0.0f;
+            CUDA_CALL_THROW(cudaEventElapsedTime(&elapsed_ms, start_event, stop_event));
+            return elapsed_ms / profile_iters;
+          } catch (const std::exception& ex) {
+            ORT_LLM_LOG_DEBUG(onnxruntime::MakeString("QMoE route candidate failed: ", ex.what()));
+            cudaGetLastError();
+            return std::nullopt;
+          }
+        };
+
+        RouteTuningResult tuning_result{};
+        tuning_result.policy = MoeRoutePolicy::Auto();
+
+        struct RouteCandidate {
+          const char* name;
+          MoeRoutePolicy policy;
+        };
+        std::vector<RouteCandidate> candidates{
+            {"auto", MoeRoutePolicy::Auto()},
+            {"grouped_gemm", MoeRoutePolicy::GroupedGemmOnly()},
+            {"gemv_where_supported", MoeRoutePolicy::GemvWhereSupported()},
+        };
+        if (fc1_gemv_may_run && fc2_gemv_may_run) {
+          candidates.push_back({"fc1_gemv_fc2_gemm", MoeRoutePolicy::Fc1GemvFc2Gemm()});
+          candidates.push_back({"fc1_gemm_fc2_gemv", MoeRoutePolicy::Fc1GemmFc2Gemv()});
+        }
+        auto set_candidate_time = [&](const char* name, float time_ms) {
+          if (std::strcmp(name, "auto") == 0) {
+            tuning_result.auto_time_ms = time_ms;
+          } else if (std::strcmp(name, "gemv_where_supported") == 0) {
+            tuning_result.gemv_where_supported_time_ms = time_ms;
+          } else if (std::strcmp(name, "grouped_gemm") == 0) {
+            tuning_result.grouped_gemm_time_ms = time_ms;
+          } else if (std::strcmp(name, "fc1_gemv_fc2_gemm") == 0) {
+            tuning_result.fc1_gemv_fc2_gemm_time_ms = time_ms;
+          } else if (std::strcmp(name, "fc1_gemm_fc2_gemv") == 0) {
+            tuning_result.fc1_gemm_fc2_gemv_time_ms = time_ms;
+          }
+        };
+
+        std::optional<float> default_time_ms;
+        std::optional<float> best_time_ms;
+        MoeRoutePolicy best_policy = MoeRoutePolicy::Auto();
+        for (const auto& candidate : candidates) {
+          const auto candidate_time_ms = profile_route(candidate.policy);
+          if (!candidate_time_ms.has_value()) {
+            continue;
+          }
+          set_candidate_time(candidate.name, *candidate_time_ms);
+          if (std::strcmp(candidate.name, "auto") == 0) {
+            default_time_ms = candidate_time_ms;
+          }
+          if (!best_time_ms.has_value() || *candidate_time_ms < *best_time_ms) {
+            best_time_ms = candidate_time_ms;
+            best_policy = candidate.policy;
+          }
+        }
+
+        if (best_time_ms.has_value()) {
+          tuning_result.policy = best_policy;
+          if (default_time_ms.has_value() && *best_time_ms >= *default_time_ms * 0.97f) {
+            tuning_result.policy = MoeRoutePolicy::Auto();
+          }
+        }
+        route_policy = tuning_result.policy;
+        qmoe_route_tuning_cache_.emplace(route_key, tuning_result);
+        if (QMoERouteTuningLogEnabled()) {
+          LOGS_DEFAULT(WARNING) << "QMoE route tuning selected " << QMoERoutePolicyName(route_policy)
+                                << " auto_ms=" << tuning_result.auto_time_ms
+                                << " gemv_where_supported_ms=" << tuning_result.gemv_where_supported_time_ms
+                                << " grouped_gemm_ms=" << tuning_result.grouped_gemm_time_ms
+                                << " fc1_gemv_fc2_gemm_ms=" << tuning_result.fc1_gemv_fc2_gemm_time_ms
+                                << " fc1_gemm_fc2_gemv_ms=" << tuning_result.fc1_gemm_fc2_gemv_time_ms
+                                << " rows=" << moe_params.num_rows
+                                << " expanded_rows=" << expanded_num_rows
+                                << " hidden_size=" << moe_params.hidden_size
+                                << " inter_size=" << moe_params.inter_size;
+        }
+      }
+    }
+  }
+
   // Set tactic and run MoE. Must hold the mutex since setTactic mutates runner state.
   {
     std::lock_guard<std::mutex> profiler_lock(mGemmProfilerMutex);
@@ -1027,15 +1276,9 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
         output->MutableDataRaw(),
         unpermuted_row_to_permuted_row,
         parallelism_config,
-        [&]() {
-          onnxruntime::llm::kernels::cutlass_kernels::ActivationParams params(activation_type_);
-          params.alpha = activation_alpha_;
-          params.beta = activation_beta_;
-          params.swiglu_fusion = swiglu_fusion;
-          params.limit = swiglu_limit_;
-          return params;
-        }(),
-        stream);
+        activation_params,
+        stream,
+        route_policy);
   }
 
   return Status::OK();

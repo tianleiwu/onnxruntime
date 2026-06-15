@@ -212,6 +212,9 @@ Set `ORT_DISABLE_MOE_GEMV=1` before process start to force the grouped GEMM
 fallback for debugging, benchmarking, or bisecting numerical differences. The
 switch is cached on first use.
 
+For planned operator-level tuning of grouped GEMM versus GEMV routes, see
+[QMoE GEMM/GEMV Autotuning Design](qmoe_gemm_gemv_autotune_design.md).
+
 ### 4.1 Per-mode dispatch matrix
 
 | Mode | SM75-89 (Ampere/Ada) | SM90 (Hopper) | SM100 (Blackwell) | SM120 (RTX 5090) |

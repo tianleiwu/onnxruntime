@@ -21,14 +21,15 @@ namespace moe_gemv {
 inline constexpr int64_t kMaxProfiledExpandedRows = 8;
 inline constexpr int64_t kMaxProfiledExpandedRowsForSmallProblemDim = 4;
 inline constexpr int64_t kMinProfiledProblemDim = 512;
-// Lowered from 704 to 512 so block-wise decode shapes (e.g. Qwen top_k=8,
-// inter_size=512) take the GEMV path. This also covers per-column INT4 shapes
-// with inter_size in [512, 704); both bands are gated by ORT_DISABLE_MOE_GEMV.
+// Legacy heuristic thresholds for the default, non-autotuned route. Explicit
+// autotune candidates may profile GEMV outside these thresholds when the kernel
+// supports the shape.
 inline constexpr int64_t kMinProfiledProblemDimForExpandedRowsAbove4 = 512;
 
 // Returns true if the batched MoE GEMV fast path supports this problem shape.
-// Requirements: FP16/BF16 activations, sm >= 80, small expanded_num_rows, supported
-// INT weight type, supported group size, and n divisible by the kernel tile width.
+// Requirements: FP16/BF16 activations, sm >= 80, positive expanded_num_rows,
+// supported INT weight type, supported group size, and launch/layout dimensions
+// that tile cleanly.
 bool is_moe_gemv_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t k,
                            int weight_bits, int group_size);
 

@@ -761,6 +761,282 @@ Nsight Systems produced one `.nsys-rep` and one `.sqlite` for each
   verifying whether a block-wise QMoE case actually reached GEMV or fell back to
   grouped GEMM.
 
+## 2026-06-14 Follow-Up: Qwen `block_size=32` Route Recheck, SM90
+
+### Setup
+
+- Goal: re-check the Qwen3.6-35B-A3B `block_size=32` and 64 behavior after a
+  stale trace set suggested b32 was falling back to grouped GEMM.
+- GPU: H200, SM90.
+- ONNX Runtime build: `~/onnxruntime/build/cu130/Release`, CUDA 13.0.
+- Python path: `~/onnxruntime/build/cu130/Release` plus
+  `~/onnxruntime/onnxruntime/test/python/transformers`.
+- Fresh artifacts: `/tmp/qmoe_profile_20260614_autopilot/`.
+
+A sweep helper was added at
+`onnxruntime/test/python/transformers/profile_qmoe_gemv_sweep.py`. It launches a
+fresh `profile_qmoe_gemv.py` process for every `{case, block_size, mode}` tuple.
+This matters because `ORT_DISABLE_MOE_GEMV` is cached after first use inside a
+process, so a single long-lived Python process can accidentally mix route state
+across enabled and forced-fallback candidates.
+
+The first `/tmp/qmoe_profile_20260614_agent/` traces were not a reliable basis
+for the b32 conclusion. After rebuilding and staging the provider, a temporary
+runtime-only route diagnostic showed the actual Qwen b32 measured run launched
+both custom kernels with `block_zeros=0`:
+
+```text
+MOE_GEMV_ROUTE stage=swiglu reason=launch rows=8 n=1024 k=2048 group=32 bits=4 disabled=0 env=0 block_zeros=0
+MOE_GEMV_ROUTE stage=plain reason=launch rows=8 n=2048 k=512 group=32 bits=4 disabled=0 env=0 block_zeros=0
+```
+
+That diagnostic was removed after confirming the route. The final route evidence
+below comes from fresh Nsight traces, not debug prints.
+
+Nsight command template:
+
+```bash
+cd ~/onnxruntime
+source .venv/bin/activate
+export CUDA_HOME=~/cuda13.0
+export CUDNN_HOME=~/cudnn9.19_cuda13
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=/usr/lib64/openmpi/lib:$CUDA_HOME/lib64:$CUDNN_HOME/lib64:$CUDNN_HOME/lib:${LD_LIBRARY_PATH:-}
+export PYTHONPATH=$PWD/build/cu130/Release:$PWD/onnxruntime/test/python/transformers:${PYTHONPATH:-}
+export TMPDIR=/tmp/qmoe_profile_20260614_autopilot/tmp
+
+for bs in 32 64; do
+  bash onnxruntime/test/python/transformers/profile_qmoe_gemv.sh \
+    --python "$PWD/.venv/bin/python" \
+    --case qwen3_6_35b_a3b_m1_top8_fp16_2048x512_e256 \
+    --block-size "$bs" --warmup 5 --repeat 50 \
+    -o /tmp/qmoe_profile_20260614_autopilot/qwen_b${bs}
+done
+```
+
+### Fresh End-To-End Benchmark Latency
+
+Lower is better. Every row reported `has_invalid_output=false`. The repeat count
+is 50 because these were captured inside the Nsight wrapper.
+
+| Mode | Block size | Latency ms | Speedup vs fallback |
+|------|------------|------------|---------------------|
+| GEMV enabled | 32 | 0.054473 | 1.59x |
+| GEMV disabled | 32 | 0.086405 | baseline |
+| GEMV enabled | 64 | 0.052596 | 1.61x |
+| GEMV disabled | 64 | 0.084702 | baseline |
+
+### Nsight Route Table
+
+Rows are restricted to the measured `benchmark` NVTX range and parsed with
+`parse_nsys.py --pattern '%'` so both custom ORT kernels and CUTLASS fallback
+kernels are visible.
+
+| Trace | Route kernel | Calls | Avg us | Total ms |
+|-------|--------------|-------|--------|----------|
+| `qwen_b32_gemv` | `moe_gemv_interleaved_swiglu_kernel` | 50 | 5.125 | 0.256253 |
+| `qwen_b32_gemv` | `moe_gemv_kernel` | 50 | 3.326 | 0.166304 |
+| `qwen_b32_gemm` | `MoeFCGemm` | 100 | 17.150 | 1.714957 |
+| `qwen_b64_gemv` | `moe_gemv_interleaved_swiglu_kernel` | 50 | 5.103 | 0.255134 |
+| `qwen_b64_gemv` | `moe_gemv_kernel` | 50 | 3.242 | 0.162111 |
+| `qwen_b64_gemm` | `MoeFCGemm` | 100 | 16.552 | 1.655185 |
+
+Fresh route evidence shows both b32 and b64 reach the custom GEMV kernels on the
+Qwen shape. The earlier b32 fallback observation should be treated as a stale
+trace/provider artifact, not a current dispatch bug.
+
+### Diagnostic Note
+
+Temporary debug prints initially showed `block_zeros=1` for b32 and suggested a
+zero-point rejection. That evidence was misleading unless the profiler path is
+distinguished from the actual measured run: the generated symmetric b32 ONNX
+benchmark graph has empty zero-point inputs and no zero-point initializers, while
+`GemmProfilerBackend::prepareQuantParams` creates dummy groupwise zero buffers
+for tactic profiling. Runtime-only diagnostics separated from profiler calls
+showed `block_zeros=0` and `reason=launch` for both FC1 and FC2.
+
+### Decision
+
+- Use Nsight NVTX-range kernels as the source of truth for route confirmation.
+- Keep the sweep helper for future block-size, dtype, and quant-bit experiments
+  because it avoids process-local environment cache effects.
+- Keep `block_size=32` enabled for Qwen-style FP16 INT4 decode: it reaches the
+  same GEMV route as `block_size=64` and improves end-to-end latency by about
+  1.6x versus grouped GEMM in this fresh repeat-50 profile.
+- Do not add a separate b32 dispatch gate based on the stale fallback trace. b64
+  remains slightly faster in this run, but the difference is small enough that
+  broader autotuning should decide block-size preferences by model and GPU.
+
+## 2026-06-14 Tile Parameter Probes: Qwen, SM90
+
+### Setup
+
+- Goal: test whether simple global GEMV tile changes improve the Qwen3.6-35B-A3B
+  FP16 INT4 decode case before adding a broader autotuner.
+- Baseline source constants: `kCtaN=8`, `kThreads=128`, `kTileSizeK=64`.
+- Probed source variants:
+  - `kCtaN=16`, `kThreads=128`, `kTileSizeK=64`.
+  - `kCtaN=8`, `kThreads=64`, `kTileSizeK=64`.
+- Artifacts: `/tmp/qmoe_profile_20260614_autopilot/`.
+
+Each variant was rebuilt as `onnxruntime_providers_cuda`, staged into
+`build/cu130/Release/onnxruntime/capi/libonnxruntime_providers_cuda.so`, and run
+with the process-isolated sweep helper. Enabled-only Nsight traces were then
+captured for the Qwen b32/b64 GEMV route to separate kernel timing from host-loop
+and profiling-wrapper noise.
+
+### Process-Isolated Sweep Latency
+
+Lower is better. Every row reported `has_invalid_output=false`. The fallback
+rows are included only to show run-to-run context; changing GEMV tile constants
+should not directly tune the grouped-GEMM fallback.
+
+| Variant | Mode | Block size | Latency ms | Artifact |
+|---------|------|------------|------------|----------|
+| Default | GEMV enabled | 32 | 0.054473 | `qwen_b32_profile.log` |
+| Default | GEMV disabled | 32 | 0.086405 | `qwen_b32_profile.log` |
+| Default | GEMV enabled | 64 | 0.052596 | `qwen_b64_profile.log` |
+| Default | GEMV disabled | 64 | 0.084702 | `qwen_b64_profile.log` |
+| CtaN=16 | GEMV enabled | 32 | 0.052276 | `qwen_ctan16.tsv` |
+| CtaN=16 | GEMV disabled | 32 | 0.076430 | `qwen_ctan16.tsv` |
+| CtaN=16 | GEMV enabled | 64 | 0.052431 | `qwen_ctan16.tsv` |
+| CtaN=16 | GEMV disabled | 64 | 0.074655 | `qwen_ctan16.tsv` |
+| Threads=64 | GEMV enabled | 32 | 0.049556 | `qwen_threads64.tsv` |
+| Threads=64 | GEMV disabled | 32 | 0.076352 | `qwen_threads64.tsv` |
+| Threads=64 | GEMV enabled | 64 | 0.048776 | `qwen_threads64.tsv` |
+| Threads=64 | GEMV disabled | 64 | 0.074470 | `qwen_threads64.tsv` |
+
+The standalone sweep made both variants look interesting, especially
+`Threads=64`. However, the fallback rows also moved substantially across runs,
+so the sweep alone is not enough to justify a global source change.
+
+### Enabled-Only Nsight Kernel Timing
+
+Rows are restricted to the `benchmark` NVTX range. Lower is better.
+
+| Variant | Trace | Kernel | Calls | Avg us | Total ms |
+|---------|-------|--------|-------|--------|----------|
+| Default | `qwen_b32_gemv` | `moe_gemv_interleaved_swiglu_kernel` | 50 | 5.125 | 0.256253 |
+| Default | `qwen_b32_gemv` | `moe_gemv_kernel` | 50 | 3.326 | 0.166304 |
+| Default | `qwen_b64_gemv` | `moe_gemv_interleaved_swiglu_kernel` | 50 | 5.103 | 0.255134 |
+| Default | `qwen_b64_gemv` | `moe_gemv_kernel` | 50 | 3.242 | 0.162111 |
+| CtaN=16 | `qwen_ctan16_b32_gemv` | `moe_gemv_interleaved_swiglu_kernel` | 50 | 8.147 | 0.407358 |
+| CtaN=16 | `qwen_ctan16_b32_gemv` | `moe_gemv_kernel` | 50 | 5.047 | 0.252350 |
+| CtaN=16 | `qwen_ctan16_b64_gemv` | `moe_gemv_interleaved_swiglu_kernel` | 50 | 8.084 | 0.404186 |
+| CtaN=16 | `qwen_ctan16_b64_gemv` | `moe_gemv_kernel` | 50 | 5.019 | 0.250943 |
+| Threads=64 | `qwen_threads64_b32_gemv` | `moe_gemv_interleaved_swiglu_kernel` | 50 | 7.154 | 0.357724 |
+| Threads=64 | `qwen_threads64_b32_gemv` | `moe_gemv_kernel` | 50 | 3.357 | 0.167872 |
+| Threads=64 | `qwen_threads64_b64_gemv` | `moe_gemv_interleaved_swiglu_kernel` | 50 | 7.089 | 0.354464 |
+| Threads=64 | `qwen_threads64_b64_gemv` | `moe_gemv_kernel` | 50 | 3.290 | 0.164480 |
+
+The enabled-only traces reject both simple global tile changes:
+
+- `CtaN=16` slows FC1 by about 58-59% and FC2 by about 52-55% versus default.
+- `Threads=64` slows FC1 by about 39-40% and is roughly neutral to slightly
+  slower on FC2.
+
+The Nsight wrapper latency agrees with the rejection for both variants:
+`CtaN=16` measured 0.058485 ms for b32 and 0.059473 ms for b64, while
+`Threads=64` measured 0.054401 ms for b32 and 0.054760 ms for b64. These are not
+better than the fresh default wrapper latencies of 0.054473 ms for b32 and
+0.052596 ms for b64.
+
+### Decision
+
+- Restore and keep the default constants: `kCtaN=8`, `kThreads=128`,
+  `kTileSizeK=64`.
+- Treat the process-isolated sweep as a candidate generator, not as the final
+  performance authority. It can be noisy when fallback rows and enabled rows both
+  move between rebuilds.
+- Use enabled-only Nsight kernel timing inside the measured NVTX range before
+  accepting a global tile change.
+- Next useful autotuning work should explore shape-specific specialization or a
+  small candidate table keyed by SM, `expanded_num_rows`, `n`, `k`, and group
+  size rather than replacing the current constants globally.
+
+## 2026-06-14 Default Block-Size Sweep: GPT-OSS, Qwen, Gemma, SM90
+
+### Setup
+
+- Goal: collect broader candidate data for a future model/shape-aware autotuner
+  without changing the restored default GEMV kernel constants.
+- Constants: `kCtaN=8`, `kThreads=128`, `kTileSizeK=64`.
+- Cases: GPT-OSS-20B, Qwen3.6-35B-A3B, and Gemma4-26B-A4B decode shapes.
+- Dtypes: FP16 and BF16 activations, INT4 weights.
+- Block-size candidates: per-column (`0`), 32, 64, and 128.
+- Warmup/repeat: 5/50, process-isolated sweep helper.
+- Artifacts:
+  - `/tmp/qmoe_profile_20260614_autopilot/fp16_default_block_sweep.tsv`
+  - `/tmp/qmoe_profile_20260614_autopilot/fp16_default_block_sweep.errors.jsonl`
+  - `/tmp/qmoe_profile_20260614_autopilot/bf16_default_block_sweep.tsv`
+  - `/tmp/qmoe_profile_20260614_autopilot/bf16_default_block_sweep.errors.jsonl`
+
+The sweep helper now supports `--keep-going`, which records unsupported
+candidate failures in an `.errors.jsonl` sidecar instead of aborting the whole
+run. This was needed because `block_size=128` is not valid for GPT-OSS and Gemma
+shapes whose relevant K dimensions are not multiples of 128; the benchmark
+construction fails during CUDA packed-weight preparation with
+`q_weights must have shape (N, K / (8 / bits))`.
+
+Command template:
+
+```bash
+python onnxruntime/test/python/transformers/profile_qmoe_gemv_sweep.py \
+  --cases gpt_oss_20b_m1_top4_fp16_2880x2880_e32,qwen3_6_35b_a3b_m1_top8_fp16_2048x512_e256,gemma4_26b_a4b_m1_top8_fp16_2816x704_e128 \
+  --block-sizes 0,32,64,128 --mode both --warmup 5 --repeat 50 \
+  --keep-going \
+  --output /tmp/qmoe_profile_20260614_autopilot/fp16_default_block_sweep
+```
+
+The BF16 run used the matching `_bf16_` case names and wrote
+`bf16_default_block_sweep.*`.
+
+### Best Candidate Summary
+
+Lower is better. Speedup compares the best GEMV candidate to the best forced
+fallback candidate within the same benchmark case.
+
+| Dtype | Benchmark case | Best GEMV block | Best GEMV ms | Best fallback block | Best fallback ms | Speedup |
+|-------|----------------|-----------------|--------------|---------------------|------------------|---------|
+| FP16 | GPT-OSS-20B | 0 | 0.060459 | 0 | 0.091758 | 1.52x |
+| FP16 | Qwen3.6-35B-A3B | 32 | 0.046350 | 0 | 0.069837 | 1.51x |
+| FP16 | Gemma4-26B-A4B | 0 | 0.051372 | 0 | 0.071092 | 1.38x |
+| BF16 | GPT-OSS-20B | 0 | 0.061926 | 0 | 0.082771 | 1.34x |
+| BF16 | Qwen3.6-35B-A3B | 128 | 0.047649 | 0 | 0.060744 | 1.27x |
+| BF16 | Gemma4-26B-A4B | 0 | 0.053314 | 0 | 0.070141 | 1.32x |
+
+### Latency Matrix
+
+| Dtype | Benchmark case | Mode | b0 ms | b32 ms | b64 ms | b128 ms |
+|-------|----------------|------|-------|--------|--------|---------|
+| FP16 | GPT-OSS-20B | GEMV | 0.060459 | 0.062778 | 0.061870 | unsupported |
+| FP16 | GPT-OSS-20B | Fallback | 0.091758 | 0.116442 | 0.115101 | unsupported |
+| FP16 | Qwen3.6-35B-A3B | GEMV | 0.047022 | 0.046350 | 0.046876 | 0.046404 |
+| FP16 | Qwen3.6-35B-A3B | Fallback | 0.069837 | 0.075454 | 0.074233 | 0.079616 |
+| FP16 | Gemma4-26B-A4B | GEMV | 0.051372 | 0.052774 | 0.054199 | unsupported |
+| FP16 | Gemma4-26B-A4B | Fallback | 0.071092 | 0.085291 | 0.084711 | unsupported |
+| BF16 | GPT-OSS-20B | GEMV | 0.061926 | 0.065489 | 0.062771 | unsupported |
+| BF16 | GPT-OSS-20B | Fallback | 0.082771 | 0.113919 | 0.113507 | unsupported |
+| BF16 | Qwen3.6-35B-A3B | GEMV | 0.048088 | 0.047839 | 0.050003 | 0.047649 |
+| BF16 | Qwen3.6-35B-A3B | Fallback | 0.060744 | 0.076441 | 0.079030 | 0.076184 |
+| BF16 | Gemma4-26B-A4B | GEMV | 0.053314 | 0.058229 | 0.054455 | unsupported |
+| BF16 | Gemma4-26B-A4B | Fallback | 0.070141 | 0.090468 | 0.087671 | unsupported |
+
+### Decision
+
+- Do not make a global block-size preference change based on this sweep. GPT-OSS
+  and Gemma prefer per-column quantization, while Qwen prefers blockwise
+  candidates by a small margin.
+- Treat Qwen blockwise choices as autotuner candidates, not as a hard rule: FP16
+  b32, FP16 b128, BF16 b32, and BF16 b128 are within a narrow band.
+- For a first shape-aware autotuner table on SM90, reasonable candidate keys are
+  activation dtype, quant bits, `expanded_num_rows`, hidden size, intermediate
+  size, and whether each GEMV K dimension is divisible by the candidate block
+  size.
+- Keep using enabled-only Nsight route/kernel timing for any candidate that would
+  change dispatch or kernel constants. The sweep table is suitable for
+  prioritizing candidates, but it is not a substitute for route verification.
+
 ## 2026-06-13 BF16 GEMV Enablement: SM90, Warmup 5, Repeat 100
 
 ### Setup

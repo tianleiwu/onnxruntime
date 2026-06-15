@@ -4,6 +4,7 @@
 #include "contrib_ops/cuda/llm/moe_gemm/moe_gemv.h"
 
 #include <cuda_fp16.h>
+#include <limits>
 #include <type_traits>
 
 #include "core/common/common.h"
@@ -401,14 +402,9 @@ bool is_moe_gemv_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t
   if (group_size > 0 && k % group_size != 0) {
     return false;
   }
-  if (expanded_num_rows <= 0 || expanded_num_rows > kMaxProfiledExpandedRows) {
-    return false;
-  }
-  if (n < kMinProfiledProblemDim || k < kMinProfiledProblemDim) {
-    return false;
-  }
-  if (expanded_num_rows > kMaxProfiledExpandedRowsForSmallProblemDim &&
-      (n < kMinProfiledProblemDimForExpandedRowsAbove4 || k < kMinProfiledProblemDimForExpandedRowsAbove4)) {
+  if (expanded_num_rows <= 0 || expanded_num_rows > std::numeric_limits<int>::max() ||
+      n <= 0 || n > std::numeric_limits<int>::max() ||
+      k <= 0 || k > std::numeric_limits<int>::max()) {
     return false;
   }
   // n must tile evenly; k must tile evenly into StepK along interleaved-K.

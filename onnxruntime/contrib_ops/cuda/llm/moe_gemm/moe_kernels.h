@@ -250,6 +250,37 @@ struct QuantParams {
   }
 };
 
+enum class MoeFcRoute {
+  kAuto,
+  kGroupedGemm,
+  kGemv,
+};
+
+struct MoeRoutePolicy {
+  MoeFcRoute fc1_route = MoeFcRoute::kAuto;
+  MoeFcRoute fc2_route = MoeFcRoute::kAuto;
+
+  static MoeRoutePolicy Auto() {
+    return {};
+  }
+
+  static MoeRoutePolicy GroupedGemmOnly() {
+    return {MoeFcRoute::kGroupedGemm, MoeFcRoute::kGroupedGemm};
+  }
+
+  static MoeRoutePolicy GemvWhereSupported() {
+    return {MoeFcRoute::kGemv, MoeFcRoute::kGemv};
+  }
+
+  static MoeRoutePolicy Fc1GemvFc2Gemm() {
+    return {MoeFcRoute::kGemv, MoeFcRoute::kGroupedGemm};
+  }
+
+  static MoeRoutePolicy Fc1GemmFc2Gemv() {
+    return {MoeFcRoute::kGroupedGemm, MoeFcRoute::kGemv};
+  }
+};
+
 class CutlassMoeFCRunnerInterface {
  public:
   virtual ~CutlassMoeFCRunnerInterface() = default;
@@ -267,7 +298,8 @@ class CutlassMoeFCRunnerInterface {
                       int const num_experts, int const experts_per_token, char* workspace_ptr, void* final_output,
                       int* unpermuted_row_to_permuted_row, MOEParallelismConfig parallelism_config,
                       ActivationParameters activation_params,
-                      cudaStream_t stream) = 0;
+                      cudaStream_t stream,
+                      MoeRoutePolicy route_policy = MoeRoutePolicy::Auto()) = 0;
 
   // Aliases for profiling the gemms
   virtual void gemm1(void const* const input, void* const output, void* const intermediate_result,
@@ -421,7 +453,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
               int const num_experts, int const experts_per_token, char* workspace_ptr, void* final_output,
               int* unpermuted_row_to_permuted_row, MOEParallelismConfig parallelism_config,
               ActivationParameters activation_params,
-              cudaStream_t stream) override;
+              cudaStream_t stream,
+              MoeRoutePolicy route_policy = MoeRoutePolicy::Auto()) override;
 
   // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
   static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
@@ -437,7 +470,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                     int const* permuted_row_to_expert, bool bias_is_broadcast,
                     cudaStream_t stream, MOEParallelismConfig parallelism_config,
                     cutlass_extensions::CutlassGemmConfig config,
-                    ActivationParameters activation_params);
+                    ActivationParameters activation_params,
+                    MoeFcRoute route);
 
   static void gemm2(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
                     T const* const input, void* const gemm_output,
@@ -453,7 +487,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                     int64_t const experts_per_token, float const** alpha_scale_ptr_array,
                     int const* permuted_row_to_expert,
                     cudaStream_t stream, MOEParallelismConfig parallelism_config,
-                    cutlass_extensions::CutlassGemmConfig config);
+                    cutlass_extensions::CutlassGemmConfig config,
+                    MoeFcRoute route);
 
   // Overrides to allow us to forward on to the internal functions with the pointers using the correct type
   void gemm1(void const* const input, void* const output, void* const intermediate_result,
@@ -473,7 +508,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                        num_valid_tokens_ptr, static_cast<ScaleBiasType const*>(fc1_int_scales), fc1_fp8_dequant, fc2_fp8_quant,
                        fc1_fp4_act_flat, fc2_fp4_act_flat, quant_params, num_rows, expanded_num_rows, hidden_size, inter_size,
                        num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array, nullptr, bias_is_broadcast, stream,
-                       MOEParallelismConfig{}, config, activation_params);
+                       MOEParallelismConfig{}, config, activation_params, MoeFcRoute::kAuto);
   }
 
   void gemm2(void const* const input, void* const gemm_output, void* const final_output,
@@ -495,7 +530,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                        token_topk_unpermuted_scales, token_topk_permuted_scales, unpermuted_row_to_permuted_row,
                        permuted_row_to_unpermuted_row, token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows,
                        hidden_size, inter_size, num_experts_per_node, experts_per_token, alpha_scale_ptr_array, nullptr,
-                       stream, parallelism_config, config);
+                       stream, parallelism_config, config, MoeFcRoute::kAuto);
   }
 
   virtual size_t getGemmWorkspaceSize(int num_experts_per_node) const override {
