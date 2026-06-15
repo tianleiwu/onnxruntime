@@ -737,3 +737,74 @@ fused GEMV path stays gated off behind `ORT_ENABLE_FP4_GEMV` as a validated
 experiment. It may still pay off on shapes with larger `top_k`, more experts, or
 batched decode where dense dequantization HBM traffic dominates — not the case
 for this model.
+
+---
+
+## 2026-06-15 — FP4 GEMV converter: branch-free bit-math decode (compute-bound fix)
+
+Revisited the gated `ORT_ENABLE_FP4_GEMV=1` path after the earlier "correct but
+not faster" result. Fresh ncu profiling overturned the old memory-bound
+assumption and produced a real decode speedup.
+
+### Root-cause (ncu, decode, gpt-oss-20b FP4, H200/SM90)
+
+The FP4 GEMV kernels were **compute(SM)-bound, not memory-bound**:
+
+| Kernel (baseline)             | Duration | Compute(SM) | DRAM | Regs | Occ |
+|-------------------------------|----------|-------------|------|------|-----|
+| `moe_gemv_interleaved_swiglu` (fc1) | 96.8 us | **88.65 %** | 8.4 % | 75 | 33.4 % |
+| `moe_gemv_kernel` (fc2)             | 51.3 us | **80.35 %** | 7.6 % | 46 | 42.6 % |
+
+DRAM was only ~8 % (≈400 GB/s of 4.8 TB/s), so the 4× fewer weight bytes from
+4-bit weights never helped — bandwidth was never the limiter. The bottleneck was
+the in-register MXFP4 weight converter `Fp4I2FConverter::decode`, which used a
+scalar lookup table:
+
+```cpp
+constexpr float kValues[8] = {0,0.5f,1,1.5f,2,3,4,6};
+float v = kValues[code & 0x7];
+return (code & 0x8) ? -v : v;
+```
+
+This compiled to a **data-dependent local-memory load + sign branch per nibble**,
+inflating register pressure (75 regs/thread → spills → 33 % occupancy) and
+saturating the SM pipes.
+
+### Change (`fpA_intB_gemv/details.h`)
+
+Replaced the LUT with a **branch-free bit-math** decode that synthesizes the
+half/bf16 bit pattern directly from the 4-bit code (sign = bit3; magnitude 0..7
+maps to {0,0.5,1,1.5,2,3,4,6}). Subnormal magnitudes (0,1) use a multiply,
+normals (≥2) compose exponent/mantissa bits. Bit patterns are **exact** for both
+`half` and `bfloat16`, so the result is numerically identical to the LUT.
+
+### Results
+
+Accuracy: `test_qmoe_fp4_cuda.py` **19/19 passed** with `ORT_ENABLE_FP4_GEMV=1`
+and with the default (off) — bit-exact, zero accuracy change.
+
+ncu after the fix:
+
+| Kernel (after)                | Duration | Compute(SM) | DRAM | Regs | Occ |
+|-------------------------------|----------|-------------|------|------|-----|
+| `moe_gemv_interleaved_swiglu` (fc1) | 64.2 us (−34 %) | 79.9 % | 12.7 % | 54 | 47.1 % |
+| `moe_gemv_kernel` (fc2)             | 38.2 us (−26 %) | 66.9 % | 10.2 % | 40 | 47.8 % |
+
+nsys decode (gen 64, CUDA graph off), per-call averages:
+
+| Kernel        | Before  | After   | Speedup |
+|---------------|---------|---------|---------|
+| fc1 GEMV      | 96.0 us | 63.5 us | 1.51×   |
+| fc2 GEMV      | 53.0 us | 37.0 us | 1.43×   |
+
+End-to-end decode throughput (`ORT_ENABLE_FP4_GEMV=1`, CUDA graph off):
+**154.9 → 189.5 tps (+22 %)**.
+
+### Conclusion
+
+The converter was the binding decode bottleneck for the fused FP4 GEMV path. The
+bit-math decode lowers register pressure, raises occupancy, and cuts both GEMV
+kernels' SM time, yielding a real +22 % decode improvement. The path is still
+somewhat compute-bound (fc1 ~80 % SM); further gains could come from vectorizing
+the converter (half2) or raising `kCtaN`. The fix is header-only, bit-exact, and
+still gated behind `ORT_ENABLE_FP4_GEMV`.
