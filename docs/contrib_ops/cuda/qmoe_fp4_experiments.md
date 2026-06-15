@@ -874,3 +874,78 @@ INT4 fc1 GEMV (~18 us) is ~38 % of the 6.9 us roofline, so there is ~2× headroo
 there too. At batch-1 (M=1) it is likely reduction/occupancy-bound; a split-K
 (2-pass / atomic) accumulation would expose more parallelism across the 132 SMs
 for both INT4 and FP4. This is a separate, larger change.
+
+## Experiment — wide (64-bit int2) weight load + FP32 accum (negative, reverted)
+
+**Status:** tried, reverted. No net decode win. *Inefficient implementation*, not a
+bad idea — recorded for revisiting via autotune.
+
+**Code record (so it can be revisited):**
+
+- Change commit: `7e9d6d7840` — *EXPERIMENT: FP4 GEMV 64-bit wide weight load
+  (int2, StepK=16) + FP32 accum*
+- Revert commit: `103a9e8724` — restores the clean `ColumnMajor` / bf16-accum
+  baseline (identical to `3cb09b0`).
+
+To revisit: `git show 7e9d6d7840` (or cherry-pick it onto a fresh branch).
+
+### What was changed
+
+Following the "widen the FP4 weight access" recommendation above, but tuned for
+this shape. The 128-bit variant (`AccessTypeW = int4`, `StepK = 32`) was too
+coarse: `StepK × Threads = 32 × 128 = 4096 > k = 2880`, leaving ~30 % of threads
+idle and making fc1 **17 % slower** (74.3 µs). So the experiment used a **64-bit**
+access instead:
+
+- New `ColumnMajorFp4Wide` layout: `AccessTypeW = int2` (64-bit),
+  `kStepK = 64/4 = 16` (vs the `ColumnMajor` baseline `kStepK = 128/16 = 8`),
+  `kInterleave = 1`, identity Mapper. `StepK × Threads = 16 × 128 = 2048 < 2880`,
+  so all 128 threads stay active.
+- The longer per-thread accumulation chain broke bf16 accuracy (max_diff 0.1445,
+  fragile), so accumulation was moved to **FP32** via a new
+  `KernelDetails::kUseFloatAccum` (gated on `IsFp4Weight`), threaded through the
+  `mma`/`epilogue`/`swiglu_epilogue` accumulators. That restored bf16 max_diff to
+  **0.0625** (well under the 0.15 gate).
+
+### Wall-time (nsys, gpt-oss-20b decode, H200, cuda-graph off)
+
+| Variant | fc1 (swiglu) | fc2 | decode tps | bf16 max_diff |
+|---|---|---|---|---|
+| Baseline (StepK=8, bf16 accum) | **63.5 µs** | 37.0 µs | **189.5** | safe |
+| 128-bit (StepK=32, fp32 accum) | 74.3 µs | 38.8 µs | ~181 | 0.0625 |
+| 64-bit (StepK=16, fp32 accum) | 66.5 µs | 35.7 µs | 186.2 | 0.0625 |
+| 64-bit (StepK=16, bf16 accum) | 63.9 µs | 35.5 µs | 189.3 | 0.1445 (fragile) |
+
+### Why it didn't win — ncu (H200, `-b 1 -l 8 -g 6`)
+
+| Metric | fc1 base → wide | fc2 base → wide |
+|---|---|---|
+| **ALU %** | 84.4 → **75.0** (−9.4) | 73.0 → **70.0** (−3.0) |
+| SM % | 79.7 → 71.0 | 67.2 → 64.4 |
+| FMA % | 23.0 → 26.9 | 20.0 → 24.9 |
+| **occupancy %** | 47.1 → **38.1** (−9.0) | 47.8 → **35.0** (−12.8) |
+| IPC | 2.6 → 2.7 | 2.2 → 2.4 |
+
+The wide load **did** do what it was supposed to: the integer-ALU pipe pressure
+dropped (fc1 −9.4 pts, fc2 −3.0 pts) because the K-loop runs half as many trips,
+cutting per-step index/address/loop arithmetic. **But** the FP32 accumulators
+(`float2` tile_acc vs the packed `half2`) raised register pressure and dropped
+occupancy 9–13 pts. With fewer resident warps the freed ALU headroom can't be
+filled (the over-subscribed pipe latency is no longer hidden), so wall-time is
+flat. The bf16-accum 64-bit variant keeps occupancy and is ~even on time, but its
+accuracy (0.1445) is too fragile to ship.
+
+### Conclusion
+
+Load-widening is a **mechanically sound** ALU-reduction lever (the ALU drop is
+real and reproducible), but in this implementation the precision tax (FP32 accum
+→ register pressure → occupancy loss) erases the gain. It is therefore an
+**inefficient implementation**, not a dead idea. The right way to capture it is to
+make `StepK` and the accumulation mode **per-shape autotuned knobs** (e.g. fc2 has
+a shorter chain and more accuracy margin than fc1, so the win/precision trade-off
+differs per kernel), paired with a register-pressure-aware accumulation strategy
+(periodic FP32 flush, or smaller `CtaN`) so the wider load does not cost
+occupancy. Search space for the autotuner:
+`StepK ∈ {8,16,32} × Threads ∈ {64,128,256} × CtaN ∈ {4,8,16} × accum ∈ {bf16,fp32} × splitK`,
+keyed on `(n, k, dtype, sm)`, gated on the accuracy check, and frozen at warmup
+for cuda-graph compatibility.
