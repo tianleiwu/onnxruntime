@@ -159,10 +159,20 @@ __device__ __forceinline__ void mma(void* acc, void* w_pack2, void* act) {
     for (int n = 0; n < VecN; ++n) {
 #pragma unroll
       for (int k = 0; k < K; ++k) {
-        reinterpret_cast<Type2*>(acc)[m * VecN + n] = MathWrapper<typename Details::TypeDetailsA>::fma2(
-            reinterpret_cast<Type2*>(w_pack2)[n * K + k],
-            MathWrapper<typename Details::TypeDetailsA>::to_vec2(reinterpret_cast<Type*>(act)[m * K + k]),
-            reinterpret_cast<Type2*>(acc)[m * VecN + n]);
+        if constexpr (Details::kUseFloatAccum) {
+          // FP32 accumulation: narrow weight/activation lanes to float and accumulate in float2 so
+          // the long per-thread chain (wide MXFP4 layout, kStepK = 16) keeps full precision.
+          Type2 w2 = reinterpret_cast<Type2*>(w_pack2)[n * K + k];
+          float a = static_cast<float>(reinterpret_cast<Type*>(act)[m * K + k]);
+          float2& accf = reinterpret_cast<float2*>(acc)[m * VecN + n];
+          accf.x += static_cast<float>(w2.x) * a;
+          accf.y += static_cast<float>(w2.y) * a;
+        } else {
+          reinterpret_cast<Type2*>(acc)[m * VecN + n] = MathWrapper<typename Details::TypeDetailsA>::fma2(
+              reinterpret_cast<Type2*>(w_pack2)[n * K + k],
+              MathWrapper<typename Details::TypeDetailsA>::to_vec2(reinterpret_cast<Type*>(act)[m * K + k]),
+              reinterpret_cast<Type2*>(acc)[m * VecN + n]);
+        }
       }
     }
   }
@@ -183,6 +193,9 @@ __device__ __forceinline__ T warp_reduce_sum(T& val) {
 template <typename Details, int CtaM, int CtaN, int Threads, bool EnableBias, bool ApplyAlphaInAdvance>
 __device__ __forceinline__ void epilogue(void* out, int stride, void* tile_acc, void* bias, float alpha) {
   using Type = typename MathWrapper<typename Details::TypeDetailsA>::Type;
+  // The MXFP4 wide path accumulates per-thread partials in FP32 (Details::kUseFloatAccum); integer
+  // paths keep the activation type. Read tile_acc with the matching element type before reducing.
+  using AccType = std::conditional_t<Details::kUseFloatAccum, float, Type>;
   static constexpr int Interleave = Details::kInterleave;
   static constexpr int ThreadsPerInterleavedTile = Details::kThreadsPerInterleavedTile;
   static constexpr int WarpSize = Details::kWarpSize;
@@ -195,7 +208,7 @@ __device__ __forceinline__ void epilogue(void* out, int stride, void* tile_acc, 
   for (int m = 0; m < CtaM; ++m) {
 #pragma unroll
     for (int n = 0; n < CtaN; ++n) {
-      float v = static_cast<float>(reinterpret_cast<Type*>(tile_acc)[m * CtaN + n]);
+      float v = static_cast<float>(reinterpret_cast<AccType*>(tile_acc)[m * CtaN + n]);
       v = warp_reduce_sum<Interleave, ThreadsPerInterleavedTile>(v);
       if (lane_id < Interleave * ThreadsPerInterleavedTile && lane_id % ThreadsPerInterleavedTile == 0) {
         shmem[warp_id * CtaM * CtaN * Interleave + m * CtaN * Interleave + n * Interleave + lane_id / ThreadsPerInterleavedTile] = v;

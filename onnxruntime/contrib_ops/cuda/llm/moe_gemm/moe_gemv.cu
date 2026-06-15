@@ -83,8 +83,10 @@ __global__ void moe_gemv_kernel(TypeA* act, uint8_t* weight, TypeA* scales, Type
     bias += tile_id_n * CtaN * Details::kInterleave;
   }
 
-  TypeA tile_acc[CtaM * CtaN];
-  fill<CtaM * CtaN>(tile_acc, static_cast<TypeA>(0.f));
+  // FP4 wide layout accumulates per-thread partials in FP32 (Details::kUseFloatAccum); INT keeps TypeA.
+  using AccT = std::conditional_t<Details::kUseFloatAccum, float, TypeA>;
+  AccT tile_acc[CtaM * CtaN];
+  fill<CtaM * CtaN>(tile_acc, static_cast<AccT>(0.f));
 
   TypeA vec_scale[CtaN];
   if constexpr (GroupSize == 0) {
@@ -135,9 +137,11 @@ __device__ __forceinline__ void swiglu_epilogue(void* out, void* tile_acc, void*
   __shared__ float shmem[CtaM * CtaN * Interleave * WarpNum];
   int tid = threadIdx.x;
   int warp_id = tid / WarpSize, lane_id = tid % WarpSize;
+  // FP4 wide path stores tile_acc in FP32 (Details::kUseFloatAccum); INT keeps TypeA.
+  using AccType = std::conditional_t<Details::kUseFloatAccum, float, TypeA>;
 #pragma unroll
   for (int n = 0; n < CtaN; ++n) {
-    float v = static_cast<float>(reinterpret_cast<TypeA*>(tile_acc)[n]);
+    float v = static_cast<float>(reinterpret_cast<AccType*>(tile_acc)[n]);
     v = warp_reduce_sum<Interleave, ThreadsPerInterleavedTile>(v);
     if (lane_id < Interleave * ThreadsPerInterleavedTile && lane_id % ThreadsPerInterleavedTile == 0) {
       shmem[warp_id * RawCols + n * Interleave + lane_id / ThreadsPerInterleavedTile] = v;
@@ -244,8 +248,10 @@ __global__ void moe_gemv_interleaved_swiglu_kernel(
     bias += tile_id_n * CtaN * Details::kInterleave;
   }
 
-  TypeA tile_acc[CtaM * CtaN];
-  fill<CtaM * CtaN>(tile_acc, static_cast<TypeA>(0.f));
+  // FP4 wide layout accumulates per-thread partials in FP32 (Details::kUseFloatAccum); INT keeps TypeA.
+  using AccT = std::conditional_t<Details::kUseFloatAccum, float, TypeA>;
+  AccT tile_acc[CtaM * CtaN];
+  fill<CtaM * CtaN>(tile_acc, static_cast<AccT>(0.f));
 
   TypeA vec_scale[CtaN];
   if constexpr (GroupSize == 0) {
@@ -537,16 +543,20 @@ struct Fp4ADetails<__nv_bfloat16> {
 };
 #endif
 
-// TileSizeK is unused by the ColumnMajor (kInterleave = 1) indexing/reduction beyond the
+// TileSizeK is unused by the ColumnMajorFp4Wide (kInterleave = 1) indexing/reduction beyond the
 // shmem-write lane gating (only lane 0 of each warp writes), so 64 matches the INT convention.
 static constexpr int kTileSizeKFp4 = 64;
+// ColumnMajorFp4Wide widens the per-thread weight access to 64 bits (int2), so StepK = 64 / 4 = 16
+// (2x fewer K-loop trips than the 32-bit ColumnMajor StepK = 128 / 16 = 8, while keeping all 128
+// threads active at k = 2880). The reduction is identical for kInterleave = 1, and 8-byte alignment
+// holds because k % 16 == 0 (MXFP4 group_size constraint).
 template <typename T>
 using Fp4KernelDetails =
-    fiv::KernelDetails<typename Fp4ADetails<T>::Type, fiv::Fp4DetailsW, fiv::ColumnMajor, false, kTileSizeKFp4>;
+    fiv::KernelDetails<typename Fp4ADetails<T>::Type, fiv::Fp4DetailsW, fiv::ColumnMajorFp4Wide, false, kTileSizeKFp4>;
 
 // MXFP4 GEMV shape support. Mirrors is_moe_gemv_supported but for the non-interleaved
-// ColumnMajor layout: kInterleave = 1, so n need only be divisible by kCtaN, and the
-// per-thread step is StepK = 128 / activation_bits = 8 (not 128 / weight_bits).
+// ColumnMajorFp4Wide layout: kInterleave = 1, so n need only be divisible by kCtaN, and the
+// per-thread step is StepK = 64 / weight_bits = 16 (64-bit int2 weight loads).
 bool is_moe_gemv_fp4_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t k, int group_size) {
   if (sm < 80) {
     return false;
@@ -570,8 +580,9 @@ bool is_moe_gemv_fp4_supported(int sm, int64_t expanded_num_rows, int64_t n, int
   if (n % kCtaN != 0) {  // kInterleave = 1
     return false;
   }
-  // StepK = 128 / activation_bits = 8; k is a multiple of 32, so k % 8 == 0 always holds.
-  if (k % (128 / 16) != 0) {
+  // ColumnMajorFp4Wide: StepK = 64 / weight_bits = 16 (64-bit int2 loads). k is a multiple of 32
+  // (group_size == 32 && k % group_size == 0), so k % 16 == 0 holds and the 8-byte loads stay aligned.
+  if (k % (64 / 4) != 0) {
     return false;
   }
   return true;
