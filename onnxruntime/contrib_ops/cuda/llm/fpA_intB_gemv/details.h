@@ -127,38 +127,6 @@ struct ColumnMajor {
   };
 };
 
-// MXFP4 wide-load variant of ColumnMajor: identical non-interleaved layout
-// (kInterleave = 1, identity Mapper) but the per-thread weight access is widened
-// from 32-bit (int) to 64-bit (int2), so kStepK = 64 / 4 = 16 (two e2m1 codes per
-// byte, 8 bytes = 16 codes per load). This halves the K-loop trip count (and the
-// per-step integer/address overhead) relative to the 32-bit ColumnMajor StepK = 8,
-// while keeping all 128 threads active for K in the 2048..4096 range (a full
-// 128-bit/int4 StepK = 32 would leave ~30% of threads idle at k = 2880). The
-// weights stay [E, n, k/2] row-major so the 8-byte load is contiguous and needs no
-// repack. The reduction is unaffected for kInterleave = 1: real_offset_k reduces to
-// tid*kStepK regardless of kTileSize, warp_reduce_sum runs the full 32-lane
-// butterfly, and only lane 0 of each warp writes shmem. 8-byte alignment holds when
-// k % 16 == 0 (guaranteed by the MXFP4 group_size == 32 / k % group_size == 0
-// support constraints). The longer per-thread chain is accumulated in FP32
-// (KernelDetails::kUseFloatAccum) to preserve bf16 precision.
-template <typename TypeDetailsA, typename TypeDetailsW, int TileSizeK>
-struct ColumnMajorFp4Wide {
-  using DetailsA = TypeDetailsA;
-  using DetailsW = TypeDetailsW;
-  using AccessTypeA = float4;
-  using AccessTypeW = int2;
-  static constexpr int kAccessSize = 64;
-  static constexpr int kStepK = kAccessSize / TypeDetailsW::kElemBits;
-  static constexpr int kTileSize = TileSizeK;
-  static constexpr int kInterleave = 1;
-
-  struct Mapper {
-    __device__ __forceinline__ int operator()(int i) {
-      return i;
-    }
-  };
-};
-
 template <typename TypeDetailsA, typename TypeDetailsW, int TileSizeK>
 struct ColumnMajorInterleavedForHopper {
   using DetailsA = TypeDetailsA;
@@ -223,12 +191,6 @@ struct KernelDetails {
   static constexpr int kThreadsPerInterleavedTile = LayoutDetails::kTileSize / kStepK;
   static constexpr int kElemsPerByteW = 8 / TypeDetailsW::kElemBits;
   static constexpr bool kUseInterleavedConverter = UseInterleavedConverter;
-  // MXFP4 widens the per-thread weight access (kStepK = 16 for the int2 wide layout), which
-  // lengthens the per-thread accumulation chain. Accumulating that chain in low-precision bf16/half
-  // loses too much (bf16 has only 7 mantissa bits), so the FP4 path accumulates the per-thread dot
-  // product in FP32 and only narrows at the cross-thread/epilogue stage. Integer paths keep the
-  // original in-type accumulation (bit-unchanged).
-  static constexpr bool kUseFloatAccum = IsFp4Weight<TypeDetailsW_>::value;
 };
 
 template <typename AType, int WElemBits, bool Interleave>
