@@ -1,0 +1,739 @@
+# QMoE FP4 Profiling Experiments
+
+This file records QMoE FP4 profiling results so future kernel and dispatch changes can be compared against a stable baseline.
+
+## 2026-06-14 FP4 (MXFP4) Dequant-Fallback Decode Bottleneck: SM90 (H200), GPT-OSS-20B, Batch 1
+
+### Motivation
+
+End-to-end benchmarking showed the exported FP4 (MXFP4) QMoE gpt-oss-20b decoding
+~50x slower than the INT4 model on the same H200 (decode ~4.85 tps / 206 ms/tok
+vs INT4 ~253 tps / 3.95 ms/tok). The expectation was that because H200 (SM90)
+lacks the native FP4 tensor-core path, FP4 weights are dequantized to BF16/FP16
+and run through the dense A16 grouped-GEMM, so FP4 should be at most a small
+constant slower than INT4 -- not 50x. This experiment profiles the kernels to
+locate the real cost.
+
+### Setup
+
+- Machine/GPU: 1x NVIDIA H200, SM90 (Hopper), `CUDA_VISIBLE_DEVICES=0`.
+- ONNX Runtime build: `~/onnxruntime/build/cu130/Release` (built with
+  `onnxruntime_USE_FP4_QMOE=ON`; `-DUSE_FP4_QMOE -DENABLE_FP4`).
+- onnxruntime-genai: `benchmark/python/benchmark_e2e.py`.
+- Models: `~/gptoss20b_fp4_qmoe` (quant_type=fp4, block_size=32) and
+  `~/gptoss20b_int4_qmoe_bs32_ropefix` (quant_type=int, 4-bit, block_size=32).
+- Nsight Systems: `~/cuda13.0/bin/nsys` 2025.3.2.
+- CUDA graph forced OFF (so individual dequant + GEMM kernels are attributable).
+- Shapes: gpt-oss-20b -- hidden 2880, intermediate 2880, 24 MoE layers,
+  32 experts, top-k 4, fused interleaved SwiGLU.
+- Driver script: `~/onnxruntime/profile_fp4_vs_int4_decode.sh`
+  (prompt 64, gen 64, repeat 1, warmup 1, `nsys profile --trace=cuda,nvtx`).
+- Report: `nsys stats --report cuda_gpu_kern_sum`.
+
+Command template:
+
+```bash
+TMPDIR=/tmp/qmoe_fp4_profile/nsystmp \
+~/cuda13.0/bin/nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+  --force-overwrite=true -o /tmp/qmoe_fp4_profile/fp4_decode \
+  python benchmark/python/benchmark_e2e.py -i ~/gptoss20b_fp4_qmoe -e cuda \
+    -b 1 -l 64 -g 64 -r 1 -w 1 --use_random_tokens --chat_template "{input}" \
+    -mn gpt-oss-20b -pr fp4
+~/cuda13.0/bin/nsys stats --report cuda_gpu_kern_sum fp4_decode.nsys-rep
+```
+
+### End-To-End Decode Throughput (CUDA graph OFF)
+
+| Model | Prefill tps | Decode tps | Decode ms/tok | Ratio vs INT4 |
+|-------|-------------|------------|---------------|---------------|
+| INT4 (int, 4-bit) | 5570.2 | 252.9 | 3.95 | 1.0x |
+| FP4 (MXFP4) | 302.3 | 4.85 | 206.0 | 52.2x slower |
+
+### Top GPU Kernels (decode, nsys `cuda_gpu_kern_sum`)
+
+FP4 -- a single kernel dominates:
+
+| Time % | Total (s) | Instances | Avg (ms) | Kernel |
+|--------|-----------|-----------|----------|--------|
+| 78.2 | 25.72 | 6144 | 4.187 | `QMoEDequantizeFp4WeightsKernel<__half>` |
+| 1.2 | 0.41 | 624 | 0.658 | `cutlass GemmUniversal GroupProblemShape` (A16 dense GEMM) |
+| 1.2 | 0.39 | 1248 | 0.313 | `cutlass MoeFCGemm MmaMultistage` |
+| ... | ... | ... | ... | remaining A16 grouped-GEMM tiles |
+
+INT4 -- no all-expert dequant kernel; time is spread across the fused
+mixed-precision `MoeFCGemm ... DqMmaMultistage` GEMMs (dequant fused *inside*
+the GEMM) plus small GEMV/activation kernels:
+
+| Time % | Total (s) | Instances | Avg (ms) | Kernel |
+|--------|-----------|-----------|----------|--------|
+| 9.8 | 0.36 | 2496 | 0.144 | `MoeFCGemm ... DqMmaMultistage` (fused dequant+GEMM) |
+| 8.0 | 0.29 | 1248 | 0.236 | `MoeFCGemm ... DqMmaMultistage` |
+| ... | ... | ... | ... | (no separate dequant kernel) |
+| 1.6 | 0.06 | 7560 | 0.008 | `MatMulFloatInt4Kernel` |
+| 1.5 | 0.06 | 3024 | 0.018 | `moe_gemv_interleaved_swiglu_kernel` |
+
+### Root Cause
+
+The FP4 dequant fallback (`moe_quantization.cc`, `ComputeInternal`, the
+`(is_fp4 && use_fp4_dequant_fallback_)` branch, lines ~924-967) dequantizes the
+**entire** MXFP4 weight tensor for **all 32 experts** into a BF16/FP16 scratch
+buffer on **every forward pass**, then hands the dense weights to the A16
+grouped-GEMM runner:
+
+```cpp
+size_t fc1_bytes = num_experts * fc1_n * fc1_k * element_size;  // ALL experts
+dequant_fc1_weights = GetScratchBuffer<void>(fc1_bytes, ...);
+LaunchQMoEDequantizeFp4Weights(... fc1 all experts ...);        // every Compute()
+LaunchQMoEDequantizeFp4Weights(... fc2 all experts ...);
+```
+
+`QMoEDequantizeFp4WeightsKernel` is called 48 times per token
+(24 layers x {fc1, fc2}) at ~4.19 ms each = **~201 ms/token**, which is
+essentially the *entire* measured 206 ms/token decode latency.
+
+Two compounding problems, both independent of FP4 arithmetic:
+
+1. **Dequantizes all experts, not just the top-k.** Decode routes 4 of 32
+   experts per token, but the fallback materializes all 32. ~8x wasted work.
+2. **Materializes full BF16 weights to HBM, then re-reads them in the GEMM
+   (un-fused).** Analytical per-MoE-layer weight traffic:
+   FP4 fallback ~2190 MB (398 MB FP4 read + 1593 MB BF16 write + 199 MB GEMM
+   read) vs INT4 fused ~50 MB (top-k INT4 read, dequant fused in-GEMM register).
+   That is **~44x** more weight memory traffic -- matching the measured 52x
+   end-to-end slowdown (memory-bound decode).
+
+So the user's intuition is correct: FP4-dequant-to-BF16 *math* is comparable to
+INT4. The 50x is **not** an FP4 compute cost -- it is the fallback's
+**all-expert, un-fused, every-step weight dequantization** dominating a
+memory-bound decode.
+
+### Recommendations (not yet implemented)
+
+- **Fuse FP4 dequant into the grouped-GEMM** like INT4's `DqMmaMultistage`
+  (dequantize MXFP4 in-register inside the MoE GEMM mainloop). This is the real
+  fix: removes the 1593 MB/layer BF16 write + re-read and limits work to the
+  routed experts. Closes nearly all of the gap.
+- **Short term:** only dequantize the top-k selected experts (gather by the
+  routing map) instead of all 32. Cuts dequant cost ~8x even before fusion.
+- **Caching is not viable for decode** because weights stay quantized in HBM by
+  design; the cost is the per-step dense materialization, not a one-time setup.
+- The native FP4 tensor-core path (`use_fp4_dequant_fallback_ = sm_ < 120`) is
+  gated to SM120+ (Blackwell), so H200/SM90 cannot use it; the fused-dequant
+  grouped-GEMM is the only path that helps Hopper.
+
+### Artifacts
+
+- `~/onnxruntime/profile_fp4_vs_int4_decode.sh`
+- `/tmp/qmoe_fp4_profile/{fp4,int4}_decode.nsys-rep`, `*_run.log`
+
+### How llama.cpp and vLLM Avoid This on H200 (reference-engine survey)
+
+Both faster engines keep MXFP4 weights **4-bit in HBM** and fuse the
+dequantization **inside** the matmul mainloop. Neither ever materializes a dense
+BF16/FP16 weight tensor, and both touch only the routed (top-k) experts.
+
+**llama.cpp (CUDA, decode / batch 1) -- fused MXFP4 GEMV via integer dp4a.**
+- `ggml/src/ggml-cuda/mmvq.cu` + `vecdotq.cuh::vec_dot_mxfp4_q8_1`.
+- The activation row is quantized to `Q8_1` (int8 + per-block scale).
+- Weights stay MXFP4. A 16-entry LUT `kvalues_mxfp4` maps each 4-bit e2m1 code
+  to an int8 value (`get_int_from_table_16`), then `dp4a` (int8x4 dot) accumulates:
+  ```cpp
+  const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4); // 4-bit -> int8 LUT
+  sumi = ggml_cuda_dp4a(v.x, q8[l+0], sumi);                   // fused int8 dot
+  sumi = ggml_cuda_dp4a(v.y, q8[l+4], sumi);
+  const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f * d_act; // e8m0 block scale
+  return d * sumi;
+  ```
+- No dense weight write/re-read; weight traffic = 4-bit, top-k experts only.
+
+**vLLM (Hopper / SM90) -- fused MXFP4 grouped-GEMM, weights stay 4-bit.**
+- `select_mxfp4_moe_backend` on capability 90 uses the OpenAI **Triton** MXFP4
+  kernels (`gpt_oss_triton_kernels_moe.py`, StridedLayout) -- a grouped GEMM that
+  dequantizes MXFP4 in the Triton mainloop.
+- Alternative `MarlinMxFp4LinearKernel` (`mxfp4/marlin.py`,
+  `apply_fp4_marlin_linear`) is a fused-dequant W4A16 Marlin GEMM (4-bit weights
+  dequantized in-register, same principle as ORT's INT4 `DqMmaMultistage`).
+- Native CUTLASS block-scaled FP4 tensor-core path is reserved for SM100+
+  (`is_device_capability_family(100)`), mirroring ORT's `sm_ < 120` gate.
+
+### Conclusion: ORT needs a fused FP4 path, not the all-expert dequant fallback
+
+The user's hypothesis is confirmed by both engines: the win is **fusing FP4
+dequant into the GEMM/GEMV** so weights stay 4-bit and only top-k experts are
+read -- exactly what ORT already does for INT4. ORT's INT4 fused machinery is
+the natural host:
+
+- **GEMV (decode, batch 1):** `onnxruntime/contrib_ops/cuda/llm/fpA_intB_gemv/`.
+  The in-register weight decode is `details.h::I2FConverter` /
+  `FastInterleavedAndBiasedNumericArrayConverter` (INT4/INT8 -> half/bf16). Add
+  an **FP4 (e2m1) converter** (16-entry LUT `{0,.5,1,1.5,2,3,4,6}` with sign,
+  like llama.cpp's `kvalues_mxfp4`, or a `prmt`/bit-twiddle convert) plus the
+  per-block **e8m0** scale, and register `FP16Fp4*/BF16Fp4*` `KernelType`s in the
+  `KERNEL_TYPE_TRAITS_REGISTRY`. Then relax `is_moe_gemv_supported` so MXFP4
+  (block_size 32) routes to GEMV.
+- **GEMM (prefill / batched):** route MXFP4 through the existing
+  `MoeFCGemm ... DqMmaMultistage` fused-dequant grouped-GEMM (the INT4 path)
+  with an e2m1+e8m0 dequant functor, instead of constructing the dense A16 runner.
+- **Net effect (projected):** removes the 1.6 GB/layer BF16 write+re-read and the
+  ~8x all-expert waste, bringing FP4 decode close to INT4 (INT4 ~253 tps vs FP4
+  ~4.85 tps today). This is the "special GEMV kernel for FP4" needed.
+
+### Proposed ORT FP4 GEMV (W4A16) vs llama.cpp (W4A8): Accuracy and Performance
+
+The proposed ORT path reuses the INT4 `fpA_intB_gemv` machinery (FP16/BF16
+activations, MXFP4 weights dequantized in-register) -- i.e. **W4A16**.
+llama.cpp's `vec_dot_mxfp4_q8_1` quantizes the activation to int8 (`Q8_1`) and
+uses integer `dp4a` -- i.e. **W4A8**. The single design difference is the
+activation precision.
+
+| | ORT proposed (W4A16) | llama.cpp (W4A8) |
+|---|---|---|
+| Weight decode | e2m1 -> FP16/BF16 in-register | e2m1 -> int8 LUT in-register |
+| Activation | FP16/BF16 (exact) | int8, Q8_1 per 32-block (lossy) |
+| Inner product | FP16/BF16 FMA, FP32 accum | int8 `dp4a`, int32 accum |
+| e8m0 block scale | exact pow-2 multiply | exact pow-2 multiply |
+
+#### Accuracy -- ORT W4A16 is strictly more accurate
+
+- Both decode **weights exactly**: e2m1 values `{0, +/-0.5, +/-1, +/-1.5, +/-2,
+  +/-3, +/-4, +/-6}` times a power-of-two e8m0 scale are dyadic, so they are
+  lossless in FP16, BF16, and as llama.cpp's int8 LUT.
+- The difference is the **activation**. W4A16 keeps activations full precision,
+  so the result is bit-equivalent to "dequantize weights then matmul" (the MXFP4
+  reference). W4A8 adds a per-block int8 rounding error on the activation that
+  compounds with depth.
+- Net: the proposed ORT path matches a BF16 reference; llama.cpp trades a small
+  amount of activation precision for integer throughput.
+
+#### Performance -- equal on the decode MoE op; llama.cpp ~10-17% faster e2e
+
+- Batch-1 decode MoE GEMV is **memory-bound on the 4-bit weights**. Both engines
+  read the same bytes (top-k experts, 4-bit, no BF16 materialization), so the
+  FP4-GEMV lower bound is essentially identical. The fixed ORT path should land
+  next to ORT INT4 today.
+- Reference e2e decode: ORT INT4 **253-271 tps**, llama.cpp MXFP4 **297 tps**,
+  vLLM ~278 tps, ORT FP4 today (broken fallback) **4.85 tps**.
+- So even after the fix llama.cpp likely stays **~10-17% ahead**, but that
+  residual gap is **mostly not the FP4 kernel** -- it is framework/host overhead
+  (per-op kernel launches, separate layernorm/RoPE/activation kernels, the genai
+  Python loop) and attention. `dp4a` (W4A8) only pulls ahead in **compute-bound**
+  regimes (prefill / larger batch), where it roughly doubles MMA throughput.
+
+#### How to close the gap
+
+1. **Cut host/launch overhead first (biggest lever).** The MoE GEMV equalizes,
+   so the gap is elsewhere. Enable CUDA graphs for decode and fuse
+   layernorm + RoPE + SwiGLU to drop per-token launch count toward llama.cpp's
+   fused graph. Confirm with a host-overhead / GPU-idle-ratio profile.
+2. **Add an opt-in W4A8 `dp4a` FP4 GEMV** mirroring llama.cpp for the
+   **prefill / batched** path where it genuinely wins. Keep W4A16 as the accurate
+   default for decode; expose A8 as a "fast" mode. ORT already has a wfp4afp8
+   (W4A8) concept for SM100+ -- extend a `dp4a` variant down to SM90.
+3. **Tune the GEMV for gpt-oss shapes** (2880x2880, top-4, 32 experts): 128-bit
+   vectorized weight loads, e2m1 LUT in constant memory, double-buffered weight
+   tiles. Reuse the INT4 tile-shape probe methodology already in this doc.
+4. **Maximize weight coalescing in the expert gather** (row-to-expert map) so the
+   4-bit reads hit peak HBM bandwidth -- the actual decode ceiling.
+5. **Keep FP32 accumulation** (ORT default) for accuracy; it is free vs
+   llama.cpp's int32 accum because decode is memory-bound.
+
+**Bottom line:** W4A16 FP4 GEMV is the right default -- more accurate than
+llama.cpp and on par on the decode MoE op. To beat the remaining ~10-17% e2e
+gap, attack host/launch overhead and add an opt-in `dp4a` W4A8 path for prefill.
+
+## 2026-06-14 Phase 0: Top-K-Only Dequant Fallback (active-expert mask)
+
+### Motivation
+
+The first short-term recommendation above ("only dequantize the top-k selected
+experts instead of all 32") is the lowest-risk, no-new-files change. Decode
+routes 4 of 32 experts per token, so the all-expert FP4 dequant fallback wastes
+~8x of its work on experts that the grouped-GEMM never reads. This phase skips
+the untouched experts while keeping the existing dequant-to-dense path.
+
+### Change
+
+- `qmoe_kernels.cu`: added `QMoEBuildActiveExpertMaskKernel` (builds a per-expert
+  0/1 mask from the `expert_indices` routing table, length `num_rows * top_k`)
+  and `LaunchQMoEBuildActiveExpertMask` (memset 0 + launch). Added a
+  `const int* expert_active` parameter to `QMoEDequantizeFp4WeightsKernel<T>`
+  with an early `return` when `expert_active[expert] == 0`. Threaded the param
+  through `LaunchQMoEDequantizeFp4WeightsImpl<T>` and both
+  `LaunchQMoEDequantizeFp4Weights` overloads (half + bf16).
+- `qmoe_kernels.h`: matching declarations.
+- `moe_quantization.cc`: in the FP4 fallback branch, allocate an
+  `expert_active` scratch buffer (`num_experts` ints), build the mask from
+  `expert_indices` (already computed by the top-k softmax), and pass it to all 4
+  `LaunchQMoEDequantizeFp4Weights` calls (fc1/fc2 x fp16/bf16).
+- Safe because grouped-GEMM only reads experts with assigned rows; skipped
+  experts leave stale scratch the GEMM never touches.
+
+### Accuracy (gate -- run BEFORE perf)
+
+`onnxruntime/test/python/transformers/test_qmoe_fp4_cuda.py`: **15/15 PASS**
+(`Ran 15 tests OK`). Covers token_counts (8/16/32/64/128), 4 and 8 experts,
+SiLU and SwiGLU, FP16 and BF16, top-4 routing -- exercises the active-expert
+mask. Max abs diff vs torch MXFP4 reference unchanged (e.g. FP16 SiLU
+`max_diff=0.001953`, BF16 SwiGLU `max_diff=0.0625`), well within
+`atol=0.12` (fp16) / `0.15` (bf16). Output is bit-identical to the all-expert
+fallback.
+
+### End-To-End Decode Throughput (CUDA graph OFF, same driver as baseline)
+
+| Model | Decode tps | Decode ms/tok | vs INT4 |
+|-------|------------|---------------|---------|
+| INT4 (int, 4-bit) | 250.5 | 3.99 | 1.0x |
+| FP4 baseline (all-expert) | 4.85 | 206.0 | 52.2x slower |
+| **FP4 Phase 0 (top-k mask)** | **12.11** | **82.58** | **20.7x slower** |
+
+Phase 0 lifts FP4 decode **~2.5x** (206.0 -> 82.58 ms/tok; 4.85 -> 12.11 tps).
+
+### Top GPU Kernels (decode, nsys `cuda_gpu_kern_sum`)
+
+| Time % | Total (s) | Instances | Avg (ms) | Kernel |
+|--------|-----------|-----------|----------|--------|
+| 58.3 | 10.01 | 6144 | 1.629 | `QMoEDequantizeFp4WeightsKernel<__half>` |
+| 2.4 | 0.42 | 624 | 0.666 | `cutlass GemmUniversal GroupProblemShape` (A16 dense GEMM) |
+| 2.3 | 0.39 | 1248 | 0.313 | `cutlass MoeFCGemm MmaMultistage` |
+| ... | ... | ... | ... | remaining A16 grouped-GEMM tiles |
+
+Dequant total dropped **25.72 s -> 10.01 s** and avg **4.187 -> 1.629 ms**
+(grid still launches over all experts and early-returns, so the instance count
+stays 6144; the skipped experts no longer do the FP4 decode + BF16 HBM write).
+
+### Remaining Gap and Next Step
+
+Dequant still dominates at **58.3%** of GPU time. Even limited to top-k experts,
+the fallback **materializes dense BF16 weights to HBM and re-reads them in the
+GEMM** (the un-fused round-trip is the second, larger problem from the root-cause
+analysis). The ~20x residual vs INT4 is this dense weight traffic. The real fix
+remains the **fused FP4 GEMV/GEMM** (weights stay 4-bit, dequant in-register),
+implemented in the following phases. Phase 0 is a safe, accuracy-neutral
+intermediate win that ships independently.
+
+### Artifacts
+
+- `/tmp/qmoe_fp4_profile/{fp4,int4}_decode.nsys-rep`, `*_run.log`,
+  `phase0_profile.log`
+- Provider lib under test: `~/ort_home_cu130/lib/libonnxruntime_providers_cuda.so`
+  (pre-change backup: `*.pre_phase0`).
+
+## 2026-06-14 Phase 1: MXFP4 (e2m1) In-Register GEMV Converter (foundation)
+
+### Motivation
+
+The real fix is a **fused FP4 GEMV** that keeps weights 4-bit in HBM and decodes
+e2m1 in-register inside the MoE GEMV mainloop -- mirroring the INT4
+`fpA_intB_gemv` path that already wins on decode. The foundational, independently
+testable piece is the in-register **e2m1 -> half/bf16 converter** that plugs into
+the existing `dequantize<>()` dispatch in
+`fpA_intB_gemv/dispatcher.h`. Phase 1 adds that converter and the supporting
+type plumbing **additively** (no existing kernel behavior changes; nothing is
+routed to it yet).
+
+### Change (additive, not yet wired into dispatch)
+
+`onnxruntime/contrib_ops/cuda/llm/fpA_intB_gemv/details.h`:
+- New `Fp4DetailsW { kElemBits = 4; }` -- same 4-bit storage as `Int4DetailsW`
+  but classified via an opt-in `IsFp4Weight<T>` trait (defaults to false; only
+  `Fp4DetailsW` specializes it to true). This keeps the integer weight
+  descriptors free of FP4-specific members.
+- New `Fp4I2FConverter<AType>` (AType = half | bf16): decodes e2m1 codes packed
+  two per byte (low nibble = even element) into half/bf16 using the magnitude LUT
+  `{0, .5, 1, 1.5, 2, 3, 4, 6}` indexed by `code & 0x7` with sign bit `code & 0x8`
+  -- identical to `DecodeFp4E2M1` in `qmoe_kernels.cu`. All e2m1 values are
+  exactly representable in fp16/bf16, so the convert is lossless.
+- `ConverterWrapper<Details>` now selects `Fp4I2FConverter` when
+  `IsFp4Weight<TypeDetailsW>::value`, else the existing integer `I2FConverter`
+  (via `std::conditional_t`). The INT4/INT8 paths resolve exactly as before.
+
+The packed nibble order the converter expects matches the existing
+`QMoERepackFP4ColToRowKernel` output (`[expert, n, k/2]` row-major, two K-values
+per byte, even K = low nibble) -- i.e. the non-interleaved `ColumnMajor`
+(`kInterleave = 1`) GEMV weight layout. This is the layout Phase 3 will produce
+in PrePack.
+
+### Accuracy (gate)
+
+Standalone CUDA harness `/tmp/fp4_converter_test/test_fp4_converter.cu`
+(`nvcc -arch=sm_90`) runs `Fp4I2FConverter<half>` and `Fp4I2FConverter<bf16>`
+over a 256-code stream exercising all 16 e2m1 codes in both nibble positions and
+compares against `DecodeFp4E2M1`:
+
+```
+[fp16] PASS (256/256 match)
+[bf16] PASS (256/256 match)
+ALL PASS
+```
+
+In-tree compile verified: incremental `ninja onnxruntime_pybind11_state`
+recompiles `moe_gemv.cu` (which transitively includes the modified `details.h`)
+and links `libonnxruntime_providers_cuda.so` cleanly. The INT4/INT8 GEMV paths
+are unchanged (no perf run -- Phase 1 adds no active kernel).
+
+### Remaining Integration (Phases 2-4, hardware-iterative)
+
+To turn the converter into an end-to-end win, the following must be wired and
+verified numerically against the dequant-fallback reference (recommended via an
+env-gated opt-in path so the proven Phase 0 fallback stays the default until the
+GEMV is proven bit-accurate):
+
+- **Phase 2 (scales):** build a per-expert `[k/32, n]` half/bf16 scale tensor
+  `scale[g, n] = exp2(e8m0[n, g] - 127) * global[expert]` -- a transpose +
+  e8m0-decode + global-fold of the MXFP4 block scales `[expert, n, k/32]` into
+  the groupwise (GroupSize = 32) layout the GEMV indexes
+  (`real_offset_k / GroupSize * n + real_offset_n`).
+- **Phase 3 (weight + scale layout via PrePack):** in the `weights_prepacked = 0`
+  PrePack hook, run `LaunchQMoERepackFP4ColToRow` for the weights and the Phase 2
+  scale-combine kernel, caching packed buffers in members.
+- **Phase 4 (dispatch + routing):** add an `Fp4` `KernelDetails`
+  (`ColumnMajor`, `UseInterleavedConverter = false`, `Fp4DetailsW`), a
+  `tryLaunchMoeGemvFp4` sibling of `tryLaunchMoeGemvIntSymmetric[InterleavedSwiGLU]`
+  in `moe_gemm/moe_kernels.cu`, extend `is_moe_gemv_supported` for FP4
+  block_size 32, and route SM<120 FP4 decode (`rows <= 8`) to the fused GEMV
+  (reusing the INT MoE prologue that builds `expert_first_token_offset` /
+  `permuted_row_to_expert`). Keep the Phase 0 fallback for unsupported
+  shapes/regimes. Verify with the python FP4 accuracy test and an
+  `ORT_DISABLE_MOE_GEMV` on/off parity check, then profile.
+
+### Artifacts
+
+- `/tmp/fp4_converter_test/test_fp4_converter.cu` (+ compiled `test_fp4_converter`)
+- `/tmp/fp4_phase1_ninja.log` (in-tree compile log)
+
+## 2026-06-14 Phase 2: MXFP4 Scale-Combine Kernel for the Fused GEMV (foundation)
+
+### Motivation
+
+The fused FP4 MoE GEMV (Phases 3-4) indexes its scales groupwise along K, then N
+(`real_offset_k / GroupSize * n + real_offset_n`, GroupSize = 32) and expects them
+in the activation dtype (half/bf16), already multiplied by the per-expert global
+scale. The MXFP4 weights instead ship two separate scale tensors: e8m0 block
+scales `[experts, n, k_blocks]` (uint8 power-of-two codes, `k_blocks = k / 32`)
+and a per-expert float32 global scale `[experts]`. Phase 2 fuses the e8m0 decode,
+the global-scale fold, and the `[n, k_blocks] -> [k_blocks, n]` transpose into one
+kernel so the eventual GEMV reads a ready-to-use TypeA scale directly (no
+dispatcher change needed).
+
+### Change (additive, not yet wired into dispatch)
+
+`onnxruntime/contrib_ops/cuda/moe/qmoe_kernels.cu` / `.h`:
+
+- New `QMoECombineFp4ScalesForGemvKernel<T>` (T = half | `__nv_bfloat16`): one
+  thread per `(expert, n, k_block)`; computes
+  `gemv_scales[expert, g, row] = exp2(e8m0[expert, row, g] - 127) * global[expert]`
+  (e8m0 code 0 -> 0). Output layout `[experts, k_blocks, n]` matches the INT MoE
+  GEMV groupwise indexing.
+- New `LaunchQMoECombineFp4ScalesForGemvImpl<T>` plus half / bf16 launcher
+  overloads `LaunchQMoECombineFp4ScalesForGemv`, declared in the header next to
+  `LaunchQMoEBuildActiveExpertMask`.
+
+INT/FP8 paths untouched; nothing dispatches to this kernel yet.
+
+### Accuracy (gate)
+
+Standalone bit-exact check `/tmp/fp4_converter_test/test_fp4_scales.cu`
+(`nvcc -arch=sm_90`) against a CPU reference (`exp2(code-127)*global`, transpose),
+including the gpt-oss-20b shape (experts=8, n=2880, k_blocks=90):
+
+```
+[fp16]       PASS (2073600/2073600 match)
+[bf16]       PASS (2073600/2073600 match)
+[fp16-small] PASS (8192/8192 match)
+ALL PASS
+```
+
+In-tree build (`ninja onnxruntime_pybind11_state`, real source files changed)
+compiled and linked clean.
+
+### Artifacts
+
+- `/tmp/fp4_converter_test/test_fp4_scales.cu` (+ compiled `test_fp4_scales`)
+- `/tmp/fp4_phase2_ninja.log` (in-tree compile log)
+
+### Phase 3-4 Design: Confirmed Non-Interleaved `ColumnMajor` Layout
+
+A code read of `moe_gemm/moe_gemv.cu` + `fpA_intB_gemv/dispatcher.h` (`epilogue`,
+`swiglu_epilogue`, `warp_reduce_sum`) confirms the **non-interleaved `ColumnMajor`
+(kInterleave = 1)** layout is the correct, lowest-risk target for the fused FP4
+GEMV, and that it is mutually consistent with the building blocks already built and
+verified:
+
+- **Weight layout** the kernel expects for `kInterleave = 1`: `[experts, n, k/2]`
+  row-major, two e2m1 codes per byte, even-K in the low nibble. This is exactly
+  the output of the existing `LaunchQMoERepackFP4ColToRow` and the order the
+  Phase 1 `Fp4I2FConverter` decodes (verified bit-exact).
+- **Scale layout** the kernel indexes for `GroupSize = 32`, `kInterleave = 1`:
+  `[experts, k/32, n]` (`real_offset_k / GroupSize * n + real_offset_n`,
+  per-N stride = `kInterleave` = 1). This is exactly the Phase 2
+  `LaunchQMoECombineFp4ScalesForGemv` output (verified bit-exact).
+- **Reduction correctness for `kInterleave = 1`:** each of the 128 threads owns a
+  strided `kStepK = 8` slice of K and accumulates partial sums for all `CtaN`
+  columns. `warp_reduce_sum<1, ...>` runs the full 5-step butterfly (16,8,4,2,1)
+  → full 32-lane warp sum; then `epilogue` / `swiglu_epilogue` sum across the
+  `WarpNum = 4` warps via shared memory (only lane 0 writes per warp, since
+  `lane_id < ThreadsPerInterleavedTile && lane_id % ThreadsPerInterleavedTile == 0`).
+  This is a provably-correct full 128-thread K-reduction for the per-channel /
+  `fc2` path. The `fc1` SwiGLU path additionally requires the fc1 columns to be
+  **(gate, linear) pair-interleaved** (`out[pair]` reads `shmem[..gate_idx]` /
+  `shmem[..linear_idx]` with `gate_idx = 2*pair`), which the PrePack step must
+  guarantee for the MXFP4 fc1 weights -- the one remaining item to verify on
+  hardware against the dequant-fallback reference.
+
+Remaining (hardware-iterative, env-gated opt-in so Phase 0 stays default):
+
+- **Phase 3 (PrePack):** in the `weights_prepacked = 0` hook, run
+  `LaunchQMoERepackFP4ColToRow` (weights) + `LaunchQMoECombineFp4ScalesForGemv`
+  (scales) once at load time, caching the packed buffers in members; ensure fc1
+  emits gate/linear pair-interleaved columns.
+- **Phase 4 (dispatch + routing):** add an `Fp4` `KernelDetails`
+  (`ColumnMajor`, `UseInterleavedConverter = false`, `Fp4DetailsW`); a
+  `tryLaunchMoeGemvFp4` sibling in `moe_kernels.cu`; extend
+  `is_moe_gemv_supported` for FP4 block_size 32; and route SM < 120 FP4 decode
+  (`rows <= 8`) through the MoE-runner prologue
+  (`expert_first_token_offset` / `permuted_row_to_expert`) to the fused GEMV,
+  keeping the Phase 0 fallback for unsupported shapes. Validate with
+  `test_qmoe_fp4_cuda.py` and an `ORT_DISABLE_MOE_GEMV` on/off parity check
+  BEFORE profiling.
+
+## 2026-06-14 Phase 4a: MXFP4 ColumnMajor GEMV Launchers + Device-Math Validation
+
+### Motivation
+
+Before wiring the fused FP4 decode path into the MoE pipeline (Phase 3 PrePack +
+Phase 4 routing), the single highest-risk unknown was whether the non-interleaved
+`ColumnMajor` (kInterleave = 1) GEMV kernel -- which the INT paths never exercise
+(they all use `ColumnMajorInterleaved`) -- produces bit-correct output, especially
+the warp/cross-warp reduction and the SwiGLU gate/linear pairing. A layout or
+reduction bug here would be a silent wrong-output failure, so it must be proven
+numerically first.
+
+### Change (additive, not yet routed)
+
+`onnxruntime/contrib_ops/cuda/llm/moe_gemm/moe_gemv.cu` / `.h`:
+
+- `Fp4ADetails<T>` + `Fp4KernelDetails<T>` =
+  `KernelDetails<FP16|BF16DetailsA, Fp4DetailsW, ColumnMajor, /*UseInterleavedConverter=*/false, 64>`.
+- `is_moe_gemv_fp4_supported(sm, expanded_num_rows, n, k, group_size)`: kInterleave = 1
+  variant of the INT support check (n divisible by `kCtaN`, not `kCtaN*interleave`;
+  StepK = 128/16 = 8; group_size == 32).
+- `launch_moe_gemv_fp4_symmetric<T>` and
+  `launch_moe_gemv_fp4_symmetric_interleaved_swiglu<T>` (half + bf16 explicit
+  instantiations), reusing the existing `dispatch_moe_gemv[_interleaved_swiglu]_group_size`
+  templates with the FP4 `KernelDetails`.
+
+INT/FP8 paths untouched. Nothing dispatches to these launchers yet.
+
+### Accuracy (gate)
+
+In-tree build (`ninja onnxruntime_pybind11_state`) compiled + linked the FP4 GEMV
+launcher instantiations clean.
+
+Faithful standalone replicas of the exact `ColumnMajor` device math (indexing,
+`warp_reduce_sum` full butterfly for Interleave = 1, `epilogue` / `swiglu_epilogue`
+shmem cross-warp sum) vs a CPU W4A16 reference:
+
+```
+# /tmp/fp4_converter_test/test_fp4_gemv.cu  (plain GEMV, fc2 path)
+[fp16 gemv]  PASS (n=512  k=512,  max_rel=0.00047)
+[fp16 gemv]  PASS (n=2880 k=2880, max_rel=0.00056)
+[bf16 gemv]  PASS (n=512  k=512,  max_rel=0.0039)
+[bf16 gemv]  PASS (n=2880 k=2880, max_rel=0.0038)
+ALL PASS
+
+# /tmp/fp4_converter_test/test_fp4_swiglu_gemv.cu  (fc1 SwiGLU path)
+[fp16 swiglu] PASS (inter=512  k=512,  max_rel=0.0038)
+[fp16 swiglu] PASS (inter=2880 k=2880, max_rel=0.011)
+[bf16 swiglu] PASS (inter=2880 k=2880, max_rel=0.0039)
+ALL PASS
+```
+
+Errors are at the fp16/bf16 accumulation-noise level (the reference accumulates in
+float; the kernel accumulates in T). The SwiGLU replica confirms the required fc1
+column ordering: output `j` reads gate = column `2*j`, linear = column `2*j+1`
+(`out_base = tile_id_n * CtaN/2`, `gate_idx = 2*pair`). PrePack (Phase 3) must emit
+fc1 weights with gate/linear columns pair-interleaved in this order.
+
+### Remaining (Phase 3 PrePack + Phase 4 routing)
+
+The fused decode path now has every device-side building block built and verified:
+Fp4 converter (Phase 1), scale-combine (Phase 2), and both GEMV kernels (this phase).
+The MoE prologue (`fusedBuildExpertMapsSortFirstToken`), activation expansion
+(`expandInputRowsKernelLauncher`), and top-k finalize
+(`finalizeMoeRoutingKernelLauncher`) are all directly-callable free/templated
+functions, so a standalone SM<120 FP4 decode path (rows <= 8) can reuse them:
+prologue -> expand -> fc1 `launch_moe_gemv_fp4_symmetric_interleaved_swiglu` -> fc2
+`launch_moe_gemv_fp4_symmetric` -> finalize, with PrePack producing the repacked
+weights ([E,n,k/2] via `LaunchQMoERepackFP4ColToRow`, fc1 gate/linear pair-interleaved)
+and combined scales ([E,k/32,n] via `LaunchQMoECombineFp4ScalesForGemv`). This is
+gated behind `ORT_ENABLE_FP4_GEMV` (default OFF) and validated against
+`test_qmoe_fp4_cuda.py` + an `ORT_DISABLE_MOE_GEMV` parity check BEFORE profiling.
+
+### Artifacts
+
+- `/tmp/fp4_converter_test/test_fp4_gemv.cu` (+ compiled `test_fp4_gemv`)
+- `/tmp/fp4_converter_test/test_fp4_swiglu_gemv.cu` (+ compiled `test_fp4_swiglu_gemv`)
+- `/tmp/fp4_phase4a_ninja.log` (in-tree compile log)
+
+## Phase 3 + 4 — PrePack GEMV weights/scales + standalone decode routing
+
+Wires the Phase 1/2/4a building blocks into a complete, opt-in fused MXFP4 W4A16
+decode path that replaces the all-active-expert dequant fallback for small-batch
+decode shapes. Gated behind `ORT_ENABLE_FP4_GEMV` (default **OFF**); the proven
+Phase 0 top-k dequant fallback remains the production default.
+
+### Phase 3 — PrePack (`moe_quantization.{h,cc}`)
+
+When `quant_type == "fp4"`, `use_fp4_dequant_fallback_` (SM < 120), and
+`ORT_ENABLE_FP4_GEMV` is set, PrePack additionally produces the GEMV-consumed
+buffers alongside (not replacing) the raw initializers the fallback still needs:
+
+- **Weights** (inputs 2/5): `PrePackRepackFP4Weights` lays out the raw
+  `[E, k, n/2]` col-major e2m1 codes into `[E, n, k/2]` row-major
+  (`LaunchQMoERepackFP4ColToRow`) in `gemv_fp4_fc{1,2}_weights_`. A **local**
+  `is_packed` is passed so the op-level `is_packed` stays `false` and the raw
+  initializer is retained for the dequant fallback (unsupported shapes).
+- **Scales**: block scales (inputs 3/6, raw `[E, n, k/32]` e8m0) and the
+  per-expert global scale (inputs 15/16, float) arrive in separate PrePack calls.
+  `TryBuildGemvFp4Scales(fc)` is invoked from **both** handlers and performs the
+  combine (`LaunchQMoECombineFp4ScalesForGemv` -> `[E, k/32, n]` activation dtype,
+  `exp2(e8m0-127) * global[e]`) exactly once, when both GPU buffers are present —
+  making the build order-independent. Block-scale dims are captured at PrePack
+  time (`gemv_fp4_fc{1,2}_scale_{e,n,kb}_`).
+
+### Phase 4 — routing (`ComputeInternal`)
+
+Before the dequant fallback, a standalone pipeline runs when all of: `is_fp4`,
+`use_fp4_dequant_fallback_`, `enable_fp4_gemv_`, fused SwiGLU, all four GEMV
+buffers built, `num_rows <= 256`, and `is_moe_gemv_fp4_supported` holds for both
+fc1 (`n = 2*inter, k = hidden`) and fc2 (`n = hidden, k = inter`) — i.e. n,k >= 512
+and `expanded_rows = num_rows * top_k` in `(0, 8]`.
+
+Sequence (dispatched on `is_fp16_`, reusing the A16 runner's free functions):
+
+```
+fusedBuildExpertMapsSortFirstToken   # prologue: permuted maps + expert offsets
+expandInputRowsKernelLauncher<T,T>   # gather permuted activations [expanded, hidden]
+launch_moe_gemv_fp4_symmetric_interleaved_swiglu<T>   # fc1 + fused SwiGLU -> [expanded, inter]
+launch_moe_gemv_fp4_symmetric<T>                      # fc2 -> [expanded, hidden]
+finalizeMoeRoutingKernelLauncher<T,T,T>               # top-k weighted scatter-add -> output
+```
+
+Per-expert fc1/fc2 bias is applied inside the GEMV launchers; finalize bias is
+`nullptr`. Scratch (`p_r2u`, `p_exp`, `p_efto`, `p_act`, `p_fc1`, `p_fc2`) comes
+from `GetScratchBuffer`; `unpermuted_row_to_permuted_row` is reused from the
+existing workspace. Unsupported shapes (prefill / large batch / missing buffers)
+fall through to the dequant fallback. `MXFP4` group size is the intrinsic 32 — the
+`block_size_` attribute is `-1` for fp4 and is **not** part of the gate (an early
+`block_size_ == 32` gate was the reason the path was initially skipped; see below).
+
+### Accuracy (gate)
+
+New decode-shaped test `TestQMoEFP4.test_fp4_decode_swiglu_gemv` (hidden = inter =
+512, 8 experts, SwiGLU, `num_tokens * top_k <= 8`) is the first case whose shape
+satisfies `is_moe_gemv_fp4_supported`, so it actually exercises the fused path
+under `ORT_ENABLE_FP4_GEMV=1` (a temporary `ORT_FP4_GEMV_TRACE` stderr marker
+confirmed `[FP4_GEMV] taken` for all four parameterizations, then was removed):
+
+```
+# ORT_ENABLE_FP4_GEMV=1  (fused GEMV path taken)
+FP4 MoE: FP16 SwiGLU tokens=1 experts=8 hidden=512 inter=512  max_diff=0.0117
+FP4 MoE: FP16 SwiGLU tokens=2 experts=8 hidden=512 inter=512  max_diff=0.0156
+FP4 MoE: BF16 SwiGLU tokens=1 experts=8 hidden=512 inter=512  max_diff=0.0781
+FP4 MoE: BF16 SwiGLU tokens=2 experts=8 hidden=512 inter=512  max_diff=0.1016
+```
+
+All within tolerance (fp16 atol 0.12, bf16 atol 0.15). Full suite parity:
+
+```
+ORT_ENABLE_FP4_GEMV=1 : Ran 19 tests ... OK   # fused path for decode shapes
+(default, unset)      : Ran 19 tests ... OK   # dequant fallback for all shapes
+```
+
+The fc1 gate/linear pair-interleaving (gate = col `2j`, linear = col `2j+1`),
+bias-before-SwiGLU, and the `[E,n,k/2]` / `[E,k/32,n]` layouts are all validated
+end-to-end by these passing decode tests against the dequantized-weight PyTorch
+reference.
+
+### Debugging note
+
+Initial runs passed accuracy but silently used the fallback (the trace never
+fired). A gate diagnostic showed `block=-1`: the MXFP4 group size is intrinsic
+(32) and is not stored in `block_size_`. Removing the `block_size_ == 32` clause
+let the path engage. Lesson: accuracy passing alone does **not** prove a new fast
+path is taken — always confirm engagement (trace / profiler) before profiling.
+
+## Phase 5 — End-to-end profiling on gpt-oss-20b (H200 / SM90)
+
+Goal: measure whether the fused MXFP4 GEMV decode path (`ORT_ENABLE_FP4_GEMV=1`)
+improves real decode throughput vs the Phase 0 dequant fallback, using
+onnxruntime-genai `benchmark_e2e.py` on the gpt-oss-20b FP4 QMoE model
+(hidden = inter = 2880, 32 experts, top_k = 4, 24 layers, fused SwiGLU).
+Decode shape: `num_rows = 1`, `expanded = 1 * 4 = 4`; fc1 `n = 5760 / k = 2880`,
+fc2 `n = 2880 / k = 2880` — all GEMV-supported.
+
+### Fast-path engagement confirmed first
+
+Before profiling, a temporary `ORT_FP4_GEMV_TRACE` marker (since removed) was
+gated on `num_rows <= 8` to capture decode (not prefill) passes. It confirmed on
+real gpt-oss-20b decode:
+
+```
+[FP4_GEMV_GATE]  ... enable=1 swiglu=1 w1=1 w2=1 s1=1 s2=1 num_rows=1 ...
+[FP4_GEMV_SHAPE] expanded=4 fc1_n=5760 hidden=2880 inter=2880 sup_fc1=1 sup_fc2=1
+```
+
+All gates pass — the fused path **is** taken during decode when enabled.
+
+### Library-sync gotcha
+
+onnxruntime-genai's Python process loads `libonnxruntime_providers_cuda.so` from
+the **onnxruntime pip package capi dir**
+(`<venv>/lib/python3.X/site-packages/onnxruntime/capi/`), *not* from
+`ort_home/lib/`. After every rebuild the fresh `.so` must be copied to **both**
+locations (and `onnxruntime_pybind11_state.so` to the venv capi dir) or the
+benchmark silently runs a stale binary. Two early "identical profile" runs were
+caused by a lagging venv capi lib.
+
+### Decode kernel attribution (nsys `cuda_gpu_kern_sum`)
+
+- `QMoEDequantizeFp4WeightsKernel` runs in **prefill only** (`num_rows = 64`,
+  GEMV-unsupported); decode never invokes it in any config.
+- Decode MoE on this model already flows through `moe_gemv_*` kernels in **both**
+  configs: the Phase 0 fallback dequantizes the active experts and the dense A16
+  runner picks its own small-row `moe_gemv` fast path, while `ORT_ENABLE_FP4_GEMV=1`
+  runs `moe_gemv` directly on the packed `[E,n,k/2]` weights. Instance counts and
+  total kernel times are essentially identical between the two
+  (`moe_gemv_interleaved` ~878 ms, `moe_gemv_kernel` ~478 ms across the whole
+  capture in both off and on).
+
+### Throughput results (batch 1, prompt 64, gen 64–128)
+
+| Config                                   | CUDA graph | Token-gen throughput |
+|------------------------------------------|------------|----------------------|
+| `ORT_DISABLE_MOE_GEMV=1` (pure dequant+GEMM) | off    | 158.5 tps |
+| default (fallback, dense `moe_gemv`)         | off    | 157.7 tps |
+| `ORT_ENABLE_FP4_GEMV=1` (fused FP4 GEMV)     | off    | 159.0 tps |
+| default                                      | **on** | 164.5 tps |
+| `ORT_ENABLE_FP4_GEMV=1`                      | **on** | 164.7 tps |
+
+nsys runs (gen 128) gave the same picture: off 155.5 tps vs on 153.1 tps.
+
+### Conclusion
+
+The fused MXFP4 GEMV path is **correct but not faster** for gpt-oss-20b decode on
+H200/SM90. All configs land within ~1 % (noise) regardless of CUDA graph. Reasons:
+
+- At `top_k = 4`, the Phase 0 fallback already dequantizes **only the active
+  experts** and reaches an efficient small-row `moe_gemv`, so the theoretical win
+  of the fused path (skipping the dense-weight HBM round-trip) is small.
+- Batch-1 decode is dominated by fixed per-token / launch overhead and overall
+  HBM traffic that is the same for both paths; the MoE GEMV cost is not the
+  binding decode bottleneck here, so swapping the MoE kernel does not move e2e
+  throughput.
+
+The Phase 0 dequant fallback therefore remains the **production default**; the
+fused GEMV path stays gated off behind `ORT_ENABLE_FP4_GEMV` as a validated
+experiment. It may still pay off on shapes with larger `top_k`, more experts, or
+batched decode where dense dequantization HBM traffic dominates — not the case
+for this model.

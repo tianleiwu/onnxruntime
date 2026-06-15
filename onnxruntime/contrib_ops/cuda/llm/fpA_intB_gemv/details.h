@@ -94,6 +94,21 @@ struct Int4DetailsW {
   static constexpr int kElemBits = 4;
 };
 
+// MXFP4 weight element descriptor. Same 4-bit storage as Int4DetailsW, but the
+// codes are e2m1 floating-point (not signed integers), so the dequant path uses
+// the dedicated Fp4I2FConverter LUT instead of the integer fast converter.
+struct Fp4DetailsW {
+  static constexpr int kElemBits = 4;
+};
+
+// Opt-in trait identifying MXFP4 (e2m1) weight descriptors. Defaults to false so
+// the integer weight descriptors stay free of FP4-specific members; only
+// Fp4DetailsW specializes it to true.
+template <typename TypeDetailsW>
+struct IsFp4Weight : std::false_type {};
+template <>
+struct IsFp4Weight<Fp4DetailsW> : std::true_type {};
+
 template <typename TypeDetailsA, typename TypeDetailsW, int TileSizeK>
 struct ColumnMajor {
   using DetailsA = TypeDetailsA;
@@ -223,12 +238,45 @@ struct I2FConverter<AType, WElemBits, false> {
   }
 };
 
+// MXFP4 (e2m1) -> half/bf16 in-register converter for the non-interleaved
+// ColumnMajor GEMV layout. The codes are stored two per byte with the low nibble
+// holding the even element. Decode matches DecodeFp4E2M1 in qmoe_kernels.cu:
+// magnitude LUT {0,.5,1,1.5,2,3,4,6} indexed by code&0x7, sign bit = code&0x8.
+// Every value is exactly representable in fp16 and bf16, so the convert is exact.
+template <typename AType>
+struct Fp4I2FConverter {
+  static_assert(std::is_same_v<AType, half> || std::is_same_v<AType, __nv_bfloat16>);
+
+  __device__ __forceinline__ static AType decode(uint8_t code) {
+    constexpr float kValues[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    float v = kValues[code & 0x7];
+    return static_cast<AType>((code & 0x8) ? -v : v);
+  }
+
+  // Converts N e2m1 codes (packed two per byte, low nibble first) into N AType.
+  template <int N>
+  __device__ __forceinline__ static void convert(void* src, void* dst) {
+    static_assert(N % 2 == 0);
+    uint8_t const* s = reinterpret_cast<uint8_t const*>(src);
+    AType* d = reinterpret_cast<AType*>(dst);
+#pragma unroll
+    for (int i = 0; i < N; i += 2) {
+      uint8_t byte = s[i >> 1];
+      d[i] = decode(static_cast<uint8_t>(byte & 0x0F));
+      d[i + 1] = decode(static_cast<uint8_t>((byte >> 4) & 0x0F));
+    }
+  }
+};
+
 template <typename Details>
 struct ConverterWrapper {
   using TypeDetailsA = typename Details::TypeDetailsA;
   using TypeDetailsW = typename Details::TypeDetailsW;
   static constexpr bool kUseInterleavedConverter = Details::kUseInterleavedConverter;
-  using Converter = I2FConverter<typename TypeDetailsA::Type, TypeDetailsW::kElemBits, kUseInterleavedConverter>;
+  using Converter = std::conditional_t<
+      IsFp4Weight<TypeDetailsW>::value,
+      Fp4I2FConverter<typename TypeDetailsA::Type>,
+      I2FConverter<typename TypeDetailsA::Type, TypeDetailsW::kElemBits, kUseInterleavedConverter>>;
 };
 
 template <bool isGroupwise, typename Details>

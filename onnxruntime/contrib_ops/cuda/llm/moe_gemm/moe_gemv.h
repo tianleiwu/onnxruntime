@@ -35,6 +35,11 @@ bool is_moe_gemv_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t
 // Backward-compatible per-channel INT4 shape check.
 bool is_moe_gemv_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t k);
 
+// MXFP4 GEMV shape support for the non-interleaved ColumnMajor layout (kInterleave = 1).
+// Requires sm >= 80, group_size == 32, n divisible by the kernel tile width (kCtaN), and the
+// profiled small-decode row/dim bounds. See launch_moe_gemv_fp4_symmetric.
+bool is_moe_gemv_fp4_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t k, int group_size);
+
 // Launches symmetric INT MoE GEMV. group_size <= 0 means per-channel scales;
 // group_size 32/64/128 means block-wise scales laid out as [num_experts, k_blocks, n].
 // T is half or __nv_bfloat16. WeightType is cutlass::uint4b_t or uint8_t.
@@ -79,6 +84,31 @@ void launch_moe_gemv_int4_per_channel_interleaved_swiglu(
     T const* act, uint8_t const* weight, T const* scales, T const* bias, T* out,
     int64_t const* expert_first_token_offset, int const* permuted_row_to_expert, int num_experts, int64_t expanded_num_rows,
     int64_t inter_size, int64_t k, int sm, cutlass_kernels::ActivationParams activation_params,
+    cudaStream_t stream);
+
+// Launches the MXFP4 (e2m1) MoE GEMV in the non-interleaved ColumnMajor layout.
+//   act:      [expanded_num_rows, k]  permuted activations (row-major), T = half/bf16
+//   weight:   [num_experts, n, k/2]  e2m1 codes packed two per byte (even-K low nibble)
+//             == LaunchQMoERepackFP4ColToRow output
+//   scales:   [num_experts, k/32, n]  TypeA block scales already folded with the per-expert
+//             global scale == LaunchQMoECombineFp4ScalesForGemv output
+//   bias:     [num_experts, n] (T) or nullptr
+//   out:      [expanded_num_rows, n] (row-major)
+// group_size is the MXFP4 block size (32).
+template <typename T>
+void launch_moe_gemv_fp4_symmetric(
+    T const* act, uint8_t const* weight, T const* scales, T const* bias, T* out,
+    int64_t const* expert_first_token_offset, int const* permuted_row_to_expert, int num_experts, int64_t expanded_num_rows,
+    int64_t n, int64_t k, int group_size, int sm, cudaStream_t stream);
+
+// Launches the MXFP4 MoE GEMV and fuses interleaved SwiGLU activation.
+//   weight/scales/bias use raw FC1 output width n = 2 * inter_size
+//   out is post-activation [expanded_num_rows, inter_size]
+template <typename T>
+void launch_moe_gemv_fp4_symmetric_interleaved_swiglu(
+    T const* act, uint8_t const* weight, T const* scales, T const* bias, T* out,
+    int64_t const* expert_first_token_offset, int const* permuted_row_to_expert, int num_experts, int64_t expanded_num_rows,
+    int64_t inter_size, int64_t k, int group_size, int sm, cutlass_kernels::ActivationParams activation_params,
     cudaStream_t stream);
 
 }  // namespace moe_gemv
