@@ -10,6 +10,8 @@
 #include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_profiler.h"
 
 #include <mutex>
+#include <string>
+#include <unordered_map>
 
 namespace onnxruntime {
 namespace contrib {
@@ -144,6 +146,68 @@ class QMoE final : public CudaKernel, public MoEBase {
   IAllocatorUniquePtr<void> packed_fc2_act_scale_;
 
   mutable onnxruntime::llm::kernels::cutlass_kernels::MoeGemmProfiler mGemmProfiler;
+  struct RouteTuningKey {
+    int sm = 0;
+    int dtype = 0;
+    int expert_weight_bits = 0;
+    int64_t block_size = 0;
+    bool has_zero_points = false;
+    int row_bucket = 0;
+    int expanded_row_bucket = 0;
+    int64_t hidden_size = 0;
+    int64_t inter_size = 0;
+    int top_k = 0;
+    int num_experts = 0;
+    int activation_type = 0;
+    int swiglu_fusion = 0;
+    int ep_size = 1;
+
+    bool operator==(const RouteTuningKey& other) const {
+      return sm == other.sm && dtype == other.dtype && expert_weight_bits == other.expert_weight_bits &&
+             block_size == other.block_size && has_zero_points == other.has_zero_points &&
+             row_bucket == other.row_bucket && expanded_row_bucket == other.expanded_row_bucket &&
+             hidden_size == other.hidden_size && inter_size == other.inter_size && top_k == other.top_k &&
+             num_experts == other.num_experts && activation_type == other.activation_type &&
+             swiglu_fusion == other.swiglu_fusion && ep_size == other.ep_size;
+    }
+  };
+
+  struct RouteTuningKeyHash {
+    size_t operator()(const RouteTuningKey& key) const {
+      size_t hash = 1469598103934665603ULL;
+      auto combine = [&hash](auto value) {
+        hash ^= static_cast<size_t>(value);
+        hash *= 1099511628211ULL;
+      };
+      combine(key.sm);
+      combine(key.dtype);
+      combine(key.expert_weight_bits);
+      combine(key.block_size);
+      combine(key.has_zero_points);
+      combine(key.row_bucket);
+      combine(key.expanded_row_bucket);
+      combine(key.hidden_size);
+      combine(key.inter_size);
+      combine(key.top_k);
+      combine(key.num_experts);
+      combine(key.activation_type);
+      combine(key.swiglu_fusion);
+      combine(key.ep_size);
+      return hash;
+    }
+  };
+
+  struct RouteTuningResult {
+    onnxruntime::llm::kernels::cutlass_kernels::MoeRoutePolicy policy;
+    float auto_time_ms = 0.0f;
+    float gemv_where_supported_time_ms = 0.0f;
+    float grouped_gemm_time_ms = 0.0f;
+    float fc1_gemv_fc2_gemm_time_ms = 0.0f;
+    float fc1_gemm_fc2_gemv_time_ms = 0.0f;
+    std::string profile_log;
+  };
+
+  mutable std::unordered_map<RouteTuningKey, RouteTuningResult, RouteTuningKeyHash> qmoe_route_tuning_cache_;
   mutable std::mutex mGemmProfilerMutex;
 };
 

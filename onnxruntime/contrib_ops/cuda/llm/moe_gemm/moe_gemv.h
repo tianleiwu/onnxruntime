@@ -18,19 +18,29 @@ namespace onnxruntime::llm {
 namespace kernels {
 namespace moe_gemv {
 
+enum class MoeGemvConfig {
+  kDefault,
+  kCtaN16,
+  kThreads64,
+  kSplitK2,
+};
+
 inline constexpr int64_t kMaxProfiledExpandedRows = 8;
 inline constexpr int64_t kMaxProfiledExpandedRowsForSmallProblemDim = 4;
 inline constexpr int64_t kMinProfiledProblemDim = 512;
-// Lowered from 704 to 512 so block-wise decode shapes (e.g. Qwen top_k=8,
-// inter_size=512) take the GEMV path. This also covers per-column INT4 shapes
-// with inter_size in [512, 704); both bands are gated by ORT_DISABLE_MOE_GEMV.
+// Legacy heuristic thresholds for the default, non-autotuned route. Explicit
+// autotune candidates may profile GEMV outside these thresholds when the kernel
+// supports the shape.
 inline constexpr int64_t kMinProfiledProblemDimForExpandedRowsAbove4 = 512;
 
 // Returns true if the batched MoE GEMV fast path supports this problem shape.
-// Requirements: FP16/BF16 activations, sm >= 80, small expanded_num_rows, supported
-// INT weight type, supported group size, and n divisible by the kernel tile width.
+// Requirements: FP16/BF16 activations, sm >= 80, positive expanded_num_rows,
+// supported INT weight type, supported group size, and launch/layout dimensions
+// that tile cleanly.
 bool is_moe_gemv_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t k,
                            int weight_bits, int group_size);
+bool is_moe_gemv_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t k,
+                           int weight_bits, int group_size, MoeGemvConfig config);
 
 // Backward-compatible per-channel INT4 shape check.
 bool is_moe_gemv_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t k);
@@ -47,7 +57,7 @@ template <typename T, typename WeightType>
 void launch_moe_gemv_int_symmetric(
     T const* act, WeightType const* weight, T const* scales, T const* bias, T* out,
     int64_t const* expert_first_token_offset, int const* permuted_row_to_expert, int num_experts, int64_t expanded_num_rows,
-    int64_t n, int64_t k, int group_size, int sm, cudaStream_t stream);
+    int64_t n, int64_t k, int group_size, int sm, MoeGemvConfig config, cudaStream_t stream);
 
 // Launches symmetric INT MoE GEMV and fuses interleaved SwiGLU activation.
 // weight/bias use raw FC1 output width n = 2 * inter_size. Scales are
@@ -58,7 +68,7 @@ void launch_moe_gemv_int_symmetric_interleaved_swiglu(
     T const* act, WeightType const* weight, T const* scales, T const* bias, T* out,
     int64_t const* expert_first_token_offset, int const* permuted_row_to_expert, int num_experts, int64_t expanded_num_rows,
     int64_t inter_size, int64_t k, int group_size, int sm, cutlass_kernels::ActivationParams activation_params,
-    cudaStream_t stream);
+    MoeGemvConfig config, cudaStream_t stream);
 
 // Launches the int4 per-channel MoE GEMV.
 //   act:      [expanded_num_rows, k]  permuted activations (row-major)
@@ -73,7 +83,7 @@ template <typename T>
 void launch_moe_gemv_int4_per_channel(
     T const* act, uint8_t const* weight, T const* scales, T const* bias, T* out,
     int64_t const* expert_first_token_offset, int const* permuted_row_to_expert, int num_experts, int64_t expanded_num_rows,
-    int64_t n, int64_t k, int sm, cudaStream_t stream);
+    int64_t n, int64_t k, int sm, MoeGemvConfig config, cudaStream_t stream);
 
 // Launches the int4 per-channel MoE GEMV and fuses interleaved SwiGLU activation.
 //   weight/scales/bias use raw FC1 output width [num_experts, k, 2 * inter_size]
@@ -84,7 +94,7 @@ void launch_moe_gemv_int4_per_channel_interleaved_swiglu(
     T const* act, uint8_t const* weight, T const* scales, T const* bias, T* out,
     int64_t const* expert_first_token_offset, int const* permuted_row_to_expert, int num_experts, int64_t expanded_num_rows,
     int64_t inter_size, int64_t k, int sm, cutlass_kernels::ActivationParams activation_params,
-    cudaStream_t stream);
+    MoeGemvConfig config, cudaStream_t stream);
 
 // Launches the MXFP4 (e2m1) MoE GEMV in the non-interleaved ColumnMajor layout.
 //   act:      [expanded_num_rows, k]  permuted activations (row-major), T = half/bf16

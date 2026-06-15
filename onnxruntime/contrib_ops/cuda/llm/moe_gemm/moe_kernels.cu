@@ -84,9 +84,17 @@ inline bool MoeGemvDisabledByEnv() {
   return disabled;
 }
 
-inline bool MoeGemvRejectedByProfiledInterSize(int64_t expanded_num_rows, int64_t inter_size) {
+inline bool MoeGemvRejectedByLegacyProfiledShape(int64_t expanded_num_rows, int64_t n, int64_t k,
+                                                 int64_t activation_output_size) {
+  if (expanded_num_rows <= 0 || expanded_num_rows > onnxruntime::llm::kernels::moe_gemv::kMaxProfiledExpandedRows) {
+    return true;
+  }
+  if (n < onnxruntime::llm::kernels::moe_gemv::kMinProfiledProblemDim ||
+      k < onnxruntime::llm::kernels::moe_gemv::kMinProfiledProblemDim) {
+    return true;
+  }
   return expanded_num_rows > onnxruntime::llm::kernels::moe_gemv::kMaxProfiledExpandedRowsForSmallProblemDim &&
-         inter_size < onnxruntime::llm::kernels::moe_gemv::kMinProfiledProblemDimForExpandedRowsAbove4;
+         activation_output_size < onnxruntime::llm::kernels::moe_gemv::kMinProfiledProblemDimForExpandedRowsAbove4;
 }
 
 template <typename WeightType>
@@ -110,22 +118,26 @@ bool tryLaunchMoeGemvIntSymmetric(T const* input, WeightType const* weights, Sca
                                   int64_t const* expert_first_token_offset, int num_experts_per_node,
                                   int const* permuted_row_to_expert, int64_t expanded_num_rows,
                                   int64_t n, int64_t k, int sm, int group_size,
-                                  bool disabled, cudaStream_t stream) {
+                                  bool disabled, moe_gemv::MoeGemvConfig config, cudaStream_t stream) {
   if constexpr ((std::is_same_v<WeightType, cutlass::uint4b_t> || std::is_same_v<WeightType, uint8_t>) &&
                 (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>) && std::is_same_v<ScaleBiasType, T>) {
     bool const env_disabled = MoeGemvDisabledByEnv();
     bool const has_block_zeros = group_size > 0 && weight_zeros != nullptr;
     constexpr int weight_bits = MoeGemvWeightBits<WeightType>();
+    if (config == moe_gemv::MoeGemvConfig::kSplitK2 &&
+        (biases != nullptr || !std::is_same_v<T, half>)) {
+      return false;
+    }
     if (disabled || env_disabled || has_block_zeros) {
       return false;
     }
     if (!onnxruntime::llm::kernels::moe_gemv::is_moe_gemv_supported(
-            sm, expanded_num_rows, n, k, weight_bits, group_size)) {
+            sm, expanded_num_rows, n, k, weight_bits, group_size, config)) {
       return false;
     }
     onnxruntime::llm::kernels::moe_gemv::launch_moe_gemv_int_symmetric<T, WeightType>(
         input, weights, scales, biases, output, expert_first_token_offset, permuted_row_to_expert,
-        num_experts_per_node, expanded_num_rows, n, k, group_size, sm, stream);
+        num_experts_per_node, expanded_num_rows, n, k, group_size, sm, config, stream);
     return true;
   } else {
     (void)input;
@@ -143,6 +155,7 @@ bool tryLaunchMoeGemvIntSymmetric(T const* input, WeightType const* weights, Sca
     (void)sm;
     (void)group_size;
     (void)disabled;
+    (void)config;
     (void)stream;
     return false;
   }
@@ -154,12 +167,19 @@ bool tryLaunchMoeGemvIntSymmetricInterleavedSwiGLU(
     ScaleBiasType const* biases, T* output,
     int64_t const* expert_first_token_offset, int num_experts_per_node, int const* permuted_row_to_expert,
     int64_t expanded_num_rows, int64_t inter_size, int64_t k, int sm, int group_size,
-    bool disabled, cutlass_kernels::ActivationParams activation_params, cudaStream_t stream) {
+    bool disabled, cutlass_kernels::ActivationParams activation_params, moe_gemv::MoeGemvConfig config,
+    cudaStream_t stream) {
   if constexpr ((std::is_same_v<WeightType, cutlass::uint4b_t> || std::is_same_v<WeightType, uint8_t>) &&
                 (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>) && std::is_same_v<ScaleBiasType, T>) {
     bool const env_disabled = MoeGemvDisabledByEnv();
     bool const has_block_zeros = group_size > 0 && weight_zeros != nullptr;
     if (disabled || env_disabled || has_block_zeros) {
+      return false;
+    }
+    // Split-K is FP16-only for now: the two-pass fused-SwiGLU launcher (fp32 partials +
+    // fused activation in pass 2) is only instantiated for half. bf16 falls back so the
+    // autotuner can still pick a non-split fused config.
+    if (config == moe_gemv::MoeGemvConfig::kSplitK2 && !std::is_same_v<T, half>) {
       return false;
     }
     int64_t const n = inter_size * 2;
@@ -172,12 +192,12 @@ bool tryLaunchMoeGemvIntSymmetricInterleavedSwiGLU(
       return false;
     }
     if (!onnxruntime::llm::kernels::moe_gemv::is_moe_gemv_supported(
-            sm, expanded_num_rows, n, k, weight_bits, group_size)) {
+            sm, expanded_num_rows, n, k, weight_bits, group_size, config)) {
       return false;
     }
     onnxruntime::llm::kernels::moe_gemv::launch_moe_gemv_int_symmetric_interleaved_swiglu<T, WeightType>(
         input, weights, scales, biases, output, expert_first_token_offset, permuted_row_to_expert,
-        num_experts_per_node, expanded_num_rows, inter_size, k, group_size, sm, activation_params, stream);
+        num_experts_per_node, expanded_num_rows, inter_size, k, group_size, sm, activation_params, config, stream);
     return true;
   } else {
     (void)input;
@@ -196,6 +216,7 @@ bool tryLaunchMoeGemvIntSymmetricInterleavedSwiGLU(
     (void)group_size;
     (void)disabled;
     (void)activation_params;
+    (void)config;
     (void)stream;
     return false;
   }
@@ -2338,7 +2359,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     int const* permuted_row_to_expert, bool bias_is_broadcast,
     cudaStream_t stream, MOEParallelismConfig parallelism_config,
     cutlass_extensions::CutlassGemmConfig config,
-    ActivationParameters activation_params) {
+    ActivationParameters activation_params,
+    MoeFcRoute route,
+    moe_gemv::MoeGemvConfig gemv_config) {
+  bool const force_grouped_gemm = route == MoeFcRoute::kGroupedGemm;
+  bool const use_legacy_gemv_heuristic = route == MoeFcRoute::kAuto;
   bool const using_tma_ws_gemm1 = gemm_runner.isTmaWarpSpecialized(config);
   bool const is_gated_activation = isGatedActivation(fc1_activation_type);
   bool const use_ampere_activation_fusion = gemm_runner.isFusedGatedActivation(config, is_gated_activation, inter_size, hidden_size);
@@ -2465,9 +2490,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
         fc1_expert_biases, output, expert_first_token_offset, num_experts_per_node,
         permuted_row_to_expert, expanded_num_rows, inter_size, hidden_size,
         onnxruntime::llm::common::getSMVersion(), quant_params.groupwise.group_size,
-        /*disabled=*/parallelism_config.ep_size > 1 || use_ampere_activation_fusion || !bias_is_broadcast ||
-            MoeGemvRejectedByProfiledInterSize(expanded_num_rows, inter_size),
-        activation_params, stream);
+        /*disabled=*/force_grouped_gemm || parallelism_config.ep_size > 1 || use_ampere_activation_fusion || !bias_is_broadcast ||
+            (use_legacy_gemv_heuristic && MoeGemvRejectedByLegacyProfiledShape(
+                                              expanded_num_rows, inter_size * 2, hidden_size, inter_size)),
+        activation_params, gemv_config, stream);
 
     // Run the GEMM with activation function overridden with `Identity`, we do the activation separately.
     // Fast path: int4 per-channel MoE GEMV for small expanded-row counts (e.g. batch-1 decode).
@@ -2483,8 +2509,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
                                                         permuted_row_to_expert, expanded_num_rows, /*n=*/static_cast<int64_t>(fc1_out_size), /*k=*/hidden_size,
                                                         onnxruntime::llm::common::getSMVersion(),
                                                         quant_params.groupwise.group_size,
-                                                        /*disabled=*/parallelism_config.ep_size > 1 || use_ampere_activation_fusion || !bias_is_broadcast ||
-                                                            MoeGemvRejectedByProfiledInterSize(expanded_num_rows, inter_size),
+                                                        /*disabled=*/force_grouped_gemm || parallelism_config.ep_size > 1 || use_ampere_activation_fusion || !bias_is_broadcast ||
+                                                            (use_legacy_gemv_heuristic && MoeGemvRejectedByLegacyProfiledShape(
+                                                                                              expanded_num_rows, static_cast<int64_t>(fc1_out_size), hidden_size,
+                                                                                              inter_size)),
+                                                        gemv_config,
                                                         stream);
     if (!fc1_did_gemv) {
       auto universal_input = GroupedGemmInput<T, WeightType, OutputType, OutputType>{input,
@@ -2542,7 +2571,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     int const num_experts_per_node, int64_t const k, float const** alpha_scale_ptr_array,
     int const* permuted_row_to_expert,
     cudaStream_t stream, MOEParallelismConfig parallelism_config,
-    cutlass_extensions::CutlassGemmConfig config) {
+    cutlass_extensions::CutlassGemmConfig config,
+    MoeFcRoute route,
+    moe_gemv::MoeGemvConfig gemv_config) {
+  bool const force_grouped_gemm = route == MoeFcRoute::kGroupedGemm;
+  bool const use_legacy_gemv_heuristic = route == MoeFcRoute::kAuto;
   int64_t const* total_tokens_including_expert = expert_first_token_offset + 1;
 
   bool const using_tma_ws_gemm2 = gemm_runner.isTmaWarpSpecialized(config);
@@ -2587,8 +2620,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
       /*biases*/ nullptr, static_cast<T*>(gemm_output), expert_first_token_offset, num_experts_per_node,
       permuted_row_to_expert, expanded_num_rows, /*n=*/hidden_size, /*k=*/inter_size, onnxruntime::llm::common::getSMVersion(),
       quant_params.groupwise.group_size,
-      /*disabled=*/parallelism_config.ep_size > 1 || using_tma_ws_gemm2 ||
-          MoeGemvRejectedByProfiledInterSize(expanded_num_rows, inter_size),
+      /*disabled=*/force_grouped_gemm || parallelism_config.ep_size > 1 || using_tma_ws_gemm2 ||
+          (use_legacy_gemv_heuristic && MoeGemvRejectedByLegacyProfiledShape(
+                                            expanded_num_rows, hidden_size, inter_size, inter_size)),
+      gemv_config,
       stream);
   if (!fc2_did_gemv) {
     auto universal_input = GroupedGemmInput<T, WeightType, OutputType, OutputType>{input, total_tokens_including_expert,
@@ -2642,7 +2677,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     int const full_num_experts, int const experts_per_token, char* workspace_ptr, void* final_output_void,
     int* unpermuted_row_to_permuted_row, MOEParallelismConfig parallelism_config,
     ActivationParameters activation_params,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    MoeRoutePolicy route_policy) {
   static constexpr bool int_scales_required = std::is_same<WeightType, uint8_t>::value || std::is_same<WeightType, cutlass::uint4b_t>::value;
   static constexpr bool fp8_scales_required = std::is_same<WeightType, __nv_fp8_e4m3>::value || std::is_same<WeightType, __nv_fp8_e5m2>::value;
 
@@ -2805,7 +2841,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
                 fc1_fp4_act_scale_, fc2_fp4_act_scale_, quant_params, num_rows, expanded_num_rows, hidden_size, inter_size,
                 num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array_fc1_, permuted_token_selected_experts_,
                 /*bias_is_broadcast=*/true, stream, parallelism_config, *gemm1_config_,
-                activation_params);
+                activation_params, route_policy.fc1_route, route_policy.fc1_gemv_config);
     sync_check_cuda_error(stream);
 
     auto gemm2_input = applyPrequantScale(smoothed_act_, fc1_result_, quant_params.groupwise.fc2.act_scales,
@@ -2817,7 +2853,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
                 permuted_token_final_scales_, unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row_,
                 token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size, inter_size,
                 num_experts_per_node, experts_per_token, alpha_scale_ptr_array_fc2_, permuted_token_selected_experts_, stream,
-                parallelism_config, *gemm2_config_);
+                parallelism_config, *gemm2_config_, route_policy.fc2_route, route_policy.fc2_gemv_config);
     sync_check_cuda_error(stream);
   }
 }
