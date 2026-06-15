@@ -49,6 +49,8 @@ bool is_moe_gemv_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t
 // Requires sm >= 80, group_size == 32, n divisible by the kernel tile width (kCtaN), and the
 // profiled small-decode row/dim bounds. See launch_moe_gemv_fp4_symmetric.
 bool is_moe_gemv_fp4_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t k, int group_size);
+bool is_moe_gemv_fp4_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t k, int group_size,
+                               MoeGemvConfig config);
 
 // Launches symmetric INT MoE GEMV. group_size <= 0 means per-channel scales;
 // group_size 32/64/128 means block-wise scales laid out as [num_experts, k_blocks, n].
@@ -109,7 +111,7 @@ template <typename T>
 void launch_moe_gemv_fp4_symmetric(
     T const* act, uint8_t const* weight, T const* scales, T const* bias, T* out,
     int64_t const* expert_first_token_offset, int const* permuted_row_to_expert, int num_experts, int64_t expanded_num_rows,
-    int64_t n, int64_t k, int group_size, int sm, cudaStream_t stream);
+    int64_t n, int64_t k, int group_size, int sm, MoeGemvConfig config, cudaStream_t stream);
 
 // Launches the MXFP4 MoE GEMV and fuses interleaved SwiGLU activation.
 //   weight/scales/bias use raw FC1 output width n = 2 * inter_size
@@ -119,7 +121,7 @@ void launch_moe_gemv_fp4_symmetric_interleaved_swiglu(
     T const* act, uint8_t const* weight, T const* scales, T const* bias, T* out,
     int64_t const* expert_first_token_offset, int const* permuted_row_to_expert, int num_experts, int64_t expanded_num_rows,
     int64_t inter_size, int64_t k, int group_size, int sm, cutlass_kernels::ActivationParams activation_params,
-    cudaStream_t stream);
+    MoeGemvConfig config, cudaStream_t stream);
 
 }  // namespace moe_gemv
 }  // namespace kernels

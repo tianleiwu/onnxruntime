@@ -55,6 +55,17 @@ bool QMoERouteTuningLogEnabled() {
   return onnxruntime::ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_ROUTE_TUNING_LOG", 0) == 1;
 }
 
+// Per-shape autotune of the fused MXFP4 GEMV CtaN/Threads tiling. Enabled by default within
+// the (already opt-in) ORT_ENABLE_FP4_GEMV path; set ORT_FP4_GEMV_AUTOTUNE=0 to force the
+// default tiling. ORT_FP4_GEMV_AUTOTUNE_LOG=1 logs the chosen configs per shape.
+bool Fp4GemvAutotuneEnabled() {
+  return onnxruntime::ParseEnvironmentVariableWithDefault<int>("ORT_FP4_GEMV_AUTOTUNE", 1) == 1;
+}
+
+bool Fp4GemvAutotuneLogEnabled() {
+  return onnxruntime::ParseEnvironmentVariableWithDefault<int>("ORT_FP4_GEMV_AUTOTUNE_LOG", 0) == 1;
+}
+
 bool QMoEGemvDisabledByEnv() {
   char const* value = std::getenv("ORT_DISABLE_MOE_GEMV");
   return value != nullptr && value[0] == '1';
@@ -1055,52 +1066,131 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
       const void* fc1_bias = fc1_experts_bias_optional ? fc1_experts_bias_optional->DataRaw() : nullptr;
       const void* fc2_bias = fc2_experts_bias_optional ? fc2_experts_bias_optional->DataRaw() : nullptr;
 
+      using MoeGemvConfig = gemv::MoeGemvConfig;
+
+      // Choose the fc1 (SwiGLU) and fc2 GEMV tiling configs. CtaN/Threads are pure tiling
+      // knobs (numerically bit-exact), so the only goal is picking the fastest. Reuse a
+      // cached per-shape result when available; otherwise profile on a non-captured (warmup)
+      // call and freeze the choice for CUDA-graph replay. During capture (or when autotune is
+      // off) fall back to the default tiling.
+      MoeGemvConfig fc1_config = MoeGemvConfig::kDefault;
+      MoeGemvConfig fc2_config = MoeGemvConfig::kDefault;
+
+      const Fp4GemvTuneKey tune_key{is_fp16_, expanded, hidden, inter, sm_};
+      const auto cached_tune = fp4_gemv_tune_cache_.find(tune_key);
+      const bool have_tune = cached_tune != fp4_gemv_tune_cache_.end();
+      if (have_tune) {
+        fc1_config = cached_tune->second.fc1_config;
+        fc2_config = cached_tune->second.fc2_config;
+      }
+
+      cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+      CUDA_CALL_THROW(cudaStreamIsCapturing(stream, &capture_status));
+      const bool is_capturing = capture_status != cudaStreamCaptureStatusNone;
+      const bool do_tune = Fp4GemvAutotuneEnabled() && !have_tune && !is_capturing;
+
+      auto run_fused = [&](auto* t_ptr) {
+        using T = std::remove_pointer_t<decltype(t_ptr)>;
+        ck::expandInputRowsKernelLauncher<T, T>(
+            static_cast<const T*>(input->DataRaw()), static_cast<T*>(p_act_buf.get()),
+            nullptr, nullptr, p_r2u, num_rows, hidden, static_cast<int>(k_), num_experts,
+            quant_params, false, p_efto, nullptr, nullptr, nullptr, stream);
+
+        auto launch_fc1 = [&](MoeGemvConfig cfg) {
+          gemv::launch_moe_gemv_fp4_symmetric_interleaved_swiglu<T>(
+              static_cast<const T*>(p_act_buf.get()),
+              static_cast<const uint8_t*>(gemv_fp4_fc1_weights_.get()),
+              static_cast<const T*>(gemv_fp4_fc1_scales_.get()),
+              static_cast<const T*>(fc1_bias), static_cast<T*>(p_fc1_buf.get()),
+              p_efto, p_exp, num_experts, expanded, inter, hidden, 32, sm_, act_params, cfg, stream);
+        };
+        auto launch_fc2 = [&](MoeGemvConfig cfg) {
+          gemv::launch_moe_gemv_fp4_symmetric<T>(
+              static_cast<const T*>(p_fc1_buf.get()),
+              static_cast<const uint8_t*>(gemv_fp4_fc2_weights_.get()),
+              static_cast<const T*>(gemv_fp4_fc2_scales_.get()),
+              static_cast<const T*>(fc2_bias), static_cast<T*>(p_fc2_buf.get()),
+              p_efto, p_exp, num_experts, expanded, hidden, inter, 32, sm_, cfg, stream);
+        };
+
+        if (do_tune) {
+          constexpr MoeGemvConfig kCandidates[] = {
+              MoeGemvConfig::kDefault, MoeGemvConfig::kCtaN16, MoeGemvConfig::kThreads64};
+          constexpr int kWarmup = 3;
+          constexpr int kIters = 20;
+
+          cudaEvent_t start_event = nullptr;
+          cudaEvent_t stop_event = nullptr;
+          CUDA_CALL_THROW(cudaEventCreate(&start_event));
+          std::unique_ptr<CUevent_st, decltype(&cudaEventDestroy)> start_event_guard(start_event, cudaEventDestroy);
+          CUDA_CALL_THROW(cudaEventCreate(&stop_event));
+          std::unique_ptr<CUevent_st, decltype(&cudaEventDestroy)> stop_event_guard(stop_event, cudaEventDestroy);
+
+          auto time_launch = [&](auto&& launch_fn) -> float {
+            for (int i = 0; i < kWarmup; ++i) {
+              launch_fn();
+            }
+            CUDA_CALL_THROW(cudaStreamSynchronize(stream));
+            CUDA_CALL_THROW(cudaEventRecord(start_event, stream));
+            for (int i = 0; i < kIters; ++i) {
+              launch_fn();
+            }
+            CUDA_CALL_THROW(cudaEventRecord(stop_event, stream));
+            CUDA_CALL_THROW(cudaEventSynchronize(stop_event));
+            float elapsed_ms = 0.0f;
+            CUDA_CALL_THROW(cudaEventElapsedTime(&elapsed_ms, start_event, stop_event));
+            return elapsed_ms;
+          };
+
+          // fc1 reads p_act_buf (populated by the expand above).
+          float best_fc1 = std::numeric_limits<float>::max();
+          for (MoeGemvConfig cfg : kCandidates) {
+            if (!gemv::is_moe_gemv_fp4_supported(sm_, expanded, fc1_n, hidden, 32, cfg)) {
+              continue;
+            }
+            const float ms = time_launch([&] { launch_fc1(cfg); });
+            if (ms < best_fc1) {
+              best_fc1 = ms;
+              fc1_config = cfg;
+            }
+          }
+          // fc2 reads p_fc1_buf; populate it once with the chosen fc1 config before timing fc2.
+          launch_fc1(fc1_config);
+          float best_fc2 = std::numeric_limits<float>::max();
+          for (MoeGemvConfig cfg : kCandidates) {
+            if (!gemv::is_moe_gemv_fp4_supported(sm_, expanded, hidden, inter, 32, cfg)) {
+              continue;
+            }
+            const float ms = time_launch([&] { launch_fc2(cfg); });
+            if (ms < best_fc2) {
+              best_fc2 = ms;
+              fc2_config = cfg;
+            }
+          }
+
+          fp4_gemv_tune_cache_.emplace(tune_key, Fp4GemvTuneResult{fc1_config, fc2_config});
+          if (Fp4GemvAutotuneLogEnabled()) {
+            LOGS_DEFAULT(WARNING) << "FP4 GEMV autotune: is_fp16=" << is_fp16_ << " expanded=" << expanded
+                                  << " hidden=" << hidden << " inter=" << inter << " fc1="
+                                  << QMoEGemvConfigName(fc1_config) << " (" << best_fc1 << "ms/" << kIters
+                                  << "it) fc2=" << QMoEGemvConfigName(fc2_config) << " (" << best_fc2 << "ms/"
+                                  << kIters << "it)";
+          }
+        }
+
+        launch_fc1(fc1_config);
+        launch_fc2(fc2_config);
+        ck::finalizeMoeRoutingKernelLauncher<T, T, T>(
+            static_cast<const T*>(p_fc2_buf.get()), static_cast<T*>(output->MutableDataRaw()),
+            nullptr, expert_scales, unpermuted_row_to_permuted_row, p_r2u, expert_indices,
+            p_efto, num_rows, hidden, static_cast<int64_t>(k_), num_experts,
+            parallelism_config, false, stream);
+      };
+
       if (is_fp16_) {
-        using T = half;
-        ck::expandInputRowsKernelLauncher<T, T>(
-            static_cast<const T*>(input->DataRaw()), static_cast<T*>(p_act_buf.get()),
-            nullptr, nullptr, p_r2u, num_rows, hidden, static_cast<int>(k_), num_experts,
-            quant_params, false, p_efto, nullptr, nullptr, nullptr, stream);
-        gemv::launch_moe_gemv_fp4_symmetric_interleaved_swiglu<T>(
-            static_cast<const T*>(p_act_buf.get()),
-            static_cast<const uint8_t*>(gemv_fp4_fc1_weights_.get()),
-            static_cast<const T*>(gemv_fp4_fc1_scales_.get()),
-            static_cast<const T*>(fc1_bias), static_cast<T*>(p_fc1_buf.get()),
-            p_efto, p_exp, num_experts, expanded, inter, hidden, 32, sm_, act_params, stream);
-        gemv::launch_moe_gemv_fp4_symmetric<T>(
-            static_cast<const T*>(p_fc1_buf.get()),
-            static_cast<const uint8_t*>(gemv_fp4_fc2_weights_.get()),
-            static_cast<const T*>(gemv_fp4_fc2_scales_.get()),
-            static_cast<const T*>(fc2_bias), static_cast<T*>(p_fc2_buf.get()),
-            p_efto, p_exp, num_experts, expanded, hidden, inter, 32, sm_, stream);
-        ck::finalizeMoeRoutingKernelLauncher<T, T, T>(
-            static_cast<const T*>(p_fc2_buf.get()), static_cast<T*>(output->MutableDataRaw()),
-            nullptr, expert_scales, unpermuted_row_to_permuted_row, p_r2u, expert_indices,
-            p_efto, num_rows, hidden, static_cast<int64_t>(k_), num_experts,
-            parallelism_config, false, stream);
+        run_fused(static_cast<half*>(nullptr));
       } else {
-        using T = __nv_bfloat16;
-        ck::expandInputRowsKernelLauncher<T, T>(
-            static_cast<const T*>(input->DataRaw()), static_cast<T*>(p_act_buf.get()),
-            nullptr, nullptr, p_r2u, num_rows, hidden, static_cast<int>(k_), num_experts,
-            quant_params, false, p_efto, nullptr, nullptr, nullptr, stream);
-        gemv::launch_moe_gemv_fp4_symmetric_interleaved_swiglu<T>(
-            static_cast<const T*>(p_act_buf.get()),
-            static_cast<const uint8_t*>(gemv_fp4_fc1_weights_.get()),
-            static_cast<const T*>(gemv_fp4_fc1_scales_.get()),
-            static_cast<const T*>(fc1_bias), static_cast<T*>(p_fc1_buf.get()),
-            p_efto, p_exp, num_experts, expanded, inter, hidden, 32, sm_, act_params, stream);
-        gemv::launch_moe_gemv_fp4_symmetric<T>(
-            static_cast<const T*>(p_fc1_buf.get()),
-            static_cast<const uint8_t*>(gemv_fp4_fc2_weights_.get()),
-            static_cast<const T*>(gemv_fp4_fc2_scales_.get()),
-            static_cast<const T*>(fc2_bias), static_cast<T*>(p_fc2_buf.get()),
-            p_efto, p_exp, num_experts, expanded, hidden, inter, 32, sm_, stream);
-        ck::finalizeMoeRoutingKernelLauncher<T, T, T>(
-            static_cast<const T*>(p_fc2_buf.get()), static_cast<T*>(output->MutableDataRaw()),
-            nullptr, expert_scales, unpermuted_row_to_permuted_row, p_r2u, expert_indices,
-            p_efto, num_rows, hidden, static_cast<int64_t>(k_), num_experts,
-            parallelism_config, false, stream);
+        run_fused(static_cast<__nv_bfloat16*>(nullptr));
       }
       return Status::OK();
     }

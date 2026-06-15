@@ -949,3 +949,81 @@ occupancy. Search space for the autotuner:
 `StepK ∈ {8,16,32} × Threads ∈ {64,128,256} × CtaN ∈ {4,8,16} × accum ∈ {bf16,fp32} × splitK`,
 keyed on `(n, k, dtype, sm)`, gated on the accuracy check, and frozen at warmup
 for cuda-graph compatibility.
+
+---
+
+## FP4 GEMV per-shape autotune (CtaN / Threads sweep)
+
+After cherry-picking the QMoE GEMM↔GEMV autotune infrastructure (the
+accuracy fix — FP32 accumulation + buffer-aliasing fix — plus the route/config
+autotuner originally built for the INT path), the FP4 fused-SwiGLU GEMV decode
+path was wired into the same per-shape config tuner.
+
+### What is tuned
+
+The first lever taken from the search space above is the **parallelization /
+tiling** pair `{CtaN, Threads}` — specifically the candidate set
+`{kDefault (CtaN=8,Threads=128), kCtaN16 (CtaN=16), kThreads64 (Threads=64)}`.
+These are **pure tiling knobs**: same reduction, same 16-bit (`AccT=T`)
+accumulation, so the result is **bit-exact across all three configs**. That is
+why this sweep needs **no accuracy gate** — the profiling iterations double as
+correct warmup work, and any config is safe to cache and replay.
+
+`StepK` and the `accum` mode were deliberately left out of this first cut because
+(per the negative result above) widening the load forces FP32 accumulation, which
+costs occupancy — that lever needs the register-pressure-aware accumulation work
+before it is worth searching.
+
+### Implementation
+
+- `launch_moe_gemv_fp4_symmetric<T>` and
+  `launch_moe_gemv_fp4_symmetric_interleaved_swiglu<T>` now take a
+  `MoeGemvConfig config` argument and dispatch `CtaN`/`Threads` as compile-time
+  template params via a generic lambda. `is_moe_gemv_fp4_supported` gained a
+  6-arg overload that re-checks `n % CtaNForConfig(config) == 0` so a wider
+  `CtaN` is only offered when the output width divides evenly.
+- In `moe_quantization.cc` the FP4 routing block builds a
+  `Fp4GemvTuneKey{is_fp16, expanded, hidden, inter, sm}` and looks up a
+  per-shape `Fp4GemvTuneResult{fc1_config, fc2_config}` cache. On the first
+  non-captured (warmup) call it CUDA-event-profiles each candidate for **fc1**
+  and **fc2 independently** (kWarmup=3, kIters=20), caches the best, and replays
+  the frozen choice thereafter.
+- **cuda-graph safety:** unlike the INT autotuner (gated to prefill `rows>1`),
+  FP4 GEMV is a decode path where graph capture happens, so tuning is gated on
+  `cudaStreamIsCapturing` — it only profiles on non-captured calls and freezes
+  the cached config for replay.
+- **Gating:** FP4 GEMV stays behind `ORT_ENABLE_FP4_GEMV` (default off); the
+  autotune is behind `ORT_FP4_GEMV_AUTOTUNE` (default **on** within the opt-in
+  path); `ORT_FP4_GEMV_AUTOTUNE_LOG=1` logs the chosen config + timing per shape.
+
+### Results (gpt-oss-20b FP4, H200, `-b 1 -l 512 -g 256`, cuda-graph off)
+
+| Variant | decode tps |
+|---|---|
+| FP4 GEMV **ON + autotune** | **188.3** |
+| FP4 GEMV ON, autotune off (kDefault) | 186.7 |
+| FP4 GEMV **OFF** (dequant fallback) | 13.4 |
+
+- Autotune over `{CtaN, Threads}` is **+0.9 %** over the fixed `kDefault` config,
+  bit-exact, on the gpt-oss decode shapes (fc1 n=5760/k=2880, fc2 n=2880/k=2880).
+  The win is modest because both kernels are already occupancy-limited near the
+  same operating point; the `kCtaN16` candidate widens the tile but the chosen
+  config is shape-dependent and the harness picks whichever profiles fastest.
+- The dominant win remains the **GEMV fast path itself (~14×)** over the dequant
+  fallback, which materializes **all 32 experts'** MXFP4 weights to dense HBM per
+  token regardless of routing.
+
+### Accuracy
+
+`test_qmoe_fp4_cuda.py` is **19/19** with autotune on (default), autotune off,
+and FP4 GEMV off — identical, as expected from the bit-exact tiling sweep. On a
+microbenchmark of small shapes (hidden=inter=512) the tuner consistently selects
+`Threads=64` for fc1/fc2, confirming the profiling path is live and per-shape.
+
+### Conclusion
+
+The `{CtaN, Threads}` sweep is the **safe, zero-accuracy-risk** first lever of
+the autotuner: it lands a small but real, bit-exact decode gain and proves the
+per-shape FP4 tune-cache + cuda-graph-safe warmup-freeze machinery end to end.
+The larger predicted gains (`StepK`/`accum` load-widening) remain future work
+gated on a register-pressure-aware accumulation strategy.
