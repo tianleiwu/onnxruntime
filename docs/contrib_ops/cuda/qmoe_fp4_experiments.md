@@ -808,3 +808,69 @@ kernels' SM time, yielding a real +22 % decode improvement. The path is still
 somewhat compute-bound (fc1 ~80 % SM); further gains could come from vectorizing
 the converter (half2) or raising `kCtaN`. The fix is header-only, bit-exact, and
 still gated behind `ORT_ENABLE_FP4_GEMV`.
+
+---
+
+## 2026-06-15 — FP4 GEMV converter SWAR vectorization (negative result) + next-step diagnosis
+
+Follow-up to the bit-math converter above. Hypothesis: the GEMV was still ~80 %
+SM, so vectorizing the e2m1 decode (process both nibbles of a byte in one 32-bit
+SWAR op, ~halving converter ALU) should cut more SM time.
+
+### What was tried
+
+Added `Fp4I2FConverter::decode2(byte)` — a SIMD-within-a-register decode that puts
+the low nibble in the low 16-bit lane and the high nibble in the high 16-bit lane
+of a `uint32`, then assembles both fp16/bf16 results with shared 32-bit ALU ops.
+Verified bit-identical to two scalar `decode()` calls for all 256 byte values
+(fp16 and bf16). Accuracy: `test_qmoe_fp4_cuda.py` 19/19 pass, on and off.
+
+### Result — no net speedup
+
+| Kernel   | scalar bit-math | SWAR decode2 | Δ |
+|----------|-----------------|--------------|---|
+| fc1 GEMV | 63.5 us | 61.6 us | −3 % |
+| fc2 GEMV | 37.0 us | 39.0 us | +5 % |
+| decode e2e | 189.5 tps | 188.1 tps | ~flat (noise) |
+
+**The change was reverted** (no measurable e2e benefit, added intricate bit-math).
+
+### Why — the bottleneck moved (ncu pipe/stall breakdown)
+
+ncu `ComputeWorkloadAnalysis` + `WarpStateStats` on the current GEMV:
+
+| Kernel | Compute(SM) | **ALU pipe** | Mem | Occ | Exec IPC | top stall |
+|--------|-------------|--------------|-----|-----|----------|-----------|
+| fc1 swiglu | 85.6 % | **90.0 %** | 25 % | 41.8 % | 2.73 | not-selected 36 %, math-throttle |
+| fc2        | 66.5 % | **76.2 %** | 20 % | 43.6 % | 2.29 | short-scoreboard (smem) 33 % |
+
+The saturated pipe is the **integer/logic ALU**, not FMA/float. After the first
+fix the float decode is already a small slice; the ALU is now dominated by
+**per-K-step loop, index, address and Mapper arithmetic**. The FP4 GEMV uses the
+non-interleaved `ColumnMajor` layout with `AccessTypeW = int` (32-bit) and
+`kStepK = 8`, so it runs **4× more K-steps** than INT4's `ColumnMajorInterleaved`
+(`AccessTypeW = int4` 128-bit, `kStepK = 32`) — i.e. ~4× the integer loop
+overhead. That, plus the low 42 % occupancy (which leaves the over-subscribed ALU
+pipe latency exposed), is the real binding constraint. More converter micro-opt
+cannot move an ALU pipe that is saturated by loop/index overhead.
+
+### Recommended next change (the proper lever)
+
+Widen the FP4 weight access to **128-bit** (`AccessTypeW = int4`, `kStepK = 32`)
+so the K-loop runs 4× fewer trips, cutting the integer-ALU overhead that now
+dominates. `kAccessNumW = 32*4/128 = 1` int4 load/step; `kAccessNumA = 32*16/128
+= 4` activation float4 loads/step. The repacked weights are already `[E, n, k/2]`
+row-major, so 16 contiguous bytes along K = 32 codes form a clean 128-bit load —
+**no weight repack needed**. The reduction changes (`kThreadsPerInterleavedTile =
+kTileSize/kStepK = 64/32 = 2` vs `64/8 = 8`), so correctness must be re-validated
+with `test_qmoe_fp4_cuda.py` and the on/off parity gate. Raising occupancy (tune
+`kCtaN`/threads) is a complementary lever to hide the ALU latency. The full
+`kInterleave=4` interleaved layout (matching INT4, requires a weight prepack) is
+the larger follow-up that also amortizes the cross-warp reduction 4×.
+
+### Note on INT4
+
+INT4 fc1 GEMV (~18 us) is ~38 % of the 6.9 us roofline, so there is ~2× headroom
+there too. At batch-1 (M=1) it is likely reduction/occupancy-bound; a split-K
+(2-pass / atomic) accumulation would expose more parallelism across the 132 SMs
+for both INT4 and FP4. This is a separate, larger change.
