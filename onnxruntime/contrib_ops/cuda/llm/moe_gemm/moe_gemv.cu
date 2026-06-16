@@ -1186,18 +1186,6 @@ void launch_moe_gemv_fp4_symmetric_interleaved_swiglu(
     cutlass_kernels::ActivationParams activation_params, MoeGemvConfig config, cudaStream_t stream) {
   ORT_UNUSED_PARAMETER(sm);
   using Details = Fp4KernelDetails<T>;
-  // EXPERIMENT (kSplitK2): two-pass split-K exposes additional CTAs along K so the tiny batch-1
-  // decode grid (expanded_rows in (0,8]) fills more of the GPU's SMs. Pass 1 accumulates each
-  // K-split in TypeA over a ~SplitK-times-shorter chain, then pass 2 sums the per-split partials
-  // in fp32 and applies the fused SwiGLU. The launcher adaptively degrades to the fused kernel
-  // when the K loop is a single tile, so it stays correct for every supported shape.
-  if (config == MoeGemvConfig::kSplitK2) {
-    fiv::dispatch_moe_gemv_splitk_twopass_swiglu_group_size<Details, kDefaultCtaN, kDefaultThreads, 2, T>(
-        const_cast<T*>(act), const_cast<uint8_t*>(weight), const_cast<T*>(scales), const_cast<T*>(bias), out,
-        expert_first_token_offset, permuted_row_to_expert, num_experts, expanded_num_rows, inter_size, k, group_size,
-        activation_params, stream);
-    return;
-  }
   // CtaN/Threads are numerically bit-exact across configs (see launch_moe_gemv_fp4_symmetric).
   auto launch = [&](auto cta_n, auto threads) {
     fiv::dispatch_moe_gemv_interleaved_swiglu_group_size<Details, cta_n(), threads(), T>(
