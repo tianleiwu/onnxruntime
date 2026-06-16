@@ -1116,7 +1116,13 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
         };
 
         if (do_tune) {
-          constexpr MoeGemvConfig kCandidates[] = {
+          // EXPERIMENT: fc1 (the dominant SwiGLU GEMV) additionally offers two-pass split-K
+          // (kSplitK2) to expose more CTAs along K at batch-1 decode. fc2 keeps the pure
+          // {CtaN, Threads} tiling sweep.
+          constexpr MoeGemvConfig kFc1Candidates[] = {
+              MoeGemvConfig::kDefault, MoeGemvConfig::kCtaN16, MoeGemvConfig::kThreads64,
+              MoeGemvConfig::kSplitK2};
+          constexpr MoeGemvConfig kFc2Candidates[] = {
               MoeGemvConfig::kDefault, MoeGemvConfig::kCtaN16, MoeGemvConfig::kThreads64};
           constexpr int kWarmup = 3;
           constexpr int kIters = 20;
@@ -1147,7 +1153,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
           // fc1 reads p_act_buf (populated by the expand above).
           const bool log_tune = Fp4GemvAutotuneLogEnabled();
           float best_fc1 = std::numeric_limits<float>::max();
-          for (MoeGemvConfig cfg : kCandidates) {
+          for (MoeGemvConfig cfg : kFc1Candidates) {
             if (!gemv::is_moe_gemv_fp4_supported(sm_, expanded, fc1_n, hidden, 32, cfg)) {
               continue;
             }
@@ -1165,7 +1171,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
           // fc2 reads p_fc1_buf; populate it once with the chosen fc1 config before timing fc2.
           launch_fc1(fc1_config);
           float best_fc2 = std::numeric_limits<float>::max();
-          for (MoeGemvConfig cfg : kCandidates) {
+          for (MoeGemvConfig cfg : kFc2Candidates) {
             if (!gemv::is_moe_gemv_fp4_supported(sm_, expanded, hidden, inter, 32, cfg)) {
               continue;
             }
