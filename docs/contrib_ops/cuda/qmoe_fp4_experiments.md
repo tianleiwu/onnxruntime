@@ -1031,3 +1031,74 @@ the autotuner: it lands a small but real, bit-exact decode gain and proves the
 per-shape FP4 tune-cache + cuda-graph-safe warmup-freeze machinery end to end.
 The larger predicted gains (`StepK`/`accum` load-widening) remain future work
 gated on a register-pressure-aware accumulation strategy.
+
+---
+
+## 2026-06-16 — FP4 fc1 split-K (`kSplitK2`) autotune candidate (negative result, reverted)
+
+Follow-up to the `{CtaN, Threads}` autotune. The earlier ncu diagnosis listed a
+**split-K (2-pass) accumulation** as a way to "expose more parallelism across the
+132 SMs" for the batch-1 decode GEMV, motivated by the ~42 % occupancy. The INT
+GEMV already has a generic two-pass split-K SwiGLU path
+(`launch_moe_gemv_splitk_twopass_swiglu` /
+`dispatch_moe_gemv_splitk_twopass_swiglu_group_size`), so wiring it into the FP4
+fc1 launcher as a new `kSplitK2` autotune candidate is a low-risk reuse.
+
+### What was tried
+
+- `moe_gemv.cu`: added a `kSplitK2` branch to
+  `launch_moe_gemv_fp4_symmetric_interleaved_swiglu<T>` that dispatches to the
+  existing generic two-pass split-K SwiGLU kernel (`SplitK=2`, fp32 cross-split
+  partials, fused SwiGLU in pass 2) for both `half` and `bfloat16`. The launcher
+  already auto-degrades to the fused kernel when `num_iters < 2`.
+- `moe_quantization.cc`: split the FP4 autotune candidate list into
+  `kFc1Candidates = {default, ctan16, threads64, splitk2}` (fc1 only) and
+  `kFc2Candidates = {default, ctan16, threads64}`.
+- No change to `is_moe_gemv_fp4_supported` (`CtaNForConfig(kSplitK2)=8`, and
+  `n % 8 == 0` holds for every target shape).
+
+### Result — split-K loses; autotune correctly rejects it
+
+`test_qmoe_fp4_cuda.py` **19/19** on and off (the fp32 two-pass reduce stays
+within the fp16/bf16 tolerance). Autotune timings on the gpt-oss-20b decode
+shape (H200/SM90, fp16, expanded=4, fc1 n=5760/k=2880), `kIters=20`:
+
+| fc1 config | ms / 20it |
+|---|---|
+| `default` | **1.326** ← chosen |
+| `splitk2` | 1.435 (+8 %) |
+| `threads64` | 1.550 |
+| `ctan16` | 1.565 |
+
+`splitk2` is faster than the other tile variants but **slower than `default`**,
+so the autotuner picks `default` (no regression) and the change ships no benefit.
+
+### Why — the GEMV grid is not SM-starved; the limiter is intra-SM
+
+Split-K helps only when the base grid under-fills the GPU. For FP4
+(`kInterleave=1`, `CtaN=8`) the fc1 grid is
+`expanded_rows × n/CtaN × SplitK`. Even at batch-1 decode the base grid
+(`expanded × n/8`) is already **far larger than any target GPU's SM count**:
+
+| Shape | base CTAs (`expanded × n/8`) | SMs (H200 / 4090 / 3090 / 5080) |
+|---|---|---|
+| gpt-oss-20b fc1 (exp=4, n=5760) | 2880 | 132 / 128 / 82 / 84 |
+| qwen3 fc1 (exp=8, n=1024) | 1024 | … |
+| gemma fc1 (exp=8, n=1408) | 1408 | … |
+
+So the grid already saturates the SMs across all targets — split-K cannot add
+useful parallelism and only adds a second reduction pass + `cudaMallocAsync`
+partials. The 42 % occupancy is an **intra-SM** limit (register pressure /
+exposed ALU-pipe latency from the non-interleaved `kStepK=8` K-loop, per the
+SWAR/wide-load diagnosis above), which split-K does not touch.
+
+### Conclusion — reverted; pivot to the interleaved layout
+
+Both edits were **reverted** (no benefit on any target, and a never-selected
+candidate is pure binary/compile-time cost). This confirms the earlier diagnosis:
+the binding constraint is the **integer-ALU loop/index overhead at low intra-SM
+occupancy**, not grid under-subscription. The real lever remains the
+**`kInterleave=4` interleaved FP4 layout** (mirroring INT4's
+`ColumnMajorInterleaved`, 128-bit `AccessTypeW`, `kStepK=32`): 4× fewer K-trips
+cut the saturated integer-ALU overhead and amortize the cross-warp reduction 4×,
+which is the structural change that should move FP4 decode toward INT4.
