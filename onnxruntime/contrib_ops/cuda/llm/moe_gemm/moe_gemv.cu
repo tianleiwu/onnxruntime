@@ -875,7 +875,7 @@ static constexpr int kInt4Interleave = 128 * 8 / (kTileSizeK * 4);  // = 4
 static constexpr int kInt8Interleave = 128 * 8 / (kTileSizeK * 8);  // = 2
 
 int CtaNForConfig(MoeGemvConfig config) {
-  return config == MoeGemvConfig::kCtaN16 ? kCtaN16 : kDefaultCtaN;
+  return (config == MoeGemvConfig::kCtaN16 || config == MoeGemvConfig::kCtaN16Threads64) ? kCtaN16 : kDefaultCtaN;
 }
 
 bool is_moe_gemv_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t k,
@@ -1009,6 +1009,8 @@ void launch_moe_gemv_int_symmetric(T const* act, WeightType const* weight, T con
     launch_cfg([] { return kCtaN16; }, [] { return kDefaultThreads; });
   } else if (config == MoeGemvConfig::kThreads64) {
     launch_cfg([] { return kDefaultCtaN; }, [] { return kThreads64; });
+  } else if (config == MoeGemvConfig::kCtaN16Threads64) {
+    launch_cfg([] { return kCtaN16; }, [] { return kThreads64; });
   } else {
     launch_cfg([] { return kDefaultCtaN; }, [] { return kDefaultThreads; });
   }
@@ -1064,6 +1066,8 @@ void launch_moe_gemv_int_symmetric_interleaved_swiglu(
     launch_cfg([] { return kCtaN16; }, [] { return kDefaultThreads; });
   } else if (config == MoeGemvConfig::kThreads64) {
     launch_cfg([] { return kDefaultCtaN; }, [] { return kThreads64; });
+  } else if (config == MoeGemvConfig::kCtaN16Threads64) {
+    launch_cfg([] { return kCtaN16; }, [] { return kThreads64; });
   } else {
     launch_cfg([] { return kDefaultCtaN; }, [] { return kDefaultThreads; });
   }
@@ -1173,6 +1177,8 @@ void launch_moe_gemv_fp4_symmetric(T const* act, uint8_t const* weight, T const*
     launch([] { return kCtaN16; }, [] { return kDefaultThreads; });
   } else if (config == MoeGemvConfig::kThreads64) {
     launch([] { return kDefaultCtaN; }, [] { return kThreads64; });
+  } else if (config == MoeGemvConfig::kCtaN16Threads64) {
+    launch([] { return kCtaN16; }, [] { return kThreads64; });
   } else {
     launch([] { return kDefaultCtaN; }, [] { return kDefaultThreads; });
   }
@@ -1197,6 +1203,8 @@ void launch_moe_gemv_fp4_symmetric_interleaved_swiglu(
     launch([] { return kCtaN16; }, [] { return kDefaultThreads; });
   } else if (config == MoeGemvConfig::kThreads64) {
     launch([] { return kDefaultCtaN; }, [] { return kThreads64; });
+  } else if (config == MoeGemvConfig::kCtaN16Threads64) {
+    launch([] { return kCtaN16; }, [] { return kThreads64; });
   } else {
     launch([] { return kDefaultCtaN; }, [] { return kDefaultThreads; });
   }

@@ -218,13 +218,18 @@ class QMoE final : public CudaKernel, public MoEBase {
   // CUDA-graph replay.
   struct Fp4GemvTuneKey {
     bool is_fp16 = false;
-    int64_t expanded = 0;
+    // Bucketed expanded row count (MoeGemmProfiler::bucketM). The CtaN/Threads tiling
+    // optima are essentially row-count independent in the tiny decode regime
+    // (expanded <= kMaxProfiledExpandedRows), so bucketing nearby row counts into one
+    // key lets a single tune be reused instead of re-profiling every distinct expanded
+    // value. Mirrors the GEMM/GEMV route cache, which already keys on bucketM.
+    int64_t row_bucket = 0;
     int64_t hidden = 0;
     int64_t inter = 0;
     int sm = 0;
 
     bool operator==(const Fp4GemvTuneKey& other) const {
-      return is_fp16 == other.is_fp16 && expanded == other.expanded && hidden == other.hidden &&
+      return is_fp16 == other.is_fp16 && row_bucket == other.row_bucket && hidden == other.hidden &&
              inter == other.inter && sm == other.sm;
     }
   };
@@ -237,7 +242,7 @@ class QMoE final : public CudaKernel, public MoEBase {
         hash *= 1099511628211ULL;
       };
       combine(key.is_fp16);
-      combine(key.expanded);
+      combine(key.row_bucket);
       combine(key.hidden);
       combine(key.inter);
       combine(key.sm);

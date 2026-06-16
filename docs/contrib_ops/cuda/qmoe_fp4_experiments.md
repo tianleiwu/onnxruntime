@@ -962,11 +962,26 @@ path was wired into the same per-shape config tuner.
 ### What is tuned
 
 The first lever taken from the search space above is the **parallelization /
-tiling** pair `{CtaN, Threads}` — specifically the candidate set
+tiling** pair `{CtaN, Threads}` -- specifically the candidate set
 `{kDefault (CtaN=8,Threads=128), kCtaN16 (CtaN=16), kThreads64 (Threads=64)}`.
+A combined `kCtaN16Threads64 (CtaN=16,Threads=64)` config exists in the enum and
+launchers but is **disabled by default** (`#if 0` around its entry in the
+`kCandidates` list in `moe_quantization.cc`). It was intended to cover the
+wide-output / high-occupancy aspect ratio that neither single-knob config
+reaches (relevant to the fc1 SwiGLU GEMV, whose output is wide), but benchmarks
+on H200 (sm_90) across gpt-oss-20b, qwen3, and gemma4 decode shapes showed it is
+consistently the **slowest** candidate -- it never wins fc1 or fc2. The decode
+GEMV is memory-bound on the 4-bit weights, and the grids are already heavily
+oversubscribed relative to SM count even on small consumer GPUs (e.g. an RTX
+4060 with 24 SMs still launches dozens of waves for these shapes), so halving
+the CTA count via CtaN=16 does not improve scheduling while the narrower
+64-thread block reduces in-flight warps and hurts latency hiding. It is left
+wired through so it can be flipped back on for experimentation on a specific
+architecture.
+
 These are **pure tiling knobs**: same reduction, same 16-bit (`AccT=T`)
-accumulation, so the result is **bit-exact across all three configs**. That is
-why this sweep needs **no accuracy gate** — the profiling iterations double as
+accumulation, so the result is **bit-exact across all configs**. That is
+why this sweep needs **no accuracy gate** -- the profiling iterations double as
 correct warmup work, and any config is safe to cache and replay.
 
 `StepK` and the `accum` mode were deliberately left out of this first cut because
@@ -983,8 +998,12 @@ before it is worth searching.
   6-arg overload that re-checks `n % CtaNForConfig(config) == 0` so a wider
   `CtaN` is only offered when the output width divides evenly.
 - In `moe_quantization.cc` the FP4 routing block builds a
-  `Fp4GemvTuneKey{is_fp16, expanded, hidden, inter, sm}` and looks up a
-  per-shape `Fp4GemvTuneResult{fc1_config, fc2_config}` cache. On the first
+  `Fp4GemvTuneKey{is_fp16, row_bucket, hidden, inter, sm}` and looks up a
+  per-shape `Fp4GemvTuneResult{fc1_config, fc2_config}` cache. `row_bucket` is
+  `MoeGemmProfiler::bucketM(expanded)` -- the expanded row count snapped up to a
+  power of two -- so nearby row counts reuse one tune instead of re-profiling
+  every distinct `expanded` value (the CtaN/Threads optima are essentially
+  row-count independent in the tiny decode regime). On the first
   non-captured (warmup) call it CUDA-event-profiles each candidate for **fc1**
   and **fc2 independently** (kWarmup=3, kIters=20), caches the best, and replays
   the frozen choice thereafter.

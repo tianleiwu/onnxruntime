@@ -128,6 +128,9 @@ const char* QMoEGemvConfigName(onnxruntime::llm::kernels::moe_gemv::MoeGemvConfi
   if (config == MoeGemvConfig::kThreads64) {
     return "threads64";
   }
+  if (config == MoeGemvConfig::kCtaN16Threads64) {
+    return "ctan16_threads64";
+  }
   if (config == MoeGemvConfig::kSplitK2) {
     return "splitk2";
   }
@@ -1076,7 +1079,9 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
       MoeGemvConfig fc1_config = MoeGemvConfig::kDefault;
       MoeGemvConfig fc2_config = MoeGemvConfig::kDefault;
 
-      const Fp4GemvTuneKey tune_key{is_fp16_, expanded, hidden, inter, sm_};
+      const int64_t row_bucket =
+          onnxruntime::llm::kernels::cutlass_kernels::MoeGemmProfiler::bucketM(expanded);
+      const Fp4GemvTuneKey tune_key{is_fp16_, row_bucket, hidden, inter, sm_};
       const auto cached_tune = fp4_gemv_tune_cache_.find(tune_key);
       const bool have_tune = cached_tune != fp4_gemv_tune_cache_.end();
       if (have_tune) {
@@ -1115,7 +1120,22 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
 
         if (do_tune) {
           constexpr MoeGemvConfig kCandidates[] = {
-              MoeGemvConfig::kDefault, MoeGemvConfig::kCtaN16, MoeGemvConfig::kThreads64};
+              MoeGemvConfig::kDefault, MoeGemvConfig::kCtaN16, MoeGemvConfig::kThreads64,
+#if 0
+              // kCtaN16Threads64 combines a wide output tile (CtaN=16) with a narrow
+              // block (Threads=64). Benchmarks on H200 (sm_90) across gpt-oss-20b,
+              // qwen3, and gemma4 decode shapes showed it is consistently the slowest
+              // candidate -- it never wins fc1 or fc2. The decode GEMV is memory-bound
+              // on the 4-bit weights, and the grids are already heavily oversubscribed
+              // relative to SM count even on small consumer GPUs (e.g. an RTX 4060 with
+              // 24 SMs still launches dozens of waves for these shapes), so halving the
+              // CTA count via CtaN=16 does not improve scheduling while the narrower
+              // 64-thread block reduces in-flight warps and hurts latency hiding. It is
+              // disabled by default but left wired through the launchers so it can be
+              // re-enabled here for experimentation on a specific architecture.
+              MoeGemvConfig::kCtaN16Threads64,
+#endif
+          };
           constexpr int kWarmup = 3;
           constexpr int kIters = 20;
 
@@ -1143,12 +1163,18 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
           };
 
           // fc1 reads p_act_buf (populated by the expand above).
+          const bool log_tune = Fp4GemvAutotuneLogEnabled();
           float best_fc1 = std::numeric_limits<float>::max();
           for (MoeGemvConfig cfg : kCandidates) {
             if (!gemv::is_moe_gemv_fp4_supported(sm_, expanded, fc1_n, hidden, 32, cfg)) {
               continue;
             }
             const float ms = time_launch([&] { launch_fc1(cfg); });
+            if (log_tune) {
+              LOGS_DEFAULT(WARNING) << "FP4 GEMV autotune candidate: fc1 expanded=" << expanded
+                                    << " n=" << fc1_n << " k=" << hidden << " cfg=" << QMoEGemvConfigName(cfg)
+                                    << " " << ms << "ms/" << kIters << "it";
+            }
             if (ms < best_fc1) {
               best_fc1 = ms;
               fc1_config = cfg;
@@ -1162,6 +1188,11 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
               continue;
             }
             const float ms = time_launch([&] { launch_fc2(cfg); });
+            if (log_tune) {
+              LOGS_DEFAULT(WARNING) << "FP4 GEMV autotune candidate: fc2 expanded=" << expanded
+                                    << " n=" << hidden << " k=" << inter << " cfg=" << QMoEGemvConfigName(cfg)
+                                    << " " << ms << "ms/" << kIters << "it";
+            }
             if (ms < best_fc2) {
               best_fc2 = ms;
               fc2_config = cfg;
@@ -1169,7 +1200,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
           }
 
           fp4_gemv_tune_cache_.emplace(tune_key, Fp4GemvTuneResult{fc1_config, fc2_config});
-          if (Fp4GemvAutotuneLogEnabled()) {
+          if (log_tune) {
             LOGS_DEFAULT(WARNING) << "FP4 GEMV autotune: is_fp16=" << is_fp16_ << " expanded=" << expanded
                                   << " hidden=" << hidden << " inter=" << inter << " fc1="
                                   << QMoEGemvConfigName(fc1_config) << " (" << best_fc1 << "ms/" << kIters
