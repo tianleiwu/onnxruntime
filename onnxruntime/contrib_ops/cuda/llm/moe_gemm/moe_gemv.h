@@ -22,10 +22,6 @@ enum class MoeGemvConfig {
   kDefault,
   kCtaN16,
   kThreads64,
-  // Combines the wide-output tile (CtaN = 16) with the higher-occupancy thread count
-  // (64 threads/CTA). Covers the aspect ratio that neither single-knob config reaches:
-  // a wide FC1-style output with more resident CTAs. Pure tiling knob (bit-exact).
-  kCtaN16Threads64,
   kSplitK2,
 };
 

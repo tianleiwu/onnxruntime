@@ -128,9 +128,6 @@ const char* QMoEGemvConfigName(onnxruntime::llm::kernels::moe_gemv::MoeGemvConfi
   if (config == MoeGemvConfig::kThreads64) {
     return "threads64";
   }
-  if (config == MoeGemvConfig::kCtaN16Threads64) {
-    return "ctan16_threads64";
-  }
   if (config == MoeGemvConfig::kSplitK2) {
     return "splitk2";
   }
@@ -1120,22 +1117,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
 
         if (do_tune) {
           constexpr MoeGemvConfig kCandidates[] = {
-              MoeGemvConfig::kDefault, MoeGemvConfig::kCtaN16, MoeGemvConfig::kThreads64,
-#if 0
-              // kCtaN16Threads64 combines a wide output tile (CtaN=16) with a narrow
-              // block (Threads=64). Benchmarks on H200 (sm_90) across gpt-oss-20b,
-              // qwen3, and gemma4 decode shapes showed it is consistently the slowest
-              // candidate -- it never wins fc1 or fc2. The decode GEMV is memory-bound
-              // on the 4-bit weights, and the grids are already heavily oversubscribed
-              // relative to SM count even on small consumer GPUs (e.g. an RTX 4060 with
-              // 24 SMs still launches dozens of waves for these shapes), so halving the
-              // CTA count via CtaN=16 does not improve scheduling while the narrower
-              // 64-thread block reduces in-flight warps and hurts latency hiding. It is
-              // disabled by default but left wired through the launchers so it can be
-              // re-enabled here for experimentation on a specific architecture.
-              MoeGemvConfig::kCtaN16Threads64,
-#endif
-          };
+              MoeGemvConfig::kDefault, MoeGemvConfig::kCtaN16, MoeGemvConfig::kThreads64};
           constexpr int kWarmup = 3;
           constexpr int kIters = 20;
 

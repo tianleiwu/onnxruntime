@@ -964,23 +964,8 @@ path was wired into the same per-shape config tuner.
 The first lever taken from the search space above is the **parallelization /
 tiling** pair `{CtaN, Threads}` -- specifically the candidate set
 `{kDefault (CtaN=8,Threads=128), kCtaN16 (CtaN=16), kThreads64 (Threads=64)}`.
-A combined `kCtaN16Threads64 (CtaN=16,Threads=64)` config exists in the enum and
-launchers but is **disabled by default** (`#if 0` around its entry in the
-`kCandidates` list in `moe_quantization.cc`). It was intended to cover the
-wide-output / high-occupancy aspect ratio that neither single-knob config
-reaches (relevant to the fc1 SwiGLU GEMV, whose output is wide), but benchmarks
-on H200 (sm_90) across gpt-oss-20b, qwen3, and gemma4 decode shapes showed it is
-consistently the **slowest** candidate -- it never wins fc1 or fc2. The decode
-GEMV is memory-bound on the 4-bit weights, and the grids are already heavily
-oversubscribed relative to SM count even on small consumer GPUs (e.g. an RTX
-4060 with 24 SMs still launches dozens of waves for these shapes), so halving
-the CTA count via CtaN=16 does not improve scheduling while the narrower
-64-thread block reduces in-flight warps and hurts latency hiding. It is left
-wired through so it can be flipped back on for experimentation on a specific
-architecture.
-
 These are **pure tiling knobs**: same reduction, same 16-bit (`AccT=T`)
-accumulation, so the result is **bit-exact across all configs**. That is
+accumulation, so the result is **bit-exact across all three configs**. That is
 why this sweep needs **no accuracy gate** -- the profiling iterations double as
 correct warmup work, and any config is safe to cache and replay.
 
