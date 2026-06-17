@@ -541,7 +541,8 @@ void preprocess_weights_for_mixed_gemm_cuda(cudaStream_t stream,
                                             int32_t* d_permutation_map,
                                             std::vector<size_t> const& shape,
                                             QuantType quant_type,
-                                            bool synchronize) {
+                                            bool synchronize,
+                                            bool apply_bias_interleave) {
   LayoutDetails details = getLayoutDetailsForTransform(quant_type, arch);
 
   ORT_ENFORCE(shape.size() == 2 || shape.size() == 3, "Shape must be 2-D or 3-D");
@@ -578,11 +579,16 @@ void preprocess_weights_for_mixed_gemm_cuda(cudaStream_t stream,
     std::swap(src_buf, dst_buf);
   }
 
-  add_bias_and_interleave_quantized_tensor_inplace_cuda(
-      src_buf,
-      num_elts,
-      quant_type,
-      stream);
+  // The bias add + pair-interleave is integer-weight specific. MXFP4 (e2m1) callers pass
+  // ``apply_bias_interleave=false`` to skip it (the e2m1 codes are decoded with a linear
+  // converter and would be corrupted by the integer bias add).
+  if (apply_bias_interleave) {
+    add_bias_and_interleave_quantized_tensor_inplace_cuda(
+        src_buf,
+        num_elts,
+        quant_type,
+        stream);
+  }
 
   if (preprocessed_quantized_weight != src_buf) {
     const size_t num_bytes = num_elts * static_cast<size_t>(get_weight_quant_bits(quant_type)) / static_cast<size_t>(8);

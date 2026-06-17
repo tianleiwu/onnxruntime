@@ -1109,17 +1109,20 @@ struct Fp4ADetails<__nv_bfloat16> {
 };
 #endif
 
-// TileSizeK is unused by the ColumnMajor (kInterleave = 1) indexing/reduction beyond the
-// shmem-write lane gating (only lane 0 of each warp writes), so 64 matches the INT convention.
+// MXFP4 (e2m1) GEMV uses the ColumnMajorInterleaved (Sm80) layout, mirroring the INT4 MoE GEMV
+// path. With TileSizeK = 64 and a 4-bit weight, kInterleave = 128*8/(64*4) = 4 and kStepK =
+// 128/4 = 32, i.e. 128-bit weight loads and 4x fewer K-loop trips than the old non-interleaved
+// ColumnMajor (kStepK = 8) layout. The interleaved kStepK = 32 also matches the MXFP4 block size
+// exactly, so each thread decodes one 32-wide block per column per step (one scale per block).
 static constexpr int kTileSizeKFp4 = 64;
 template <typename T>
 using Fp4KernelDetails =
-    fiv::KernelDetails<typename Fp4ADetails<T>::Type, fiv::Fp4DetailsW, fiv::ColumnMajor, false, kTileSizeKFp4>;
+    fiv::KernelDetails<typename Fp4ADetails<T>::Type, fiv::Fp4DetailsW, fiv::ColumnMajorInterleaved, false, kTileSizeKFp4>;
 
-// MXFP4 GEMV shape support. Mirrors is_moe_gemv_supported but for the non-interleaved
-// ColumnMajor layout: kInterleave = 1, so n need only be divisible by the CtaN tile width
-// selected by `config`, and the per-thread step is StepK = 128 / activation_bits = 8
-// (not 128 / weight_bits).
+// MXFP4 GEMV shape support for the ColumnMajorInterleaved layout (kInterleave = 4). n must tile
+// evenly across the interleaved CtaN width (CtaN * kInterleave), and k must form complete
+// kTileSizeK (64) K-tiles so no thread reads past the activation row (same constraint as
+// is_moe_gemv_supported's interleaved path).
 bool is_moe_gemv_fp4_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t k, int group_size,
                                MoeGemvConfig config) {
   if (sm < 80) {
@@ -1141,11 +1144,13 @@ bool is_moe_gemv_fp4_supported(int sm, int64_t expanded_num_rows, int64_t n, int
       (n < kMinProfiledProblemDimForExpandedRowsAbove4 || k < kMinProfiledProblemDimForExpandedRowsAbove4)) {
     return false;
   }
-  if (n % CtaNForConfig(config) != 0) {  // kInterleave = 1
+  // kInterleave = 4: n must tile evenly across the interleaved CtaN width.
+  if (n % (CtaNForConfig(config) * kInt4Interleave) != 0) {
     return false;
   }
-  // StepK = 128 / activation_bits = 8; k is a multiple of 32, so k % 8 == 0 always holds.
-  if (k % (128 / 16) != 0) {
+  // The interleaved kernel reads K in whole tiles of kTileSizeKFp4 (64); require complete tiles so
+  // the upper-half threads never read past the valid k range of the activation row.
+  if (k % kTileSizeKFp4 != 0) {
     return false;
   }
   return true;

@@ -1614,14 +1614,16 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
     PrePackRepackFP4Weights(tensor, stream, alloc, packed_fp4_fc2_weights_, is_packed);
     is_packed = false;
   } else if (input_idx == 2 && quant_type_ == "fp4" && enable_fp4_gemv_) {
-    // Fused MXFP4 GEMV: lay out fc1 weights as [E, 2*inter, hidden/2] row-major. Keep
-    // is_packed = false so the raw [E, hidden, n/2] initializer remains available for the
+    // Fused MXFP4 GEMV: lay out fc1 weights in the ColumnMajorInterleaved (kInterleave=4) layout.
+    // Keep is_packed = false so the raw [E, hidden, n/2] initializer remains available for the
     // dequant fallback used by shapes the GEMV does not support.
     bool local_packed = false;
-    PrePackRepackFP4Weights(tensor, stream, alloc, gemv_fp4_fc1_weights_, local_packed);
+    PrePackRepackFP4Weights(tensor, stream, alloc, gemv_fp4_fc1_weights_, local_packed,
+                            /*interleaved_gemv_layout=*/true);
   } else if (input_idx == 5 && quant_type_ == "fp4" && enable_fp4_gemv_) {
     bool local_packed = false;
-    PrePackRepackFP4Weights(tensor, stream, alloc, gemv_fp4_fc2_weights_, local_packed);
+    PrePackRepackFP4Weights(tensor, stream, alloc, gemv_fp4_fc2_weights_, local_packed,
+                            /*interleaved_gemv_layout=*/true);
   } else if (input_idx == 2 && quant_type_ == "int" && !weights_prepacked_) {
     // Caller opted in (``weights_prepacked=0`` attribute) to having ORT
     // do the CUTLASS fpA_intB layout transform internally, instead of
@@ -1926,10 +1928,27 @@ void QMoE::PrePackSwizzleBlockScales(const Tensor& tensor, cudaStream_t stream, 
 }
 
 // ---------------------------------------------------------------------------
-// PrePack helper: Repack column-major FP4 weights to row-major using GPU kernel.
-// ---------------------------------------------------------------------------
+// PrePack helper: repack the raw [E, K, N/2] MXFP4 (e2m1) initializer.
+//
+// ``interleaved_gemv_layout == false`` (native WFP4AFP8 path): repack to the [E, N, K/2]
+// row-major ColToRow layout the native CUTLASS runner consumes.
+//
+// ``interleaved_gemv_layout == true`` (fused FP4 GEMV path): build the interleaved
+// (ColumnMajorInterleaved, kInterleave=4) layout, mirroring the INT4 MoE GEMV path. The source
+// weights are [E, K, N/2] packed col-major (each byte holds two e2m1 codes along N, low nibble =
+// even N) -- already the same [K, N/2] orientation the CUTLASS fpA_intB preprocessor expects as
+// input, so the e2m1 codes are fed directly into ``preprocess_weights_for_mixed_gemm_cuda``
+// (SM80 W4_A16) with ``apply_bias_interleave=false``. That applies only the row-permutation +
+// subbyte-transpose + column-interleave (steps 1-3), producing the same positional layout as the
+// INT4 interleaved MoE GEMV path. The integer bias/pair-interleave (step 4) is skipped because it
+// would corrupt the floating-point e2m1 codes; the GEMV decodes them with the linear
+// ``Fp4I2FConverter``, whose output order matches steps-1-3 logical order (so the
+// ColumnMajorInterleaved Mapper is reused unchanged). The block scales are unaffected: with the
+// interleaved kStepK=32 each thread processes exactly one 32-wide MXFP4 block per column per step,
+// so the existing [E, k/32, n] fused-scale layout (TryBuildGemvFp4Scales) stays correct.
 void QMoE::PrePackRepackFP4Weights(const Tensor& tensor, cudaStream_t stream, AllocatorPtr alloc,
-                                   IAllocatorUniquePtr<void>& packed_buf, bool& is_packed) {
+                                   IAllocatorUniquePtr<void>& packed_buf, bool& is_packed,
+                                   bool interleaved_gemv_layout) {
   auto shape = tensor.Shape();
   ORT_ENFORCE(shape.NumDimensions() == 3, "Expected 3D FP4 weights for WFP4AFP8 native prepack");
   ORT_ENFORCE(tensor.IsDataType<uint8_t>(), "Expected uint8 FP4 weights for WFP4AFP8 native prepack");
@@ -1955,11 +1974,57 @@ void QMoE::PrePackRepackFP4Weights(const Tensor& tensor, cudaStream_t stream, Al
 
   packed_buf = IAllocator::MakeUniquePtr<void>(alloc, bytes, true);
 
-  LaunchQMoERepackFP4ColToRow(
-      static_cast<const uint8_t*>(p_src),
-      static_cast<uint8_t*>(packed_buf.get()),
-      static_cast<int>(experts),
-      k, n, stream);
+  if (!interleaved_gemv_layout) {
+    LaunchQMoERepackFP4ColToRow(
+        static_cast<const uint8_t*>(p_src),
+        static_cast<uint8_t*>(packed_buf.get()),
+        static_cast<int>(experts),
+        k, n, stream);
+
+    CUDA_CALL_THROW(cudaStreamSynchronize(stream));
+    is_packed = true;
+    return;
+  }
+
+  int8_t* dst_all = reinterpret_cast<int8_t*>(packed_buf.get());
+
+  // Per-expert byte count: k rows x n/2 packed bytes.
+  const size_t per_expert_bytes = static_cast<size_t>(k) * static_cast<size_t>(n) / 2;
+
+  // ``preprocess_weights_for_mixed_gemm_cuda`` ping-pongs between its input and output buffers,
+  // so the e2m1 source must be copied into a writable per-expert scratch before each call.
+  IAllocatorUniquePtr<void> input_scratch = this->GetTransientScratchBuffer<void>(per_expert_bytes);
+  int8_t* input_scratch_ptr = reinterpret_cast<int8_t*>(input_scratch.get());
+  IAllocatorUniquePtr<int32_t> permutation_map = this->GetTransientScratchBuffer<int32_t>(32);
+
+  // The QMoE int4/fp4 MoE GEMV always consumes the SM80 CUTLASS fpA_intB layout (see the note in
+  // PrePackIntExpertWeights), so preprocess for SM80 regardless of the runtime device SM.
+  const int packing_sm =
+      onnxruntime::llm::kernels::weight_only::get_arch_for_mixed_gemm_weight_preprocess(80);
+  using onnxruntime::llm::kernels::weight_only::QuantType;
+
+  const uint8_t* src_base_gpu = static_cast<const uint8_t*>(p_src);
+  for (int64_t e = 0; e < experts; ++e) {
+    const uint8_t* src_e = src_base_gpu + static_cast<size_t>(e) * per_expert_bytes;
+    int8_t* dst_e = dst_all + static_cast<size_t>(e) * per_expert_bytes;
+
+    // Copy the (immutable) source expert slice into the writable scratch consumed by preprocess.
+    CUDA_CALL_THROW(cudaMemcpyAsync(input_scratch_ptr, src_e, per_expert_bytes,
+                                    cudaMemcpyDeviceToDevice, stream));
+
+    // Steps 1-3 only (apply_bias_interleave=false): row-permute + subbyte-transpose +
+    // column-interleave on the e2m1 codes. ``synchronize=false``: a single sync follows the loop.
+    onnxruntime::llm::kernels::weight_only::preprocess_weights_for_mixed_gemm_cuda(
+        stream,
+        packing_sm,
+        dst_e,
+        input_scratch_ptr,
+        permutation_map.get(),
+        {static_cast<size_t>(k), static_cast<size_t>(n)},
+        QuantType::W4_A16,
+        /*synchronize=*/false,
+        /*apply_bias_interleave=*/false);
+  }
 
   CUDA_CALL_THROW(cudaStreamSynchronize(stream));
   is_packed = true;
