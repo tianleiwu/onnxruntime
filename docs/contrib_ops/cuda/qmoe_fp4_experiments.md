@@ -1102,3 +1102,91 @@ occupancy**, not grid under-subscription. The real lever remains the
 `ColumnMajorInterleaved`, 128-bit `AccessTypeW`, `kStepK=32`): 4× fewer K-trips
 cut the saturated integer-ALU overhead and amortize the cross-warp reduction 4×,
 which is the structural change that should move FP4 decode toward INT4.
+
+## 2026-06-17 — FP4 GEMV interleaved (`kInterleave=4`) `ColumnMajorInterleaved` layout (negative result, reverted)
+
+This is the structural change predicted as "the real lever" by every prior
+diagnosis above: make the fused MXFP4 W4A16 GEMV mirror INT4's
+`ColumnMajorInterleaved` weight layout, replacing the non-interleaved
+`ColumnMajor` (`kStepK=8`) path. It was implemented end-to-end, measured, and
+**reverted** — it produced **no decode speedup** and **regressed bf16 accuracy**.
+
+### What was changed
+
+- **`fpA_intB_gemm_preprocessors.{h,cu}`**: added `bool apply_bias_interleave =
+  true` to `preprocess_weights_for_mixed_gemm_cuda`. FP4 callers pass `false` so
+  the integer-only step 4 (add `+8` bias + pair-interleave) is skipped — that
+  step's integer bias would corrupt the floating-point e2m1 codes. Steps 1–3
+  (row-permute + subbyte-transpose + column-interleave) are layout-only and
+  apply to e2m1 unchanged.
+- **`moe_quantization.{h,cc}` `PrePackRepackFP4Weights`**: added an
+  `interleaved_gemv_layout` flag. `false` (native WFP4AFP8) keeps the existing
+  `LaunchQMoERepackFP4ColToRow` `[E,n,k/2]` layout; `true` (fused FP4 GEMV) feeds
+  the raw `[E,k,n/2]` e2m1 codes per-expert through the CUTLASS fpA_intB SM80
+  `W4_A16` preprocessor with `apply_bias_interleave=false`. The decode kernel
+  reuses the **existing** linear `Fp4I2FConverter` + `ColumnMajorInterleaved`
+  `Mapper` unchanged (steps-1–3 logical order == linear-converter output order).
+- **`moe_gemv.cu`**: `Fp4KernelDetails` switched `ColumnMajor` →
+  `ColumnMajorInterleaved` (with `TileSizeK=64`, `kElemBits=4` ⇒ `kInterleave=4`,
+  `kStepK=32`, `kThreadsPerInterleavedTile=2`). `is_moe_gemv_fp4_supported` now
+  requires `n % (CtaN*4)==0` and `k % 64==0` (complete interleaved K-tiles).
+- **Scales unchanged**: the interleaved `kStepK=32` equals the MXFP4 block size,
+  so the standard interleaved group-scale iterator (`GroupSize=32`) already maps
+  one scale per column per K-block. The existing `[E,k/32,n]` fused-scale layout
+  (`TryBuildGemvFp4Scales`) needed no change.
+
+### Result — no speedup (gpt-oss-20b FP4, H200, `-b 1 -l 512 -g 256`, cuda-graph off)
+
+| Variant | decode tps |
+|---|---|
+| FP4 GEMV non-interleaved (`kInterleave=1`, baseline) | 188.3 |
+| FP4 GEMV **interleaved (`kInterleave=4`)** | **188.8** |
+| INT4 GEMV (reference target) | ~250 |
+| FP4 dequant fallback (GEMV off) | ~13 |
+
+`+0.3 %` — within run-to-run noise. The 4× reduction in K-loop trips did **not**
+translate into any decode-throughput gain, and the gap to INT4 (~250 tps) was
+unmoved.
+
+### Why it didn't win
+
+The hypothesis (loop/index integer-ALU overhead from `kStepK=8` is the binding
+constraint) was **wrong, or at best not the whole story**. With the interleaved
+layout each thread now holds `kStepK=32` weights + activations per step in
+registers (4× the non-interleaved footprint) and the warp reduction is split
+across only `32/kInterleave = 8` lanes per column-group. The reduced K-trip
+count is offset by **higher per-thread register pressure** (the kernel was
+already occupancy-bound at ~42 %, so any register growth pushes occupancy the
+wrong way) and by the **per-element e2m1 decode cost**, which is independent of
+the K-tiling and remains the same total work. Net: a wash.
+
+### Accuracy regression (the reason it cannot ship even at break-even)
+
+The GEMV accumulates in-register in the **activation dtype** (`tile_acc` is
+`TypeA`, not fp32). Interleaving lengthens each bf16 accumulation chain (32
+products/accumulator/step vs 8) and reduces the number of reducing lanes, so the
+bf16 rounding error roughly **doubles**:
+
+| `test_qmoe_fp4_cuda.py` bf16 SwiGLU case | dequant fallback | interleaved GEMV | atol |
+|---|---|---|---|
+| tokens=1, hidden=inter=512 | 0.0625 | **0.1563** | 0.15 |
+| tokens=2, hidden=inter=512 | 0.0938 | **0.1875** | 0.15 |
+
+Both bf16 GEMV-shaped cases exceed the 0.15 bf16 tolerance (2/19 fail); the fp16
+cases (tighter 0.12 atol) still pass. This is intrinsic to the interleaved
+layout under in-register bf16 accumulation — the only fix is fp32 accumulation,
+which was **already tried and reverted** (register pressure → occupancy
+35 % → wash, see the wide-load experiment above). So interleaving and bf16
+accuracy are fundamentally in tension here.
+
+### Conclusion — reverted
+
+No throughput gain on the target decode shape **and** a bf16 parity regression,
+with the natural mitigation (fp32 accum) independently known to erase any gain.
+The interleaved layout is therefore **not** the lever it was predicted to be: the
+FP4 GEMV bottleneck is **intra-SM occupancy / per-element e2m1 decode + bf16
+accumulation precision**, not K-loop integer-ALU overhead. All five files were
+reverted (`git revert`). Future work that wants the interleaved layout must pair
+it with an accumulation strategy that is both higher-precision (for bf16 parity)
+and register-frugal (to preserve occupancy) — the two have so far been mutually
+exclusive in this kernel.
