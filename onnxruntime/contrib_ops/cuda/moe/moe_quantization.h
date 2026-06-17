@@ -38,13 +38,8 @@ class QMoE final : public CudaKernel, public MoEBase {
                         IAllocatorUniquePtr<void>& packed_buf, bool& is_packed);
   void PrePackSwizzleBlockScales(const Tensor& tensor, cudaStream_t stream, AllocatorPtr alloc,
                                  IAllocatorUniquePtr<void>& packed_buf, bool& is_packed);
-  // Repacks the raw [E, K, N/2] MXFP4 (e2m1) initializer into the layout consumed downstream.
-  // ``interleaved_gemv_layout=false`` (native WFP4AFP8 path) produces the [E, N, K/2] row-major
-  // ColToRow layout. ``interleaved_gemv_layout=true`` (fused FP4 GEMV path) produces the
-  // ColumnMajorInterleaved (kInterleave=4) layout via the CUTLASS fpA_intB preprocessor.
   void PrePackRepackFP4Weights(const Tensor& tensor, cudaStream_t stream, AllocatorPtr alloc,
-                               IAllocatorUniquePtr<void>& packed_buf, bool& is_packed,
-                               bool interleaved_gemv_layout = false);
+                               IAllocatorUniquePtr<void>& packed_buf, bool& is_packed);
   // Builds the fused MXFP4 GEMV scale buffer for fc (1 or 2) once both the e8m0 block
   // scales (inputs 3/6) and the per-expert global scale (inputs 15/16) have been staged
   // to GPU. Order-independent: invoked from both PrePack handlers; the call that completes
