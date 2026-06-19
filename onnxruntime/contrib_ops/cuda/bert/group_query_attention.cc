@@ -338,8 +338,10 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
   // 3. Sequence length is 1.
   // 4. Past and Present KV cache share the same buffer (required for XQA specific memory access).
   // 5. No Softcap (XQA doesn't support softcap).
-  // 6. Standard Softmax (no smooth softmax).
+  // 6. Standard Softmax, or smooth softmax represented by a head_sink tensor.
   // 7. No local window attention (global attention only).
+  const bool use_xqa_attention_sinks = head_sink != nullptr && !is_inputs_quantized;
+  const bool is_xqa_smooth_softmax_supported = !parameters.use_smooth_softmax || use_xqa_attention_sinks;
   if (enable_xqa_ &&
       (device_prop.major >= 8) &&
       !parameters.is_first_prompt &&
@@ -347,7 +349,7 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
       parameters.kv_sequence_length > 0 &&  // Shared KV (kv_seq=0) has no new K/V to append
       parameters.past_present_share_buffer &&
       parameters.softcap == 0.0f &&
-      !parameters.use_smooth_softmax &&
+      is_xqa_smooth_softmax_supported &&
       parameters.local_window_size == -1) {
     int group_size = parameters.num_heads / parameters.kv_num_heads;
 
@@ -389,23 +391,36 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
       assert(xqa_internal_bytes > 0);
       // Calculate additional scratch needed for manual RoPE/Append in ExtremeDecoding
       size_t xqa_total_bytes = xqa_internal_bytes;
+      size_t q_bytes = 0;
+      size_t k_bytes = 0;
       if (parameters.do_rotary) {
         // 1. Q_rotated buffer: B * N * H * sizeof(T) (if rotary)
         // 2. K_rotated buffer: B * Nk * H * sizeof(T) (if rotary)
         size_t element_size = sizeof(CudaT);
-        size_t q_bytes = parameters.batch_size * parameters.num_heads * parameters.head_size * element_size;
-        size_t k_bytes = parameters.batch_size * parameters.kv_num_heads * parameters.head_size * element_size;
+        q_bytes = parameters.batch_size * parameters.num_heads * parameters.head_size * element_size;
+        k_bytes = parameters.batch_size * parameters.kv_num_heads * parameters.head_size * element_size;
         q_bytes = (q_bytes + 255) / 256 * 256;
         k_bytes = (k_bytes + 255) / 256 * 256;
         xqa_total_bytes += q_bytes + k_bytes;
+      }
+      size_t xqa_head_sink_bytes = 0;
+      if (use_xqa_attention_sinks) {
+        xqa_head_sink_bytes = parameters.num_heads * sizeof(float);
+        xqa_head_sink_bytes = (xqa_head_sink_bytes + 255) / 256 * 256;
+        xqa_total_bytes += xqa_head_sink_bytes;
       }
 
       xqa_scratch_buffer = this->GetScratchBuffer<void>(xqa_total_bytes, GetComputeStream(context));
       data.xqa_buffer = xqa_scratch_buffer.get();
       data.xqa_buffer_bytes = xqa_internal_bytes;
 
+      char* xqa_extra_buffer = reinterpret_cast<char*>(data.xqa_buffer) + xqa_internal_bytes;
       if (parameters.do_rotary) {
-        data.qkv_buffer = reinterpret_cast<CudaT*>(reinterpret_cast<char*>(data.xqa_buffer) + xqa_internal_bytes);
+        data.qkv_buffer = reinterpret_cast<CudaT*>(xqa_extra_buffer);
+        xqa_extra_buffer += q_bytes + k_bytes;
+      }
+      if (use_xqa_attention_sinks) {
+        data.xqa_head_sink = reinterpret_cast<float*>(xqa_extra_buffer);
       }
     }
   }
@@ -606,6 +621,7 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
 
   if (kernel_options_->AllowDebugInfo()) {
     AttentionKernelDebugInfo debug_info;
+    debug_info.use_xqa = data.use_xqa;
     debug_info.use_flash_attention = data.use_flash_attention;
     debug_info.use_efficient_attention = data.use_memory_efficient_attention;
     debug_info.use_cudnn_flash_attention = data.use_cudnn_sdpa;

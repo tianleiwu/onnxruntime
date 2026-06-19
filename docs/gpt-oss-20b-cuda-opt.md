@@ -18,7 +18,7 @@ MODEL=/tianlei/models/gpt-oss-20b/variants/cuda_int4_int4_qmoe_rtn_matmul_only \
 bash /tianlei/scripts/run_gpt_oss.sh
 ```
 
-Important: CUDA `GroupQueryAttention` XQA is not enabled by default for the GPT-OSS non-quantized KV-cache path, so benchmark scripts should still opt in with `ORT_ENABLE_XQA=1` for negative-control testing. However, the supplied GPT-OSS graph also wires `head_sink` into `GroupQueryAttention`, which sets smooth-softmax mode and currently disqualifies XQA. The observed path for this model is FlashAttention/FlashDecode, not XQA. `/tianlei/scripts/run_gpt_oss.sh` now exports `ORT_ENABLE_XQA=1` by default and normalizes generated model configs to `enable_cuda_graph=1` and `enable_skip_layer_norm_strict_mode=0`.
+Important: CUDA `GroupQueryAttention` XQA is not enabled by default for the GPT-OSS non-quantized KV-cache path, so benchmark scripts should still opt in with `ORT_ENABLE_XQA=1` for XQA testing. The supplied GPT-OSS graph wires `head_sink` into `GroupQueryAttention`; older ORT builds treated that as smooth-softmax mode and disqualified XQA. This working tree adds a narrow non-quantized global-decode XQA path for `head_sink`, while sliding-window layers remain FlashDecode-only. `/tianlei/scripts/run_gpt_oss.sh` now exports `ORT_ENABLE_XQA=1` by default and normalizes generated model configs to `enable_cuda_graph=1` and `enable_skip_layer_norm_strict_mode=0`.
 
 ## Current Baseline
 
@@ -99,7 +99,7 @@ and should set:
 export ORT_ENABLE_XQA=1
 ```
 
-`ORT_ENABLE_XQA=1` is necessary but not sufficient for this model. The current GPT-OSS graph has a non-empty `head_sink` input on `GroupQueryAttention`; ORT converts that to `parameters.use_smooth_softmax=true`, and the XQA eligibility gate requires `!parameters.use_smooth_softmax`. As a result, the current model selects FlashAttention/FlashDecode even when `ORT_ENABLE_XQA=1` is set.
+`ORT_ENABLE_XQA=1` is necessary but not sufficient for older builds of this model. The GPT-OSS graph has a non-empty `head_sink` input on `GroupQueryAttention`; before the XQA head-sink patch, ORT converted that to `parameters.use_smooth_softmax=true`, and the XQA eligibility gate required `!parameters.use_smooth_softmax`. As a result, the unpatched model selected FlashAttention/FlashDecode even when `ORT_ENABLE_XQA=1` was set.
 
 The experiment log attributes about 277 us/token of the `rtn_matmul_only` vs `rtn_mixed_lmh8_bs64` gap to `enable_skip_layer_norm_strict_mode=1`, which disables the fused `SkipLayerNormKernelSmall` and falls back to slower standalone layer norm kernels. Flipping the flag from `1` to `0` recovered about 7 percent decode throughput in the recorded sweep.
 
@@ -214,6 +214,50 @@ Launch-count comparison for the same `PROMPT_LEN=512`, `GEN_LEN=8`, no-CUDA-grap
 
 The measured wall-clock decode latency in the profiled no-CUDA-graph nsys run changed from about 98.0 ms/token to 97.3 ms/token. Treat this as directional only because attention is a tiny fraction of this profiling-mode run and QMoE dominates total kernel time. The robust signal is the split-K combine launch reduction from 168 to 84.
 
+### Implementation update: XQA with `head_sink` for global decode
+
+A scoped XQA head-sink path was added for non-quantized FP16/BF16 global decode layers:
+
+- `head_sink` is allowed through the XQA gate when it is the reason smooth-softmax mode is active.
+- Quantized INT8/FP8 XQA paths still reject attention sinks.
+- The ORT `head_sink` tensor remains in op dtype (`fp16`/`bf16`) and is converted into a small float scratch buffer before launching XQA.
+- The existing XQA `attentionSinks` hook is now wired through the loader layers into `launchMHA`.
+- `ORT_ENABLE_ATTENTION_KERNEL_DEBUG_INFO=1` now reports `SdpaKernel=XQA` when GQA selects XQA.
+
+The semantics were cross-checked against TensorRT-LLM XQA and ORT Flash/CPU GQA: all treat a head sink as an extra softmax-denominator term, equivalent to adding `exp(sink - row_max)` with no value contribution. The sink is not scaled and is not softcapped.
+
+Synthetic GPT-OSS-like validation on H200:
+
+```bash
+cd /home/tianlei/onnxruntime/onnxruntime/test/python/transformers
+PYTHONPATH=/home/tianlei/onnxruntime/build/cu130/Release:$PYTHONPATH \
+  ORT_TEST_CUDA_PLUGIN_EP=1 ORT_ENABLE_XQA=1 \
+  ORT_ENABLE_ATTENTION_KERNEL_DEBUG_INFO=1 \
+  python profile_gqa.py --mode fp16 --batch-size 1 --sequence-length 1 \
+    --past-sequence-length 128 --max-sequence-length 256 \
+    --num-heads 64 --kv-num-heads 8 --head-size 64 \
+    --is-packed-qkv --head-sink --warmup 1 --repeat 1
+```
+
+Result: `SdpaKernel=XQA` for packed-QKV fp16 decode with `head_sink`.
+
+For the same packed head-sink shape, XQA output was compared against the FlashAttention path using deterministic inputs:
+
+| Metric | Value |
+|---|---:|
+| Max absolute difference | `3.0517578125e-05` |
+| Mean absolute difference | `1.7285346984863281e-06` |
+| Max output magnitude | `0.0345458984375` |
+
+Synthetic timing at past length 2048, max cache length 4096, packed QKV, `num_heads=64`, `kv_num_heads=8`, `head_size=64`, `head_sink=true`, warmup 20, repeat 100:
+
+| Path | Average latency |
+|---|---:|
+| FlashAttention/FlashDecode (`ORT_ENABLE_XQA=0`) | `0.1774 ms` |
+| XQA with head sink (`ORT_ENABLE_XQA=1`) | `0.0761 ms` |
+
+These are synthetic single-node numbers, not whole-model throughput. They indicate that the 12 GPT-OSS global attention layers now have an XQA candidate path; the 12 sliding-window layers still use FlashDecode because XQA continues to require `local_window_size == -1`.
+
 ### 2. The fastest current ORT decode model is already competitive with llama.cpp
 
 In the recorded sweep, `rtn_matmul_only` and llama.cpp are both about 297 tok/s for prompt lengths 256 to 512. The bigger remaining gap is sequence-length robustness: llama.cpp decode stays flat through 2048, while ORT loses about 7 percent. That points toward attention/KV-cache work rather than pure weight-only GEMV throughput.
@@ -238,7 +282,7 @@ Action: for decode throughput, do not prioritize QMoE block-size kernel tuning u
 |---|---|---|
 | `MatMulNBits` CUDA | `onnxruntime/contrib_ops/cuda/quantization/matmul_nbits.cc`, `matmul_4bits.cu`, `matmul_8bits.cu` | Uses fpA_intB prepacking when available, with fallback dequant plus cuBLAS. Supports 4-bit and 8-bit, optional zero-points, and chunked dequant for large outputs. |
 | QMoE CUDA | `onnxruntime/contrib_ops/cuda/moe/moe_quantization.cc`, `qmoe_kernels.cu`, `contrib_ops/cuda/llm/moe_gemm/*` | CUTLASS MoE runner, fused SwiGLU, in-kernel softmax-topk helpers. Integer QMoE uses Ampere-style grouped GEMM layout even on SM90. |
-| GQA CUDA | `onnxruntime/contrib_ops/cuda/bert/group_query_attention.cc`, `group_query_attention_impl.cu` | Supports XQA, cuDNN SDPA, Flash Attention, memory-efficient attention, and unfused fallback. XQA is opt-in for the GPT-OSS non-quantized KV path via `ORT_ENABLE_XQA=1`; it rejects softcap, smooth softmax/head sink, and local-window attention. |
+| GQA CUDA | `onnxruntime/contrib_ops/cuda/bert/group_query_attention.cc`, `group_query_attention_impl.cu` | Supports XQA, cuDNN SDPA, Flash Attention, memory-efficient attention, and unfused fallback. XQA is opt-in for the GPT-OSS non-quantized KV path via `ORT_ENABLE_XQA=1`; this working tree supports non-quantized global decode with `head_sink`, while softcap, quantized head-sink XQA, and local-window attention remain rejected. |
 | Skip/RMSNorm fusion | `onnxruntime/contrib_ops/cuda/bert/skip_layer_norm_impl.cu`, `onnxruntime/core/optimizer/skip_layer_norm_fusion.*` | CUDA has fused skip layer norm. Strict mode can prevent the fast path. Standalone Add + SimplifiedLayerNorm fusion is not the same as regular LayerNorm fusion. |
 | Existing MatMulNBits QKV fusion | `onnxruntime/core/optimizer/matmul_nbits_qkv_fusion.*` | Graph transformer exists, but the fused `MatMulNBitsQkv` contrib op is WebGPU-only today. |
 | Existing GQA pre-norm fusion | `onnxruntime/core/optimizer/group_query_attention_pre_norm_fusion.*` | WebGPU-only. CUDA `GroupQueryAttention` rejects q/k norm inputs in slots 14 and 15. |
