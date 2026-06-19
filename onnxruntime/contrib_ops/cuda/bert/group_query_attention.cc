@@ -76,6 +76,7 @@ REGISTER_KERNEL_TYPED(BFloat16, uint8_t)
 #endif
 
 constexpr const char* kDisableFlashDecode = "ORT_DISABLE_FLASH_DECODE";
+constexpr int kHeadSinkInputIndex = 11;
 
 // Group Query Attention (GQA) Operator
 //
@@ -131,6 +132,48 @@ GroupQueryAttention<T, U>::GroupQueryAttention(const OpKernelInfo& info)
   }
 
   disable_flash_decode_ = ParseEnvironmentVariableWithDefault<bool>(kDisableFlashDecode, false);
+}
+
+template <typename T, typename U>
+Status GroupQueryAttention<T, U>::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
+                                          bool& is_packed, PrePackedWeights* prepacked_weights) {
+  ORT_UNUSED_PARAMETER(prepacked_weights);
+  is_packed = false;
+
+  if (input_idx != kHeadSinkInputIndex) {
+    return Status::OK();
+  }
+
+  if constexpr (std::is_same_v<T, MLFloat16> || std::is_same_v<T, BFloat16>) {
+    const auto& shape = tensor.Shape();
+    ORT_RETURN_IF_NOT(shape.NumDimensions() == 1,
+                      "head_sink must be a 1D tensor, got ", shape.NumDimensions(), " dimensions");
+    ORT_RETURN_IF_NOT(shape[0] == num_heads_,
+                      "head_sink dimension 0 must be equal to the num heads, got ", shape[0]);
+    ORT_RETURN_IF_NOT(tensor.IsDataType<T>(), "head_sink type must match GroupQueryAttention input type");
+
+    const size_t head_sink_bytes = tensor.SizeInBytes();
+    const void* head_sink_data = tensor.DataRaw();
+    IAllocatorUniquePtr<void> head_sink_gpu;
+    cudaStream_t stream = cudaStreamLegacy;
+
+    if (tensor.Location().device.Type() == OrtDevice::CPU) {
+      head_sink_gpu = IAllocator::MakeUniquePtr<void>(alloc, head_sink_bytes, true);
+      CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(head_sink_gpu.get(), head_sink_data, head_sink_bytes,
+                                           cudaMemcpyHostToDevice, stream));
+      head_sink_data = head_sink_gpu.get();
+    }
+
+    xqa_head_sink_ = IAllocator::MakeUniquePtr<float>(alloc, static_cast<size_t>(num_heads_), true);
+    using CudaT = typename onnxruntime::cuda::OrtToCudaType<T>::type;
+    ORT_RETURN_IF_ERROR(LaunchConvertHeadSinkToFloat<CudaT>(
+        reinterpret_cast<const CudaT*>(head_sink_data), xqa_head_sink_.get(), num_heads_, stream,
+        GetDeviceProp().maxThreadsPerBlock));
+    CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream));
+    xqa_head_sink_count_ = num_heads_;
+  }
+
+  return Status::OK();
 }
 
 // ComputeInternal executes the GQA kernel.
@@ -403,8 +446,11 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
         k_bytes = (k_bytes + 255) / 256 * 256;
         xqa_total_bytes += q_bytes + k_bytes;
       }
+      const bool use_prepacked_xqa_head_sink =
+          use_xqa_attention_sinks && xqa_head_sink_ != nullptr && xqa_head_sink_count_ == parameters.num_heads;
+      const bool convert_xqa_head_sink = use_xqa_attention_sinks && !use_prepacked_xqa_head_sink;
       size_t xqa_head_sink_bytes = 0;
-      if (use_xqa_attention_sinks) {
+      if (convert_xqa_head_sink) {
         xqa_head_sink_bytes = parameters.num_heads * sizeof(float);
         xqa_head_sink_bytes = (xqa_head_sink_bytes + 255) / 256 * 256;
         xqa_total_bytes += xqa_head_sink_bytes;
@@ -419,8 +465,11 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
         data.qkv_buffer = reinterpret_cast<CudaT*>(xqa_extra_buffer);
         xqa_extra_buffer += q_bytes + k_bytes;
       }
-      if (use_xqa_attention_sinks) {
+      if (use_prepacked_xqa_head_sink) {
+        data.xqa_head_sink = xqa_head_sink_.get();
+      } else if (convert_xqa_head_sink) {
         data.xqa_head_sink = reinterpret_cast<float*>(xqa_extra_buffer);
+        data.xqa_head_sink_needs_conversion = true;
       }
     }
   }

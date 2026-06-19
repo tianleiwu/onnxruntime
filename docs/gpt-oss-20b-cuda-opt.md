@@ -220,7 +220,7 @@ A scoped XQA head-sink path was added for non-quantized FP16/BF16 global decode 
 
 - `head_sink` is allowed through the XQA gate when it is the reason smooth-softmax mode is active.
 - Quantized INT8/FP8 XQA paths still reject attention sinks.
-- The ORT `head_sink` tensor remains in op dtype (`fp16`/`bf16`) and is converted into a small float scratch buffer before launching XQA.
+- The ORT `head_sink` tensor remains in op dtype (`fp16`/`bf16`). If it is an initializer, `PrePack` converts it once into a cached FP32 CUDA buffer for XQA; dynamic sinks still use a small per-launch FP32 scratch buffer.
 - The existing XQA `attentionSinks` hook is now wired through the loader layers into `launchMHA`.
 - `ORT_ENABLE_ATTENTION_KERNEL_DEBUG_INFO=1` now reports `SdpaKernel=XQA` when GQA selects XQA.
 
@@ -257,6 +257,15 @@ Synthetic timing at past length 2048, max cache length 4096, packed QKV, `num_he
 | XQA with head sink (`ORT_ENABLE_XQA=1`) | `0.0761 ms` |
 
 These are synthetic single-node numbers, not whole-model throughput. They indicate that the 12 GPT-OSS global attention layers now have an XQA candidate path; the 12 sliding-window layers still use FlashDecode because XQA continues to require `local_window_size == -1`.
+
+Whole-model decode benchmark on H200, batch 1, prompt 512, generated tokens 128, warmup 2, repeat 5, CUDA graph enabled, `enable_skip_layer_norm_strict_mode=0`:
+
+| XQA | Decode latency/token | Decode throughput |
+|---|---:|---:|
+| `ORT_ENABLE_XQA=0` | `3.0496 ms` | `327.91 tokens/s` |
+| `ORT_ENABLE_XQA=1` | `2.8660 ms` | `348.91 tokens/s` |
+
+Measured decode throughput gain: about `+6.4%`. This benchmark used the full GPT-OSS-20B INT4 QMoE model at `/tianlei/models/gpt-oss-20b/variants/cuda_int4_int4_qmoe_rtn_matmul_only`.
 
 ### 2. The fastest current ORT decode model is already competitive with llama.cpp
 

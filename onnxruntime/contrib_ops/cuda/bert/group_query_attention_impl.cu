@@ -675,8 +675,9 @@ Status ExtremeDecoding(
   void* xqa_workspace = data.xqa_buffer;
   size_t xqa_workspace_size = data.xqa_buffer_bytes;
 
-  if (data.head_sink != nullptr) {
+  if (data.xqa_head_sink_needs_conversion) {
     ORT_ENFORCE(data.xqa_head_sink != nullptr, "XQA head_sink conversion buffer was not allocated.");
+    ORT_ENFORCE(data.head_sink != nullptr, "XQA head_sink input was not available for conversion.");
     ORT_RETURN_IF_ERROR(LaunchConvertHeadSinkToFloat<T>(
         data.head_sink, data.xqa_head_sink, num_heads, stream, device_prop.maxThreadsPerBlock));
   }
@@ -1342,6 +1343,20 @@ Status QkvToContext(
 template struct GroupQueryAttentionData<half, half>;
 template struct GroupQueryAttentionData<__nv_bfloat16, __nv_bfloat16>;
 template struct GroupQueryAttentionData<half, int8_t>;
+
+template Status LaunchConvertHeadSinkToFloat<half>(
+    const half* input,
+    float* output,
+    int count,
+    cudaStream_t stream,
+    int max_threads_per_block);
+
+template Status LaunchConvertHeadSinkToFloat<__nv_bfloat16>(
+    const __nv_bfloat16* input,
+    float* output,
+    int count,
+    cudaStream_t stream,
+    int max_threads_per_block);
 
 template Status QkvToContext<half, half>(
     const cudaDeviceProp& device_prop,
