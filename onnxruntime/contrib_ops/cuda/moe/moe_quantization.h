@@ -152,6 +152,13 @@ class QMoE final : public CudaKernel, public MoEBase {
   // the compute-bound regime (measured crossover ~128 tokens/expert on H200). 0 disables the upper
   // bound (always native for prefill). Overridable via ORT_FP4_NATIVE_MAX_TOKENS_PER_EXPERT.
   int64_t fp4_native_max_tokens_per_expert_ = 0;
+  // Per-shape autotune of the fused MXFP4 GEMV tiling. Both knobs are read once in the constructor
+  // (default-on autotune, default-off logging) rather than fresh on every inference call, so the
+  // decision cannot change underneath a session whose runner/layout was already built — matching
+  // the constructor-plumbed pattern used by ORT_FP4_SM80_GEMM. Overridable via
+  // ORT_FP4_GEMV_AUTOTUNE / ORT_FP4_GEMV_AUTOTUNE_LOG.
+  bool enable_fp4_gemv_autotune_ = true;
+  bool enable_fp4_gemv_autotune_log_ = false;
   IAllocatorUniquePtr<void> gemv_fp4_fc1_weights_;  // [E, 2*inter, hidden/2] row-major e2m1
   IAllocatorUniquePtr<void> gemv_fp4_fc2_weights_;  // [E, hidden, inter/2] row-major e2m1
   IAllocatorUniquePtr<void> gemv_fp4_fc1_scales_;   // [E, hidden/32, 2*inter] activation dtype

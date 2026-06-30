@@ -271,6 +271,12 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
       if (enable_fp4_sm80_gemm_) {
         enable_fp4_gemv_ = true;
       }
+      // Capture the fused MXFP4 GEMV autotune knobs once here (at op-construction time) instead of
+      // re-reading the environment on every inference call, so a session's autotune behavior cannot
+      // change underneath it if the process mutates the environment after construction (mirrors the
+      // ORT_FP4_SM80_GEMM constructor-plumbed decision below).
+      enable_fp4_gemv_autotune_ = Fp4GemvAutotuneEnabled();
+      enable_fp4_gemv_autotune_log_ = Fp4GemvAutotuneLogEnabled();
 #else
       use_fp4_dequant_fallback_ = true;
 #endif
@@ -317,6 +323,10 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
         m_fp4_dense_fallback_runner_ = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16>>(
             sm_, activation_type_, normalize_routing_weights_, use_sparse_mixer_);
       }
+      // Capture the SM80-FP4 routing decision (made above from the environment at op-construction
+      // time) into the runner, so inference-time config/tactic selection does not re-read the
+      // environment (which may have changed since the session was created, e.g. in unit tests).
+      m_moe_runner->setUseSm80Fp4(enable_fp4_sm80_gemm_);
 #endif
     } else if (quant_type_ == "wfp4afp8" && !use_wfp4afp8_dequant_fallback_) {
 #if defined(ENABLE_FP4) && defined(USE_FP4_QMOE) && defined(ENABLE_FP8) && defined(USE_FP8_QMOE)
@@ -1198,7 +1208,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
       cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
       CUDA_CALL_THROW(cudaStreamIsCapturing(stream, &capture_status));
       const bool is_capturing = capture_status != cudaStreamCaptureStatusNone;
-      const bool do_tune = Fp4GemvAutotuneEnabled() && !have_tune && !is_capturing;
+      const bool do_tune = enable_fp4_gemv_autotune_ && !have_tune && !is_capturing;
 
       auto run_fused = [&](auto* t_ptr) {
         using T = std::remove_pointer_t<decltype(t_ptr)>;
@@ -1254,7 +1264,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
           };
 
           // fc1 reads p_act_buf (populated by the expand above).
-          const bool log_tune = Fp4GemvAutotuneLogEnabled();
+          const bool log_tune = enable_fp4_gemv_autotune_log_;
           float best_fc1 = std::numeric_limits<float>::max();
           for (MoeGemvConfig cfg : kCandidates) {
             if (!gemv::is_moe_gemv_fp4_supported(sm_, expanded, fc1_n, hidden, 32, cfg)) {
