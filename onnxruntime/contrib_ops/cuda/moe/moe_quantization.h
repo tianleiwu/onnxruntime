@@ -8,8 +8,10 @@
 #include "contrib_ops/cuda/moe/moe_base.h"
 #include "contrib_ops/cuda/llm/moe_gemm/moe_kernels.h"
 #include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_profiler.h"
+#include "contrib_ops/cuda/llm/moe_gemm/moe_gemv_fp4.h"
 
 #include <mutex>
+#include <unordered_map>
 
 namespace onnxruntime {
 namespace contrib {
@@ -179,6 +181,44 @@ class QMoE final : public CudaKernel, public MoEBase {
 
   mutable onnxruntime::llm::kernels::cutlass_kernels::MoeGemmProfiler mGemmProfiler;
   mutable std::mutex mGemmProfilerMutex;
+
+  struct Fp4GemvTuneKey {
+    bool is_fp16 = false;
+    int64_t row_bucket = 0;
+    int64_t hidden = 0;
+    int64_t inter = 0;
+    int sm = 0;
+
+    bool operator==(const Fp4GemvTuneKey& other) const {
+      return is_fp16 == other.is_fp16 && row_bucket == other.row_bucket && hidden == other.hidden &&
+             inter == other.inter && sm == other.sm;
+    }
+  };
+
+  struct Fp4GemvTuneKeyHash {
+    size_t operator()(const Fp4GemvTuneKey& key) const {
+      size_t hash = 1469598103934665603ULL;
+      auto combine = [&hash](auto value) {
+        hash ^= static_cast<size_t>(value);
+        hash *= 1099511628211ULL;
+      };
+      combine(key.is_fp16);
+      combine(key.row_bucket);
+      combine(key.hidden);
+      combine(key.inter);
+      combine(key.sm);
+      return hash;
+    }
+  };
+
+  struct Fp4GemvTuneResult {
+    onnxruntime::llm::kernels::moe_gemv::MoeGemvConfig fc1_config =
+        onnxruntime::llm::kernels::moe_gemv::MoeGemvConfig::kDefault;
+    onnxruntime::llm::kernels::moe_gemv::MoeGemvConfig fc2_config =
+        onnxruntime::llm::kernels::moe_gemv::MoeGemvConfig::kDefault;
+  };
+
+  mutable std::unordered_map<Fp4GemvTuneKey, Fp4GemvTuneResult, Fp4GemvTuneKeyHash> fp4_gemv_tune_cache_;
 };
 
 }  // namespace cuda

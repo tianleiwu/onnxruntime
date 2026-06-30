@@ -268,6 +268,24 @@ void LaunchQMoERepackFP4ColToRow(
     int64_t n,
     cudaStream_t stream);
 
+void LaunchQMoECombineFp4ScalesForGemv(
+    const uint8_t* block_scales,
+    const float* global_scales,
+    half* output,
+    int experts,
+    int n,
+    int k_blocks,
+    cudaStream_t stream);
+
+void LaunchQMoECombineFp4ScalesForGemv(
+    const uint8_t* block_scales,
+    const float* global_scales,
+    __nv_bfloat16* output,
+    int experts,
+    int n,
+    int k_blocks,
+    cudaStream_t stream);
+
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime
