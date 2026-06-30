@@ -198,7 +198,7 @@ void launch_moe_gemv_fp4_symmetric_interleaved_swiglu(
     T const* act, uint8_t const* weight, T const* scales, T const* bias, T* out,
     int64_t const* expert_first_token_offset, int const* permuted_row_to_expert, int num_experts,
     int64_t expanded_num_rows, int64_t inter_size, int64_t k, int group_size, int sm,
-  cutlass_kernels::ActivationParams activation_params, MoeGemvConfig config, cudaStream_t stream) {
+    cutlass_kernels::ActivationParams activation_params, MoeGemvConfig config, cudaStream_t stream) {
   ORT_UNUSED_PARAMETER(sm);
   // Lever A (opt-in): ColumnMajorInterleaved layout + dtype-conditional accumulation + smaller
   // CtaN, fusing SwiGLU. Takes precedence over the split-K path so the kernel matches the
@@ -244,7 +244,7 @@ template void launch_moe_gemv_fp4_symmetric<half>(
     int64_t, int64_t, int64_t, int, int, MoeGemvConfig, cudaStream_t);
 template void launch_moe_gemv_fp4_symmetric_interleaved_swiglu<half>(
     half const*, uint8_t const*, half const*, half const*, half*, int64_t const*, int const*, int,
-  int64_t, int64_t, int64_t, int, int, cutlass_kernels::ActivationParams, MoeGemvConfig, cudaStream_t);
+    int64_t, int64_t, int64_t, int, int, cutlass_kernels::ActivationParams, MoeGemvConfig, cudaStream_t);
 #ifdef ENABLE_BF16
 template void launch_moe_gemv_fp4_symmetric<__nv_bfloat16>(
     __nv_bfloat16 const*, uint8_t const*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16*,
@@ -252,7 +252,7 @@ template void launch_moe_gemv_fp4_symmetric<__nv_bfloat16>(
 template void launch_moe_gemv_fp4_symmetric_interleaved_swiglu<__nv_bfloat16>(
     __nv_bfloat16 const*, uint8_t const*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16*,
     int64_t const*, int const*, int, int64_t, int64_t, int64_t, int, int, cutlass_kernels::ActivationParams,
-  MoeGemvConfig, cudaStream_t);
+    MoeGemvConfig, cudaStream_t);
 #endif
 
 }  // namespace moe_gemv
