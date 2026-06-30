@@ -107,6 +107,28 @@ class QMoE final : public CudaKernel, public MoEBase {
   IAllocatorUniquePtr<void> packed_fp4_fc1_block_scales_;
   IAllocatorUniquePtr<void> packed_fp4_fc2_block_scales_;
 
+  // Fused MXFP4 GEMV (W4A16) decode path. Default-on (opt-out via ORT_ENABLE_FP4_GEMV=0) on
+  // the SM<120 dequant-fallback regime. When enabled, PrePack additionally lays out the MXFP4
+  // weights in the GEMV-consumed [E, n, k/2] row-major layout and combines the e8m0 block
+  // scales with the per-expert global scale into the
+  // [E, k/32, n] activation-dtype scale layout. ComputeInternal routes small-decode shapes
+  // through a standalone fused GEMV pipeline (prologue -> expand -> fc1 SwiGLU GEMV ->
+  // fc2 GEMV -> finalize) instead of dequantizing to dense weights. Falls back to the
+  // dequant path for unsupported shapes (prefill / large batch).
+  bool enable_fp4_gemv_ = false;
+  IAllocatorUniquePtr<void> gemv_fp4_fc1_weights_;  // [E, 2*inter, hidden/2] row-major e2m1
+  IAllocatorUniquePtr<void> gemv_fp4_fc2_weights_;  // [E, hidden, inter/2] row-major e2m1
+  IAllocatorUniquePtr<void> gemv_fp4_fc1_scales_;   // [E, hidden/32, 2*inter] activation dtype
+  IAllocatorUniquePtr<void> gemv_fp4_fc2_scales_;   // [E, inter/32, hidden] activation dtype
+  // Block-scale dimensions captured at PrePack time so TryBuildGemvFp4Scales can size and
+  // launch the combine kernel once the global scale also arrives. [E, n, k_blocks].
+  int64_t gemv_fp4_fc1_scale_e_ = 0;
+  int64_t gemv_fp4_fc1_scale_n_ = 0;
+  int64_t gemv_fp4_fc1_scale_kb_ = 0;
+  int64_t gemv_fp4_fc2_scale_e_ = 0;
+  int64_t gemv_fp4_fc2_scale_n_ = 0;
+  int64_t gemv_fp4_fc2_scale_kb_ = 0;
+
   // Per-expert global weight scales used by FP4 and FP8 modes.
   IAllocatorUniquePtr<void> packed_fc1_global_scale_;
   IAllocatorUniquePtr<void> packed_fc2_global_scale_;
