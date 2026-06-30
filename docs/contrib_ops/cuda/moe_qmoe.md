@@ -757,7 +757,7 @@ switch (hopper_inputs.fusion) {
 ### 9.9 Runtime environment variables
 
 The FP4 path is gated by several process-start environment variables (read once in the
-QMoE constructor). Defaults give the fastest validated behavior; the rest are opt-in or
+QMoE constructor). Defaults give the validated production behavior; the rest are opt-in or
 debug switches.
 
 | Variable | Default | Effect |
@@ -767,6 +767,7 @@ debug switches.
 | `ORT_FP4_GEMV_AUTOTUNE_LOG` | `0` | Set to `1` to log the chosen GEMV configs per shape. |
 | `ORT_FP4_GEMV_INTERLEAVED` | `0` | **Experimental, opt-in ("Lever A").** Routes the MXFP4 decode GEMV through the `ColumnMajorInterleaved` weight layout (`kInterleave=4`, `kStepK=32`) with dtype-conditional accumulation. fp16 gets ~4% faster decode; bf16 stays accuracy-safe. Default off keeps the shipping `ColumnMajor` path byte-for-byte unchanged. See [§9.10](#910-interleaved-gemv-layout--dtype-conditional-accumulation). |
 | `ORT_FP4_GEMV_INTERLEAVED_HALFACC` | `0` | **Diagnostic only.** When `ORT_FP4_GEMV_INTERLEAVED=1`, forces 16-bit accumulation for *both* fp16 and bf16, overriding the dtype-conditional policy. Used to isolate the layout-vs-accumulation effect; regresses bf16 accuracy. |
+| `ORT_FP4_SM80_GEMM` | `1` | Routes SM80/Ampere FP4 prefill through the fused-dequant grouped GEMM. Set to `0` to force dense fallback for debugging or comparison. Decode still routes through fused MXFP4 GEMV when supported. |
 | `ORT_ENABLE_FP4_CUTLASS_GEMM` | `0` | Opt-in native SM90 WFP4A16 CUTLASS GEMM (fast prefill). Requires FP16, SM90, and aligned shapes (`hidden`/`inter` divisible by 256). Must be combined with `ORT_ENABLE_FP4_CUTLASS_UNSAFE=1`. |
 | `ORT_ENABLE_FP4_CUTLASS_UNSAFE` | `0` | Confirms use of the experimental native SM90 path. Without it, a request to enable native GEMM logs a warning and falls back to dequant/GEMV. |
 | `ORT_FP4_PREFILL_MIN_TOKENS` | `64` | When native CUTLASS is enabled, the per-node decode threshold. Tokens with `M >= threshold` (prefill) route to native CUTLASS; `M < threshold` (decode) route to the fused GEMV. Both weight/scale layouts are pre-packed so one node serves both regimes. |

@@ -58,10 +58,20 @@ The largest production win is routing WFP4A16 through the Ampere SM80 fused-dequ
 - allow e2m1 weights with groupwise scales in the SM80 mixed-input kernel,
 - add the e2m1 interleaved converter support needed by the SM80 path,
 - prepack SM80 interleaved FP4 weights and activation-dtype group scales,
-- select SM80 configs for WFP4A16 when `ORT_FP4_SM80_GEMM` is enabled,
-- keep `ORT_FP4_SM80_GEMM=0` as the dense fallback comparison knob.
+- select SM80 configs for WFP4A16 by default,
+- keep `ORT_FP4_SM80_GEMM=0` as the dense fallback comparison/debug knob.
 
-The SM80 path is default-on in the FP4 fallback regime unless native FP4 CUTLASS is explicitly requested with `ORT_ENABLE_FP4_CUTLASS_GEMM=1`.
+The SM80 path is default-on in the FP4 fallback regime unless native FP4 CUTLASS is explicitly requested with `ORT_ENABLE_FP4_CUTLASS_GEMM=1`. Decode still routes through the fused MXFP4 GEMV path; SM80 grouped GEMM is used for prefill and GEMV-unsupported shapes.
+
+End-to-end GPT-OSS A100 smoke validation with `prompt=128`, `gen=16`, `warmup=1`, locked 1410 MHz:
+
+| config | CUDA graph | prefill tps | decode tps | decode ms/tok |
+|---|---:|---:|---:|---:|
+| SM80 FP4 default-on | 0 | 3795.1 | 133.2 | 7.51 |
+| SM80 FP4 disabled (`ORT_FP4_SM80_GEMM=0`) | 0 | 298.1 | 133.6 | 7.48 |
+| SM80 FP4 default-on | 1 | 3732.5 | 122.8 | 8.14 |
+
+The earlier `can_implement` failure on the default path is no longer reproducible after the GEMV scale-prepack fix; grep over fresh A100 runs found only the old failing log. The decode throughput parity above verifies that enabling SM80 prefill no longer disables the fused GEMV decode path.
 
 #### A100 FP16 Sweep
 

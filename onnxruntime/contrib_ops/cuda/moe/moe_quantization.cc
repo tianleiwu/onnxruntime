@@ -256,7 +256,8 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
       // Only meaningful in the dequant-fallback regime (sm_ < 120, e.g. H200), where the
       // native SM90 TMA FP4 path is the slow prefill path. This SM80 grouped GEMM is several
       // times faster at the gpt-oss-20b prefill regime, so it is enabled by DEFAULT for FP16/BF16;
-      // set ORT_FP4_SM80_GEMM=0 to fall back to the dequant path. If the user EXPLICITLY
+      // set ORT_FP4_SM80_GEMM=0 to fall back to the dequant path.
+      // If the user EXPLICITLY
       // requested the native CUTLASS GEMM (ORT_ENABLE_FP4_CUTLASS_GEMM=1) we honor that intent
       // and do not take the SM80 path — this keeps the kernel-side moeUseSm80Fp4() (which reads
       // the same two env vars) in lock-step with this decision in every regime, including the
@@ -625,7 +626,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   const bool route_native_fp4 =
       fp4_native_available &&
       (fp4_native_max_tokens_per_expert_ <= 0 || avg_tokens_per_expert <= fp4_native_max_tokens_per_expert_);
-  // SM80 FP4 grouped-GEMM prefill path. Active by default (unless ORT_FP4_SM80_GEMM=0) when the
+  // SM80 FP4 grouped-GEMM prefill path. Active only when ORT_FP4_SM80_GEMM=1 and the
   // GEMV prepack produced the SM80 CUTLASS-interleaved e2m1 weights + activation-dtype group scales. Decode
   // shapes are still served by the fused GEMV (which returns early below); everything that
   // falls through to the runner here (prefill / GEMV-unsupported shapes) runs on the FP4
@@ -1134,9 +1135,11 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
       use_fp4_dequant_fallback_ ||
       (enable_fp4_cutlass_gemm_ && fp4_prefill_min_tokens_ > 0 &&
        moe_params.num_rows < fp4_prefill_min_tokens_);
-  if (is_fp4 && fp4_decode_regime && enable_fp4_gemv_ && is_fused_swiglu && !enable_fp4_sm80_gemm_ &&
+  const bool fp4_gemv_buffers_ready =
       gemv_fp4_fc1_weights_ != nullptr && gemv_fp4_fc2_weights_ != nullptr &&
-      gemv_fp4_fc1_scales_ != nullptr && gemv_fp4_fc2_scales_ != nullptr) {
+      gemv_fp4_fc1_scales_ != nullptr && gemv_fp4_fc2_scales_ != nullptr;
+  if (is_fp4 && fp4_decode_regime && enable_fp4_gemv_ && is_fused_swiglu &&
+      fp4_gemv_buffers_ready) {
     namespace gemv = onnxruntime::llm::kernels::moe_gemv;
     namespace ck = onnxruntime::llm::kernels::cutlass_kernels;
     const int num_experts = static_cast<int>(moe_params.num_experts);
@@ -1145,9 +1148,9 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
     const int64_t hidden = moe_params.hidden_size;
     const int64_t inter = moe_params.inter_size;
     const int64_t fc1_n = inter * 2;
-    if (num_rows > 0 && num_rows <= 256 && expanded > 0 &&
-        gemv::is_moe_gemv_fp4_supported(sm_, expanded, fc1_n, hidden, 32) &&
-        gemv::is_moe_gemv_fp4_supported(sm_, expanded, hidden, inter, 32)) {
+    const bool fc1_gemv_supported = gemv::is_moe_gemv_fp4_supported(sm_, expanded, fc1_n, hidden, 32);
+    const bool fc2_gemv_supported = gemv::is_moe_gemv_fp4_supported(sm_, expanded, hidden, inter, 32);
+    if (num_rows > 0 && num_rows <= 256 && expanded > 0 && fc1_gemv_supported && fc2_gemv_supported) {
       auto p_r2u_buf = GetScratchBuffer<int>(expanded, GetComputeStream(context));
       auto p_exp_buf = GetScratchBuffer<int>(expanded, GetComputeStream(context));
       auto p_efto_buf = GetScratchBuffer<int64_t>(num_experts + 1, GetComputeStream(context));
@@ -1574,6 +1577,12 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
       PrePackSwizzleBlockScales(tensor, stream, alloc, packed_fp4_fc1_block_scales_, is_packed);
     } else if (quant_type_ == "fp4" || quant_type_ == "wfp4afp8") {
       PrePackCopyToGpu(tensor, stream, alloc, packed_fp4_fc1_block_scales_, is_packed);
+      if (quant_type_ == "fp4" && enable_fp4_gemv_ && tensor.Shape().NumDimensions() == 3) {
+        gemv_fp4_fc1_scale_e_ = tensor.Shape()[0];
+        gemv_fp4_fc1_scale_n_ = tensor.Shape()[1];
+        gemv_fp4_fc1_scale_kb_ = tensor.Shape()[2];
+        TryBuildGemvFp4Scales(1, stream, alloc);
+      }
     } else if (quant_type_ == "int") {
       PrePackTransposeAndPack(tensor, stream, alloc, packed_fc1_scales_, is_packed);
       DUMP_PACK_TENSOR("packed_fc1_scales", packed_fc1_scales_, tensor);
@@ -1594,6 +1603,12 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
       PrePackSwizzleBlockScales(tensor, stream, alloc, packed_fp4_fc2_block_scales_, is_packed);
     } else if (quant_type_ == "fp4" || quant_type_ == "wfp4afp8") {
       PrePackCopyToGpu(tensor, stream, alloc, packed_fp4_fc2_block_scales_, is_packed);
+      if (quant_type_ == "fp4" && enable_fp4_gemv_ && tensor.Shape().NumDimensions() == 3) {
+        gemv_fp4_fc2_scale_e_ = tensor.Shape()[0];
+        gemv_fp4_fc2_scale_n_ = tensor.Shape()[1];
+        gemv_fp4_fc2_scale_kb_ = tensor.Shape()[2];
+        TryBuildGemvFp4Scales(2, stream, alloc);
+      }
     } else if (quant_type_ == "int") {
       PrePackTransposeAndPack(tensor, stream, alloc, packed_fc2_scales_, is_packed);
       DUMP_PACK_TENSOR("packed_fc2_scales", packed_fc2_scales_, tensor);
@@ -1610,8 +1625,10 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
              (quant_type_ == "fp4" || quant_type_ == "fp8" || quant_type_ == "wfp4afp8")) {
     if (input_idx == 15) {
       PrePackCopyToGpu(tensor, stream, alloc, packed_fc1_global_scale_, is_packed);
+      TryBuildGemvFp4Scales(1, stream, alloc);
     } else {
       PrePackCopyToGpu(tensor, stream, alloc, packed_fc2_global_scale_, is_packed);
+      TryBuildGemvFp4Scales(2, stream, alloc);
     }
   } else if ((input_idx == 17 || input_idx == 18) && quant_type_ == "wfp4afp8") {
     if (input_idx == 17) {
