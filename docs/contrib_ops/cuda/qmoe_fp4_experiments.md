@@ -1324,3 +1324,465 @@ Two distinct levers, in priority order:
 > Never run them concurrently against the same model directory — a race made an
 > early FP4-on run read `enable_cuda_graph=0`. Run sequentially, or point them at
 > separate model copies.
+
+---
+
+## 2026-06-28 — Closing the residual 1.58× decode gap: vLLM (MXFP4) comparison + plan
+
+After the default-on win, FP4 decode is **263 tps** vs INT4 **354–427 tps** and
+vLLM MXFP4 **~350 tps**. Why is INT4/vLLM faster, and what is the lever?
+
+### What vLLM does (gpt-oss MXFP4, H200/SM90)
+
+vLLM picks the **Triton `matmul_ogs`** backend on SM90 (FlashInfer-TRTLLM is
+SM100+; Marlin is lower priority). That kernel is a **tensor-core grouped GEMM**
+(M = tokens × top_k) that dequantizes e2m1 + e8m0 **in the mainloop** with a
+Hopper value/scale swizzle, fused SwiGLU epilogue, one kernel for prefill and
+decode. So vLLM avoids both ORT problems at once: no dense dequant round-trip
+(prefill) and tensor-core MMA at low M (decode).
+
+### Why ORT INT4 already beats vLLM but FP4 does not
+
+ORT INT4 decode is **not** tensor-core — it is the CUDA-core `moe_gemv` with the
+`ColumnMajorInterleaved` layout (`kStepK = 128/4 = 32`, 128-bit weight loads) and
+fp16 accumulation, and it hits 354–427 tps. FP4 uses a **separate** `moe_gemv_fp4`
+with non-interleaved `ColumnMajor` (`kStepK = 8`, 32-bit loads) → 4× more K-trips
+and worse weight coalescing, hence ~2.9× slower per MoE layer (1.58× e2e). The
+structural reasons FP4 has not matched INT4's interleaving are recorded above
+(interleaved + bf16 regression; wide-load + fp32-accum occupancy wash).
+
+### Two candidate levers
+
+1. **Match INT4's interleaved GEMV for FP4 (in-family).** INT4 already supports a
+   clean per-shape **fp32-accum** instantiation (`TypeTag<float>` in `moe_gemv.cu`;
+   `bf16 always fp32`). The reverted FP4 interleave failed because it kept bf16
+   accum; pairing interleave with INT4's fp32-accum *and* a smaller `CtaN`/
+   register budget to hold occupancy is the untried combination. Ceiling ≈ INT4
+   GEMV (~400 tps) — closes decode but **not** prefill.
+2. **Tensor-core grouped GEMM with in-mainloop e2m1 dequant (vLLM-equivalent).**
+   Route FP4 through the CUTLASS `fpA_intB` grouped GEMM that INT4 prefill uses,
+   adding an e2m1+e8m0 converter. Closes **both** decode and prefill, matches
+   vLLM, but is a large kernel effort. Highest payoff, highest risk.
+
+Recommended order: try (1) first (bounded, reuses INT4 fp32-accum), keep (2) as
+the structural follow-up that also kills the 6.7× prefill gap.
+
+---
+
+## 2026-06-28 — FP4 GEMV converter: 2-nibbles-per-32-bit-store packing (re-run 2026-06-30: performance-neutral)
+
+Restart of "FlashInfer-style decode" experiments. Small contained converter
+change while warming back up to the kernel; deliberately low-risk.
+
+> **Update 2026-06-30:** Re-run on a fully idle H200 (all 8 GPUs at 0 % SM).
+> Original 2026-06-28 numbers were contention noise. Conclusion below is now
+> **resolved**: the change is performance-neutral, confirming the store count
+> is not the GEMV bottleneck.
+
+### Change
+
+- Commit: `0fb02a5fb7` — *EXP: FP4 GEMV converter packs 2 nibbles into one 32-bit
+  store (bit-identical)*. File: `onnxruntime/contrib_ops/cuda/llm/fpA_intB_gemv/details.h`.
+- `Fp4I2FConverter::convert<N>` now decodes both nibbles of each byte via a
+  `decode_bits()` helper, ORs them into one `uint32_t`, and emits a single aligned
+  store instead of two scalar `half`/`bf16` writes. `decode()` is preserved.
+  Bit-identical to two scalar decodes.
+
+### Reproduce
+
+```bash
+# Build (C++/CUDA only)
+cd /home/tianlei/onnxruntime/build/cu130_fp4_bench/Release && ninja onnxruntime_providers_cuda
+cd /home/tianlei/onnxruntime
+cp build/cu130_fp4_bench/Release/libonnxruntime_providers_cuda.so \
+   .venv_cu130/lib/python*/site-packages/onnxruntime/capi/
+cp build/cu130_fp4_bench/Release/libonnxruntime_providers_cuda.so \
+   /home/tianlei/ort_home_cu130_fp4_bench/lib/
+
+# Correctness (20 FP4 tests)
+cd onnxruntime/test/python/transformers
+export CUDA_VISIBLE_DEVICES=0
+export LD_LIBRARY_PATH=/home/tianlei/ort_home_cu130_fp4_bench/lib:/home/tianlei/onnxruntime/build/cu130_fp4_bench/Release:/home/tianlei/cuda13.0/lib64:$LD_LIBRARY_PATH
+/home/tianlei/onnxruntime/.venv_cu130/bin/python -m pytest test_qmoe_fp4_cuda.py -k fp4 -q
+
+# Decode microbench (small fast shape; gpt-oss 32E build is slow)
+export ORT_FORCE_DETERMINISTIC_MOE=1
+for r in 1 2 3; do /home/tianlei/onnxruntime/.venv_cu130/bin/python \
+  bench_fp4_gemv_autotune.py --hidden 512 --inter 512 --experts 8 --top_k 4 \
+  --tokens 1 --iters 200 --reps 4 2>&1 | tail -1; done
+```
+
+### Result — re-run 2026-06-30 on idle GPU (resolved: neutral)
+
+The 2026-06-28 run was abandoned because the farm was contended (406/510/422 µs,
+557 s test wall-clock). Re-ran on 2026-06-30 with all 8 H200s idle (0 % SM), doing
+a proper A/B: rebuilt the **baseline** (pre-change scalar converter, parent of
+`0fb02a5fb7`) and the **experiment** (2-nibble store) from the same tree and
+benchmarked both back-to-back on GPU 0.
+
+- Correctness: **20/20** `test_qmoe_fp4_cuda.py` pass in 44 s (vs 557 s contended).
+- Decode bench (512/512/E8, tok=1). H200 clocks are unlocked on this farm
+  (idle 345 MHz → boost 1980 MHz; `nvidia-smi -lgc` denied — no permission), so
+  per-launch `BEST` is bimodal between a fully-boosted state (~56–58 µs) and a
+  partially-boosted state (~100–119 µs). The boosted **best-case minimum** across
+  many launches is the only clock-stable metric:
+
+  | Build | Best-case min (µs) | Typical band (µs) |
+  |-------|--------------------|-------------------|
+  | Baseline (scalar store) | **55.87** | 100–119 |
+  | Experiment (2-nibble store) | **57.58** | 98–117 |
+
+  The 55.87 vs 57.58 µs gap is ~3 %, inside clock/measurement jitter, and a
+  bit-identical store-packing change cannot produce a real 2× swing — the
+  bimodality is purely the GPU boost state. **Verdict: performance-neutral.**
+
+### Conclusion
+
+- The 2-nibbles-per-32-bit-store packing is **bit-identical and performance-neutral**
+  on SM90. It neither helps nor hurts, which **confirms the GEMV is not store-bound**
+  — consistent with the 2026-06-15 SWAR/`decode2` negative result and its ncu finding
+  that the kernel is **integer-ALU / loop-index bound**. Store count is not the lever.
+- Because the change is correct, simpler than the reverted `decode2`, and at worst
+  neutral, it is kept as a tidy refactor rather than reverted.
+
+### Next step
+
+- Stop pursuing converter/store-side micro-optimizations for the decode GEMV; they
+  are dead ends while the kernel is ALU/loop-index bound.
+- Pivot to the two structural levers recorded above, in order:
+  1. **Interleaved layout + fp32 accumulation** (lever 1) — bounded, reuses the
+     INT4 path; attack the integer-ALU/loop-index bound directly.
+  2. **Tensor-core grouped GEMM** (lever 2) — the structural fix that also closes
+     the 6.7× prefill gap.
+- If any further decode-converter idea is tried, profile with ncu (not wall-clock)
+  and lock GPU clocks first; unlocked-clock wall-clock A/B on this farm cannot
+  resolve deltas below ~10 %.
+
+## 2026-06-30 — FP4 fc1 split-K + **fp32-accumulation** SwiGLU GEMV, opt-in (FINISHED 2026-07-02 — confirmed slower on both H200 (~2.6 % fc1 / ~1.2 % e2e) and A100 (~4.5 %); second split-K negative)
+
+Revisit of the 2026-06-16 `kSplitK2` negative result, motivated by a new INT4
+data point: in the **current** tree INT4's two-pass split-K SwiGLU GEMV (`SplitK=2`,
+`AccT=float`) is *faster* than its non-split-K path with fp32 accumulation
+(`moe_gemv.cu` gates it behind `ORT_MOE_GEMV_SPLITK2_SWIGLU`). The split-K kernels
+were refactored since 2026-06-16: `moe_gemv_splitk_partials_kernel` now defaults
+`AccT=float`, so **each split accumulates its (shorter) K-chain in fp32 per-thread**
+and the cross-split reduce sums fp32 partials — not just the bf16-accum + fp32-reduce
+the original `kSplitK2` used. The question: does borrowing INT4's *current* split-K +
+fp32-accum recipe finally help FP4?
+
+### What was tried (kept, opt-in — not reverted)
+
+All behind a new env gate `ORT_FP4_GEMV_SPLITK=1`; default path is byte-for-byte
+unchanged (off by default).
+
+- `moe_gemv_fp4.h`: `Fp4MoeGemvUseSplitK()` accessor, `kFp4MoeGemvSplitK = 2`, and a
+  `void* splitk_partials` parameter on `launch_moe_gemv_fp4_symmetric_interleaved_swiglu`.
+- `moe_gemv_fp4.cu`: when `splitk_partials != nullptr && Fp4MoeGemvUseSplitK()`, the
+  fc1 launcher dispatches the **existing generic** two-pass kernel
+  `dispatch_moe_gemv_splitk_twopass_swiglu_group_size<Fp4KernelDetails<T>, CtaN,
+  Threads, 2, T, float, float>` (`AccT=float`, `PartialT=float`). The shared
+  `dequantize<Details,…>` routes to `Fp4I2FConverter` automatically (same `Details`
+  as the single-pass FP4 kernel), so no new device code is needed. Auto-degrades to
+  single-pass when `num_iters < 2`.
+- `moe_quantization.cc`: allocates the fp32 partials scratch
+  (`kFp4MoeGemvSplitK · expanded · 2·inter_size` floats) only when the env is set, and
+  plumbs it to the fc1 launch. fc2 (non-SwiGLU) is unchanged.
+
+Only fc1 (the dominant ~49.6 µs SwiGLU GEMV) is wired; fc2 keeps single-pass.
+
+### Engagement caveat (important for benchmarking)
+
+FP4 `ColumnMajor` has `kStepK = 128/16 = 8`, so `CtaK = StepK·Threads = 1024` and
+`num_iters = ceil(k / 1024)`. Split-K only engages when `num_iters ≥ 2`, i.e.
+**k ≥ 2048**. The small microbench shape (`--hidden 512`) degrades to single-pass and
+cannot measure this — the A/B **must** use realistic dims (gpt-oss-20b
+`hidden=inter=2880` → `num_iters=3`).
+
+### Result — correctness PASS; performance ~2.6 % slower (idle GPU, resolved)
+
+- Correctness: **20/20** `test_qmoe_fp4_cuda.py` pass with `ORT_FP4_GEMV_SPLITK=1`
+  (fp32 per-split + fp32 cross-split reduce holds the bf16/fp16 tolerance).
+- Clean A/B on a **fully idle** H200 (all 8 GPUs at 0 % SM), clocks locked to
+  1980 MHz (`sudo nvidia-smi -i 0 -lgc 1980`; reset `-rgc` after), no-dump-node
+  build (`git-commit-id=e8df8f4dd6`, `dump-node` compiled out — the earlier
+  `dump-node=1` build added per-node I/O dumps that inflated and de-stabilized the
+  measurement). `bench_fp4_gemv_autotune.py --hidden 2880 --inter 2880 --experts 8
+  --top_k 4 --tokens 1 --warmup 30 --iters 300 --reps 8`, best-of-reps:
+
+  | Config | Whole MoE-layer BEST (µs) |
+  |--------|---------------------------|
+  | Baseline (single-pass) | **119.88** |
+  | Split-K + fp32-accum (`SPLITK=1`) | **121.30** (+1.2 %) |
+
+- **Per-kernel attribution** (nsys `cuda_gpu_kern_sum`, median over 254 fc1 calls)
+  isolates the change to the fc1 GEMV itself — the cleanest signal:
+
+  | fc1 component | Baseline | Split-K |
+  |---------------|----------|---------|
+  | `moe_gemv_interleaved_swiglu_kernel` (single-pass) | 53,439 ns | — |
+  | `moe_gemv_splitk_partials_kernel` (two-pass, fp32) | — | 52,927 ns |
+  | `moe_gemv_splitk_reduce_swiglu_kernel` | — | +1,920 ns |
+  | **fc1 total** | **53,439 ns** | **54,847 ns (+2.6 %)** |
+
+  The split-K **partials** kernel is marginally *faster* than the baseline
+  single-pass (52,927 vs 53,439 ns — the shorter, fp32-accumulated per-split
+  K-chains help slightly and tighten the variance), **but** the mandatory reduce
+  pass (1,920 ns) more than erases that gain. Net fc1 is +2.6 % slower per call,
+  matching the +1.2 % whole-layer e2e delta (diluted by the rest of the op).
+
+### Why it's slower — confirmed grid-occupancy mechanism
+
+The mechanism is exactly as hypothesized from the 2026-06-16 `kSplitK2` result:
+FP4's non-interleaved `ColumnMajor` (`kInterleave=1`, `CtaN=8`) already launches
+`expanded × n/8` base CTAs — **4× more y-blocks than INT4's interleaved
+`n/(CtaN·4)` grid** — so the SMs are already saturated. Splitting K therefore only
+adds the second reduce pass + partials round-trip without filling idle SMs. INT4
+benefits from the same recipe because its interleaved grid is 4× coarser and *does*
+leave SMs to fill. The fp32-per-split refinement that helped INT4 does **not**
+transfer to FP4 because the two paths differ in **grid occupancy, not accumulation
+precision** — the partials kernel even ran slightly faster here, so it is purely the
+reduce-pass overhead on an already-full grid.
+
+### Status / verdict
+
+- **Resolved negative — the second split-K negative for FP4** (after 2026-06-16
+  `kSplitK2`). Split-K + fp32-accum is correct but ~2.6 % slower on the fc1 GEMV
+  and ~1.2 % slower e2e on idle, locked-clock H200/SM90.
+- The code is **kept dormant**, opt-in behind `ORT_FP4_GEMV_SPLITK` (default off,
+  default path byte-for-byte unchanged, correctness-validated 20/20) so the A/B is
+  reproducible and so the same plumbing can be re-tested cheaply on a *different*
+  architecture (e.g. A100/SM80, which has fewer SMs and so an even-more-saturated
+  FP4 grid — expected to confirm the same negative, but worth a data point) without
+  rebuilding. No revert needed; it adds no cost when off.
+- The FP4 decode lever is therefore confirmed to be **not** grid parallelism but the
+  **interleaved layout (lever 1)** / **tensor-core grouped GEMM (lever 2)** recorded
+  above.
+
+### Benchmark-harness note (why setup, not measurement, was the slow part)
+
+The earlier "contention-blocked" run also suffered from a pathological *setup*
+cost unrelated to the kernel: the MXFP4 reference quantizer
+(`test_qmoe_fp4_cuda.py::quantize_weight_to_mxfp4`) computed the ue8m0 block scales
+in a **pure-Python double loop calling `.item()` per element** — ~25 M serialized
+GPU↔CPU syncs at the gpt-oss-20b 2880/32-expert shape (a reference quantizer
+written for tiny 128–256 unit-test shapes, reused unchanged at full size), which
+alone pushed one build past 7 minutes. It was **vectorized** to pure tensor ops
+(round-half-to-even `log2`, clamp `[1,254]`, default `1.0`/code `127` for all-zero
+blocks), verified **bit-identical** to the loop (0 mismatches over a 2880×90 tensor
+including zero blocks). The *measurement* loop was always fine; only the per-process
+setup was slow. After the fix, a full A/B (both arms, best-of-8) runs in well under
+a minute.
+
+### Result — re-run 2026-07-02 on idle A100 (resolved: split-K confirmed ~4.5 % SLOWER)
+
+The clean A/B was re-run on a **fully idle A100-SXM4-80GB** (sm_80, 108 SMs, all 8
+GPUs at 0 % SM), GPU 0 persistence-mode on and graphics clock locked to its 1410 MHz
+max (`sudo nvidia-smi -i 0 -lgc 1410`; reset with `-rgc` after). Same realistic shape
+(`hidden=inter=2880`, `E=32`, `top_k=4`, 1 token, fp16 → fc1 `n=5760 k=2880`,
+`num_iters=3`, so split-K genuinely engages). Best-case min µs/run over 8 internal
+reps × 3 process launches per arm:
+
+| Config | launch 1 | launch 2 | launch 3 | Best-case min (µs) |
+|--------|---------:|---------:|---------:|-------------------:|
+| Baseline (single-pass) | 171.87 | 172.40 | 171.63 | **171.63** |
+| Split-K + fp32-accum (`SPLITK=1`) | 179.27 | 179.30 | 179.66 | **179.27** |
+
+**Verdict: split-K is ~4.5 % slower** (179.27 / 171.63 = 1.045), with **zero overlap**
+between the two arms across all six launches — a clean, reproducible negative. This
+confirms (and is directionally stronger than) the contended H200 preliminary read of
+~1.5–3 % slower, and matches the 2026-06-16 `kSplitK2` finding.
+
+The mechanism argument holds and is in fact **reinforced on A100**: FP4's
+non-interleaved `ColumnMajor` (`kInterleave=1`, `CtaN=8`) launches `expanded × n/8`
+= `4 × 720 = 2880` base CTAs for fc1 — far above A100's 108 SMs — so the SMs are
+already saturated and split-K only adds the cross-split reduce pass + fp32-partials
+round-trip without filling idle SMs. With **fewer** SMs than the H200 (108 vs 132),
+the device is even more saturated, so the relative overhead of the extra pass is
+larger here (~4.5 % vs the H200's predicted 1.5–3 %). The fp32-per-split refinement
+that helped INT4 does not transfer to FP4, because the two paths differ in **grid
+occupancy**, not accumulation precision (INT4's interleaved grid is 4× coarser and
+*does* leave SMs to fill; FP4's does not).
+
+### Status — FINISHED
+
+- **Done.** This is the **second split-K negative** for FP4. The FP4 decode lever is
+  **not** grid parallelism but the **interleaved layout (lever 1)** / **tensor-core
+  grouped GEMM (lever 2)** recorded above.
+- The split-K code stays **committed but dormant** behind `ORT_FP4_GEMV_SPLITK=1`
+  (default off, single-pass path byte-for-byte unchanged, correctness 5/5 on sm_80 +
+  20/20 on session-capable GPUs). Keeping it opt-in preserves the reproducible
+  experiment without any cost to the shipping path; a follow-up may revert it once the
+  negative is considered permanently settled.
+
+#### Environment / harness notes (A100 re-run)
+
+The re-run was on a newer-onnx box than the original H200 capture; two
+environment-compatibility fixes to the test tree were needed to make the harness
+runnable (behavior-preserving; correctness re-validated):
+
+- `quantize_weight_to_mxfp4` (`test_qmoe_fp4_cuda.py`) used a per-element Python
+  `.item()` double loop for the ue8m0 block-scale codes (~24.9 M serialized GPU↔CPU
+  syncs at this shape) → `build_session` took **> 7 min and never finished**. Replaced
+  with a vectorized torch computation (`torch.round(log2(...))` + `clamp(1,254)`),
+  dropping per-session setup to ~8 s. Correctness unchanged.
+- `create_fp4_moe_onnx_graph` stamps the onnx-package default opset (27 for
+  onnx ≥ 1.22), which ORT rejects (`ai.onnx` officially supported through opset 26).
+  The MoE op is a `com.microsoft` contrib op, so `bench_fp4_gemv_autotune.py`'s
+  `build_session` now clamps the `ai.onnx` opset to 26 before session creation.
+
+---
+
+## 2026-06-30 — FP4 GEMV interleaved (“Lever A”) + **dtype-conditional accumulation**, opt-in (fp16 decode win ~4 %; bf16 accuracy-safe)
+
+This revisits the **2026-06-17 interleaved-layout negative** above, which closed
+with the open question:
+
+> Future work that wants the interleaved layout must pair it with an accumulation
+> strategy that is both higher-precision (for bf16 parity) **and** register-frugal
+> (to preserve occupancy) — the two have so far been mutually exclusive in this
+> kernel.
+
+“Lever A” is the attempt to satisfy that constraint. The key realization is that
+the precision-vs-occupancy tension **does not have to be resolved by one
+accumulator** — it can be split **per activation dtype**, because fp16 and bf16
+have different mantissa budgets. The result: **fp16 gets a real ~4 % decode win**
+from the interleaved layout, and **bf16 stays accurate** at a small (~1.6 %) cost.
+The path is kept **committed but opt-in** behind `ORT_FP4_GEMV_INTERLEAVED=1`
+(default off; shipping `ColumnMajor` path byte-for-byte unchanged).
+
+### What was implemented (kept, opt-in — not reverted)
+
+The three "levers" the prior single attempts kept separate, now combined:
+
+1. **Interleaved layout (lever 1).** `Fp4KernelDetailsInterleaved<T>` =
+   `KernelDetails<…, ColumnMajorInterleaved, false, TileSizeK=64>` ⇒
+   `kInterleave=4`, `kStepK=32`, `kThreadsPerInterleavedTile=2` (4× fewer K-trips
+   than the `kStepK=8` `ColumnMajor` baseline). The linear `Fp4I2FConverter` is
+   reused (`UseInterleavedConverter=false`); the preprocessor's layout-only
+   steps 1–3 produce exactly the nibble order the linear converter expects.
+2. **dtype-conditional accumulation (lever 2 — the new idea).**
+   `Fp4LeverAAccT<T> = std::conditional_t<std::is_same_v<T, half>, half, float>`:
+   - **fp16 → fp16 accum.** fp16's 10-bit mantissa tolerates 16-bit accumulation
+     over the longer `kStepK=32` chains; this keeps registers low (~79 reg).
+   - **bf16 → fp32 accum.** bf16's 7-bit mantissa does **not** — 16-bit accum
+     fails the bf16 tolerance — so bf16 accumulates in fp32 (~96 reg).
+3. **Smaller `CtaN` (lever 3).** `kInterleavedCtaN=4` (vs default 8), pinned with
+   `kInterleavedThreads=128` (config ignored so weights and kernel always agree).
+
+A diagnostic override `ORT_FP4_GEMV_INTERLEAVED_HALFACC=1` forces **16-bit accum
+for both dtypes** (used to isolate the layout-vs-accum effect; it regresses bf16).
+
+Files (all behind the gate; native WFP4AFP8 paths unchanged):
+
+- **`moe_gemv_fp4.{h,cu}`**: `Fp4MoeGemvUseInterleaved()` (env gate),
+  `Fp4MoeGemvInterleavedHalfAccum()` (diagnostic), `Fp4KernelDetailsInterleaved<T>`,
+  `Fp4LeverAAccT<T>`, interleaved branch in both `launch_moe_gemv_fp4_symmetric`
+  (fc2) and `launch_moe_gemv_fp4_symmetric_interleaved_swiglu` (fc1, before split-K),
+  and the interleaved shape gate (`n % (CtaN*4)==0`, `k % 64==0`).
+- **`fpA_intB_gemm_preprocessors.{h,_impl.cu}`**: `apply_bias_interleave=true`
+  param; FP4 passes `false` to skip integer-only step 4 (the `+8` bias +
+  pair-interleave would corrupt e2m1 float codes); layout-only steps 1–3 apply
+  to e2m1 unchanged.
+- **`moe_quantization.{h,cc}`**: `PrePackRepackFP4Weights(..., gemv_interleaved)`;
+  the interleaved branch routes raw `[E,k,n/2]` e2m1 per-expert through the CUTLASS
+  fpA_intB SM80 `W4_A16` preprocessor (`apply_bias_interleave=false`,
+  `packing_sm=80`). Scales unchanged (`kStepK=32` == MXFP4 block size).
+
+### Result — correctness PASS (4/4), fp16 decode win, bf16 accuracy-safe
+
+Hardware: **A100-SXM4-80GB (sm_80)**, graphics clock locked to 1410 MHz, idle GPU,
+CUDA 13.0. Correctness shape `hidden=inter=512`, swiglu, top_k=4; microbench shape
+`hidden=inter=2880`, `E=32`, `top_k=4`, `tokens=1` (`bench_fp4_gemv_autotune.py`).
+
+**Correctness (vs torch reference, all 4 cases PASS):**
+
+| `test_fp4_decode_swiglu_gemv` case | baseline (fp32 accum) | Lever A | atol |
+|---|---|---|---|
+| FP16 tokens=1 | 0.0078 | 0.0156 | 0.12 |
+| FP16 tokens=2 | 0.0078 | 0.0234 | 0.12 |
+| BF16 tokens=1 | 0.0625 | **0.0625** | 0.15 |
+| BF16 tokens=2 | 0.0625 | **0.0625** | 0.15 |
+
+fp16 uses the cheaper 16-bit accum (slightly looser but well within the 0.12
+atol); bf16 keeps fp32 accum and is bit-for-bit the baseline quality — the
+2026-06-17 bf16 regression (0.1563 / 0.1875) is **resolved**.
+
+**Decode kernel (ncu, fc1 fused-SwiGLU GEMV, `moe_gemv_interleaved_swiglu_kernel`):**
+
+| Config | reg/thread | occupancy | fc1 GEMV duration |
+|---|---|---|---|
+| baseline `ColumnMajor` (fp32 accum) | 56 | 48.9 % | ~101 µs |
+| **Lever A fp16** (fp16 accum) | **79** | **31.7 %** | **~96.8 µs** |
+| Lever A bf16 (fp32 accum) | 96 | 27.9 % | ~107.8 µs |
+
+**End-to-end (`BEST` of 8 reps × 400 iters, µs/run):**
+
+| dtype | baseline | Lever A | Δ |
+|---|---|---|---|
+| **fp16** | 172.1 | **165.3** | **−4.0 % (faster)** |
+| bf16 | 173.8 | 176.6 | +1.6 % (slower) |
+
+### Why fp16 wins and bf16 does not
+
+The 2026-06-17 diagnosis was correct that this GEMV is **occupancy/register-bound,
+not K-loop-bound** — the 4× K-trip reduction alone is a wash. The lever that
+actually moves occupancy is the **accumulator width**, not the layout, `CtaN`, or
+K-tiling:
+
+- A `CtaN` probe (4 vs 2) gave **identical** 96 reg / 28 % occ — `CtaN` is *not*
+  the register lever.
+- fp32 accum costs **+17 registers** (79 → 96), which drops occupancy 31.7 % →
+  27.9 % and **exactly cancels** the interleaved layout's K-trip savings (Lever A
+  bf16 is ~neutral-to-slightly-slower vs baseline).
+- fp16 accum stays at 79 reg / 31.7 % occ, so fp16 **keeps** the interleaved
+  layout's K-trip savings → a genuine ~4 % e2e win.
+
+So the precision-vs-occupancy tension is real and per-dtype: fp16 can afford the
+cheap accumulator and pockets the layout win; bf16 cannot, so it pays the fp32
+register cost and the layout win is erased. There is no single accumulator that is
+both high-precision and register-frugal here — the dtype split is the resolution.
+
+### Reproduce
+
+```bash
+# Build (C++/CUDA only, sm_80, FP4 QMoE on)
+cd ~/git/onnxruntime && ./build.sh --config Release --build_dir build/cu130_fp4_bench \
+  --build_wheel --parallel --nvcc_threads 2 --use_cuda \
+  --cuda_home <cuda> --cudnn_home <cudnn> --compile_no_warning_as_error --skip_tests \
+  --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES=80 \
+  --cmake_extra_defines onnxruntime_USE_FP4_QMOE=ON \
+  --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF
+
+# Correctness (A100/sm_80; monkeypatch the SM<90 skip to exercise the decode path)
+ORT_ENABLE_FP4_GEMV=1 ORT_FP4_GEMV_INTERLEAVED=1 python test_fp4_decode_swiglu_gemv ...
+
+# Decode microbench / ncu (lock clocks first: sudo nvidia-smi -i 0 -lgc 1410)
+cd onnxruntime/test/python/transformers
+ORT_ENABLE_FP4_GEMV=1 ORT_FP4_GEMV_INTERLEAVED=1 python bench_fp4_gemv_autotune.py \
+  --dtype fp16 --reps 8 --iters 400      # baseline: drop ORT_FP4_GEMV_INTERLEAVED
+```
+
+> **Reproducibility gotcha (cost a wrong measurement).** The ORT `--build_wheel`
+> step **strips** `libonnxruntime_providers_cuda.so`, which can drop newly-added
+> template-instantiated `__global__` kernels (here the fp16 16-bit-accum interleaved
+> kernels). The installed wheel `.so` then silently falls back to a surviving
+> instantiation, making two configs that should differ produce **bit-identical**
+> ncu numbers. Verify with `nm -C <installed.so> | grep moe_gemv_interleaved_swiglu_kernel
+> | grep ColumnMajorInterleaved | grep ', 4, 128,'`; if the expected `__half, __half`
+> / `__nv_bfloat16, float` instantiations are missing, copy the **unstripped**
+> `build/.../Release/libonnxruntime_providers_cuda.so` over the venv copy before
+> profiling.
+
+### Status / verdict
+
+- **Kept, opt-in.** First **positive** FP4 decode result in this series: a real
+  ~4 % fp16 e2e decode win, accuracy-safe for bf16. The interleaved layout *is* a
+  lever — but only for fp16, and only once the accumulator is chosen per dtype.
+- **bf16 gets no win** (the fp32 register cost erases it), so for bf16 the
+  interleaved path is not worth enabling; the gate being opt-in lets fp16-only
+  deployments take the win without affecting bf16 or the shipping default.
+- **Open follow-up** (still the 2026-06-17 dream for bf16): a **register-frugal
+  higher-precision accumulator** — e.g. fp32 only in the final cross-step reduce,
+  or fewer live fp32 accumulators — to give bf16 the same occupancy as fp16-accum
+  while keeping fp32 precision. That, plus the tensor-core grouped-GEMM lever,
+  remain the paths to close the bf16 decode gap.
