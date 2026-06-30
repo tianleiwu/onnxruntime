@@ -58,9 +58,6 @@ const char* QMoEGemvConfigName(onnxruntime::llm::kernels::moe_gemv::MoeGemvConfi
   if (config == MoeGemvConfig::kThreads64) {
     return "threads64";
   }
-  if (config == MoeGemvConfig::kSplitK2) {
-    return "splitk2";
-  }
   return "default";
 }
 
