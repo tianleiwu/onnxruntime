@@ -301,9 +301,16 @@ class MoeGemmRunner {
                TmaWarpSpecializedGroupedGemmInput hopper_inputs);
 
   std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs() const;
-  static std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(int sm);
-  static std::vector<cutlass_extensions::CutlassGemmConfig> getTmaWarpSpecializedConfigs(int sm);
-  static std::vector<cutlass_extensions::CutlassGemmConfig> getAmpereConfigs(int sm);
+  static std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(int sm, bool use_sm80_fp4 = false);
+  static std::vector<cutlass_extensions::CutlassGemmConfig> getTmaWarpSpecializedConfigs(int sm, bool use_sm80_fp4 = false);
+  static std::vector<cutlass_extensions::CutlassGemmConfig> getAmpereConfigs(int sm, bool use_sm80_fp4 = false);
+
+  // Route wfp4a16 (MXFP4 weights + FP16/BF16 activations) through the SM80 fused-dequant grouped
+  // GEMM instead of the SM90 TMA WS path. The decision is made once in the QMoE op constructor
+  // (which reads ORT_FP4_SM80_GEMM / ORT_ENABLE_FP4_CUTLASS_GEMM at the right time) and pushed in
+  // here, so config selection at inference time does NOT depend on the live environment.
+  void setUseSm80Fp4(bool v) { use_sm80_fp4_ = v; }
+  [[nodiscard]] bool useSm80Fp4() const { return use_sm80_fp4_; }
 
   [[nodiscard]] bool isTmaWarpSpecialized(cutlass_extensions::CutlassGemmConfig gemm_config) const;
   [[nodiscard]] bool supportsTmaWarpSpecialized() const;
@@ -327,6 +334,9 @@ class MoeGemmRunner {
  private:
   int sm_{};
   int multi_processor_count_{};
+  // wfp4a16 only: when true, config selection offers the SM80 fused-dequant Ampere grouped GEMM
+  // and suppresses the SM90 TMA WS configs. Set by the QMoE op after construction.
+  bool use_sm80_fp4_ = false;
   mutable int num_experts_ = 0;
   mutable size_t gemm_workspace_size_ = 0;
   size_t calcMaxWorkspaceSize(int num_experts) const;

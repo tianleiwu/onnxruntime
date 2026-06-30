@@ -2087,3 +2087,54 @@ flag off (default path unchanged).
 At the gpt-oss-20b prefill regime (~64 tok/expert) the SM80 path is **4.7× faster than the
 SM90 TMA mixed kernel and 7.5× faster than the dense A16 dequant fallback**, landing close
 to INT4's SM80 envelope (0.66 ms) — closing the bulk of the FP4-vs-INT4 prefill gap.
+
+## 2026-06-30 FP4 SM80 Grouped GEMM: Default-On + Constructor-Plumbed Decision + Long-Sequence Crossover
+
+### Default-on
+
+The SM80 fused-dequant FP4 grouped GEMM is now **enabled by default** for fp16 wfp4a16 on
+`sm < 120` (set `ORT_FP4_SM80_GEMM=0` to disable). At the common gpt-oss-20b prefill regime
+it is several times faster than both the SM90 TMA mixed kernel and the dense A16 dequant
+fallback (see prior section), so it is the better default. The `enable_fp4_sm80_gemm_` decision
+in `moe_quantization.cc` is gated by `use_fp4_dequant_fallback_ (= sm_ < 120) && is_fp16 &&
+!requested_native`, so it yields to the explicit native opt-in (`ORT_ENABLE_FP4_CUTLASS_GEMM=1`)
+and never engages on Blackwell (`sm >= 120`, native FP4 tensor cores).
+
+### Env read once in the constructor, then plumbed (not per-call `getenv`)
+
+Config/tactic selection for the MoE grouped GEMM happens lazily at **inference** time, not at
+session creation. The earlier implementation read `ORT_FP4_SM80_GEMM` / `ORT_ENABLE_FP4_CUTLASS_GEMM`
+fresh inside `moeUseSm80Fp4()` on every config-selection call. A unit test
+(`test_fp4_native_cutlass_row_varying_scales`) creates the session with native enabled, then
+**restores** the environment in a `finally` block *before* calling `session.run()`. The profiler
+then re-read the (restored) env at inference time and disagreed with the runner that was built at
+construction → `!config.is_tma_warp_specialized was false` at `moe_kernels.cu:2163`.
+
+Fix: the QMoE op reads the env **once in its constructor** (`enable_fp4_sm80_gemm_`) and pushes the
+decision into the runner via a new `setUseSm80Fp4(bool)` virtual on `CutlassMoeFCRunnerInterface`,
+which forwards to `MoeGemmRunner::setUseSm80Fp4()` (a stored `use_sm80_fp4_` member) and re-picks a
+valid default tactic from the now-filtered config list. `getConfigs`/`getAmpereConfigs`/
+`getTmaWarpSpecializedConfigs` take the flag as a parameter (instance path uses the stored member);
+no environment is read during inference. All 20 tests pass with flags unset, with
+`ORT_FP4_SM80_GEMM=0`, and with explicit native (`ORT_ENABLE_FP4_CUTLASS_GEMM=1` + `_UNSAFE=1`).
+
+### Long-sequence crossover: keep the dequant fallback
+
+Question: now that both SM80 and SM90 kernels exist, is the dense A16 dequant fallback still needed?
+Swept gpt-oss-20b shape (H=2880, I=2880, E=32, top_k=4) to long sequences on H200, comparing the
+SM80 grouped GEMM (`ORT_FP4_SM80_GEMM=1`) against the dense dequant fallback (`ORT_FP4_SM80_GEMM=0`)
+and the SM90 native TMA path:
+
+| tokens/expert | total tokens | **SM80 grouped** | dense A16 fallback | SM90 native TMA |
+|--------------:|-------------:|-----------------:|-------------------:|----------------:|
+| 128           | 1024         | **1.52 ms**      | 8.32 ms            | 9.58 ms         |
+| 256           | 2048         | **2.47 ms**      | 8.64 ms            | 8.60 ms         |
+| 512           | 4096         | **4.50 ms**      | 9.38 ms            | 9.29 ms         |
+| 1024          | 8192         | **8.27 ms**      | 10.72 ms           | 10.67 ms        |
+| 2048          | 16384        | 15.84 ms         | **13.63 ms**       | 13.52 ms        |
+
+SM80 wins decisively up to ~1024 tokens/expert (up to 5× faster than the fallback), but **loses
+~16% at 2048 tokens/expert** (a 16K-token MoE call), where the dense fallback (and the equivalent
+compute-bound SM90 native path) become faster. So the dequant fallback is **kept** — it is the
+right path for extreme-long prefill. The `ORT_FP4_SM80_GEMM=0` knob selects it; SM80 stays the
+default because typical gpt-oss-20b prefills sit in the ≤1024 tok/expert regime where it dominates.

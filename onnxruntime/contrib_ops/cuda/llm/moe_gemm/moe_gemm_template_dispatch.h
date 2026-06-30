@@ -603,51 +603,31 @@ template <typename T, typename WeightType, typename OutputType, typename ScaleBi
 std::vector<cutlass_extensions::CutlassGemmConfig>
 MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs() const {
   ORT_LLM_LOG_ENTRY();
-  return getConfigs(sm_);
+  return getConfigs(sm_, use_sm80_fp4_);
 }
 
-// Route wfp4a16 (MXFP4 weights + FP16/BF16 activations) through the SM80 fused-dequant
-// grouped GEMM instead of the SM90 TMA WS path. Requires moe_quantization.cc to provide SM80
-// interleaved weights + FP16 group scales. ENABLED BY DEFAULT (it is several times faster than
-// the SM90 TMA FP4 path at the gpt-oss-20b prefill regime); set ORT_FP4_SM80_GEMM=0 to disable.
-//
-// This MUST stay in lock-step with the ``enable_fp4_sm80_gemm_`` decision in moe_quantization.cc,
-// which is gated by ``use_fp4_dequant_fallback_ (= sm_ < 120) && is_fp16 && !requested_native``:
-//   - ``sm < 120``: on Blackwell (sm >= 120) the FP4 runner is built for the NATIVE TMA/Blackwell
-//     path with non-interleaved weights, so SM80 must NOT be selected there.
-//   - ``!ORT_ENABLE_FP4_CUTLASS_GEMM``: if the user explicitly requested the native CUTLASS GEMM,
-//     honor that and use the TMA WS path instead. Reading the same env var here keeps both sites
-//     consistent even when native is requested but its shapes are unsupported (constructor then
-//     uses the dequant path, and this returns false, so no SM80 configs are offered).
-// The env is read fresh on every call (these are cold config-selection paths, not per-token): the
-// constructor reads it per-op, so caching here would desync the two sites whenever a process
-// changes the env between op constructions (e.g. unit tests toggling os.environ).
-inline bool moeUseSm80Fp4(int sm) {
-  if (sm >= 120) {
-    return false;
-  }
-  const char* e = std::getenv("ORT_FP4_SM80_GEMM");
-  // Default-on: only an explicit disabling value ('0'/'n'/'f') turns it off.
-  const bool sm80_enabled =
-      e == nullptr || !(e[0] == '0' || e[0] == 'n' || e[0] == 'N' || e[0] == 'f' || e[0] == 'F');
-  const char* n = std::getenv("ORT_ENABLE_FP4_CUTLASS_GEMM");
-  const bool native_requested = n != nullptr && n[0] == '1';
-  return sm80_enabled && !native_requested;
+// Whether wfp4a16 should use the SM80 fused-dequant grouped GEMM (vs the SM90 TMA WS path).
+// The ``use_sm80_fp4`` flag is the decision captured by the QMoE op constructor and pushed into
+// the runner via setUseSm80Fp4(); we only add the hard architectural guard that the SM80 path is
+// for sm < 120 (on Blackwell the FP4 runner uses the native TMA/Blackwell path). No environment
+// is read here, so inference-time config selection is independent of the live environment.
+inline bool moeUseSm80Fp4(int sm, bool use_sm80_fp4) {
+  return use_sm80_fp4 && sm < 120;
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs(
-    int sm) {
+    int sm, bool use_sm80_fp4) {
   ORT_LLM_LOG_ENTRY();
-  std::vector<cutlass_extensions::CutlassGemmConfig> candidate_configs = getTmaWarpSpecializedConfigs(sm);
-  std::vector<cutlass_extensions::CutlassGemmConfig> ampere_configs = getAmpereConfigs(sm);
+  std::vector<cutlass_extensions::CutlassGemmConfig> candidate_configs = getTmaWarpSpecializedConfigs(sm, use_sm80_fp4);
+  std::vector<cutlass_extensions::CutlassGemmConfig> ampere_configs = getAmpereConfigs(sm, use_sm80_fp4);
   std::copy(ampere_configs.begin(), ampere_configs.end(), std::back_inserter(candidate_configs));
   return candidate_configs;
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 std::vector<cutlass_extensions::CutlassGemmConfig>
-MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getAmpereConfigs(int sm) {
+MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getAmpereConfigs(int sm, bool use_sm80_fp4) {
   ORT_LLM_LOG_ENTRY();
   using onnxruntime::llm::cutlass_extensions::CutlassGemmConfig;
   static constexpr auto weight_only_flag = std::is_same<T, WeightType>::value ? CutlassGemmConfig::NONE : CutlassGemmConfig::WEIGHT_ONLY;
@@ -666,7 +646,7 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getAmpereConfigs(int sm
   // wfp4a16 is Ampere-valid (for the SM80 fused-dequant path) but only offer SM80 configs when the
   // SM80 FP4 path is enabled (default-on for sm < 120); otherwise the default SM90 TMA WS path is used.
   if constexpr (use_wfp4a16) {
-    if (!moeUseSm80Fp4(sm)) {
+    if (!moeUseSm80Fp4(sm, use_sm80_fp4)) {
       return {};
     }
   }
@@ -677,7 +657,7 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getAmpereConfigs(int sm
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 std::vector<cutlass_extensions::CutlassGemmConfig>
-MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedConfigs(int sm) {
+MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedConfigs(int sm, bool use_sm80_fp4) {
   ORT_LLM_LOG_ENTRY();
   using onnxruntime::llm::cutlass_extensions::CutlassGemmConfig;
   static constexpr auto weight_only_flag = std::is_same<T, WeightType>::value ? CutlassGemmConfig::NONE : CutlassGemmConfig::WEIGHT_ONLY;
@@ -695,7 +675,7 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
   // When the SM80 FP4 path is enabled, wfp4a16 uses the Ampere fused-dequant grouped GEMM only;
   // do not offer any TMA WS configs.
   if constexpr (use_wfp4a16) {
-    if (moeUseSm80Fp4(sm)) {
+    if (moeUseSm80Fp4(sm, use_sm80_fp4)) {
       return {};
     }
   }
@@ -746,7 +726,7 @@ bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsTmaWarpSpe
   }
 
   if constexpr (use_wfp4a16) {
-    if (moeUseSm80Fp4(sm_)) {
+    if (moeUseSm80Fp4(sm_, use_sm80_fp4_)) {
       return false;  // SM80 fused-dequant grouped GEMM path; not TMA warp specialized.
     }
     return sm_ >= 90 && kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType>();

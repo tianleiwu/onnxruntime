@@ -319,6 +319,10 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
         m_fp4_dense_fallback_runner_ = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16>>(
             sm_, activation_type_, normalize_routing_weights_, use_sparse_mixer_);
       }
+      // Capture the SM80-FP4 routing decision (made above from the environment at op-construction
+      // time) into the runner, so inference-time config/tactic selection does not re-read the
+      // environment (which may have changed since the session was created, e.g. in unit tests).
+      m_moe_runner->setUseSm80Fp4(enable_fp4_sm80_gemm_);
 #endif
     } else if (quant_type_ == "wfp4afp8" && !use_wfp4afp8_dequant_fallback_) {
 #if defined(ENABLE_FP4) && defined(USE_FP4_QMOE) && defined(ENABLE_FP8) && defined(USE_FP8_QMOE)
