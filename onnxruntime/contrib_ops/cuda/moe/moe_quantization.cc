@@ -1146,7 +1146,9 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
       (enable_fp4_cutlass_gemm_ && fp4_prefill_min_tokens_ > 0 &&
        moe_params.num_rows < fp4_prefill_min_tokens_);
   const bool fp4_gemv_buffers_ready =
-      gemv_fp4_fc1_weights_ != nullptr && gemv_fp4_fc2_weights_ != nullptr &&
+      (enable_fp4_sm80_gemm_
+           ? (gemv_fp4_fc1_weights_decode_ != nullptr && gemv_fp4_fc2_weights_decode_ != nullptr)
+           : (gemv_fp4_fc1_weights_ != nullptr && gemv_fp4_fc2_weights_ != nullptr)) &&
       gemv_fp4_fc1_scales_ != nullptr && gemv_fp4_fc2_scales_ != nullptr;
   if (is_fp4 && fp4_decode_regime && enable_fp4_gemv_ && is_fused_swiglu &&
       fp4_gemv_buffers_ready) {
@@ -1161,6 +1163,13 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
     const bool fc1_gemv_supported = gemv::is_moe_gemv_fp4_supported(sm_, expanded, fc1_n, hidden, 32);
     const bool fc2_gemv_supported = gemv::is_moe_gemv_fp4_supported(sm_, expanded, hidden, inter, 32);
     if (num_rows > 0 && num_rows <= 256 && expanded > 0 && fc1_gemv_supported && fc2_gemv_supported) {
+      // When the SM80 grouped-GEMM prefill repurposes gemv_fp4_fc*_weights_ for its pair-
+      // interleaved layout, the decode GEMV reads its own ColToRow copy in
+      // gemv_fp4_fc*_weights_decode_ instead (the SM80 layout is not GEMV-decodable).
+      const uint8_t* gemv_fc1_weight = static_cast<const uint8_t*>(
+          (enable_fp4_sm80_gemm_ ? gemv_fp4_fc1_weights_decode_ : gemv_fp4_fc1_weights_).get());
+      const uint8_t* gemv_fc2_weight = static_cast<const uint8_t*>(
+          (enable_fp4_sm80_gemm_ ? gemv_fp4_fc2_weights_decode_ : gemv_fp4_fc2_weights_).get());
       auto p_r2u_buf = GetScratchBuffer<int>(expanded, GetComputeStream(context));
       auto p_exp_buf = GetScratchBuffer<int>(expanded, GetComputeStream(context));
       auto p_efto_buf = GetScratchBuffer<int64_t>(num_experts + 1, GetComputeStream(context));
@@ -1220,7 +1229,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
         auto launch_fc1 = [&](MoeGemvConfig cfg) {
           gemv::launch_moe_gemv_fp4_symmetric_interleaved_swiglu<T>(
               static_cast<const T*>(p_act_buf.get()),
-              static_cast<const uint8_t*>(gemv_fp4_fc1_weights_.get()),
+              gemv_fc1_weight,
               static_cast<const T*>(gemv_fp4_fc1_scales_.get()),
               static_cast<const T*>(fc1_bias), static_cast<T*>(p_fc1_buf.get()),
               p_efto, p_exp, num_experts, expanded, inter, hidden, 32, sm_, act_params, cfg, stream);
@@ -1228,7 +1237,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
         auto launch_fc2 = [&](MoeGemvConfig cfg) {
           gemv::launch_moe_gemv_fp4_symmetric<T>(
               static_cast<const T*>(p_fc1_buf.get()),
-              static_cast<const uint8_t*>(gemv_fp4_fc2_weights_.get()),
+              gemv_fc2_weight,
               static_cast<const T*>(gemv_fp4_fc2_scales_.get()),
               static_cast<const T*>(fc2_bias), static_cast<T*>(p_fc2_buf.get()),
               p_efto, p_exp, num_experts, expanded, hidden, inter, 32, sm_, cfg, stream);
@@ -1546,16 +1555,31 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
     // is_packed = false so the raw [E, hidden, n/2] initializer remains available for the
     // dequant fallback used by shapes the GEMV does not support. When the SM80 grouped-GEMM
     // port is enabled, force the SM80 CUTLASS ColumnMajorTileInterleave layout (Lever A) so
-    // the same buffer feeds both the decode GEMV and the prefill grouped GEMM.
+    // this buffer feeds the prefill grouped GEMM; the decode GEMV then reads its own ColToRow
+    // copy in gemv_fp4_fc1_weights_decode_ (packed below) since it cannot consume that layout.
     bool local_packed = false;
     PrePackRepackFP4Weights(tensor, stream, alloc, gemv_fp4_fc1_weights_, local_packed,
                             onnxruntime::llm::kernels::moe_gemv::Fp4MoeGemvUseInterleaved() ||
-                                enable_fp4_sm80_gemm_);
+                                enable_fp4_sm80_gemm_,
+                            /*sm80_pair_interleave=*/enable_fp4_sm80_gemm_);
+    if (enable_fp4_sm80_gemm_) {
+      bool decode_packed = false;
+      PrePackRepackFP4Weights(tensor, stream, alloc, gemv_fp4_fc1_weights_decode_, decode_packed,
+                              onnxruntime::llm::kernels::moe_gemv::Fp4MoeGemvUseInterleaved(),
+                              /*sm80_pair_interleave=*/false);
+    }
   } else if (input_idx == 5 && quant_type_ == "fp4" && enable_fp4_gemv_) {
     bool local_packed = false;
     PrePackRepackFP4Weights(tensor, stream, alloc, gemv_fp4_fc2_weights_, local_packed,
                             onnxruntime::llm::kernels::moe_gemv::Fp4MoeGemvUseInterleaved() ||
-                                enable_fp4_sm80_gemm_);
+                                enable_fp4_sm80_gemm_,
+                            /*sm80_pair_interleave=*/enable_fp4_sm80_gemm_);
+    if (enable_fp4_sm80_gemm_) {
+      bool decode_packed = false;
+      PrePackRepackFP4Weights(tensor, stream, alloc, gemv_fp4_fc2_weights_decode_, decode_packed,
+                              onnxruntime::llm::kernels::moe_gemv::Fp4MoeGemvUseInterleaved(),
+                              /*sm80_pair_interleave=*/false);
+    }
   } else if (input_idx == 2 && quant_type_ == "int" && !weights_prepacked_) {
     // Caller opted in (``weights_prepacked=0`` attribute) to having ORT
     // do the CUTLASS fpA_intB layout transform internally, instead of
@@ -1928,7 +1952,7 @@ void QMoE::PrePackFp4ScalesForTmaWs(const Tensor& tensor, cudaStream_t stream, A
 // ---------------------------------------------------------------------------
 void QMoE::PrePackRepackFP4Weights(const Tensor& tensor, cudaStream_t stream, AllocatorPtr alloc,
                                    IAllocatorUniquePtr<void>& packed_buf, bool& is_packed,
-                                   bool gemv_interleaved) {
+                                   bool gemv_interleaved, bool sm80_pair_interleave) {
   auto shape = tensor.Shape();
   ORT_ENFORCE(shape.NumDimensions() == 3, "Expected 3D FP4 weights for WFP4AFP8 native prepack");
   ORT_ENFORCE(tensor.IsDataType<uint8_t>(), "Expected uint8 FP4 weights for WFP4AFP8 native prepack");
@@ -1985,10 +2009,10 @@ void QMoE::PrePackRepackFP4Weights(const Tensor& tensor, cudaStream_t stream, Al
                                       per_expert_bytes, cudaMemcpyDeviceToDevice, stream));
       // synchronize=false: one host-blocking sync after the loop (stream ordering guarantees
       // expert e finishes before e+1 reuses src_scratch). apply_bias_interleave=false for e2m1.
-      // When this buffer feeds the SM80 MoE grouped GEMM (enable_fp4_sm80_gemm_), additionally
+      // When this buffer feeds the SM80 MoE grouped GEMM (sm80_pair_interleave), additionally
       // apply step 4's nibble pair-interleave WITHOUT the +8 bias, which is the layout that
-      // GEMM's e2m1 dequant converter inverts. The fused GEMV decode kernel (disabled under the
-      // SM80 flag) uses the plain steps-1-3 layout, so interleave_without_bias stays false there.
+      // GEMM's e2m1 dequant converter inverts. The fused GEMV decode kernel consumes the plain
+      // steps-1-3 layout, so it packs its own copy with sm80_pair_interleave=false.
       onnxruntime::llm::kernels::weight_only::preprocess_weights_for_mixed_gemm_cuda(
           stream,
           packing_sm,
@@ -1999,7 +2023,7 @@ void QMoE::PrePackRepackFP4Weights(const Tensor& tensor, cudaStream_t stream, Al
           QuantType::W4_A16,
           /*synchronize=*/false,
           /*apply_bias_interleave=*/false,
-          /*interleave_without_bias=*/enable_fp4_sm80_gemm_);
+          /*interleave_without_bias=*/sm80_pair_interleave);
     }
     CUDA_CALL_THROW(cudaStreamSynchronize(stream));
     is_packed = true;

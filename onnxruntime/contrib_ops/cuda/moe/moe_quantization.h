@@ -39,9 +39,15 @@ class QMoE final : public CudaKernel, public MoEBase {
                                  IAllocatorUniquePtr<void>& packed_buf, bool& is_packed);
   void PrePackFp4ScalesForTmaWs(const Tensor& tensor, cudaStream_t stream, AllocatorPtr alloc,
                                 IAllocatorUniquePtr<void>& packed_buf, bool& is_packed);
+  // ``gemv_interleaved`` selects the CUTLASS fpA_intB interleaved layout (steps 1-3) instead of
+  // the plain [E, n, k/2] row-major ColToRow layout. ``sm80_pair_interleave`` additionally applies
+  // the SM80 grouped-GEMM nibble pair-interleave (step 4, no +8 bias) on top of the interleaved
+  // layout; it is meaningful only when ``gemv_interleaved`` is true. The decode GEMV consumes the
+  // ColToRow (or steps-1-3) layout, so it must pass ``sm80_pair_interleave = false``; only the SM80
+  // grouped-GEMM prefill buffer sets it true.
   void PrePackRepackFP4Weights(const Tensor& tensor, cudaStream_t stream, AllocatorPtr alloc,
                                IAllocatorUniquePtr<void>& packed_buf, bool& is_packed,
-                               bool gemv_interleaved = false);
+                               bool gemv_interleaved = false, bool sm80_pair_interleave = false);
   // Builds the fused MXFP4 GEMV scale buffer for fc (1 or 2) once both the e8m0 block
   // scales (inputs 3/6) and the per-expert global scale (inputs 15/16) have been staged
   // to GPU. Order-independent: invoked from both PrePack handlers; the call that completes
@@ -141,7 +147,9 @@ class QMoE final : public CudaKernel, public MoEBase {
   // DqMma grouped GEMM (the same kernel INT4 uses) closes most of the gap. When set, PrePack lays the e2m1
   // weights out in the SM80 CUTLASS ColumnMajorTileInterleave layout (reusing the GEMV
   // "Lever A" buffers) and ComputeInternal routes prefill through the FP4 runner with
-  // QuantParams::GroupWise(32, ...) activation-dtype group scales. Decode still uses the fused GEMV.
+  // QuantParams::GroupWise(32, ...) activation-dtype group scales. Because that layout is
+  // incompatible with the decode GEMV kernel, PrePack also packs a separate ColToRow copy of
+  // the e2m1 weights (gemv_fp4_fc*_weights_decode_) that the fused GEMV decode path consumes.
   bool enable_fp4_sm80_gemm_ = false;
   // When native CUTLASS WFP4A16 is enabled, GEMV is also pre-packed and used for decode shapes
   // (M < this threshold); prefill (M >= threshold) runs the native grouped GEMM. 0 disables the
@@ -161,6 +169,13 @@ class QMoE final : public CudaKernel, public MoEBase {
   bool enable_fp4_gemv_autotune_log_ = false;
   IAllocatorUniquePtr<void> gemv_fp4_fc1_weights_;  // [E, 2*inter, hidden/2] row-major e2m1
   IAllocatorUniquePtr<void> gemv_fp4_fc2_weights_;  // [E, hidden, inter/2] row-major e2m1
+  // When enable_fp4_sm80_gemm_ repurposes gemv_fp4_fc*_weights_ for the SM80 grouped-GEMM
+  // prefill (SM80 pair-interleaved layout, which the decode GEMV kernel cannot read), these
+  // hold the decode GEMV's own copy of the e2m1 weights in the GEMV-consumed layout
+  // (ColToRow, or Lever-A steps-1-3). Null when SM80 GEMM is disabled -- then the decode GEMV
+  // reads gemv_fp4_fc*_weights_ directly.
+  IAllocatorUniquePtr<void> gemv_fp4_fc1_weights_decode_;
+  IAllocatorUniquePtr<void> gemv_fp4_fc2_weights_decode_;
   IAllocatorUniquePtr<void> gemv_fp4_fc1_scales_;   // [E, hidden/32, 2*inter] activation dtype
   IAllocatorUniquePtr<void> gemv_fp4_fc2_scales_;   // [E, inter/32, hidden] activation dtype
   // Raw [E, n, k_blocks] e8m0 block scales kept for GEMV when the native CUTLASS path has
