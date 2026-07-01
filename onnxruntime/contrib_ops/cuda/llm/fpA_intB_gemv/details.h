@@ -94,6 +94,15 @@ struct Int4DetailsW {
   static constexpr int kElemBits = 4;
 };
 
+struct Fp4DetailsW {
+  static constexpr int kElemBits = 4;
+};
+
+template <typename TypeDetailsW>
+struct IsFp4Weight : std::false_type {};
+template <>
+struct IsFp4Weight<Fp4DetailsW> : std::true_type {};
+
 template <typename TypeDetailsA, typename TypeDetailsW, int TileSizeK>
 struct ColumnMajor {
   using DetailsA = TypeDetailsA;
@@ -223,12 +232,39 @@ struct I2FConverter<AType, WElemBits, false> {
   }
 };
 
+template <typename AType>
+struct Fp4I2FConverter {
+  static_assert(std::is_same_v<AType, half> || std::is_same_v<AType, __nv_bfloat16>);
+
+  __device__ __forceinline__ static AType decode(uint8_t code) {
+    constexpr float kValues[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    float v = kValues[code & 0x7];
+    return static_cast<AType>((code & 0x8) ? -v : v);
+  }
+
+  template <int N>
+  __device__ __forceinline__ static void convert(void* src, void* dst) {
+    static_assert(N % 2 == 0);
+    uint8_t const* s = reinterpret_cast<uint8_t const*>(src);
+    AType* d = reinterpret_cast<AType*>(dst);
+#pragma unroll
+    for (int i = 0; i < N; i += 2) {
+      uint8_t byte = s[i >> 1];
+      d[i] = decode(static_cast<uint8_t>(byte & 0x0F));
+      d[i + 1] = decode(static_cast<uint8_t>((byte >> 4) & 0x0F));
+    }
+  }
+};
+
 template <typename Details>
 struct ConverterWrapper {
   using TypeDetailsA = typename Details::TypeDetailsA;
   using TypeDetailsW = typename Details::TypeDetailsW;
   static constexpr bool kUseInterleavedConverter = Details::kUseInterleavedConverter;
-  using Converter = I2FConverter<typename TypeDetailsA::Type, TypeDetailsW::kElemBits, kUseInterleavedConverter>;
+  using Converter = std::conditional_t<
+      IsFp4Weight<TypeDetailsW>::value,
+      Fp4I2FConverter<typename TypeDetailsA::Type>,
+      I2FConverter<typename TypeDetailsA::Type, TypeDetailsW::kElemBits, kUseInterleavedConverter>>;
 };
 
 template <bool isGroupwise, typename Details>

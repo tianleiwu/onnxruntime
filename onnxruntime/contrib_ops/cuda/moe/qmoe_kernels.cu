@@ -1020,6 +1020,121 @@ void LaunchQMoEDequantizeFp4Weights(
   LaunchQMoEDequantizeFp4WeightsImpl(packed_weights, block_scales, global_scales, output, num_experts, n, k, stream);
 }
 
+template <typename T>
+__global__ void QMoECombineFp4ScalesForGemvKernel(
+    const uint8_t* block_scales,
+    const float* global_scales,
+    T* output,
+    int experts,
+    int n,
+    int k_blocks) {
+  int64_t total = static_cast<int64_t>(experts) * n * k_blocks;
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= total) {
+    return;
+  }
+
+  int64_t expert_stride = static_cast<int64_t>(n) * k_blocks;
+  int expert = static_cast<int>(index / expert_stride);
+  int64_t offset = index - static_cast<int64_t>(expert) * expert_stride;
+  int row = static_cast<int>(offset / k_blocks);
+  int k_block = static_cast<int>(offset - static_cast<int64_t>(row) * k_blocks);
+
+  int64_t output_index = (static_cast<int64_t>(expert) * k_blocks + k_block) * n + row;
+  float scale = DecodeUE8M0(block_scales[index]) * global_scales[expert];
+  output[output_index] = static_cast<T>(scale);
+}
+
+template <typename T>
+void LaunchQMoECombineFp4ScalesForGemvImpl(
+    const uint8_t* block_scales,
+    const float* global_scales,
+    T* output,
+    int experts,
+    int n,
+    int k_blocks,
+    cudaStream_t stream) {
+  int64_t total = static_cast<int64_t>(experts) * n * k_blocks;
+  constexpr int block = 256;
+  int grid = onnxruntime::narrow<int>((total + block - 1) / block);
+  QMoECombineFp4ScalesForGemvKernel<<<grid, block, 0, stream>>>(
+      block_scales, global_scales, output, experts, n, k_blocks);
+}
+
+void LaunchQMoECombineFp4ScalesForGemv(
+    const uint8_t* block_scales,
+    const float* global_scales,
+    half* output,
+    int experts,
+    int n,
+    int k_blocks,
+    cudaStream_t stream) {
+  LaunchQMoECombineFp4ScalesForGemvImpl(block_scales, global_scales, output, experts, n, k_blocks, stream);
+}
+
+void LaunchQMoECombineFp4ScalesForGemv(
+    const uint8_t* block_scales,
+    const float* global_scales,
+    __nv_bfloat16* output,
+    int experts,
+    int n,
+    int k_blocks,
+    cudaStream_t stream) {
+  LaunchQMoECombineFp4ScalesForGemvImpl(block_scales, global_scales, output, experts, n, k_blocks, stream);
+}
+
+__global__ void QMoEPackFp4ScalesForTmaWsKernel(
+    const uint8_t* input,
+    uint8_t* output,
+    int n,
+    int k_blocks,
+    int k_blocks_padded,
+    int packed_scales_per_k_tile,
+    int64_t total) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= total) {
+    return;
+  }
+
+  int inner = static_cast<int>(index % packed_scales_per_k_tile);
+  int row = static_cast<int>((index / packed_scales_per_k_tile) % n);
+  int64_t packed_k_tile = (index / packed_scales_per_k_tile) / n;
+  int packed_k_tiles = k_blocks_padded / packed_scales_per_k_tile;
+  int expert = static_cast<int>(packed_k_tile / packed_k_tiles);
+  int tile = static_cast<int>(packed_k_tile - static_cast<int64_t>(expert) * packed_k_tiles);
+  int k_block = tile * packed_scales_per_k_tile + inner;
+
+  // Tail k-blocks added by padding k_blocks up to a multiple of packed_scales_per_k_tile are
+  // zero-filled. They are only read by the GEMM's last partial CTA-K-tile, where the matching
+  // A/B K elements are TMA-zeroed, so their scale value does not affect the result.
+  output[index] = (k_block < k_blocks)
+                      ? input[(static_cast<int64_t>(expert) * n + row) * k_blocks + k_block]
+                      : static_cast<uint8_t>(0);
+}
+
+void LaunchQMoEPackFp4ScalesForTmaWs(
+    const uint8_t* input,
+    uint8_t* output,
+    int experts,
+    int n,
+    int k_blocks,
+    cudaStream_t stream) {
+  constexpr int kPackedScalesPerKTile = 8;
+  // Pad k_blocks up to a multiple of the packed K-tile so the GEMM's last (possibly partial)
+  // CTA-K-tile can read a full packed scale group. The caller must allocate the output buffer
+  // for the padded k-block count (experts * n * k_blocks_padded bytes).
+  const int k_blocks_padded =
+      ((k_blocks + kPackedScalesPerKTile - 1) / kPackedScalesPerKTile) * kPackedScalesPerKTile;
+  int64_t total = static_cast<int64_t>(experts) * n * k_blocks_padded;
+  if (total <= 0) {
+    return;
+  }
+  constexpr int block = 256;
+  int grid = onnxruntime::narrow<int>((total + block - 1) / block);
+  QMoEPackFp4ScalesForTmaWsKernel<<<grid, block, 0, stream>>>(
+      input, output, n, k_blocks, k_blocks_padded, kPackedScalesPerKTile, total);
+}
+
 __device__ __forceinline__ float DecodeFloat8E4M3FN(uint8_t code) {
   // ONNX float8e4m3fn has no infinities. The only NaN payloads are 0x7F/0xFF;
   // finite values, including the max finite code 0x7E, use the normal E4M3 formula.
