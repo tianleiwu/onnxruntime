@@ -527,6 +527,57 @@ class TestQMoEFP4(unittest.TestCase):
     # Dimensions must be multiples of 128 for MXFP4 alignment
     # (MinKDimAlignmentMXFPX = 128, MinNDimAlignmentMXFPX = 128)
 
+    def test_fp4_rejects_non_32_multiple_hidden_size(self):
+        """Reject truncated MXFP4 block-scale shapes before launching kernels."""
+        self._skip_if_no_fp4()
+
+        hidden_size = 258
+        inter_size = 256
+        num_experts = 2
+        top_k = 1
+        num_tokens = 1
+        onnx_dtype = TensorProto.FLOAT16
+
+        fc1_weights = torch.zeros((num_experts, hidden_size, inter_size // 2), dtype=torch.uint8, device=device)
+        fc2_weights = torch.zeros((num_experts, inter_size, hidden_size // 2), dtype=torch.uint8, device=device)
+        fc1_block_scales = torch.ones((num_experts, inter_size, hidden_size // 32), dtype=torch.uint8, device=device)
+        fc2_block_scales = torch.ones((num_experts, hidden_size, inter_size // 32), dtype=torch.uint8, device=device)
+        global_scale = torch.ones(num_experts, dtype=torch.float32, device=device)
+
+        onnx_model = create_fp4_moe_onnx_graph(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            inter_size=inter_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            onnx_dtype=onnx_dtype,
+            fc1_weights=fc1_weights,
+            fc2_weights=fc2_weights,
+            fc1_block_scales=fc1_block_scales,
+            fc1_global_scale=global_scale,
+            fc2_block_scales=fc2_block_scales,
+            fc2_global_scale=global_scale,
+        )
+
+        opts = onnxruntime.SessionOptions()
+        opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_DISABLE_ALL
+        opts.add_session_config_entry("session.disable_prepacking", "1")
+        session = onnxruntime.InferenceSession(
+            onnx_model, opts, providers=[resolve_cuda_plugin_ep("CUDAExecutionProvider")]
+        )
+
+        input_tensor = torch.zeros((num_tokens, hidden_size), device=device, dtype=torch.float16)
+        router_logits = torch.ones((num_tokens, num_experts), device=device, dtype=torch.float16)
+        output_tensor = torch.empty((num_tokens, hidden_size), device=device, dtype=torch.float16)
+
+        iobinding = session.io_binding()
+        iobinding.bind_input("input", "cuda", 0, onnx_dtype, input_tensor.shape, input_tensor.data_ptr())
+        iobinding.bind_input("router_probs", "cuda", 0, onnx_dtype, router_logits.shape, router_logits.data_ptr())
+        iobinding.bind_output("output", "cuda", 0, onnx_dtype, output_tensor.shape, output_tensor.data_ptr())
+
+        with self.assertRaisesRegex(Exception, "hidden_size to be a multiple of 32"):
+            session.run_with_iobinding(iobinding)
+
     def test_fp4_fp16_silu_basic(self):
         """Basic FP16 + SiLU activation."""
         self._run_fp4_moe_test(

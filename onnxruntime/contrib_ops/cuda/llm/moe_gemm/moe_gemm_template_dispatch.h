@@ -609,10 +609,10 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs() const {
 // Whether wfp4a16 should use the SM80 fused-dequant grouped GEMM (vs the SM90 TMA WS path).
 // The ``use_sm80_fp4`` flag is the decision captured by the QMoE op constructor and pushed into
 // the runner via setUseSm80Fp4(); we only add the hard architectural guard that the SM80 path is
-// for sm < 120 (on Blackwell the FP4 runner uses the native TMA/Blackwell path). No environment
-// is read here, so inference-time config selection is independent of the live environment.
+// for Ampere through pre-Blackwell. No environment is read here, so inference-time config selection
+// is independent of the live environment.
 inline bool moeUseSm80Fp4(int sm, bool use_sm80_fp4) {
-  return use_sm80_fp4 && sm < 120;
+  return use_sm80_fp4 && sm >= 80 && sm < 120;
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>

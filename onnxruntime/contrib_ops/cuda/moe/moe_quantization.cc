@@ -253,9 +253,9 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
             "ORT_FP4_NATIVE_MAX_TOKENS_PER_EXPERT", 128);
       }
       // SM80 FP4 grouped GEMM (port of the INT4 fused-dequant Ampere path to MXFP4).
-      // Only meaningful in the dequant-fallback regime (sm_ < 120, e.g. H200), where the
-      // native SM90 TMA FP4 path is the slow prefill path. This SM80 grouped GEMM is several
-      // times faster at the gpt-oss-20b prefill regime, so it is enabled by DEFAULT for FP16/BF16;
+      // Only meaningful on Ampere through pre-Blackwell in the dequant-fallback regime
+      // (80 <= sm_ < 120, e.g. H200), where the native SM90 TMA FP4 path is the slow prefill path.
+      // This SM80 grouped GEMM is several times faster at the gpt-oss-20b prefill regime, so it is enabled by DEFAULT for FP16/BF16;
       // set ORT_FP4_SM80_GEMM=0 to fall back to the dequant path.
       // If the user EXPLICITLY
       // requested the native CUTLASS GEMM (ORT_ENABLE_FP4_CUTLASS_GEMM=1) we honor that intent
@@ -266,7 +266,7 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
       // e2m1 weights + activation-dtype group scales) and later override the runner to the FP4 runner so
       // prefill can dispatch to the SM80 DqMma grouped GEMM (see moeUseSm80Fp4 in the kernels).
       enable_fp4_sm80_gemm_ =
-          use_fp4_dequant_fallback_ && !requested_fp4_cutlass_gemm &&
+          use_fp4_dequant_fallback_ && sm_ >= 80 && sm_ < 120 && !requested_fp4_cutlass_gemm &&
           onnxruntime::ParseEnvironmentVariableWithDefault<int>("ORT_FP4_SM80_GEMM", 1) == 1;
       if (enable_fp4_sm80_gemm_) {
         enable_fp4_gemv_ = true;
@@ -533,6 +533,12 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
 
   if (uses_fp4_weight_scales) {
     constexpr int64_t fp4_block_size = 32;
+    ORT_RETURN_IF_NOT(moe_params.hidden_size % fp4_block_size == 0,
+                      "QMoE quant_type='fp4'/'wfp4afp8' requires hidden_size to be a multiple of ",
+                      fp4_block_size, " for MXFP4 block scales, got hidden_size=", moe_params.hidden_size, ".");
+    ORT_RETURN_IF_NOT(moe_params.inter_size % fp4_block_size == 0,
+                      "QMoE quant_type='fp4'/'wfp4afp8' requires inter_size to be a multiple of ",
+                      fp4_block_size, " for MXFP4 block scales, got inter_size=", moe_params.inter_size, ".");
     const int64_t fc1_out_size = is_fused_swiglu ? moe_params.inter_size * 2 : moe_params.inter_size;
     auto check_fp4_block_scale = [](const Tensor* tensor, const char* name, int64_t num_experts,
                                     int64_t n, int64_t k) -> Status {
@@ -1207,11 +1213,15 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
       const int64_t row_bucket =
           onnxruntime::llm::kernels::cutlass_kernels::MoeGemmProfiler::bucketM(expanded);
       const Fp4GemvTuneKey tune_key{is_fp16_, row_bucket, hidden, inter, sm_};
-      const auto cached_tune = fp4_gemv_tune_cache_.find(tune_key);
-      const bool have_tune = cached_tune != fp4_gemv_tune_cache_.end();
-      if (have_tune) {
-        fc1_config = cached_tune->second.fc1_config;
-        fc2_config = cached_tune->second.fc2_config;
+      bool have_tune = false;
+      {
+        std::lock_guard<std::mutex> lock(fp4_gemv_tune_cache_mutex_);
+        const auto cached_tune = fp4_gemv_tune_cache_.find(tune_key);
+        have_tune = cached_tune != fp4_gemv_tune_cache_.end();
+        if (have_tune) {
+          fc1_config = cached_tune->second.fc1_config;
+          fc2_config = cached_tune->second.fc2_config;
+        }
       }
 
       cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
@@ -1309,7 +1319,10 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
             }
           }
 
-          fp4_gemv_tune_cache_.emplace(tune_key, Fp4GemvTuneResult{fc1_config, fc2_config});
+          {
+            std::lock_guard<std::mutex> lock(fp4_gemv_tune_cache_mutex_);
+            fp4_gemv_tune_cache_.try_emplace(tune_key, Fp4GemvTuneResult{fc1_config, fc2_config});
+          }
           if (log_tune) {
             LOGS_DEFAULT(WARNING) << "FP4 GEMV autotune: is_fp16=" << is_fp16_ << " expanded=" << expanded
                                   << " hidden=" << hidden << " inter=" << inter << " fc1="

@@ -176,8 +176,8 @@ class QMoE final : public CudaKernel, public MoEBase {
   // reads gemv_fp4_fc*_weights_ directly.
   IAllocatorUniquePtr<void> gemv_fp4_fc1_weights_decode_;
   IAllocatorUniquePtr<void> gemv_fp4_fc2_weights_decode_;
-  IAllocatorUniquePtr<void> gemv_fp4_fc1_scales_;   // [E, hidden/32, 2*inter] activation dtype
-  IAllocatorUniquePtr<void> gemv_fp4_fc2_scales_;   // [E, inter/32, hidden] activation dtype
+  IAllocatorUniquePtr<void> gemv_fp4_fc1_scales_;  // [E, hidden/32, 2*inter] activation dtype
+  IAllocatorUniquePtr<void> gemv_fp4_fc2_scales_;  // [E, inter/32, hidden] activation dtype
   // Raw [E, n, k_blocks] e8m0 block scales kept for GEMV when the native CUTLASS path has
   // already swizzled packed_fp4_*_block_scales_ into the TMA layout. Empty in the pure-GEMV
   // regime, where TryBuildGemvFp4Scales reads packed_fp4_*_block_scales_ directly.
@@ -240,6 +240,7 @@ class QMoE final : public CudaKernel, public MoEBase {
         onnxruntime::llm::kernels::moe_gemv::MoeGemvConfig::kDefault;
   };
 
+  mutable std::mutex fp4_gemv_tune_cache_mutex_;
   mutable std::unordered_map<Fp4GemvTuneKey, Fp4GemvTuneResult, Fp4GemvTuneKeyHash> fp4_gemv_tune_cache_;
 };
 

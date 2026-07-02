@@ -511,6 +511,12 @@ void interleave_without_bias_quantized_tensor_inplace_cuda(
     cudaStream_t stream) {
   ORT_ENFORCE(quant_type == QuantType::W4_A16 || quant_type == QuantType::W4_AFP8,
               "Interleave-without-bias is only supported for 4-bit (e2m1) weights.");
+  if (num_elts == 0) {
+    return;
+  }
+  ORT_ENFORCE(num_elts >= 8 && num_elts % 8 == 0,
+              "Interleave-without-bias requires the number of 4-bit elements to be a non-zero multiple of 8, got ",
+              num_elts, ".");
   const int threads_per_block = 256;
   const int num_registers = SafeInt<int32_t>(num_elts) / 8;
   const int num_blocks = (num_registers + threads_per_block - 1) / threads_per_block;
