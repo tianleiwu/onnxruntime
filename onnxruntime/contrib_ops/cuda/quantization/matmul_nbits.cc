@@ -36,6 +36,17 @@ using onnxruntime::llm::kernels::weight_only::WeightOnlyGroupwiseQuantGemmPlugin
 using onnxruntime::llm::kernels::weight_only::WeightTypeId;
 static GemmPluginProfilerManager<WeightOnlyGroupwiseQuantGemmPluginProfiler> s_profilerManager;
 
+// Process-global persistent tactic cache, shared across all MatMulNBits nodes so identical
+// shapes are tuned once and reused across sessions. Returns nullptr when persistence is not
+// configured (session config and env vars unset), in which case the profiler keeps its
+// in-process behavior. The first constructed kernel fixes the cache location.
+static std::shared_ptr<onnxruntime::llm::gemm_cache::MatMulNBitsTacticCache> GetGlobalMatMulNBitsTacticCache(
+    const std::string& config_dir, const std::string& config_prefix) {
+  static std::shared_ptr<onnxruntime::llm::gemm_cache::MatMulNBitsTacticCache> cache =
+      onnxruntime::llm::gemm_cache::MatMulNBitsTacticCache::MaybeCreate(config_dir, config_prefix);
+  return cache;
+}
+
 constexpr auto kScaleAndZeros = cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS;
 constexpr auto kScaleOnly = cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY;
 
@@ -91,6 +102,14 @@ void MatMulNBits<T>::InitGemmProfiler(int sm) {
   gemmProfiler_->setCudaKernelType(cuda_kernel_type, sm);
   gemmProfiler_->setQuant(nbits_, has_bias_, has_zero_points_);
   gemmProfiler_->setGroupSize(block_size_);
+
+  // Resolve the persistent tactic cache location from session config (falls back to env vars).
+  const auto& config_options = this->Info().GetConfigOptions();
+  const std::string cache_dir =
+      config_options.GetConfigOrDefault(onnxruntime::llm::gemm_cache::kSessionConfigCacheDir, "");
+  const std::string cache_prefix =
+      config_options.GetConfigOrDefault(onnxruntime::llm::gemm_cache::kSessionConfigCachePrefix, "");
+  gemmProfiler_->setPersistentCache(GetGlobalMatMulNBitsTacticCache(cache_dir, cache_prefix));
 
   auto allocator = this->Info().GetAllocator(OrtMemType::OrtMemTypeDefault);
   gemmProfiler_->setAllocator(allocator);
@@ -355,7 +374,12 @@ Status MatMulNBits<T>::ComputeInternal(OpKernelContext* ctx) const {
 
       const void* fpA_intB_weight = is_prepacked_weight_ ? fpA_intB_weight_buffer_.get() : static_cast<const void*>(blob_data);
 
-      auto const& bestTactic = gemmProfiler_->getBestConfig(m, gemmId_);
+      auto const bestTactic = gemmProfiler_->getBestConfigOrProfile(m, gemmId_);
+      if (!bestTactic.has_value()) {
+        return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL,
+                               "No valid fpA_intB MatMulNBits tactic for M=", m,
+                               ", N=", n, ", K=", k);
+      }
 
 #if ORT_LLM_VERBOSE > 1
       std::cout << "Best tactic for m=" << m << ", n=" << n << ", k=" << k << "group_size=" << block_size_
