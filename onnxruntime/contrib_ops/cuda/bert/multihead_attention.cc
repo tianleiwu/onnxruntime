@@ -42,6 +42,92 @@ REGISTER_KERNEL_TYPED(float, BFloat16)
 REGISTER_KERNEL_TYPED(BFloat16, float)
 REGISTER_KERNEL_TYPED(BFloat16, BFloat16)
 
+#if USE_LEAN_ATTENTION
+namespace {
+
+// Prototype heuristic derived from docs/contrib_ops/cuda/lean_attention_experiments.md.
+// It intentionally covers only measured quick-sweep decode regions. Broaden this only
+// after full-grid and non-SM90 validation.
+bool IsMeasuredLeanBetterThanFlash(const AttentionParameters& parameters) {
+  if (parameters.sequence_length != 1) {
+    return false;
+  }
+
+  const int batch_size = parameters.batch_size;
+  const int num_heads = parameters.num_heads;
+  const int head_size = parameters.head_size;
+  const int past_sequence_length = parameters.past_sequence_length;
+
+  if (head_size == 64) {
+    if (batch_size == 1) {
+      return (num_heads == 8 && (past_sequence_length == 512 || past_sequence_length == 2048)) ||
+             (num_heads == 32 && past_sequence_length >= 2048);
+    }
+
+    if (batch_size == 4) {
+      return (num_heads == 8 && past_sequence_length >= 32768) ||
+             (num_heads == 32 && (past_sequence_length == 512 || past_sequence_length >= 2048));
+    }
+
+    if (batch_size >= 16) {
+      return (num_heads == 8) ||
+             (num_heads == 32 && past_sequence_length >= 2048);
+    }
+  }
+
+  if (head_size == 128) {
+    if (batch_size == 1) {
+      return num_heads == 32 && (past_sequence_length == 2048 || past_sequence_length >= 32768);
+    }
+
+    if (batch_size == 4) {
+      return (num_heads == 8 && past_sequence_length >= 8192) ||
+             (num_heads == 32 && past_sequence_length >= 8192);
+    }
+
+    if (batch_size >= 16) {
+      return num_heads == 8 || num_heads == 32;
+    }
+  }
+
+  return false;
+}
+
+bool IsMeasuredLeanBetterThanFlashAndCudnn(const AttentionParameters& parameters) {
+  if (parameters.sequence_length != 1) {
+    return false;
+  }
+
+  const int batch_size = parameters.batch_size;
+  const int num_heads = parameters.num_heads;
+  const int head_size = parameters.head_size;
+  const int past_sequence_length = parameters.past_sequence_length;
+
+  if (head_size == 64) {
+    return (batch_size == 1 && num_heads == 8 && past_sequence_length == 512) ||
+           (batch_size == 1 && num_heads == 32 && past_sequence_length >= 32768) ||
+           (batch_size == 4 && num_heads == 32 && past_sequence_length >= 32768) ||
+           (batch_size >= 16 && num_heads == 8 &&
+            (past_sequence_length == 512 || past_sequence_length >= 32768));
+  }
+
+  if (head_size == 128) {
+    return (batch_size == 1 && num_heads == 32 &&
+            (past_sequence_length == 2048 || past_sequence_length >= 32768)) ||
+           (batch_size >= 16 && num_heads == 8 && past_sequence_length == 8192);
+  }
+
+  return false;
+}
+
+bool IsSmartLeanAttentionCandidate(const AttentionParameters& parameters, bool cudnn_sdpa_supported) {
+  return cudnn_sdpa_supported ? IsMeasuredLeanBetterThanFlashAndCudnn(parameters)
+                              : IsMeasuredLeanBetterThanFlash(parameters);
+}
+
+}  // namespace
+#endif
+
 template <typename T, typename QK>
 MultiHeadAttention<T, QK>::MultiHeadAttention(const OpKernelInfo& info)
     : CudaKernel(info),
@@ -258,9 +344,38 @@ Status MultiHeadAttention<T, QK>::ComputeInternal(OpKernelContext* context) cons
   size_t out_accum_bytes = 0;
 #endif
 
+  // === cuDNN SDPA eligibility (computed before lean / flash so smart dispatch can account for it) ===
+  // cuDNN SDPA only supports no mask, or a 1D key sequence length (padding) mask.
+  bool is_mask_none_or_1d_k_len = parameters.mask_type == AttentionMaskType::MASK_NONE ||
+                                  parameters.mask_type == AttentionMaskType::MASK_1D_KEY_SEQ_LEN;
+  // cuDNN SDPA is enabled when explicitly requested, or auto-preferred on SM>=90 (unless the user
+  // pinned a different SDPA kernel through the sdpa_kernel provider option).
+  bool cudnn_sdpa_enabled = enable_cudnn_flash_attention_ ||
+                            (auto_enable_cudnn_flash_attention_ && sm >= 90);
+  // Bottom-right causal masking (used by cuDNN when s_q != s_kv) does not support attention bias.
+  bool cudnn_sdpa_bias_ok = attention_bias == nullptr ||
+                            !is_unidirectional_ ||
+                            parameters.sequence_length == parameters.total_sequence_length;
+  bool cudnn_sdpa_supported = cudnn_sdpa_enabled &&
+                              cudnn_sdpa_bias_ok &&
+                              is_mask_none_or_1d_k_len &&
+                              onnxruntime::cudnn_sdpa::is_stable() &&
+                              onnxruntime::cudnn_sdpa::is_supported(device_prop,
+                                                                    parameters.num_heads,              // num_heads_q
+                                                                    parameters.num_heads,              // num_heads_kv
+                                                                    parameters.head_size,              // head_size_qk
+                                                                    parameters.v_head_size,            // head_size_v
+                                                                    parameters.sequence_length,        // seq_len_q
+                                                                    parameters.total_sequence_length,  // seq_len_kv
+                                                                    is_unidirectional_);
+
 #if USE_LEAN_ATTENTION
   // Lean attention only supports token-generation phase with sequence_length == 1.
-  bool use_lean_attention = enable_lean_attention_ &&
+  bool auto_use_lean_attention = !enable_lean_attention_ &&
+                                 !kernel_options_->HasExplicitKernelSelection() &&
+                                 !disable_flash_attention_ &&
+                                 IsSmartLeanAttentionCandidate(parameters, cudnn_sdpa_supported);
+  bool use_lean_attention = (enable_lean_attention_ || auto_use_lean_attention) &&
                             parameters.sequence_length == 1 &&
                             parameters.past_sequence_length > 0 &&
                             nullptr == attention_bias &&
@@ -272,6 +387,7 @@ Status MultiHeadAttention<T, QK>::ComputeInternal(OpKernelContext* context) cons
                                                             parameters.num_heads);
 
   size_t sync_flag_bytes = 0;
+  DUMP_STRING("Auto lean attn = ", (auto_use_lean_attention == true));
   DUMP_STRING("Use lean attn = ", (use_lean_attention == true));
   if (use_lean_attention) {
     softmax_lse_bytes = onnxruntime::lean::get_softmax_lse_size(parameters.sequence_length,
@@ -304,31 +420,6 @@ Status MultiHeadAttention<T, QK>::ComputeInternal(OpKernelContext* context) cons
 #else
   constexpr bool use_lean_attention = false;
 #endif
-
-  // === cuDNN SDPA eligibility (computed before flash so it can take priority on SM>=90) ===
-  // cuDNN SDPA only supports no mask, or a 1D key sequence length (padding) mask.
-  bool is_mask_none_or_1d_k_len = parameters.mask_type == AttentionMaskType::MASK_NONE ||
-                                  parameters.mask_type == AttentionMaskType::MASK_1D_KEY_SEQ_LEN;
-  // cuDNN SDPA is enabled when explicitly requested, or auto-preferred on SM>=90 (unless the user
-  // pinned a different SDPA kernel through the sdpa_kernel provider option).
-  bool cudnn_sdpa_enabled = enable_cudnn_flash_attention_ ||
-                            (auto_enable_cudnn_flash_attention_ && sm >= 90);
-  // Bottom-right causal masking (used by cuDNN when s_q != s_kv) does not support attention bias.
-  bool cudnn_sdpa_bias_ok = attention_bias == nullptr ||
-                            !is_unidirectional_ ||
-                            parameters.sequence_length == parameters.total_sequence_length;
-  bool cudnn_sdpa_supported = cudnn_sdpa_enabled &&
-                              cudnn_sdpa_bias_ok &&
-                              is_mask_none_or_1d_k_len &&
-                              onnxruntime::cudnn_sdpa::is_stable() &&
-                              onnxruntime::cudnn_sdpa::is_supported(device_prop,
-                                                                    parameters.num_heads,              // num_heads_q
-                                                                    parameters.num_heads,              // num_heads_kv
-                                                                    parameters.head_size,              // head_size_qk
-                                                                    parameters.v_head_size,            // head_size_v
-                                                                    parameters.sequence_length,        // seq_len_q
-                                                                    parameters.total_sequence_length,  // seq_len_kv
-                                                                    is_unidirectional_);
 
 #if USE_FLASH_ATTENTION
   // On SM>=90 (Hopper/Blackwell) prefer cuDNN SDPA ahead of flash attention.
