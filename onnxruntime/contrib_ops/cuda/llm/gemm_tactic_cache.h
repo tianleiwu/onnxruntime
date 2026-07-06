@@ -58,14 +58,14 @@ constexpr const char* kSessionConfigCachePrefix = "ep.cuda.gemm_tactic_cache_pre
 // Hardware / build signature used both to name cache files and as a stored guard.
 // Reuse is rejected on mismatch of any strict field (see StrictMatches).
 struct HardwareSignature {
-  std::string device_name;        // cudaDeviceProp.name, e.g. "NVIDIA A100-SXM4-80GB"
-  int sm = 0;                     // major*10 + minor, e.g. 80, 89, 90
-  int multiprocessor_count = 0;   // diagnostic only
-  int cuda_runtime = 0;           // CUDART_VERSION
-  int cuda_driver = 0;            // cudaDriverGetVersion(), diagnostic only
-  std::string ort_version;        // ORT_VERSION
-  std::string ort_git_commit;     // parsed from ORT_BUILD_INFO or "unknown"
-  std::string ort_build_config;   // "Release" / "Debug"
+  std::string device_name;       // cudaDeviceProp.name, e.g. "NVIDIA A100-SXM4-80GB"
+  int sm = 0;                    // major*10 + minor, e.g. 80, 89, 90
+  int multiprocessor_count = 0;  // diagnostic only
+  int cuda_runtime = 0;          // CUDART_VERSION
+  int cuda_driver = 0;           // cudaDriverGetVersion(), diagnostic only
+  std::string ort_version;       // ORT_VERSION
+  std::string ort_git_commit;    // parsed from ORT_BUILD_INFO or "unknown"
+  std::string ort_build_config;  // "Release" / "Debug"
 
   // Computes the signature for the current CUDA device and build.
   static HardwareSignature Compute();
@@ -104,12 +104,12 @@ std::optional<std::optional<CutlassGemmConfig>> ParseConfigColumns(
 struct MatMulNBitsKey {
   int n_16b = 0;
   int k = 0;
-  std::string activation_dtype;   // "half" / "bfloat16"
-  std::string weight_type;        // "uint4b_t" / "uint8_t"
+  std::string activation_dtype;  // "half" / "bfloat16"
+  std::string weight_type;       // "uint4b_t" / "uint8_t"
   int bits = 0;
   int block_size = 0;
   bool has_zero_points = false;
-  std::string zero_point_dtype;   // e.g. "uint4b_t" / activation dtype / "none"
+  std::string zero_point_dtype;  // e.g. "uint4b_t" / activation dtype / "none"
   bool gemv_enabled = false;
   int packing_sm = 0;
 

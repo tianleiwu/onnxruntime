@@ -32,6 +32,10 @@ import argparse
 import os
 import sys
 
+import numpy as np
+
+import onnxruntime as ort
+
 # fpA_intB gemm option bits, mirrored from contrib_ops/cuda/quantization/matmul_nbits.h.
 _FPA_INTB_OPTION_ALL = 0x01  # enables both GEMM and the CUDA GEMV fast path
 _FPA_INTB_OPTION_INT4 = 0x04
@@ -42,8 +46,8 @@ _CACHE_TABLE_SUFFIX = ".matmulnbits_fpa_intb.tsv"
 
 def _parse_m_values(text: str) -> list[int]:
     values = []
-    for token in text.split(","):
-        token = token.strip()
+    for t in text.split(","):
+        token = t.strip()
         if not token:
             continue
         m = int(token)
@@ -72,8 +76,6 @@ def _set_tuning_env(output_prefix: str, enable_gemv: bool, m_values: list[int]) 
 
 
 def _numpy_dtype_for(ort_type: str):
-    import numpy as np
-
     mapping = {
         "tensor(float16)": np.float16,
         "tensor(bfloat16)": np.float16,  # numpy has no bf16; only used for dummy inputs
@@ -93,7 +95,6 @@ def _make_dummy_inputs(session, m: int) -> dict:
     """Best-effort dummy inputs. The first symbolic/dynamic dim of each input is set to
     ``m`` (a heuristic to drive the GEMM M dimension); remaining dynamic dims become 1.
     """
-    import numpy as np
 
     feeds = {}
     for inp in session.get_inputs():
@@ -128,8 +129,8 @@ def _summarize_cache(cache_path: str) -> None:
     rows = 0
     unique_keys = set()
     with open(cache_path, encoding="utf-8") as f:
-        for line in f:
-            line = line.rstrip("\n")
+        for raw_line in f:
+            line = raw_line.rstrip("\n")
             if not line:
                 continue
             if line.startswith("#"):
@@ -145,8 +146,15 @@ def _summarize_cache(cache_path: str) -> None:
             rows += 1
             # Build a key tuple from the problem-key columns for a unique-shape count.
             key_cols = [
-                "n_16b", "k", "activation_dtype", "weight_type", "bits", "block_size",
-                "has_zero_points", "gemv_enabled", "packing_sm",
+                "n_16b",
+                "k",
+                "activation_dtype",
+                "weight_type",
+                "bits",
+                "block_size",
+                "has_zero_points",
+                "gemv_enabled",
+                "packing_sm",
             ]
             key = tuple(fields[n_key_col[c]] for c in key_cols if c in n_key_col)
             unique_keys.add(key)
@@ -162,15 +170,12 @@ def _summarize_cache(cache_path: str) -> None:
 
 
 def tune(model: str, output_prefix: str, enable_gemv: bool, m_values: list[int], run_inference: bool) -> str:
-    import onnxruntime as ort
-
     _set_tuning_env(output_prefix, enable_gemv, m_values)
 
     available = ort.get_available_providers()
     if "CUDAExecutionProvider" not in available:
         raise RuntimeError(
-            "CUDAExecutionProvider is not available in this onnxruntime build. "
-            f"Available providers: {available}"
+            f"CUDAExecutionProvider is not available in this onnxruntime build. Available providers: {available}"
         )
 
     print(f"Creating CUDA session for {model} (this profiles the M buckets)...")
@@ -183,7 +188,7 @@ def tune(model: str, output_prefix: str, enable_gemv: bool, m_values: list[int],
                 feeds = _make_dummy_inputs(session, m)
                 session.run(None, feeds)
                 print(f"  ran dummy inference for M={m}")
-            except Exception as exc:  # noqa: BLE001 - best-effort; init-time profiling still applies
+            except Exception as exc:
                 print(f"  skipped dummy inference for M={m}: {exc}")
 
     cache_path = output_prefix + _CACHE_TABLE_SUFFIX

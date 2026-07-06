@@ -164,8 +164,8 @@ TEST(GemmTacticCacheTest, ConfigColumnsNullTacticRoundTrip) {
   std::vector<std::string> row;
   gc::AppendConfigColumns(row, std::nullopt);  // profiled bucket with no valid tactic
   auto parsed = gc::ParseConfigColumns(row, 0);
-  ASSERT_TRUE(parsed.has_value());        // outer: the columns parsed
-  EXPECT_FALSE(parsed->has_value());      // inner: no valid tactic
+  ASSERT_TRUE(parsed.has_value());    // outer: the columns parsed
+  EXPECT_FALSE(parsed->has_value());  // inner: no valid tactic
 }
 
 TEST(GemmTacticCacheTest, StoreLoadRoundTrip) {
@@ -196,7 +196,7 @@ TEST(GemmTacticCacheTest, StoreLoadRoundTrip) {
   ExpectConfigEqual(MakeSm90Config(), **c64);
 
   auto c128 = reloaded.Get(key, 128);
-  ASSERT_TRUE(c128.has_value());   // present in the cache
+  ASSERT_TRUE(c128.has_value());    // present in the cache
   EXPECT_FALSE(c128->has_value());  // but no valid tactic
 
   EXPECT_FALSE(reloaded.Get(key, 999).has_value());  // never profiled

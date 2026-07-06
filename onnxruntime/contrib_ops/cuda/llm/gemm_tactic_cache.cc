@@ -36,9 +36,9 @@ namespace {
 
 using onnxruntime::llm::cutlass_extensions::ClusterShape;
 using onnxruntime::llm::cutlass_extensions::CutlassTileConfig;
-using onnxruntime::llm::cutlass_extensions::CutlassTileConfigSM90;
 using onnxruntime::llm::cutlass_extensions::CutlassTileConfigSM100;
 using onnxruntime::llm::cutlass_extensions::CutlassTileConfigSM120;
+using onnxruntime::llm::cutlass_extensions::CutlassTileConfigSM90;
 using onnxruntime::llm::cutlass_extensions::EpilogueScheduleType;
 using onnxruntime::llm::cutlass_extensions::MainloopScheduleType;
 using onnxruntime::llm::cutlass_extensions::SplitKStyle;
@@ -281,20 +281,20 @@ void AppendConfigColumns(std::vector<std::string>& row, const std::optional<Cutl
   }
 
   const CutlassGemmConfig& c = *config;
-  row.emplace_back("1");                                                          // valid_config
-  row.emplace_back(std::to_string(c.sm_version));                                 // sm_version
-  row.emplace_back(std::to_string(static_cast<int>(c.tile_config_sm80)));         // tile80
-  row.emplace_back(std::to_string(static_cast<int>(c.tile_config_sm90)));         // tile90
-  row.emplace_back(std::to_string(static_cast<int>(c.tile_config_sm100)));        // tile100
-  row.emplace_back(std::to_string(static_cast<int>(c.tile_config_sm120)));        // tile120
-  row.emplace_back(std::to_string(static_cast<int>(c.split_k_style)));            // split_k_style
-  row.emplace_back(std::to_string(c.split_k_factor));                             // split_k
-  row.emplace_back(std::to_string(c.stages));                                     // stages
-  row.emplace_back(std::to_string(static_cast<int>(c.cluster_shape)));            // cluster
-  row.emplace_back(std::to_string(static_cast<int>(c.mainloop_schedule)));        // mainloop
-  row.emplace_back(std::to_string(static_cast<int>(c.epilogue_schedule)));        // epilogue
-  row.emplace_back(c.is_tma_warp_specialized ? "1" : "0");                        // tma
-  row.emplace_back(c.enableCudaKernel ? "1" : "0");                               // enable_cuda_kernel
+  row.emplace_back("1");                                                    // valid_config
+  row.emplace_back(std::to_string(c.sm_version));                           // sm_version
+  row.emplace_back(std::to_string(static_cast<int>(c.tile_config_sm80)));   // tile80
+  row.emplace_back(std::to_string(static_cast<int>(c.tile_config_sm90)));   // tile90
+  row.emplace_back(std::to_string(static_cast<int>(c.tile_config_sm100)));  // tile100
+  row.emplace_back(std::to_string(static_cast<int>(c.tile_config_sm120)));  // tile120
+  row.emplace_back(std::to_string(static_cast<int>(c.split_k_style)));      // split_k_style
+  row.emplace_back(std::to_string(c.split_k_factor));                       // split_k
+  row.emplace_back(std::to_string(c.stages));                               // stages
+  row.emplace_back(std::to_string(static_cast<int>(c.cluster_shape)));      // cluster
+  row.emplace_back(std::to_string(static_cast<int>(c.mainloop_schedule)));  // mainloop
+  row.emplace_back(std::to_string(static_cast<int>(c.epilogue_schedule)));  // epilogue
+  row.emplace_back(c.is_tma_warp_specialized ? "1" : "0");                  // tma
+  row.emplace_back(c.enableCudaKernel ? "1" : "0");                         // enable_cuda_kernel
 }
 
 std::optional<std::optional<CutlassGemmConfig>> ParseConfigColumns(
