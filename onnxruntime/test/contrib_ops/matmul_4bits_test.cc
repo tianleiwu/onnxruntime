@@ -992,7 +992,12 @@ TEST(MatMulNBits, Fp16_Int4_PrepackedWeightRequiresFpAIntBGemm) {
   RunTest<MLFloat16>(opts, std::move(eps));
 }
 
-TEST(MatMulNBits, Fp16_Int4_PrepackedSm90WeightReserved) {
+// weight_prepacked=2 selects the native SM90 (Hopper) mixed-GEMM layout. It is rejected up front
+// unless the device is SM90 and block_size is 64 or 128 (the SM90 TMA kernel requires group_size to
+// be a multiple of the 64-element Hopper K tile, so block_size=32 is SM80-only). Both rejection
+// messages begin with "weight_prepacked=2 (SM90 layout)", so this test is device-independent:
+// non-Hopper hits the compute-capability guard, Hopper hits the block_size guard.
+TEST(MatMulNBits, Fp16_Int4_PrepackedSm90BlockSize32Rejected) {
   ScopedEnvironmentVariables scoped_env_vars{EnvVarMap{{"ORT_FPA_INTB_GEMM", "1"}}};
 
   auto cuda_ep = DefaultCudaExecutionProvider();
@@ -1002,9 +1007,9 @@ TEST(MatMulNBits, Fp16_Int4_PrepackedSm90WeightReserved) {
 
   TestOptions opts{};
   opts.M = 1, opts.N = 256, opts.K = 1024;
-  opts.block_size = 64;
+  opts.block_size = 32;
   opts.weight_prepacked = 2;
-  opts.expected_failure = "weight_prepacked";
+  opts.expected_failure = "weight_prepacked=2 (SM90 layout)";
   std::vector<std::unique_ptr<IExecutionProvider>> eps;
   eps.push_back(std::move(cuda_ep));
   RunTest<MLFloat16>(opts, std::move(eps));

@@ -82,6 +82,11 @@ class CutlassFpAIntBGemmRunnerInterface {
   // Default: no-op (keep detected SM).
   virtual void setArch(int /*sm*/) {}
 
+  // Opts in to the native SM90 (Hopper TMA/WGMMA) mixed-GEMM kernel instead of the SM80
+  // compatibility path. Only meaningful when the runner targets SM90 (setArch is left at 90) and
+  // the weights were prepacked for the Hopper layout. Default: no-op (keep the SM80 kernel).
+  virtual void setUseSm90Native(bool /*use*/) {}
+
  protected:
   static constexpr int SPLIT_K_LIMIT = 7;
   static constexpr int MIN_M_TILE = 16;
@@ -128,6 +133,8 @@ class CutlassFpAIntBGemmRunner : public virtual CutlassFpAIntBGemmRunnerInterfac
 
   void setArch(int sm) override { sm_ = sm; }
 
+  void setUseSm90Native(bool use) override { use_sm90_native_ = use; }
+
  private:
   template <typename EpilogueTag>
   void dispatch_to_arch(ActivationType const* A, WeightType const* B, ScaleZeroType const* weight_scales,
@@ -138,6 +145,7 @@ class CutlassFpAIntBGemmRunner : public virtual CutlassFpAIntBGemmRunnerInterfac
  private:
   int sm_;
   int multi_processor_count_;
+  bool use_sm90_native_{false};
 };
 
 }  // namespace cutlass_kernels

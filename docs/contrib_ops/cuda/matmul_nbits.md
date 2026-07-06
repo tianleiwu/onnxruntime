@@ -44,7 +44,7 @@ Source files:
 | `bits` | Quantization bit width: `4` or `8`. |
 | `block_size` | Quantization group size along `K` (16 / 32 / 64 / 128). One scale (and optional zero point) per group. |
 | `accuracy_level` | Minimum accuracy level for internal handling of `A`; default `0` means unset. |
-| `weight_prepacked` | CUDA fpA_intB weight-layout selector. `0` (default): `B` is in standard MatMulNBits layout and may be runtime-prepacked. `1`: `B` is already prepacked in the CUDA SM80 fpA_intB layout. `2`: reserved SM90 layout; currently rejected. |
+| `weight_prepacked` | CUDA fpA_intB weight-layout selector. `0` (default): `B` is in standard MatMulNBits layout and may be runtime-prepacked. `1`: `B` is already prepacked in the CUDA SM80 fpA_intB layout. `2`: `B` is prepacked in the CUDA SM90 (Hopper) fpA_intB layout, consumed by the native SM90 kernel (requires an SM90 device and `block_size` in {64, 128}). |
 
 | Input | Index | Notes |
 |-------|-------|-------|
@@ -95,13 +95,18 @@ prepacked_flat = _pybind.pack_weights_for_cuda_mixed_gemm(
 prepacked_b = np.asarray(prepacked_flat, dtype=np.int8).view(np.uint8).reshape(q_weight.shape)
 ```
 
-The final argument is the target packing architecture. For MatMulNBits v1, use
-`80`: both runtime preprocessing and offline preprocessing force the SM80
-layout. On SM90 devices, the supported mixed FP16/BF16 activation + int4/int8
-weight path routes to the SM80 CUTLASS kernel/layout for this operator.
+The final argument is the target packing architecture. Use `80` for the SM80
+layout (consumed by the SM80 CUTLASS kernel, including on newer GPUs via the
+compatibility path) and set `weight_prepacked=1` on the node. Use `90` for the
+native SM90 (Hopper) layout and set `weight_prepacked=2` on the node.
 
-`weight_prepacked=2` is reserved for a future SM90/Hopper-specific layout and is
-currently rejected during kernel construction.
+`weight_prepacked=2` selects the native SM90 (Hopper TMA/WGMMA) mixed-GEMM
+kernel and its Hopper weight layout. It requires a compute capability 9.0 device
+and `block_size` in `{64, 128}` (the SM90 kernel needs `group_size` to be a
+multiple of the 64-element Hopper K tile, so `block_size=32` is SM80-only). On
+SM90 devices, runtime-prepacked (`weight_prepacked=0`) and SM80-prepacked
+(`weight_prepacked=1`) weights continue to route to the SM80 CUTLASS
+kernel/layout.
 
 ---
 
@@ -262,8 +267,10 @@ Prepacked weights are intentionally strict:
   throws instead of silently falling back to a raw-layout path.
 - Nonzero `weight_prepacked` requires FP16 or BF16 input `A`, because only the
   CUDA fpA_intB path consumes this layout.
-- `weight_prepacked=1` must match the currently required SM80 layout; `2` is
-  reserved and rejected.
+- `weight_prepacked` must match the layout the selected kernel expects: `1` is
+  the SM80 layout, `2` is the native SM90 (Hopper) layout. `2` additionally
+  requires a compute-capability 9.0 device and `block_size ∈ {64, 128}` and is
+  rejected otherwise.
 
 ---
 

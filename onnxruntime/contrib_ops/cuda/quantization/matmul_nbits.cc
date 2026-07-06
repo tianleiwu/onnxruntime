@@ -52,7 +52,12 @@ constexpr auto kScaleOnly = cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY;
 
 template <typename T>
 int MatMulNBits<T>::FpAIntBPackingSmForKernel() const {
-  // MatMulNBits mixed int-weight GEMM/GEMV consumes the SM80 fpA_intB weight layout in v1.
+  // Select the native SM90 (Hopper) mixed-weight layout only when the weights were prepacked for it
+  // (weight_prepacked_ == 2) AND the device is SM90. Otherwise use the SM80 layout, which is also
+  // used as the SM90 compatibility path for runtime-prepacked (or SM80-prepacked) weights.
+  if (sm_ == 90 && weight_prepacked_ == kMatMulNBitsWeightPrepackedSm90) {
+    return 90;
+  }
   return 80;
 }
 
@@ -99,13 +104,18 @@ void MatMulNBits<T>::InitGemmProfiler(int sm) {
     }
   }
 
-  // On SM90 the half/bf16 weight-only path dispatches the SM80 (Ampere) mixed-GEMM kernel (which
-  // runs on Hopper via GemmFpAIntB::operator()). The runner otherwise defaults to the detected
-  // device SM and getConfigs() would enumerate Hopper tactics (tile_config_sm90) that the SM80
-  // dispatch cannot consume, leaving no CUTLASS GEMM tactic for M>=16 (GEMV only covers M<16).
-  // Force the runner to the SM80 kernels/configs the MatMulNBits path packs and dispatches for
-  // (FpAIntBPackingSmForKernel()==80) so tactic enumeration and workspace sizing stay consistent.
-  if (sm_ == 90) {
+  // On SM90 the half/bf16 weight-only path can run either the native Hopper (SM90 TMA/WGMMA) kernel
+  // or the SM80 (Ampere) mixed-GEMM kernel (which also runs on Hopper via GemmFpAIntB::operator()).
+  //   - Native SM90 (sm == 90): keep the runner targeting SM90 so getConfigs() enumerates Hopper
+  //     tactics (tile_config_sm90) and getWorkspaceSize() reserves the stream-K workspace; opt in to
+  //     the native kernel via setUseSm90Native(true).
+  //   - SM80 compat (sm == 80 while the device is SM90): force the runner to SM80 so tactic
+  //     enumeration and workspace sizing stay consistent with the dispatched SM80 kernel (the runner
+  //     otherwise defaults to the detected device SM and would enumerate Hopper tactics the SM80
+  //     dispatch cannot consume, leaving no CUTLASS GEMM tactic for M>=16).
+  if (sm == 90) {
+    weightOnlyGemmRunner_->setUseSm90Native(true);
+  } else if (sm_ == 90) {
     weightOnlyGemmRunner_->setArch(sm);
   }
 
@@ -130,10 +140,13 @@ void MatMulNBits<T>::RunGemmProfile(bool hasWeightOnlyCudaKernel, int min_m, int
   // Number of 16-bit elements after casting int8/int4 to fp16.
   int n_16b = N_ / (nbits_ == 8 ? 2 : 4);
 
+  // Include the packing/kernel SM in the GEMM id so the SM80-compatibility and native SM90 kernels
+  // (which need different tactics) do not share profiled configs for the same (N, K, dtype).
+  const int kernel_sm = FpAIntBPackingSmForKernel();
   if constexpr (std::is_same_v<T, MLFloat16>) {
-    gemmId_ = GemmIdCore(n_16b, K_, onnxruntime::llm::nvinfer::DataType::kHALF);
+    gemmId_ = GemmIdCore(n_16b, K_, onnxruntime::llm::nvinfer::DataType::kHALF, kernel_sm);
   } else if constexpr (std::is_same_v<T, BFloat16>) {
-    gemmId_ = GemmIdCore(n_16b, K_, onnxruntime::llm::nvinfer::DataType::kBF16);
+    gemmId_ = GemmIdCore(n_16b, K_, onnxruntime::llm::nvinfer::DataType::kBF16, kernel_sm);
   }
 
   GemmDims dims = {min_m, max_m, n_16b, K_};
@@ -398,9 +411,9 @@ Status MatMulNBits<T>::ComputeInternal(OpKernelContext* ctx) const {
           ParseEnvironmentVariableWithDefault<int>("ORT_FPA_INTB_DEBUG", 0) != 0;
       if (fpA_intB_debug) {
         const char* weight_fmt = is_prepacked_weight_ ? "runtime-prepacked(SM80 layout)"
-                                 : (weight_prepacked_ == kMatMulNBitsWeightPrepackedSm80 ? "offline-prepacked-SM80"
-                                    : (weight_prepacked_ == kMatMulNBitsWeightPrepackedSm90 ? "offline-prepacked-SM90"
-                                                                                           : "raw"));
+                                                      : (weight_prepacked_ == kMatMulNBitsWeightPrepackedSm80 ? "offline-prepacked-SM80"
+                                                                                                              : (weight_prepacked_ == kMatMulNBitsWeightPrepackedSm90 ? "offline-prepacked-SM90"
+                                                                                                                                                                      : "raw"));
         std::cout << "[fpA_intB_debug] M=" << m << " N=" << n << " K=" << k
                   << " nbits=" << nbits_ << " block_size=" << block_size_
                   << " device_sm=" << sm_

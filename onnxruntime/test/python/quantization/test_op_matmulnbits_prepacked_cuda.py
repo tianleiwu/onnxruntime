@@ -101,7 +101,15 @@ class TestMatMulNBitsPrepackedCuda(unittest.TestCase):
         sess = ort.InferenceSession(model.SerializeToString(), providers=["CUDAExecutionProvider"])
         return sess.run(None, {"A": a})[0]
 
-    def _check_prepacked_parity(self, bits: int, block_size: int, m: int, has_bias: bool = False):
+    def _check_prepacked_parity(
+        self,
+        bits: int,
+        block_size: int,
+        m: int,
+        has_bias: bool = False,
+        force_arch: int = 80,
+        weight_prepacked: int = 1,
+    ):
         rng = np.random.default_rng(1234 + bits * 10 + block_size + m)
         k = 256
         n = 256 if bits == 8 else 512
@@ -110,12 +118,12 @@ class TestMatMulNBitsPrepackedCuda(unittest.TestCase):
         bias = rng.normal(0.0, 1.0, size=(n,)).astype(np.float16) if has_bias else None
 
         q_weight, scales = self._quantize_weight(weight, bits, block_size)
-        prepacked_flat = _pybind.pack_weights_for_cuda_mixed_gemm(q_weight.reshape(n, -1), n, k, bits, 80)
+        prepacked_flat = _pybind.pack_weights_for_cuda_mixed_gemm(q_weight.reshape(n, -1), n, k, bits, force_arch)
         prepacked_weight = np.asarray(prepacked_flat, dtype=np.int8).view(np.uint8).reshape(q_weight.shape)
 
         raw_model = self._make_model((m, k), q_weight, scales, bits, block_size, weight_prepacked=0, bias=bias)
         prepacked_model = self._make_model(
-            (m, k), prepacked_weight, scales, bits, block_size, weight_prepacked=1, bias=bias
+            (m, k), prepacked_weight, scales, bits, block_size, weight_prepacked=weight_prepacked, bias=bias
         )
 
         with set_env("ORT_FPA_INTB_GEMM", "1"):
@@ -140,6 +148,27 @@ class TestMatMulNBitsPrepackedCuda(unittest.TestCase):
     def test_int4_sm80_prepacked_weight_with_bias_matches_runtime_prepack(self):
         self._check_prepacked_parity(bits=4, block_size=64, m=1, has_bias=True)
         self._check_prepacked_parity(bits=4, block_size=128, m=32, has_bias=True)
+
+    def _check_sm90_parity(self, **kwargs):
+        # The native SM90 (Hopper) layout (force_arch=90, weight_prepacked=2) only runs on an SM90
+        # device; the MatMulNBits kernel rejects it up front elsewhere. Self-gate by skipping when
+        # the compute-capability guard fires so the test is a no-op on non-Hopper CI.
+        try:
+            self._check_prepacked_parity(force_arch=90, weight_prepacked=2, **kwargs)
+        except Exception as exc:
+            if "compute capability 9.0" in str(exc):
+                self.skipTest("native SM90 fpA_intB requires a Hopper (SM90) device")
+            raise
+
+    def test_int4_sm90_prepacked_weight_matches_runtime_prepack(self):
+        self._check_sm90_parity(bits=4, block_size=64, m=1)
+        self._check_sm90_parity(bits=4, block_size=128, m=32)
+
+    def test_int4_sm90_prepacked_weight_with_bias_matches_runtime_prepack(self):
+        self._check_sm90_parity(bits=4, block_size=128, m=32, has_bias=True)
+
+    def test_int8_sm90_prepacked_weight_matches_runtime_prepack(self):
+        self._check_sm90_parity(bits=8, block_size=128, m=32)
 
 
 if __name__ == "__main__":
