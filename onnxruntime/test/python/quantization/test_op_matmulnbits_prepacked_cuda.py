@@ -128,6 +128,11 @@ class TestMatMulNBitsPrepackedCuda(unittest.TestCase):
         self._check_prepacked_parity(bits=4, block_size=64, m=1)
         self._check_prepacked_parity(bits=4, block_size=128, m=32)
 
+    def test_int4_bs32_sm80_prepacked_weight_matches_runtime_prepack(self):
+        # Production rc2/rc3 models use block_size=32 (SM80/Ampere layout, weight_prepacked=1).
+        self._check_prepacked_parity(bits=4, block_size=32, m=1)
+        self._check_prepacked_parity(bits=4, block_size=32, m=32)
+
     def test_int8_sm80_prepacked_weight_matches_runtime_prepack(self):
         self._check_prepacked_parity(bits=8, block_size=64, m=1)
         self._check_prepacked_parity(bits=8, block_size=128, m=32)

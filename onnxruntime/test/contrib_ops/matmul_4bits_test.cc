@@ -880,6 +880,39 @@ TEST(MatMulNBits, Fp16_Int4_NoZeroPoint) {
   }
 }
 
+// block_size=32 with the fpA_intB path. Production rc2/rc3 int4 models are quantized with
+// block_size=32. The fpA_intB kernels support group_size=32: the GEMV select_gs dispatches
+// GroupSize==32, and the SM80/Ampere fine-grained CUTLASS GEMM uses kMinFinegrainedGroupSize=32
+// (two scale rows per 64-element K tile). Exercises M=1 (GEMV) and M=32 (CUTLASS), with and
+// without zero-points, for fp16 and bf16.
+TEST(MatMulNBits, Fp16_Int4_BlockSize32_FpAIntB) {
+  constexpr float abs_error = 0.1f;
+  constexpr bool zp_is_4bit = true;
+
+  ScopedEnvironmentVariables scoped_env_vars{EnvVarMap{{"ORT_FPA_INTB_GEMM", "1"}}};
+
+  for (auto has_zeropoint : {false, true}) {
+    RunTest<MLFloat16>(1, 256, 1024, 32, has_zeropoint, zp_is_4bit, abs_error);
+    RunTest<MLFloat16>(32, 1024, 2048, 32, has_zeropoint, zp_is_4bit, abs_error);
+  }
+}
+
+TEST(MatMulNBits, BFloat16_Int4_BlockSize32_FpAIntB) {
+  if (!HasCudaEnvironment(800)) {
+    GTEST_SKIP() << "Skipping BFloat16 MatMul tests on CUDA < 8.0";
+  }
+
+  constexpr float abs_error = 0.5f;
+  constexpr bool zp_is_4bit = true;
+
+  ScopedEnvironmentVariables scoped_env_vars{EnvVarMap{{"ORT_FPA_INTB_GEMM", "1"}}};
+
+  for (auto has_zeropoint : {false, true}) {
+    RunTest<BFloat16>(1, 256, 1024, 32, has_zeropoint, zp_is_4bit, abs_error);
+    RunTest<BFloat16>(32, 1024, 2048, 32, has_zeropoint, zp_is_4bit, abs_error);
+  }
+}
+
 // Fused bias with the fpA_intB path. Exercises both the GEMV path (M=1) and the CUTLASS GEMM path
 // (M=32), for fp16 and bf16, with block_size 64/128. This is the gpt-oss qkv_proj/o_proj scenario
 // where MatMulNBitsFusion folds the Add(bias) into MatMulNBits input[5].

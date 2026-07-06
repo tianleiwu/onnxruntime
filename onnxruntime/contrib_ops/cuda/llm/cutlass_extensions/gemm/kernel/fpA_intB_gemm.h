@@ -247,7 +247,7 @@ struct GemmFpAIntB {
     }
 
     if constexpr (isFinegrained(Mma::QuantOp)) {
-      if (args.group_size != 64 && args.group_size != 128) {
+      if (args.group_size != 32 && args.group_size != 64 && args.group_size != 128) {
         return Status::kErrorNotSupported;
       }
     }

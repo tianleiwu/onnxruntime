@@ -134,8 +134,8 @@ void generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType const
       }
     }
 
-    if (group_size != 64 && group_size != 128) {
-      ORT_THROW("Only group size 64 and 128 supported for fine grained kernels.");
+    if (group_size != 32 && group_size != 64 && group_size != 128) {
+      ORT_THROW("Only group size 32, 64 and 128 supported for fine grained kernels.");
     }
 
     if constexpr (QuantOp == cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY) {

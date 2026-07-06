@@ -112,7 +112,7 @@ falls through to progressively more general ones:
 
 ```mermaid
 flowchart TD
-  A[ComputeInternal] --> F{has_fpA_intB_gemm_?<br/>FP16/BF16, ORT-prepackable weights,<br/>block 64/128, sm>=75}
+  A[ComputeInternal] --> F{has_fpA_intB_gemm_?<br/>FP16/BF16, ORT-prepackable weights,<br/>block 32/64/128, sm>=75}
   F -- yes --> FP[fpA_intB CUDA GEMV<br/>or CUTLASS grouped GEMM] --> R[return]
   F -- no --> G{reorder_idx == null<br/>and zero_points not typed-T?}
   G -- no --> DQ
@@ -236,10 +236,14 @@ and enabled via `ORT_FPA_INTB_GEMM`, FP16/BF16 MatMulNBits can use the
 TensorRT-LLM-derived CUTLASS weight-only kernels. The constructor sets
 `has_fpA_intB_gemm_` only when:
 
-- dtype is FP16 or BF16, `bits ∈ {4, 8}`, `block_size ∈ {64, 128}`,
-- no `g_idx`, no `bias`, `N % (bits==8 ? 32 : 64) == 0`, `K % block_size == 0`,
+- dtype is FP16 or BF16, `bits ∈ {4, 8}`, `block_size ∈ {32, 64, 128}`,
+- no `g_idx`, `N % (bits==8 ? 32 : 64) == 0`, `K % block_size == 0`,
 - `sm_ >= 75`, and weight/scale/zero-point inputs are constant initializers that
   ORT can prepack.
+
+`block_size=32` is served by the SM80/Ampere-class fine-grained kernel (and its
+SM90 compatibility path); the native SM90 kernel (`weight_prepacked=2`) supports
+only `block_size ∈ {64, 128}` — see §2.1.
 
 At run time a profiler picks the best tactic; small `M` may use a dedicated CUDA
 GEMV kernel (`bestTactic->enableCudaKernel`), otherwise a CUTLASS grouped GEMM.

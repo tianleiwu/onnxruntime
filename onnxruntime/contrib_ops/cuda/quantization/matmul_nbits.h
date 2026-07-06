@@ -106,7 +106,7 @@ class MatMulNBits final : public CudaKernel {
       // GEMM (EpilogueOpBias), and the tactic profiler, so bias-bearing nodes (e.g. gpt-oss
       // qkv_proj/o_proj) are eligible. Only g_idx/reorder remains unsupported by this path.
       if ((option & (static_cast<int>(nbits_) | kFpAIntBGemmOption_All)) != 0 &&
-          (block_size_ == 64 || block_size_ == 128) &&
+          (block_size_ == 32 || block_size_ == 64 || block_size_ == 128) &&
           (nbits_ == 4 || nbits_ == 8) &&
           !has_g_idx_ &&
           N_ % (nbits_ == 8 ? 32 : 64) == 0 &&
