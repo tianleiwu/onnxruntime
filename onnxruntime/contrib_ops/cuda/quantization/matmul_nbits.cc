@@ -99,6 +99,16 @@ void MatMulNBits<T>::InitGemmProfiler(int sm) {
     }
   }
 
+  // On SM90 the half/bf16 weight-only path dispatches the SM80 (Ampere) mixed-GEMM kernel (which
+  // runs on Hopper via GemmFpAIntB::operator()). The runner otherwise defaults to the detected
+  // device SM and getConfigs() would enumerate Hopper tactics (tile_config_sm90) that the SM80
+  // dispatch cannot consume, leaving no CUTLASS GEMM tactic for M>=16 (GEMV only covers M<16).
+  // Force the runner to the SM80 kernels/configs the MatMulNBits path packs and dispatches for
+  // (FpAIntBPackingSmForKernel()==80) so tactic enumeration and workspace sizing stay consistent.
+  if (sm_ == 90) {
+    weightOnlyGemmRunner_->setArch(sm);
+  }
+
   gemmProfiler_->setCudaKernelType(cuda_kernel_type, sm);
   gemmProfiler_->setQuant(nbits_, has_bias_, has_zero_points_);
   gemmProfiler_->setGroupSize(block_size_);
@@ -381,6 +391,28 @@ Status MatMulNBits<T>::ComputeInternal(OpKernelContext* ctx) const {
                                ", N=", n, ", K=", k);
       }
 
+      // Env-gated diagnostics (ORT_FPA_INTB_DEBUG=1): dump the selected tactic, the kernel path
+      // (GEMV CUDA kernel vs CUTLASS GEMM), the weight format, and the device/packing SM so that
+      // SM90 correctness issues (e.g. running the SM80 kernel on Hopper) can be traced.
+      static const bool fpA_intB_debug =
+          ParseEnvironmentVariableWithDefault<int>("ORT_FPA_INTB_DEBUG", 0) != 0;
+      if (fpA_intB_debug) {
+        const char* weight_fmt = is_prepacked_weight_ ? "runtime-prepacked(SM80 layout)"
+                                 : (weight_prepacked_ == kMatMulNBitsWeightPrepackedSm80 ? "offline-prepacked-SM80"
+                                    : (weight_prepacked_ == kMatMulNBitsWeightPrepackedSm90 ? "offline-prepacked-SM90"
+                                                                                           : "raw"));
+        std::cout << "[fpA_intB_debug] M=" << m << " N=" << n << " K=" << k
+                  << " nbits=" << nbits_ << " block_size=" << block_size_
+                  << " device_sm=" << sm_
+                  << " packing_sm=" << FpAIntBPackingSmForKernel()
+                  << " has_bias=" << (bias_data != nullptr ? 1 : 0)
+                  << " has_zero_points=" << (has_zero_points_ ? 1 : 0)
+                  << " weight_format=" << weight_fmt
+                  << " kernel=" << (bestTactic->enableCudaKernel ? "GEMV(cuda)" : "CUTLASS(sm80 gemm)")
+                  << " tactic=" << bestTactic->toString()
+                  << std::endl;
+      }
+
 #if ORT_LLM_VERBOSE > 1
       std::cout << "Best tactic for m=" << m << ", n=" << n << ", k=" << k << "group_size=" << block_size_
                 << " is: " << bestTactic->toString() << std::endl;
@@ -404,7 +436,13 @@ Status MatMulNBits<T>::ComputeInternal(OpKernelContext* ctx) const {
             bias_data, out_data,
             alpha, m, n, k, block_size_, cuda_kernel_type, apply_alpha_in_advance);
 
-        onnxruntime::llm::kernels::fpA_intB_gemv::kernel_launcher(sm_, params, stream);
+        // Launch the GEMV with the arch the weights were PACKED for (FpAIntBPackingSmForKernel),
+        // not the raw device SM. The GEMV interleave layout is arch-dependent: arch in [90,100)
+        // uses ColumnMajorInterleavedForHopper while the SM80 packing uses ColumnMajorInterleaved.
+        // PrePack_B packs the SM80 layout, and the tactic profiler also profiles with the packing
+        // arch, so passing the device SM (e.g. 90) here would read the SM80-packed weights with the
+        // Hopper interleave and produce wrong results.
+        onnxruntime::llm::kernels::fpA_intB_gemv::kernel_launcher(FpAIntBPackingSmForKernel(), params, stream);
       } else {
         const size_t workspace_size = weightOnlyGemmRunner_->getWorkspaceSize(m, n, k);
         auto workspace_buffer = this->template GetScratchBuffer<void>(workspace_size, this->GetComputeStream(ctx));

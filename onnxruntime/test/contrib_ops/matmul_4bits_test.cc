@@ -880,6 +880,67 @@ TEST(MatMulNBits, Fp16_Int4_NoZeroPoint) {
   }
 }
 
+// Fused bias with the fpA_intB path. Exercises both the GEMV path (M=1) and the CUTLASS GEMM path
+// (M=32), for fp16 and bf16, with block_size 64/128. This is the gpt-oss qkv_proj/o_proj scenario
+// where MatMulNBitsFusion folds the Add(bias) into MatMulNBits input[5].
+TEST(MatMulNBits, Fp16_Int4_NoZeroPoint_Bias) {
+  constexpr float abs_error = 0.1f;
+  constexpr bool zp_is_4bit = true;
+  constexpr bool has_zeropoint = false;
+  constexpr bool has_g_idx = false;
+  constexpr bool has_bias = true;
+
+  ScopedEnvironmentVariables scoped_env_vars{EnvVarMap{{"ORT_FPA_INTB_GEMM", "1"}}};
+
+  for (auto block_size : {64, 128}) {
+    RunTest<MLFloat16>(1, 256, 1024, block_size, has_zeropoint, zp_is_4bit, abs_error, has_g_idx, has_bias);
+    RunTest<MLFloat16>(32, 1024, 2048, block_size, has_zeropoint, zp_is_4bit, abs_error, has_g_idx, has_bias);
+  }
+}
+
+TEST(MatMulNBits, BFloat16_Int4_NoZeroPoint_Bias) {
+  if (!HasCudaEnvironment(800)) {
+    GTEST_SKIP() << "Skipping BFloat16 MatMul tests on CUDA < 8.0";
+  }
+
+  constexpr float abs_error = 0.5f;
+  constexpr bool zp_is_4bit = true;
+  constexpr bool has_zeropoint = false;
+  constexpr bool has_g_idx = false;
+  constexpr bool has_bias = true;
+
+  ScopedEnvironmentVariables scoped_env_vars{EnvVarMap{{"ORT_FPA_INTB_GEMM", "1"}}};
+
+  for (auto block_size : {64, 128}) {
+    RunTest<BFloat16>(1, 256, 1024, block_size, has_zeropoint, zp_is_4bit, abs_error, has_g_idx, has_bias);
+    RunTest<BFloat16>(32, 1024, 2048, block_size, has_zeropoint, zp_is_4bit, abs_error, has_g_idx, has_bias);
+  }
+}
+
+TEST(MatMulNBits, Fp16_Int4_NoZeroPoint_Bias_Prepacked) {
+  ScopedEnvironmentVariables scoped_env_vars{EnvVarMap{{"ORT_FPA_INTB_GEMM", "1"}}};
+
+  auto cuda_ep = DefaultCudaExecutionProvider();
+  if (!cuda_ep) {
+    GTEST_SKIP() << "CUDA execution provider is unavailable";
+  }
+
+  // Bias-bearing node with runtime prepacking (weight_prepacked=0): the kernel's PrePack transforms
+  // the raw weight into the fpA_intB layout at session init and the fused bias flows through the
+  // CUTLASS/GEMV epilogue. Offline weight_prepacked=1 parity for bias is covered by the Python test
+  // test_op_matmulnbits_prepacked_cuda.py.
+  TestOptions opts{};
+  opts.M = 32, opts.N = 1024, opts.K = 2048;
+  opts.block_size = 64;
+  opts.has_zero_point = false;
+  opts.has_bias = true;
+  opts.output_abs_error = 0.1f;
+  opts.output_rel_error = 0.02f;
+  std::vector<std::unique_ptr<IExecutionProvider>> eps;
+  eps.push_back(std::move(cuda_ep));
+  RunTest<MLFloat16>(opts, std::move(eps));
+}
+
 TEST(MatMulNBits, Fp16_Int4_PrepackedWeightRequiresFpAIntBGemm) {
   ScopedEnvironmentVariables scoped_env_vars{EnvVarMap{{"ORT_FPA_INTB_GEMM", "0"}}};
 

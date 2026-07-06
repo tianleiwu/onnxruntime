@@ -74,6 +74,14 @@ class CutlassFpAIntBGemmRunnerInterface {
 
   virtual std::vector<tkc::CutlassGemmConfig> getConfigs() const = 0;
 
+  // Overrides the SM architecture used for tactic/config enumeration, workspace sizing and kernel
+  // dispatch. By default the runner targets the detected device SM. On SM90 the half/bf16
+  // weight-only path dispatches the SM80 (Ampere) mixed-GEMM kernel (which now runs on Hopper, see
+  // GemmFpAIntB::operator()), so MatMulNBits forces the runner to SM80 to keep the enumerated
+  // tactics (tile_config_sm80) and workspace sizing consistent with the dispatched kernel.
+  // Default: no-op (keep detected SM).
+  virtual void setArch(int /*sm*/) {}
+
  protected:
   static constexpr int SPLIT_K_LIMIT = 7;
   static constexpr int MIN_M_TILE = 16;
@@ -117,6 +125,8 @@ class CutlassFpAIntBGemmRunner : public virtual CutlassFpAIntBGemmRunnerInterfac
   size_t getWorkspaceSize(int const m, int const n, int const k) override;
 
   std::vector<tkc::CutlassGemmConfig> getConfigs() const override;
+
+  void setArch(int sm) override { sm_ = sm; }
 
  private:
   template <typename EpilogueTag>
