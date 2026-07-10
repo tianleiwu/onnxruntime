@@ -192,7 +192,11 @@ def _preprocess_weights_for_mixed_gemm_torch(tensor, bits: int, sm: int):
         rows_per_tile = 128 * 8 // bits_a
         elts_in_int32 = 32 // bits_b
         if num_rows % elts_in_int32 != 0 or num_rows % rows_per_tile != 0:
-            raise ValueError(f"num_rows ({num_rows}) is incompatible with column-interleave tiling.")
+            raise ValueError(
+                f"num_rows ({num_rows}) is incompatible with the column-interleaved mixed-GEMM layout: "
+                f"the GEMM reduction dim (K) must be a multiple of {rows_per_tile} (the interleave K tile), "
+                f"but {num_rows} % {rows_per_tile} == {num_rows % rows_per_tile}."
+            )
         tensor = tensor.reshape(
             num_experts, -1, interleave, num_rows // rows_per_tile, rows_per_tile * 4 // elts_in_int32
         )

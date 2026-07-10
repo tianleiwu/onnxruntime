@@ -40,7 +40,7 @@ namespace cutlass::gemm::collective {
 
 template <class ArchTag, class OpClass, class ElementA, class GmemLayoutA, int AlignmentA, class ElementB,
           class GmemLayoutB, int AlignmentB, class ElementAccumulator, class TileShape_MNK, class ClusterShape_MNK,
-          class StageCountType, class KernelScheduleType, class Enable = void>
+          class StageCountType, class KernelScheduleType, int ScaleKPerTile = 1, class Enable = void>
 struct CollectiveBuilderInterleaved {
   static_assert(sizeof(ElementA) == 0, "Could not build a collective for given parameters.");
 };

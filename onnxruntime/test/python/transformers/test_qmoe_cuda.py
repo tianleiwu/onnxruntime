@@ -1861,9 +1861,14 @@ class TestSwigluQMoE(unittest.TestCase):
         # NaN-hardening regression: the INT4/INT8 weight-only path stores B in the column-interleaved
         # layout, whose CUTLASS K iterator requires each GEMM reduction dim to be a whole multiple of the
         # 64-element interleave tile (fc1.K == hidden_size, fc2.K == inter_size). A partial final K tile
-        # is read past the valid range and silently produces garbage/NaN. QMoE now rejects such shapes up
-        # front with a clear error instead of computing wrong results. Here inter_size 544 (== 17*32) is
-        # block-quant valid (block_size=32) but 544 % 64 == 32, so the op must raise.
+        # is read past the valid range and silently produces garbage/NaN, so such shapes must be rejected.
+        # Here inter_size 544 (== 17*32) is block-quant valid (block_size=32) but 544 % 64 == 32.
+        #
+        # The rejection happens up front when the CUDA quantizer CUTLASS-prepacks the fc2 weight
+        # (K == inter_size == 544): a partial K tile cannot be represented in the interleaved layout, so
+        # the model cannot be built at all. The CUDA kernel additionally enforces the same constraint at
+        # run time in ComputeInternal ("inter_size to be a multiple of 64") as defense-in-depth for models
+        # built by other means.
         torch.manual_seed(4321)
         numpy.random.seed(4321)
 
@@ -1879,12 +1884,10 @@ class TestSwigluQMoE(unittest.TestCase):
             use_asymmetric_quant=False,
         )
 
-        # Build the ONNX model + session (the interleaved-layout guard fires at run time in
-        # ComputeInternal, not during session creation), then assert the run is rejected.
-        self.assertTrue(swiglu_moe.recreate_onnx_model())
-        hidden_states = torch.randn(1, 1, config.hidden_size).to(device).to(torch.float16)
-        with self.assertRaisesRegex(Exception, "inter_size to be a multiple of 64"):
-            swiglu_moe.ort_forward(hidden_states)
+        # Building the model CUTLASS-prepacks fc2 (K == inter_size == 544), which rejects the partial
+        # interleave K tile up front (K must be a multiple of 64).
+        with self.assertRaisesRegex(Exception, r"multiple of 64|column-interleaved mixed-GEMM layout"):
+            swiglu_moe.recreate_onnx_model()
 
     @parameterized.expand(swiglu_test_cases)
     def test_swiglu_qmoe_parity_bf16(self, batch_size, sequence_length, quant_bits):

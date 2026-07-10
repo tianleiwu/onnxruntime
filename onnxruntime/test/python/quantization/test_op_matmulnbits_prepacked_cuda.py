@@ -24,6 +24,24 @@ except ImportError:
     _cuda_quant = None
 
 
+def _cuda_device_sm() -> int | None:
+    """Best-effort compute capability (major*10 + minor) of the active CUDA device, or None if it
+    cannot be determined (e.g. torch is unavailable or CUDA is not present)."""
+    try:
+        import torch  # noqa: PLC0415
+
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+            return major * 10 + minor
+    except Exception:
+        pass
+    return None
+
+
+# Compute capability of the device the tests run on (e.g. 90 for Hopper/H100/H200, 80 for A100).
+_CUDA_SM = _cuda_device_sm()
+
+
 @contextmanager
 def set_env(name: str, value: str):
     old_value = os.environ.get(name)
@@ -157,8 +175,11 @@ class TestMatMulNBitsPrepackedCuda(unittest.TestCase):
 
     def _check_sm90_parity(self, **kwargs):
         # The native SM90 (Hopper) layout (force_arch=90, weight_prepacked=2) only runs on an SM90
-        # device; the MatMulNBits kernel rejects it up front elsewhere. Self-gate by skipping when
-        # the compute-capability guard fires so the test is a no-op on non-Hopper CI.
+        # device; the MatMulNBits kernel enforces compute capability 9.0. Skip up front on non-SM90
+        # devices (e.g. A100/SM80) when the capability is known, and fall back to catching the
+        # capability guard when it is not (e.g. torch unavailable) so the test is a no-op off Hopper.
+        if _CUDA_SM is not None and _CUDA_SM != 90:
+            self.skipTest(f"native SM90 fpA_intB requires a Hopper (SM90) device (found sm_{_CUDA_SM})")
         try:
             self._check_prepacked_parity(force_arch=90, weight_prepacked=2, **kwargs)
         except Exception as exc:
@@ -169,6 +190,17 @@ class TestMatMulNBitsPrepackedCuda(unittest.TestCase):
     def test_int4_sm90_prepacked_weight_matches_runtime_prepack(self):
         self._check_sm90_parity(bits=4, block_size=64, m=1)
         self._check_sm90_parity(bits=4, block_size=128, m=32)
+
+    def test_int4_sm90_bs32_prepacked_weight_matches_runtime_prepack(self):
+        # block_size=32 on the native SM90 (Hopper) kernel exercises the multi-scale-per-K-tile path
+        # (two block_size=32 scale groups share the 64-element Hopper K-tile). Parity is checked
+        # against the runtime-prepacked SM80-layout path (the proven reference) for both the GEMV
+        # (m=1) and CUTLASS GEMM (m>1) shapes.
+        self._check_sm90_parity(bits=4, block_size=32, m=1)
+        self._check_sm90_parity(bits=4, block_size=32, m=32)
+
+    def test_int4_sm90_bs32_prepacked_weight_with_bias_matches_runtime_prepack(self):
+        self._check_sm90_parity(bits=4, block_size=32, m=32, has_bias=True)
 
     def test_int4_sm90_prepacked_weight_with_bias_matches_runtime_prepack(self):
         self._check_sm90_parity(bits=4, block_size=128, m=32, has_bias=True)

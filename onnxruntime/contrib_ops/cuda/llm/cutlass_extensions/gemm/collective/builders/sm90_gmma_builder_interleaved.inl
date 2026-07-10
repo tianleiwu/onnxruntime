@@ -38,10 +38,10 @@ namespace cutlass::gemm::collective
 // GMMA_TMA_WS_RS Mixed Scaled GEMM
 template <class ElementPairA_, class GmemLayoutATag_, int AlignmentA, class ElementPairB_, class GmemLayoutBTag_,
     int AlignmentB, class ElementAccumulator, class TileShape_MNK, class ClusterShape_MNK, class StageCountType,
-    class KernelScheduleType>
+    class KernelScheduleType, int ScaleKPerTile>
 struct CollectiveBuilderInterleaved<arch::Sm90, arch::OpClassTensorOp, ElementPairA_, GmemLayoutATag_, AlignmentA,
     ElementPairB_, GmemLayoutBTag_, AlignmentB, ElementAccumulator, TileShape_MNK, ClusterShape_MNK, StageCountType,
-    KernelScheduleType,
+    KernelScheduleType, ScaleKPerTile,
     cute::enable_if_t<(cute::is_same_v<KernelScheduleType, KernelTmaWarpSpecialized>
         || cute::is_same_v<KernelScheduleType, KernelTmaWarpSpecializedPingpong>
         || cute::is_same_v<KernelScheduleType, KernelTmaWarpSpecializedCooperative>)>>
@@ -130,7 +130,7 @@ public:
 
     using CollectiveOp = CollectiveMmaInterleaved<DispatchPolicy, TileShape_MNK, ElementPairA, StrideA, ElementPairB,
         StrideB, TiledMma, GmemTiledCopyA, SmemLayoutAtomA, SmemCopyAtomA, cute::identity, GmemTiledCopyB,
-        SmemLayoutAtomB, SmemCopyAtomB, cute::identity>;
+        SmemLayoutAtomB, SmemCopyAtomB, cute::identity, ScaleKPerTile>;
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

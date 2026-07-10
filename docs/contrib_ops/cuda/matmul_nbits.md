@@ -44,7 +44,7 @@ Source files:
 | `bits` | Quantization bit width: `4` or `8`. |
 | `block_size` | Quantization group size along `K` (16 / 32 / 64 / 128). One scale (and optional zero point) per group. |
 | `accuracy_level` | Minimum accuracy level for internal handling of `A`; default `0` means unset. |
-| `weight_prepacked` | CUDA fpA_intB weight-layout selector. `0` (default): `B` is in standard MatMulNBits layout and may be runtime-prepacked. `1`: `B` is already prepacked in the CUDA SM80 fpA_intB layout. `2`: `B` is prepacked in the CUDA SM90 (Hopper) fpA_intB layout, consumed by the native SM90 kernel (requires an SM90 device and `block_size` in {64, 128}). |
+| `weight_prepacked` | CUDA fpA_intB weight-layout selector. `0` (default): `B` is in standard MatMulNBits layout and may be runtime-prepacked. `1`: `B` is already prepacked in the CUDA SM80 fpA_intB layout. `2`: `B` is prepacked in the CUDA SM90 (Hopper) fpA_intB layout, consumed by the native SM90 kernel (requires an SM90 device and `block_size` in {32, 64, 128}). |
 
 | Input | Index | Notes |
 |-------|-------|-------|
@@ -102,8 +102,19 @@ native SM90 (Hopper) layout and set `weight_prepacked=2` on the node.
 
 `weight_prepacked=2` selects the native SM90 (Hopper TMA/WGMMA) mixed-GEMM
 kernel and its Hopper weight layout. It requires a compute capability 9.0 device
-and `block_size` in `{64, 128}` (the SM90 kernel needs `group_size` to be a
-multiple of the 64-element Hopper K tile, so `block_size=32` is SM80-only). On
+and `block_size` in `{32, 64, 128}`. `block_size` 64 / 128 map one quantization
+scale onto each 64-element Hopper K tile; `block_size=32` uses the
+multi-scale-per-tile path, where the mainloop stages the two 32-element scale
+groups that share a 64-element K tile (one single-row scale TMA copy per group,
+since a 2-row scale TMA descriptor is invalid on Hopper) and selects the correct
+scale per MMA K-block. The `block_size 64/128` kernels are byte-for-byte
+identical to the pre-existing single-scale-per-tile kernel (the multi-scale code
+is a compile-time-gated specialization, `ScaleKPerTile == 1`), so their
+performance is unchanged. To bound SM90 compile time and binary size, the
+`block_size=32` (`ScaleKPerTile == 2`) kernels are only instantiated for the
+`1x1x1` cluster shape — every tile shape still has a `1x1x1` tactic, so the
+`block_size=32` profiler keeps full tile-shape choice, and the multicast cluster
+variants (a large-GEMM optimization) are skipped for the fine-grained path. On
 SM90 devices, runtime-prepacked (`weight_prepacked=0`) and SM80-prepacked
 (`weight_prepacked=1`) weights continue to route to the SM80 CUTLASS
 kernel/layout.
@@ -236,9 +247,13 @@ tile saturates the SMs while keeping scratch ≲128 MB.
 
 ## 6. fpA_intB_gemm Path (CUTLASS weight-only)
 
-When built with `onnxruntime_USE_FPA_INTB_GEMM=ON` (`USE_FPA_INTB_GEMM` in C++)
-and enabled via `ORT_FPA_INTB_GEMM`, FP16/BF16 MatMulNBits can use the
-TensorRT-LLM-derived CUTLASS weight-only kernels. The constructor sets
+When built with `onnxruntime_USE_FPA_INTB_GEMM=ON` (`USE_FPA_INTB_GEMM` in C++),
+FP16/BF16 MatMulNBits can use the TensorRT-LLM-derived CUTLASS weight-only
+kernels. For a node whose weights are **not** prepacked, the path is opt-in via
+`ORT_FPA_INTB_GEMM` (or the `ep.cuda.fpa_intb_gemm` session config). A node with
+an offline-prepacked weight (the `weight_prepacked` attribute set to 1 or 2)
+always uses this path and does **not** consult `ORT_FPA_INTB_GEMM`, since its
+weight is already stored in the fpA_intB layout. The constructor sets
 `has_fpA_intB_gemm_` only when:
 
 - dtype is FP16 or BF16, `bits ∈ {4, 8}`, `block_size ∈ {32, 64, 128}`,
@@ -247,8 +262,8 @@ TensorRT-LLM-derived CUTLASS weight-only kernels. The constructor sets
   ORT can prepack.
 
 `block_size=32` is served by the SM80/Ampere-class fine-grained kernel (and its
-SM90 compatibility path); the native SM90 kernel (`weight_prepacked=2`) supports
-only `block_size ∈ {64, 128}` — see §2.1.
+SM90 compatibility path) as well as by the native SM90 kernel
+(`weight_prepacked=2`) via the multi-scale-per-tile mainloop path — see §2.1.
 
 At run time a profiler picks the best tactic; small `M` may use a dedicated CUDA
 GEMV kernel (`bestTactic->enableCudaKernel`), otherwise a CUTLASS grouped GEMM.
@@ -271,7 +286,7 @@ Prepacked weights are intentionally strict:
   CUDA fpA_intB path consumes this layout.
 - `weight_prepacked` must match the layout the selected kernel expects: `1` is
   the SM80 layout, `2` is the native SM90 (Hopper) layout. `2` additionally
-  requires a compute-capability 9.0 device and `block_size ∈ {64, 128}` and is
+  requires a compute-capability 9.0 device and `block_size ∈ {32, 64, 128}` and is
   rejected otherwise.
 
 ---

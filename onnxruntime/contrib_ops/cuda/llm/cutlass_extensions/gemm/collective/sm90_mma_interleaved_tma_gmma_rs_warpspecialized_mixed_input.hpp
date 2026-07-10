@@ -62,10 +62,11 @@ using namespace cute;
 template <int Stages, class ClusterShape, class KernelSchedule, class TileShape_, class ElementAOptionalTuple,
           class StrideA_, class ElementBOptionalTuple, class StrideB_, class TiledMma_, class GmemTiledCopyA_,
           class SmemLayoutAtomA_, class SmemCopyAtomA_, class TransformA_, class GmemTiledCopyB_, class SmemLayoutAtomB_,
-          class SmemCopyAtomB_, class TransformB_>
+          class SmemCopyAtomB_, class TransformB_, int ScaleKPerTile_>
 struct CollectiveMmaInterleaved<MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInput<Stages, ClusterShape, KernelSchedule>,
                                 TileShape_, ElementAOptionalTuple, StrideA_, ElementBOptionalTuple, StrideB_, TiledMma_, GmemTiledCopyA_,
-                                SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_, GmemTiledCopyB_, SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_> {
+                                SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_, GmemTiledCopyB_, SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_,
+                                ScaleKPerTile_> {
  private:
   template <class PointerType>
   static constexpr auto get_logical_ptr(PointerType const* ptr) {
@@ -195,6 +196,18 @@ struct CollectiveMmaInterleaved<MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInpu
   // One threads per CTA are producers (1 for operand tile)
   static constexpr int NumProducerThreadEvents = 1;
 
+  // Number of quantization scale rows consumed per CTA K-tile. 1 => one scale per K-tile (the
+  // original single-scale-per-tile behavior; group_size is a multiple of the CTA K-tile, e.g.
+  // block_size 64/128). >1 => several scale groups share a K-tile (e.g. block_size 32 with a
+  // 64-element K-tile => 2), which requires loading ScaleKPerTile scale rows per iteration and
+  // selecting the correct row per MMA K-block.
+  static constexpr int ScaleKPerTile = ScaleKPerTile_;
+  static_assert(ScaleKPerTile == 1 || ScaleKPerTile == 2, "ScaleKPerTile must be 1 or 2.");
+
+  // The scale TMA always uses a single-row (K==1) box: the Hopper TMA descriptor for a 2-row scale
+  // box fails to initialize. For ScaleKPerTile>1 the smem holds ScaleKPerTile rows and load() issues
+  // one single-row TMA copy per row, reusing the proven single-row descriptor. SmemLayoutAtomScale is
+  // therefore K==1; the extra rows live in SmemLayoutScale's K extent (ScaleKPerTile).
   using SmemLayoutAtomScale = Layout<Shape<decltype(cute::shape<0>(InternalSmemLayoutAtomA{})), cute::Int<1>>>;
   using ScaleTileShape = decltype(make_shape(shape<0>(TileShape{}), shape<1>(SmemLayoutAtomScale{})));
   static constexpr int type_factor = sizeof_bits<ElementB>::value / sizeof_bits<ElementA>::value;
@@ -242,11 +255,26 @@ struct CollectiveMmaInterleaved<MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInpu
                                              cute::conditional_t<::cutlass::gemm::detail::is_major<0, InternalStrideB>(), Step<_2, _1, _3>,
                                                                  Step<_1, _2, _3>>{}));
 
-  // It is assumed that the scales and zero-points share the same smem layout
-  using SmemLayoutScale = decltype(tile_to_shape(SmemLayoutAtomScale{},
-                                                 make_shape(shape<0>(ScaleTileShape{}), shape<1>(ScaleTileShape{}), Int<Stages>{}),
-                                                 cute::conditional_t<::cutlass::gemm::detail::is_major<0, NonVoidStrideScale>(), Step<_2, _1, _3>,
-                                                                     Step<_1, _2, _3>>{}));
+  // It is assumed that the scales and zero-points share the same smem layout.
+  // Smem holds ScaleKPerTile scale rows per stage (one per block_size group sharing the K-tile).
+  // For ScaleKPerTile>1 the rows must be an OUTER dimension (M contiguous, row r at offset r*M): the
+  // default tile_to_shape ordering would make the K(row) mode innermost and interleave the rows into
+  // M (M-stride == ScaleKPerTile), which makes the per-row single-row views non-contiguous and breaks
+  // the vectorized smem->rmem scale copy. ScaleKPerTile==1 keeps the original layout verbatim.
+  using SmemLayoutScale = cute::conditional_t<
+      ScaleKPerTile == 1,
+      decltype(tile_to_shape(SmemLayoutAtomScale{},
+                             make_shape(shape<0>(ScaleTileShape{}), Int<ScaleKPerTile>{}, Int<Stages>{}),
+                             cute::conditional_t<::cutlass::gemm::detail::is_major<0, NonVoidStrideScale>(), Step<_2, _1, _3>,
+                                                 Step<_1, _2, _3>>{})),
+      decltype(make_layout(make_shape(shape<0>(ScaleTileShape{}), Int<ScaleKPerTile>{}, Int<Stages>{}),
+                           make_stride(_1{}, shape<0>(ScaleTileShape{}),
+                                       shape<0>(ScaleTileShape{}) * Int<ScaleKPerTile>{})))>;
+  // Single-row smem layout used to build the scale/zero TMA descriptor (one row per TMA copy).
+  using SmemLayoutScaleTmaBox = decltype(tile_to_shape(SmemLayoutAtomScale{},
+                                                       make_shape(shape<0>(ScaleTileShape{}), shape<1>(ScaleTileShape{}), Int<Stages>{}),
+                                                       cute::conditional_t<::cutlass::gemm::detail::is_major<0, NonVoidStrideScale>(), Step<_2, _1, _3>,
+                                                                           Step<_1, _2, _3>>{}));
 
   static_assert(DispatchPolicy::Stages >= 2, "Specialization requires Stages set to value 2 or more.");
   static_assert(!cute::is_base_of<cute::GMMA::DescriptorIterator, typename TiledMma::FrgTypeA>::value && cute::is_base_of<cute::GMMA::DescriptorIterator, typename TiledMma::FrgTypeB>::value,
@@ -258,10 +286,11 @@ struct CollectiveMmaInterleaved<MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInpu
       cute::is_same_v<GmemTiledCopyB, SM90_TMA_LOAD> || cute::is_same_v<GmemTiledCopyB, SM90_TMA_LOAD_MULTICAST>,
       "GmemTiledCopy - invalid SM90 TMA copy atom specified.");
 
-  // To relax them, we need to handle loading more than 1 row of scales for every main loop iteration.
-  // We must also handle updating the pipeline transaction bytes on the fly.
-  // NOTE: Deleting this assertion without required changes will cause the code to hang.
-  static_assert(size<1>(SmemLayoutAtomScale{}) == 1, "size<1>(SmemLayoutAtomScale) must be 1.");
+  // ScaleKPerTile scale rows are staged per K-tile (in SmemLayoutScale's K extent). The TMA box is
+  // always single-row (SmemLayoutAtomScale K==1); load() issues one single-row TMA copy per row, so
+  // pipeline transaction bytes stay compile-time constant and each descriptor is a valid Hopper TMA.
+  static_assert(size<1>(SmemLayoutAtomScale{}) == 1, "Scale TMA box must be single-row.");
+  static_assert(size<1>(SmemLayoutScale{}) == ScaleKPerTile, "SmemLayoutScale must stage ScaleKPerTile rows.");
 
  private:
   static constexpr ConversionMode get_conversion_mode() {
@@ -375,7 +404,7 @@ struct CollectiveMmaInterleaved<MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInpu
    private:
     using Outer = CollectiveMmaInterleaved<DispatchPolicy, TileShape_, ElementAOptionalTuple, StrideA_,
                                            ElementBOptionalTuple, StrideB_, TiledMma_, GmemTiledCopyA_, SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_,
-                                           GmemTiledCopyB_, SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_>;
+                                           GmemTiledCopyB_, SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_, ScaleKPerTile_>;
 
    public:
     // Assumption: StrideA is congruent with Problem_MK
@@ -388,13 +417,13 @@ struct CollectiveMmaInterleaved<MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInpu
     using TMA_Scale = decltype(make_tma_copy(GmemTiledCopyScale{},
                                              make_tensor(Outer::get_logical_ptr(static_cast<NonVoidElementScale const*>(nullptr)),
                                                          repeat_like(NonVoidStrideScale{}, static_cast<int32_t>(0)), NonVoidStrideScale{}),
-                                             SmemLayoutScale{}(_, _, cute::Int<0>{}), ScaleTileShape{},
+                                             SmemLayoutScaleTmaBox{}(_, _, cute::Int<0>{}), ScaleTileShape{},
                                              _1{}));  // mcast along N mode for this M load, if any. Scale is ALWAYS loaded with A for RF kernel
 
     using TMA_Zero = decltype(make_tma_copy(GmemTiledCopyScale{},
                                             make_tensor(Outer::get_logical_ptr(static_cast<NonVoidElementZero const*>(nullptr)),
                                                         repeat_like(NonVoidStrideScale{}, static_cast<int32_t>(0)), NonVoidStrideScale{}),
-                                            SmemLayoutScale{}(_, _, cute::Int<0>{}), ScaleTileShape{},
+                                            SmemLayoutScaleTmaBox{}(_, _, cute::Int<0>{}), ScaleTileShape{},
                                             _1{}));  // mcast along N mode for this M load, if any. Scale is ALWAYS loaded with A for RF kernel
 
     // Assumption: StrideB is congruent with Problem_NK
@@ -469,7 +498,7 @@ struct CollectiveMmaInterleaved<MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInpu
       ElementScale const* ptr_S = args.ptr_S;
       StrideScale dS = args.dS;
       Tensor tensor_scale = make_tensor(get_logical_ptr(ptr_S), make_layout(make_shape(M, scale_k, L), dS));
-      tma_load_scale = make_tma_copy(GmemTiledCopyScale{}, tensor_scale, SmemLayoutScale{}(_, _, cute::Int<0>{}),
+      tma_load_scale = make_tma_copy(GmemTiledCopyScale{}, tensor_scale, SmemLayoutScaleTmaBox{}(_, _, cute::Int<0>{}),
                                      ScaleTileShape{}, _1{});  // mcast along N mode for this M load, if any
 
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
@@ -477,7 +506,7 @@ struct CollectiveMmaInterleaved<MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInpu
                 TmaTransactionBytes, TmaTransactionBytesMK, TmaTransactionBytesNK};
       } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         Tensor tensor_zero = make_tensor(get_logical_ptr(args.ptr_Z), make_layout(make_shape(M, scale_k, L), dS));
-        tma_load_zero = make_tma_copy(GmemTiledCopyScale{}, tensor_zero, SmemLayoutScale{}(_, _, cute::Int<0>{}),
+        tma_load_zero = make_tma_copy(GmemTiledCopyScale{}, tensor_zero, SmemLayoutScaleTmaBox{}(_, _, cute::Int<0>{}),
                                       ScaleTileShape{}, _1{});  // mcast along N mode for this M load, if any
         return {tma_load_a, tma_load_b, tma_load_scale, tma_load_zero, scale_k, args.group_size,
                 TmaTransactionBytes, TmaTransactionBytesMK, TmaTransactionBytesNK};
@@ -512,7 +541,14 @@ struct CollectiveMmaInterleaved<MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInpu
       constexpr int min_tma_aligned_elements_scale = tma_alignment_bits / cutlass::sizeof_bits<ElementScale>::value;
       implementable = implementable && cutlass::detail::check_alignment<min_tma_aligned_elements_scale>(
                                            cute::make_shape(scale_mn, scale_k, L), StrideScale{});
-      implementable = implementable && (args.group_size == K || ((args.group_size % size<2>(TileShape{})) == 0));
+      // ScaleKPerTile == 1: group_size must equal K (per-column) or be a multiple of the CTA K-tile.
+      // ScaleKPerTile > 1: the K-tile carries ScaleKPerTile scale groups, so group_size * ScaleKPerTile
+      // must equal the CTA K-tile (e.g. group_size 32, K-tile 64, ScaleKPerTile 2).
+      if constexpr (ScaleKPerTile == 1) {
+        implementable = implementable && (args.group_size == K || ((args.group_size % size<2>(TileShape{})) == 0));
+      } else {
+        implementable = implementable && (args.group_size * ScaleKPerTile == size<2>(TileShape{}));
+      }
       implementable = implementable && args.group_size != 0;
       implementable = implementable && (args.ptr_S != nullptr);
 
@@ -702,26 +738,55 @@ struct CollectiveMmaInterleaved<MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInpu
           // Nothing extra to do.
         } else if constexpr (ModeHasScales) {
           auto tSgS = get<0>(extra_input_partitions);
-          auto tSsS = get<1>(extra_input_partitions);
 
           // Temporary factor which will determine which k tile to reload from gmem. Needed so we don't modify
           // tma transaction bytes on the fly. We must do a ceiling divide here to correctly handle with
           // group_size == K. In that case, we don't require that K is a multiple of the threadblock tile K
           int const ReloadFactor = (mainloop_params.group_size + size<2>(TileShape{}) - 1) / size<2>(TileShape{});
           int const scale_load_k = *k_tile_iter / ReloadFactor;  // This will always be 0 when group_size == K.
-          copy(mainloop_params.tma_load_scale.with(*tma_barrier, mcast_mask_s), tSgS(_, _, _, scale_load_k),
-               tSsS(_, _, _, write_stage));
 
-          if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-            // Nothing extra to do
-          } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-            auto tZgZ = get<2>(extra_input_partitions);
-            auto tZsZ = get<3>(extra_input_partitions);
-            copy(mainloop_params.tma_load_zero.with(*tma_barrier, mcast_mask_s),
-                 tZgZ(_, _, _, scale_load_k), tZsZ(_, _, _, write_stage));
+          if constexpr (ScaleKPerTile == 1) {
+            auto tSsS = get<1>(extra_input_partitions);
+            copy(mainloop_params.tma_load_scale.with(*tma_barrier, mcast_mask_s), tSgS(_, _, _, scale_load_k),
+                 tSsS(_, _, _, write_stage));
+
+            if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+              // Nothing extra to do
+            } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+              auto tZgZ = get<2>(extra_input_partitions);
+              auto tZsZ = get<3>(extra_input_partitions);
+              copy(mainloop_params.tma_load_zero.with(*tma_barrier, mcast_mask_s),
+                   tZgZ(_, _, _, scale_load_k), tZsZ(_, _, _, write_stage));
+            } else {
+              static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                            "Conversion mode not handled for TMA copy op.");
+            }
           } else {
-            static_assert(cutlass::detail::dependent_false<KernelSchedule>,
-                          "Conversion mode not handled for TMA copy op.");
+            // ScaleKPerTile == 2: the K-tile spans two block_size groups; issue one single-row TMA
+            // copy per row. gmem scale row for group r of tile t is (ScaleKPerTile * t + r) since
+            // group_size < K-tile (ReloadFactor == 1 here).
+            auto tSsS0 = get<1>(extra_input_partitions);
+            auto tSsS1 = get<2>(extra_input_partitions);
+            int const base_row = ScaleKPerTile * scale_load_k;
+            copy(mainloop_params.tma_load_scale.with(*tma_barrier, mcast_mask_s), tSgS(_, _, _, base_row + 0),
+                 tSsS0(_, _, _, write_stage));
+            copy(mainloop_params.tma_load_scale.with(*tma_barrier, mcast_mask_s), tSgS(_, _, _, base_row + 1),
+                 tSsS1(_, _, _, write_stage));
+
+            if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+              // Nothing extra to do
+            } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+              auto tZgZ = get<3>(extra_input_partitions);
+              auto tZsZ0 = get<4>(extra_input_partitions);
+              auto tZsZ1 = get<5>(extra_input_partitions);
+              copy(mainloop_params.tma_load_zero.with(*tma_barrier, mcast_mask_s), tZgZ(_, _, _, base_row + 0),
+                   tZsZ0(_, _, _, write_stage));
+              copy(mainloop_params.tma_load_zero.with(*tma_barrier, mcast_mask_s), tZgZ(_, _, _, base_row + 1),
+                   tZsZ1(_, _, _, write_stage));
+            } else {
+              static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                            "Conversion mode not handled for TMA copy op.");
+            }
           }
         } else {
           static_assert(cutlass::detail::dependent_false<KernelSchedule>,
@@ -1065,29 +1130,49 @@ struct CollectiveMmaInterleaved<MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInpu
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       return cute::make_tuple();
     } else if constexpr (ModeHasScales) {
-      Tensor sS = make_tensor(
-          make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScale{});  // (BLK_M,BLK_K,PIPE)
       Tensor gS_mkl = get<2>(load_inputs);
       auto block_tma_s = mainloop_params.tma_load_scale.get_slice(cluster_local_block_id.y);
-      Tensor gS = gS_mkl(_, _, m_coord, _, l_coord);  // (BLK_M,BLK_K,k)
+      Tensor gS = gS_mkl(_, _, m_coord, _, l_coord);  // (BLK_M,1,scale_k)
+      Tensor tSgS = block_tma_s.partition_S(gS);      // (TMA,TMA_M,TMA_K,scale_k)
 
-      Tensor tSgS = block_tma_s.partition_S(gS);  // (TMA,TMA_M,TMA_K,k)
-      Tensor tSsS = block_tma_s.partition_D(sS);  // (TMA,TMA_M,TMA_K,PIPE)
-      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return cute::make_tuple(tSgS, tSsS);
-      } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-        Tensor sZ = make_tensor(
-            make_smem_ptr(shared_tensors.smem_zero.begin()), SmemLayoutScale{});  // (BLK_M,BLK_K,PIPE)
-        Tensor gZ_mkl = get<3>(load_inputs);
-        auto block_tma_z = mainloop_params.tma_load_zero.get_slice(cluster_local_block_id.y);
-        Tensor gZ = gZ_mkl(_, _, m_coord, _, l_coord);  // (BLK_M,BLK_K,k)
-
-        Tensor tZgZ = block_tma_z.partition_S(gZ);  // (TMA,TMA_M,TMA_K,k)
-        Tensor tZsZ = block_tma_z.partition_D(sZ);  // (TMA,TMA_M,TMA_K,PIPE)
-        return cute::make_tuple(tSgS, tSsS, tZgZ, tZsZ);
+      if constexpr (ScaleKPerTile == 1) {
+        Tensor sS = make_tensor(
+            make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScale{});  // (BLK_M,1,PIPE)
+        Tensor tSsS = block_tma_s.partition_D(sS);                                 // (TMA,TMA_M,TMA_K,PIPE)
+        if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+          return cute::make_tuple(tSgS, tSsS);
+        } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+          Tensor sZ = make_tensor(
+              make_smem_ptr(shared_tensors.smem_zero.begin()), SmemLayoutScale{});
+          Tensor gZ_mkl = get<3>(load_inputs);
+          auto block_tma_z = mainloop_params.tma_load_zero.get_slice(cluster_local_block_id.y);
+          Tensor gZ = gZ_mkl(_, _, m_coord, _, l_coord);
+          Tensor tZgZ = block_tma_z.partition_S(gZ);
+          Tensor tZsZ = block_tma_z.partition_D(sZ);
+          return cute::make_tuple(tSgS, tSsS, tZgZ, tZsZ);
+        } else {
+          static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                        "Conversion mode not handled for input partitioning.");
+        }
       } else {
-        static_assert(cutlass::detail::dependent_false<KernelSchedule>,
-                      "Conversion mode not handled for input partitioning.");
+        // ScaleKPerTile == 2: one single-row smem destination per scale row; load() issues one
+        // single-row TMA copy per row (a valid Hopper TMA descriptor, unlike a 2-row box).
+        Tensor tSsS0 = block_tma_s.partition_D(make_scale_row_smem(shared_tensors.smem_scale.begin(), 0));
+        Tensor tSsS1 = block_tma_s.partition_D(make_scale_row_smem(shared_tensors.smem_scale.begin(), 1));
+        if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+          return cute::make_tuple(tSgS, tSsS0, tSsS1);
+        } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+          Tensor gZ_mkl = get<3>(load_inputs);
+          auto block_tma_z = mainloop_params.tma_load_zero.get_slice(cluster_local_block_id.y);
+          Tensor gZ = gZ_mkl(_, _, m_coord, _, l_coord);
+          Tensor tZgZ = block_tma_z.partition_S(gZ);
+          Tensor tZsZ0 = block_tma_z.partition_D(make_scale_row_smem(shared_tensors.smem_zero.begin(), 0));
+          Tensor tZsZ1 = block_tma_z.partition_D(make_scale_row_smem(shared_tensors.smem_zero.begin(), 1));
+          return cute::make_tuple(tSgS, tSsS0, tSsS1, tZgZ, tZsZ0, tZsZ1);
+        } else {
+          static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                        "Conversion mode not handled for input partitioning.");
+        }
       }
     } else {
       static_assert(cutlass::detail::dependent_false<KernelSchedule>,
@@ -1106,6 +1191,19 @@ struct CollectiveMmaInterleaved<MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInpu
     }
   }
 
+  // Build a single-scale-row (K==1) smem view into a multi-row (ScaleKPerTile) scale/zero buffer.
+  // partition_A collapses the extra scale rows (the scale is broadcast, not a real MMA K operand), so
+  // for ScaleKPerTile>1 we slice out row r and re-insert a unit K mode. The result partitions exactly
+  // like the single-row (block_size 64/128) case, so the proven copy/transform machinery is reused
+  // per row. M and PIPE sublayouts are carried through verbatim (they may be hierarchical).
+  template <class Ptr>
+  CUTLASS_DEVICE auto make_scale_row_smem(Ptr base, int r) const {
+    Tensor sS_full = make_tensor(make_smem_ptr(base), SmemLayoutScale{});  // (BLK_M, ScaleK, PIPE)
+    Tensor sS_r = sS_full(_, r, _);                                        // (BLK_M, PIPE)
+    auto row_layout = make_layout(get<0>(sS_r.layout()), make_layout(Int<1>{}, Int<0>{}), get<1>(sS_r.layout()));
+    return make_tensor(sS_r.data(), row_layout);  // (BLK_M, 1, PIPE)
+  }
+
   /// Utilities for partitioning extra inputs for loading from smem in the mainloop.
   template <class ThreadMma>
   CUTLASS_DEVICE auto partition_extra_mma_info(ThreadMma const& mma_thread_slice, TensorStorage& shared_tensors) {
@@ -1113,25 +1211,52 @@ struct CollectiveMmaInterleaved<MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInpu
       // nothing to do
       return cute::make_tuple();
     } else if constexpr (ModeHasScales) {
-      Tensor sS = make_tensor(
-          make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScale{});  // (BLK_M,BLK_SCALE_K,PIPE)
-      Tensor tCsS = mma_thread_slice.partition_A(sS);
       auto remappingScale = scale_remapping<InternalElementB>();
-      Tensor tCsS_remapped = tCsS.compose(remappingScale, _, _, _);
-      Tensor tCrS = make_tensor<ElementScale>(mma_thread_slice.partition_fragment_A(sS(_, _, Int<0>{})).shape());
+      if constexpr (ScaleKPerTile == 1) {
+        Tensor sS = make_tensor(
+            make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScale{});  // (BLK_M,BLK_SCALE_K,PIPE)
+        Tensor tCsS = mma_thread_slice.partition_A(sS);
+        Tensor tCsS_remapped = tCsS.compose(remappingScale, _, _, _);
+        Tensor tCrS = make_tensor<ElementScale>(mma_thread_slice.partition_fragment_A(sS(_, _, Int<0>{})).shape());
 
-      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return cute::make_tuple(tCsS_remapped, tCrS);
-      } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-        Tensor sZ = make_tensor(
-            make_smem_ptr(shared_tensors.smem_zero.begin()), SmemLayoutScale{});  // (BLK_M,BLK_SCALE_K,PIPE)
-        Tensor tCsZ = mma_thread_slice.partition_A(sZ);
-        Tensor tCsZ_remapped = tCsZ.compose(remappingScale, _, _, _);
-        Tensor tCrZ = make_tensor<ElementZero>(mma_thread_slice.partition_fragment_A(sZ(_, _, Int<0>{})).shape());
-        return cute::make_tuple(tCsS_remapped, tCrS, tCsZ_remapped, tCrZ);
+        if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+          return cute::make_tuple(tCsS_remapped, tCrS);
+        } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+          Tensor sZ = make_tensor(
+              make_smem_ptr(shared_tensors.smem_zero.begin()), SmemLayoutScale{});  // (BLK_M,BLK_SCALE_K,PIPE)
+          Tensor tCsZ = mma_thread_slice.partition_A(sZ);
+          Tensor tCsZ_remapped = tCsZ.compose(remappingScale, _, _, _);
+          Tensor tCrZ = make_tensor<ElementZero>(mma_thread_slice.partition_fragment_A(sZ(_, _, Int<0>{})).shape());
+          return cute::make_tuple(tCsS_remapped, tCrS, tCsZ_remapped, tCrZ);
+        } else {
+          static_assert(
+              cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
+        }
       } else {
-        static_assert(
-            cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
+        // ScaleKPerTile == 2: two resident scale rows, one per block_size=32 group in the K-tile.
+        auto* s_base = shared_tensors.smem_scale.begin();
+        Tensor sS0 = make_scale_row_smem(s_base, 0);
+        Tensor sS1 = make_scale_row_smem(s_base, 1);
+        Tensor tCsS0 = mma_thread_slice.partition_A(sS0).compose(remappingScale, _, _, _);
+        Tensor tCsS1 = mma_thread_slice.partition_A(sS1).compose(remappingScale, _, _, _);
+        Tensor tCrS0 = make_tensor<ElementScale>(mma_thread_slice.partition_fragment_A(sS0(_, _, Int<0>{})).shape());
+        Tensor tCrS1 = make_tensor<ElementScale>(mma_thread_slice.partition_fragment_A(sS1(_, _, Int<0>{})).shape());
+
+        if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+          return cute::make_tuple(tCsS0, tCrS0, tCsS1, tCrS1);
+        } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+          auto* z_base = shared_tensors.smem_zero.begin();
+          Tensor sZ0 = make_scale_row_smem(z_base, 0);
+          Tensor sZ1 = make_scale_row_smem(z_base, 1);
+          Tensor tCsZ0 = mma_thread_slice.partition_A(sZ0).compose(remappingScale, _, _, _);
+          Tensor tCsZ1 = mma_thread_slice.partition_A(sZ1).compose(remappingScale, _, _, _);
+          Tensor tCrZ0 = make_tensor<ElementZero>(mma_thread_slice.partition_fragment_A(sZ0(_, _, Int<0>{})).shape());
+          Tensor tCrZ1 = make_tensor<ElementZero>(mma_thread_slice.partition_fragment_A(sZ1(_, _, Int<0>{})).shape());
+          return cute::make_tuple(tCsS0, tCrS0, tCsZ0, tCrZ0, tCsS1, tCrS1, tCsZ1, tCrZ1);
+        } else {
+          static_assert(
+              cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
+        }
       }
     } else {
       static_assert(
@@ -1149,16 +1274,34 @@ struct CollectiveMmaInterleaved<MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInpu
     } else if constexpr (ModeHasScales) {
       auto smem_tiled_copy_S = make_tiled_copy_A(SmemCopyAtomScale{}, tiled_mma);
       auto smem_thr_copy_S = smem_tiled_copy_S.get_thread_slice(warp_group_thread_idx);
-      Tensor tCrS_copy_view = smem_thr_copy_S.retile_D(cute::get<1>(partitioned_extra_info));  // (CPY,CPY_M,CPY_K)
+      if constexpr (ScaleKPerTile == 1) {
+        Tensor tCrS_copy_view = smem_thr_copy_S.retile_D(cute::get<1>(partitioned_extra_info));  // (CPY,CPY_M,CPY_K)
 
-      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return cute::make_tuple(smem_tiled_copy_S, tCrS_copy_view);
-      } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-        Tensor tCrZ_copy_view = smem_thr_copy_S.retile_D(cute::get<3>(partitioned_extra_info));  // (CPY,CPY_M,CPY_K)
-        return cute::make_tuple(smem_tiled_copy_S, tCrS_copy_view, tCrZ_copy_view);
+        if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+          return cute::make_tuple(smem_tiled_copy_S, tCrS_copy_view);
+        } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+          Tensor tCrZ_copy_view = smem_thr_copy_S.retile_D(cute::get<3>(partitioned_extra_info));  // (CPY,CPY_M,CPY_K)
+          return cute::make_tuple(smem_tiled_copy_S, tCrS_copy_view, tCrZ_copy_view);
+        } else {
+          static_assert(
+              cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
+        }
       } else {
-        static_assert(
-            cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
+        // ScaleKPerTile == 2: retile the copy views for both resident scale (and zero) rows.
+        if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+          Tensor vS0 = smem_thr_copy_S.retile_D(cute::get<1>(partitioned_extra_info));
+          Tensor vS1 = smem_thr_copy_S.retile_D(cute::get<3>(partitioned_extra_info));
+          return cute::make_tuple(smem_tiled_copy_S, vS0, vS1);
+        } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+          Tensor vS0 = smem_thr_copy_S.retile_D(cute::get<1>(partitioned_extra_info));
+          Tensor vZ0 = smem_thr_copy_S.retile_D(cute::get<3>(partitioned_extra_info));
+          Tensor vS1 = smem_thr_copy_S.retile_D(cute::get<5>(partitioned_extra_info));
+          Tensor vZ1 = smem_thr_copy_S.retile_D(cute::get<7>(partitioned_extra_info));
+          return cute::make_tuple(smem_tiled_copy_S, vS0, vZ0, vS1, vZ1);
+        } else {
+          static_assert(
+              cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
+        }
       }
     } else {
       static_assert(
@@ -1181,23 +1324,52 @@ struct CollectiveMmaInterleaved<MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInpu
              tCrA_copy_view_reshaped(_, _, k_block / kNumKIterationsPerWarpBLoad));
     }
     if (k_block == 0) {
-      // We are starting a new k-tile so copy the scale
+      // We are starting a new k-tile so copy the scale(s). ScaleKPerTile scale rows belong to this
+      // K-tile (1 for block_size 64/128, 2 when a 64-element K-tile carries two block_size=32 groups).
       if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
         // nothing to do
       } else if constexpr (ModeHasScales) {
         auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
-        auto tCrS_copy_view = cute::get<1>(tiled_copy_and_views);
-        auto tCsS = cute::get<0>(partitioned_mma_extra_info);
-        copy(smem_tiled_copy_S, tCsS(_, _, k_block, read_stage), tCrS_copy_view(_, _, k_block));
-        if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-          // Nothing extra to do
-        } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-          auto tCsZ = cute::get<2>(partitioned_mma_extra_info);
-          auto tCrZ_copy_view = cute::get<2>(tiled_copy_and_views);
-          copy(smem_tiled_copy_S, tCsZ(_, _, k_block, read_stage), tCrZ_copy_view(_, _, k_block));
+        if constexpr (ScaleKPerTile == 1) {
+          auto tCrS_copy_view = cute::get<1>(tiled_copy_and_views);
+          auto tCsS = cute::get<0>(partitioned_mma_extra_info);
+          copy(smem_tiled_copy_S, tCsS(_, _, k_block, read_stage), tCrS_copy_view(_, _, k_block));
+          if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+            // Nothing extra to do
+          } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+            auto tCsZ = cute::get<2>(partitioned_mma_extra_info);
+            auto tCrZ_copy_view = cute::get<2>(tiled_copy_and_views);
+            copy(smem_tiled_copy_S, tCsZ(_, _, k_block, read_stage), tCrZ_copy_view(_, _, k_block));
+          } else {
+            static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                          "Conversion mode not handled in A -> RF path.");
+          }
         } else {
-          static_assert(cutlass::detail::dependent_false<KernelSchedule>,
-                        "Conversion mode not handled in A -> RF path.");
+          // ScaleKPerTile == 2: copy both resident scale (and zero) rows from their per-row smem views.
+          if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+            auto tCsS0 = cute::get<0>(partitioned_mma_extra_info);
+            auto tCsS1 = cute::get<2>(partitioned_mma_extra_info);
+            auto vS0 = cute::get<1>(tiled_copy_and_views);
+            auto vS1 = cute::get<2>(tiled_copy_and_views);
+            copy(smem_tiled_copy_S, tCsS0(_, _, 0, read_stage), vS0(_, _, 0));
+            copy(smem_tiled_copy_S, tCsS1(_, _, 0, read_stage), vS1(_, _, 0));
+          } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+            auto tCsS0 = cute::get<0>(partitioned_mma_extra_info);
+            auto tCsZ0 = cute::get<2>(partitioned_mma_extra_info);
+            auto tCsS1 = cute::get<4>(partitioned_mma_extra_info);
+            auto tCsZ1 = cute::get<6>(partitioned_mma_extra_info);
+            auto vS0 = cute::get<1>(tiled_copy_and_views);
+            auto vZ0 = cute::get<2>(tiled_copy_and_views);
+            auto vS1 = cute::get<3>(tiled_copy_and_views);
+            auto vZ1 = cute::get<4>(tiled_copy_and_views);
+            copy(smem_tiled_copy_S, tCsS0(_, _, 0, read_stage), vS0(_, _, 0));
+            copy(smem_tiled_copy_S, tCsZ0(_, _, 0, read_stage), vZ0(_, _, 0));
+            copy(smem_tiled_copy_S, tCsS1(_, _, 0, read_stage), vS1(_, _, 0));
+            copy(smem_tiled_copy_S, tCsZ1(_, _, 0, read_stage), vZ1(_, _, 0));
+          } else {
+            static_assert(cutlass::detail::dependent_false<KernelSchedule>,
+                          "Conversion mode not handled in A -> RF path.");
+          }
         }
       } else {
         static_assert(
@@ -1211,50 +1383,135 @@ struct CollectiveMmaInterleaved<MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInpu
   CUTLASS_DEVICE void transform_A_kblock(TCrA_load const& tCrA_load, cute::Int<VectorWidthA> vec_A,
                                          TCrA_mma& tCrA_mma, cute::tuple<Ts...> const& partitioned_extra_info, int const k_block,
                                          int kNumKIterationsPerWarpBLoad) {
-    if (kNumKIterationsPerWarpBLoad != 1) {
-      if (k_block % kNumKIterationsPerWarpBLoad == 0) {
-        int k_block_load = k_block / kNumKIterationsPerWarpBLoad;
-        using reshape_layout = Layout<Shape<Shape<_2, _2, _2, _2>, _1, _2>>;
-        auto tCrA_load_reshaped = tCrA_load.compose(reshape_layout{});
-        auto tCra_mma_reshaped = tCrA_mma.compose(reshape_layout{});
+    if constexpr (ScaleKPerTile == 1) {
+      // Original single-scale-per-K-tile path. Kept verbatim so block_size 64/128 is unaffected.
+      if (kNumKIterationsPerWarpBLoad != 1) {
+        if (k_block % kNumKIterationsPerWarpBLoad == 0) {
+          int k_block_load = k_block / kNumKIterationsPerWarpBLoad;
+          using reshape_layout = Layout<Shape<Shape<_2, _2, _2, _2>, _1, _2>>;
+          auto tCrA_load_reshaped = tCrA_load.compose(reshape_layout{});
+          auto tCra_mma_reshaped = tCrA_mma.compose(reshape_layout{});
 
-        using scale_reshape = Layout<Shape<Shape<_2, _2, _2, _2>, _1, _1>, Stride<Stride<_0, _0, _0, _4>, _0, _0>>;
+          using scale_reshape = Layout<Shape<Shape<_2, _2, _2, _2>, _1, _1>, Stride<Stride<_0, _0, _0, _4>, _0, _0>>;
+          if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
+            transform_internal_A(
+                tCrA_load_reshaped(_, _, k_block_load), vec_A, tCra_mma_reshaped(_, _, k_block_load));
+          } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+            auto tCrS = cute::get<1>(partitioned_extra_info);
+            auto tCrS_reshaped = tCrS.compose(scale_reshape{});
+            transform_internal_A(tCrA_load_reshaped(_, _, k_block_load), vec_A,
+                                 make_fragment_like<ElementScale>(tCra_mma_reshaped)(_, _, k_block_load), tCrS_reshaped(_, _, 0),
+                                 tCra_mma_reshaped(_, _, k_block_load));
+          } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+            auto tCrS = cute::get<1>(partitioned_extra_info);
+            auto tCrS_reshaped = tCrS.compose(scale_reshape{});
+            auto tCrZ = cute::get<3>(partitioned_extra_info);
+            auto tCrZ_reshaped = tCrZ.compose(scale_reshape{});
+            transform_internal_A(tCrA_load_reshaped(_, _, k_block_load), vec_A,
+                                 make_fragment_like<ElementScale>(tCra_mma_reshaped)(_, _, k_block_load), tCrS_reshaped(_, _, 0),
+                                 tCrZ_reshaped(_, _, 0), tCra_mma_reshaped(_, _, k_block_load));
+          } else {
+            static_assert(cutlass::detail::dependent_false<KernelSchedule>, "No A data is loaded.");
+          }
+        }
+      } else {
         if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
-          transform_internal_A(
-              tCrA_load_reshaped(_, _, k_block_load), vec_A, tCra_mma_reshaped(_, _, k_block_load));
+          transform_internal_A(tCrA_load(_, _, k_block), vec_A, tCrA_mma(_, _, k_block));
         } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
           auto tCrS = cute::get<1>(partitioned_extra_info);
-          auto tCrS_reshaped = tCrS.compose(scale_reshape{});
-          transform_internal_A(tCrA_load_reshaped(_, _, k_block_load), vec_A,
-                               make_fragment_like<ElementScale>(tCra_mma_reshaped)(_, _, k_block_load), tCrS_reshaped(_, _, 0),
-                               tCra_mma_reshaped(_, _, k_block_load));
+          transform_internal_A(tCrA_load(_, _, k_block), vec_A,
+                               make_fragment_like<ElementScale>(tCrA_mma)(_, _, k_block), tCrS(_, _, 0), tCrA_mma(_, _, k_block));
         } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
           auto tCrS = cute::get<1>(partitioned_extra_info);
-          auto tCrS_reshaped = tCrS.compose(scale_reshape{});
           auto tCrZ = cute::get<3>(partitioned_extra_info);
-          auto tCrZ_reshaped = tCrZ.compose(scale_reshape{});
-          transform_internal_A(tCrA_load_reshaped(_, _, k_block_load), vec_A,
-                               make_fragment_like<ElementScale>(tCra_mma_reshaped)(_, _, k_block_load), tCrS_reshaped(_, _, 0),
-                               tCrZ_reshaped(_, _, 0), tCra_mma_reshaped(_, _, k_block_load));
+          transform_internal_A(tCrA_load(_, _, k_block), vec_A,
+                               make_fragment_like<ElementScale>(tCrA_mma)(_, _, k_block), tCrS(_, _, 0), tCrZ(_, _, 0),
+                               tCrA_mma(_, _, k_block));
         } else {
           static_assert(cutlass::detail::dependent_false<KernelSchedule>, "No A data is loaded.");
         }
       }
     } else {
-      if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
-        transform_internal_A(tCrA_load(_, _, k_block), vec_A, tCrA_mma(_, _, k_block));
-      } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        auto tCrS = cute::get<1>(partitioned_extra_info);
-        transform_internal_A(tCrA_load(_, _, k_block), vec_A,
-                             make_fragment_like<ElementScale>(tCrA_mma)(_, _, k_block), tCrS(_, _, 0), tCrA_mma(_, _, k_block));
-      } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-        auto tCrS = cute::get<1>(partitioned_extra_info);
-        auto tCrZ = cute::get<3>(partitioned_extra_info);
-        transform_internal_A(tCrA_load(_, _, k_block), vec_A,
-                             make_fragment_like<ElementScale>(tCrA_mma)(_, _, k_block), tCrS(_, _, 0), tCrZ(_, _, 0),
-                             tCrA_mma(_, _, k_block));
+      // Multi-scale-per-K-tile path (ScaleKPerTile == 2, e.g. block_size 32 with a 64-element K-tile).
+      // Two full scale rows are resident (see partition_extra_mma_info). Each MMA K-block lies entirely
+      // within one block_size=32 group, so we pick the row for this K-block and reuse the exact
+      // single-row reshape/broadcast, guaranteeing identical numerics to the 64/128 path per row.
+      if (kNumKIterationsPerWarpBLoad != 1) {
+        if (k_block % kNumKIterationsPerWarpBLoad == 0) {
+          int k_block_load = k_block / kNumKIterationsPerWarpBLoad;
+          using reshape_layout = Layout<Shape<Shape<_2, _2, _2, _2>, _1, _2>>;
+          auto tCrA_load_reshaped = tCrA_load.compose(reshape_layout{});
+          auto tCra_mma_reshaped = tCrA_mma.compose(reshape_layout{});
+          // size<2>(tCrA_load_reshaped) K-block-loads map 1:1 onto ScaleKPerTile groups here.
+          constexpr int kNumKBlockLoads = decltype(size<2>(tCrA_load_reshaped))::value;
+          int const scale_row = k_block_load * ScaleKPerTile / kNumKBlockLoads;
+
+          using scale_reshape = Layout<Shape<Shape<_2, _2, _2, _2>, _1, _1>, Stride<Stride<_0, _0, _0, _4>, _0, _0>>;
+          if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
+            transform_internal_A(
+                tCrA_load_reshaped(_, _, k_block_load), vec_A, tCra_mma_reshaped(_, _, k_block_load));
+          } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+            auto tCrS0 = cute::get<1>(partitioned_extra_info).compose(scale_reshape{});
+            auto tCrS1 = cute::get<3>(partitioned_extra_info).compose(scale_reshape{});
+            if (scale_row == 0) {
+              transform_internal_A(tCrA_load_reshaped(_, _, k_block_load), vec_A,
+                                   make_fragment_like<ElementScale>(tCra_mma_reshaped)(_, _, k_block_load), tCrS0(_, _, 0),
+                                   tCra_mma_reshaped(_, _, k_block_load));
+            } else {
+              transform_internal_A(tCrA_load_reshaped(_, _, k_block_load), vec_A,
+                                   make_fragment_like<ElementScale>(tCra_mma_reshaped)(_, _, k_block_load), tCrS1(_, _, 0),
+                                   tCra_mma_reshaped(_, _, k_block_load));
+            }
+          } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+            auto tCrS0 = cute::get<1>(partitioned_extra_info).compose(scale_reshape{});
+            auto tCrZ0 = cute::get<3>(partitioned_extra_info).compose(scale_reshape{});
+            auto tCrS1 = cute::get<5>(partitioned_extra_info).compose(scale_reshape{});
+            auto tCrZ1 = cute::get<7>(partitioned_extra_info).compose(scale_reshape{});
+            if (scale_row == 0) {
+              transform_internal_A(tCrA_load_reshaped(_, _, k_block_load), vec_A,
+                                   make_fragment_like<ElementScale>(tCra_mma_reshaped)(_, _, k_block_load), tCrS0(_, _, 0),
+                                   tCrZ0(_, _, 0), tCra_mma_reshaped(_, _, k_block_load));
+            } else {
+              transform_internal_A(tCrA_load_reshaped(_, _, k_block_load), vec_A,
+                                   make_fragment_like<ElementScale>(tCra_mma_reshaped)(_, _, k_block_load), tCrS1(_, _, 0),
+                                   tCrZ1(_, _, 0), tCra_mma_reshaped(_, _, k_block_load));
+            }
+          } else {
+            static_assert(cutlass::detail::dependent_false<KernelSchedule>, "No A data is loaded.");
+          }
+        }
       } else {
-        static_assert(cutlass::detail::dependent_false<KernelSchedule>, "No A data is loaded.");
+        constexpr int kNumKBlocks = decltype(size<2>(tCrA_mma))::value;
+        int const scale_row = k_block * ScaleKPerTile / kNumKBlocks;
+        if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
+          transform_internal_A(tCrA_load(_, _, k_block), vec_A, tCrA_mma(_, _, k_block));
+        } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+          auto tCrS0 = cute::get<1>(partitioned_extra_info);
+          auto tCrS1 = cute::get<3>(partitioned_extra_info);
+          if (scale_row == 0) {
+            transform_internal_A(tCrA_load(_, _, k_block), vec_A,
+                                 make_fragment_like<ElementScale>(tCrA_mma)(_, _, k_block), tCrS0(_, _, 0), tCrA_mma(_, _, k_block));
+          } else {
+            transform_internal_A(tCrA_load(_, _, k_block), vec_A,
+                                 make_fragment_like<ElementScale>(tCrA_mma)(_, _, k_block), tCrS1(_, _, 0), tCrA_mma(_, _, k_block));
+          }
+        } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+          auto tCrS0 = cute::get<1>(partitioned_extra_info);
+          auto tCrZ0 = cute::get<3>(partitioned_extra_info);
+          auto tCrS1 = cute::get<5>(partitioned_extra_info);
+          auto tCrZ1 = cute::get<7>(partitioned_extra_info);
+          if (scale_row == 0) {
+            transform_internal_A(tCrA_load(_, _, k_block), vec_A,
+                                 make_fragment_like<ElementScale>(tCrA_mma)(_, _, k_block), tCrS0(_, _, 0), tCrZ0(_, _, 0),
+                                 tCrA_mma(_, _, k_block));
+          } else {
+            transform_internal_A(tCrA_load(_, _, k_block), vec_A,
+                                 make_fragment_like<ElementScale>(tCrA_mma)(_, _, k_block), tCrS1(_, _, 0), tCrZ1(_, _, 0),
+                                 tCrA_mma(_, _, k_block));
+          }
+        } else {
+          static_assert(cutlass::detail::dependent_false<KernelSchedule>, "No A data is loaded.");
+        }
       }
     }
   }

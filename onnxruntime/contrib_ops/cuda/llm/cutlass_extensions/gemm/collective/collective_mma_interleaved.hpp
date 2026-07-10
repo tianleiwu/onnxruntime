@@ -38,9 +38,15 @@ namespace cutlass::gemm::collective {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+// ScaleKPerTile: number of quantization scale rows consumed per CTA K-tile.
+//   1 (default): one scale per K-tile -> group_size must be a multiple of the CTA K-tile
+//     (e.g. block_size 64/128 on Hopper where the K-tile is 64). Byte-for-byte identical to the
+//     original single-scale-per-tile mainloop, so 64/128 performance is unaffected.
+//   >1: multiple scale groups per K-tile, enabling finer group sizes (e.g. block_size 32 with a
+//     64-element K-tile -> ScaleKPerTile == 2). Only instantiated for the fine-grained path.
 template <class DispatchPolicy, class TileShape, class ElementA, class StrideA, class ElementB, class StrideB,
           class TiledMma, class GmemTiledCopyA, class SmemLayoutAtomA, class SmemCopyAtomA, class TransformA,
-          class GmemTiledCopyB, class SmemLayoutAtomB, class SmemCopyAtomB, class TransformB>
+          class GmemTiledCopyB, class SmemLayoutAtomB, class SmemCopyAtomB, class TransformB, int ScaleKPerTile = 1>
 struct CollectiveMmaInterleaved {
   static_assert(cutlass::detail::dependent_false<ElementA>, "Could not find a mainloop specialization.");
 };

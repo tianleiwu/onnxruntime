@@ -131,12 +131,12 @@ class MatMulNBits final : public CudaKernel {
                 weight_prepacked_);
     if (weight_prepacked_ == kMatMulNBitsWeightPrepackedSm90) {
       // The native SM90 (Hopper TMA/WGMMA) mixed-GEMM kernel requires a compute-capability 9.0
-      // device and a block_size that is a multiple of the Hopper K tile (128 / sizeof(half) = 64).
-      // block_size=32 is only supported by the SM80/Ampere-class kernel + GEMV path.
+      // device. block_size must tile the 64-element Hopper K-tile: 64/128 use one scale per K-tile,
+      // and 32 is served by the multi-scale-per-tile path (two block_size=32 groups per K-tile).
       ORT_ENFORCE(sm_ == 90,
                   "weight_prepacked=2 (SM90 layout) requires a compute capability 9.0 (Hopper) device, but got sm ", sm_);
-      ORT_ENFORCE(block_size_ == 64 || block_size_ == 128,
-                  "weight_prepacked=2 (SM90 layout) supports block_size 64 or 128 only, but got ", block_size_);
+      ORT_ENFORCE(block_size_ == 32 || block_size_ == 64 || block_size_ == 128,
+                  "weight_prepacked=2 (SM90 layout) supports block_size 32, 64, or 128 only, but got ", block_size_);
     }
 
     if constexpr (std::is_same<T, MLFloat16>::value || std::is_same<T, BFloat16>::value) {

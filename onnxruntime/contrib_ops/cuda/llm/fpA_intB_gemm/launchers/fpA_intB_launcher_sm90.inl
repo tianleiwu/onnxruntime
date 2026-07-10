@@ -56,9 +56,6 @@ namespace tk = onnxruntime::llm::common;
 namespace tkc = onnxruntime::llm::cutlass_extensions;
 using namespace cute;
 
-template <typename ActivationType, typename WeightType, typename ScaleZeroType, typename BiasType, typename OutputType,
-          cutlass::WeightOnlyQuantOp QuantOp, typename EpilogueTag, typename CTAShape, typename ClusterShape,
-          typename MainloopScheduleType, typename EpilogueScheduleType>
 // Gate the real launcher on the COMPILE_HOPPER_TMA_GEMMS preprocessor macro only (matching the MoE
 // TMA launcher in moe_gemm_tma_ws_launcher.inl). The host-callable launcher symbol is emitted from
 // the host compilation pass, so it must NOT be gated on __CUDA_ARCH__/__NV_SASS_VERSION__ (which are
@@ -66,7 +63,14 @@ template <typename ActivationType, typename WeightType, typename ScaleZeroType, 
 // fails at runtime with "recompile ... 90a". The device kernel body is guarded internally by the
 // collective (CUTE_ARCH_MMA_SM90A_ENABLED); these files are compiled at sm_90a-real.
 #if defined(COMPILE_HOPPER_TMA_GEMMS)
-void sm90_generic_mixed_gemm_kernelLauncher(
+// ScaleKPerTile: quantization scale rows consumed per CTA K-tile. 1 => one scale per K-tile
+// (block_size 64/128, byte-identical to the original kernel). 2 => two block_size=32 groups share a
+// 64-element K-tile. Selected at runtime by the public wrapper below based on group_size, so both
+// variants are instantiated in this translation unit and the ABI symbol is unchanged.
+template <int ScaleKPerTile, typename ActivationType, typename WeightType, typename ScaleZeroType, typename BiasType,
+          typename OutputType, cutlass::WeightOnlyQuantOp QuantOp, typename EpilogueTag, typename CTAShape,
+          typename ClusterShape, typename MainloopScheduleType, typename EpilogueScheduleType>
+void sm90_generic_mixed_gemm_kernelLauncher_impl(
     ActivationType const* A, WeightType const* B,
     ScaleZeroType const* weight_scales, ScaleZeroType const* weight_zero_points, BiasType const* biases,
     float const alpha, OutputType* C, int m, int n, int k, int const group_size, tkc::CutlassGemmConfig /*gemm_config*/,
@@ -166,7 +170,7 @@ void sm90_generic_mixed_gemm_kernelLauncher(
         LayoutA_Transpose, AlignmentA, ElementAccumulator, TileShape, ClusterShape,
         cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
             sizeof(typename CollectiveEpilogue::SharedStorage))>,
-        KernelSchedule>::CollectiveOp;
+        KernelSchedule, ScaleKPerTile>::CollectiveOp;
 
     using TileScheduler = cute::conditional_t<size<0>(CTAShape{}) == Int<64>{}, cutlass::gemm::PersistentScheduler,
                                               cutlass::gemm::StreamKScheduler>;
@@ -193,8 +197,11 @@ void sm90_generic_mixed_gemm_kernelLauncher(
 
     if constexpr (cutlass::isFinegrained(QuantOp)) {
       int cta_shape_k = cute::size<2>(TileShape{});
-      if (group_size % cta_shape_k != 0) {
-        std::string err_msg = "The group size must a multiple of " + std::to_string(cta_shape_k);
+      // group_size is valid if it is a multiple of the CTA K-tile (ScaleKPerTile==1, block 64/128)
+      // or if ScaleKPerTile groups tile it exactly (e.g. ScaleKPerTile==2, group_size 32, K-tile 64).
+      if (group_size % cta_shape_k != 0 && group_size * ScaleKPerTile != cta_shape_k) {
+        std::string err_msg = "The group size must a multiple of " + std::to_string(cta_shape_k) +
+                              " or tile it exactly with ScaleKPerTile=" + std::to_string(ScaleKPerTile);
         ORT_THROW("[fpA_intB_gemm] ", err_msg);
       }
 
@@ -273,8 +280,58 @@ void sm90_generic_mixed_gemm_kernelLauncher(
     ORT_THROW(ss.str());
   }
 }
+
+// Bounds SM90 fine-grained (ScaleKPerTile=2, i.e. block_size=32) compile time / binary size: the
+// extra kernels are only instantiated for the 1x1x1 cluster. Every tile shape still has a 1x1x1
+// config, so the block_size=32 tactic profiler retains full tile-shape choice; the multicast cluster
+// variants (a large-GEMM optimization) are intentionally not instantiated for the fine-grained path.
+// Configs without an instantiated ScaleKPerTile=2 kernel fall through to the ScaleKPerTile=1 launcher,
+// whose group-size check throws for group_size=32, and the tactic profiler simply skips them.
+// block_size 64/128 (ScaleKPerTile=1) never take this path, so their kernels and performance are
+// unchanged. To trade compile time for more block_size=32 tactics, widen this predicate.
+template <class CTAShape, class ClusterShape>
+constexpr bool sm90_scale_k_per_tile_2_instantiated() {
+  return cute::size<0>(ClusterShape{}) == 1 && cute::size<1>(ClusterShape{}) == 1;
+}
+
+// Public ABI launcher. Chooses ScaleKPerTile from the runtime group_size so both the standard
+// (block_size 64/128) and fine-grained (block_size 32) variants are instantiated in this TU, keeping
+// the explicitly-instantiated symbol signature unchanged.
+template <typename ActivationType, typename WeightType, typename ScaleZeroType, typename BiasType, typename OutputType,
+          cutlass::WeightOnlyQuantOp QuantOp, typename EpilogueTag, typename CTAShape, typename ClusterShape,
+          typename MainloopScheduleType, typename EpilogueScheduleType>
+void sm90_generic_mixed_gemm_kernelLauncher(
+    ActivationType const* A, WeightType const* B,
+    ScaleZeroType const* weight_scales, ScaleZeroType const* weight_zero_points, BiasType const* biases,
+    float const alpha, OutputType* C, int m, int n, int k, int const group_size, tkc::CutlassGemmConfig gemm_config,
+    char* workspace, size_t workspace_bytes, cudaStream_t stream, int* occupancy) {
+  ORT_LLM_LOG_ENTRY();
+  constexpr int cta_k = cute::size<2>(CTAShape{});
+  // Fine-grained groups smaller than the CTA K-tile need multiple scale rows per tile. Only the
+  // exact-half case (e.g. group_size 32 with a 64-element K-tile) is supported, and only for the
+  // cluster shapes for which the ScaleKPerTile=2 kernel is instantiated (see predicate above).
+  if constexpr (cutlass::isFinegrained(QuantOp) &&
+                sm90_scale_k_per_tile_2_instantiated<CTAShape, ClusterShape>()) {
+    if (group_size > 0 && group_size * 2 == cta_k) {
+      sm90_generic_mixed_gemm_kernelLauncher_impl<2, ActivationType, WeightType, ScaleZeroType, BiasType, OutputType,
+                                                  QuantOp, EpilogueTag, CTAShape, ClusterShape, MainloopScheduleType,
+                                                  EpilogueScheduleType>(
+          A, B, weight_scales, weight_zero_points, biases, alpha, C, m, n, k,
+          group_size, gemm_config, workspace, workspace_bytes, stream, occupancy);
+      return;
+    }
+  }
+  sm90_generic_mixed_gemm_kernelLauncher_impl<1, ActivationType, WeightType, ScaleZeroType, BiasType, OutputType,
+                                              QuantOp, EpilogueTag, CTAShape, ClusterShape, MainloopScheduleType,
+                                              EpilogueScheduleType>(
+      A, B, weight_scales, weight_zero_points, biases, alpha, C, m, n, k,
+      group_size, gemm_config, workspace, workspace_bytes, stream, occupancy);
+}
 #else   // COMPILE_HOPPER_TMA_GEMMS
 // This stub is now used for ALL non-SASS or non-SM90A compilation passes includes the 90-virtual (PTX) pass.
+template <typename ActivationType, typename WeightType, typename ScaleZeroType, typename BiasType, typename OutputType,
+          cutlass::WeightOnlyQuantOp QuantOp, typename EpilogueTag, typename CTAShape, typename ClusterShape,
+          typename MainloopScheduleType, typename EpilogueScheduleType>
 void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const*, WeightType const*,
                                             ScaleZeroType const*, ScaleZeroType const*, BiasType const*,
                                             float const, OutputType*, int, int, int, int const, tkc::CutlassGemmConfig,
