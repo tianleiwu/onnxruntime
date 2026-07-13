@@ -309,6 +309,24 @@ void LaunchQMoECombineFp4ScalesForGemv(
     int k_blocks,
     cudaStream_t stream);
 
+void LaunchQMoECombineNvfp4ScalesForGemv(
+    const uint8_t* block_scales,
+    const float* global_scales,
+    half* output,
+    int experts,
+    int n,
+    int k_blocks,
+    cudaStream_t stream);
+
+void LaunchQMoECombineNvfp4ScalesForGemv(
+    const uint8_t* block_scales,
+    const float* global_scales,
+    __nv_bfloat16* output,
+    int experts,
+    int n,
+    int k_blocks,
+    cudaStream_t stream);
+
 }  // namespace cuda
 }  // namespace contrib
 }  // namespace onnxruntime

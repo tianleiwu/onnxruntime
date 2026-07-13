@@ -291,6 +291,19 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
       // dequantize E2M1 weights (E4M3 block scales, block size 16, per-expert global scale)
       // to FP16/BF16 and run the dense A16 MoE runner.
       use_fp4_dequant_fallback_ = true;
+#if defined(ENABLE_FP4) && defined(USE_FP4_QMOE)
+      // Fused FP4 GEMV (W4A16) decode fast path, shared with MXFP4 but with block size 16 and
+      // Float8E4M3FN block scales. Default-on (opt-out via ORT_ENABLE_FP4_GEMV=0): small-decode
+      // shapes route through the fused GEMV instead of re-dequantizing every expert to dense
+      // BF16/FP16 each token, and any unsupported shape (prefill / large batch) falls through to
+      // the dequant fallback. NVFP4 has no native CUTLASS/SM80 path, so those stay disabled.
+      {
+        const char* v = std::getenv("ORT_ENABLE_FP4_GEMV");
+        enable_fp4_gemv_ = (v == nullptr || v[0] == '\0' || v[0] != '0');
+      }
+      enable_fp4_gemv_autotune_ = Fp4GemvAutotuneEnabled();
+      enable_fp4_gemv_autotune_log_ = Fp4GemvAutotuneLogEnabled();
+#endif
     } else if (quant_type_ == "wfp4afp8") {
       ORT_ENFORCE(expert_weight_bits_ == 4, "WFP4AFP8 (W4A8) quantization requires expert_weight_bits=4");
 #if defined(ENABLE_FP4) && defined(USE_FP4_QMOE) && defined(ENABLE_FP8)
@@ -1208,7 +1221,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
            ? (gemv_fp4_fc1_weights_decode_ != nullptr && gemv_fp4_fc2_weights_decode_ != nullptr)
            : (gemv_fp4_fc1_weights_ != nullptr && gemv_fp4_fc2_weights_ != nullptr)) &&
       gemv_fp4_fc1_scales_ != nullptr && gemv_fp4_fc2_scales_ != nullptr;
-  if (is_fp4 && fp4_decode_regime && enable_fp4_gemv_ && is_fused_swiglu &&
+  if (is_fp4_family && fp4_decode_regime && enable_fp4_gemv_ && is_fused_swiglu &&
       fp4_gemv_buffers_ready) {
     namespace gemv = onnxruntime::llm::kernels::moe_gemv;
     namespace ck = onnxruntime::llm::kernels::cutlass_kernels;
@@ -1218,8 +1231,10 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
     const int64_t hidden = moe_params.hidden_size;
     const int64_t inter = moe_params.inter_size;
     const int64_t fc1_n = inter * 2;
-    const bool fc1_gemv_supported = gemv::is_moe_gemv_fp4_supported(sm_, expanded, fc1_n, hidden, 32);
-    const bool fc2_gemv_supported = gemv::is_moe_gemv_fp4_supported(sm_, expanded, hidden, inter, 32);
+    // MXFP4 uses block size 32 (e2m1 + e8m0); NVFP4 uses block size 16 (e2m1 + e4m3).
+    const int gemv_group_size = is_nvfp4 ? 16 : 32;
+    const bool fc1_gemv_supported = gemv::is_moe_gemv_fp4_supported(sm_, expanded, fc1_n, hidden, gemv_group_size);
+    const bool fc2_gemv_supported = gemv::is_moe_gemv_fp4_supported(sm_, expanded, hidden, inter, gemv_group_size);
     if (num_rows > 0 && num_rows <= 256 && expanded > 0 && fc1_gemv_supported && fc2_gemv_supported) {
       // When the SM80 grouped-GEMM prefill repurposes gemv_fp4_fc*_weights_ for its pair-
       // interleaved layout, the decode GEMV reads its own ColToRow copy in
@@ -1294,7 +1309,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
               gemv_fc1_weight,
               static_cast<const T*>(gemv_fp4_fc1_scales_.get()),
               static_cast<const T*>(fc1_bias), static_cast<T*>(p_fc1_buf.get()),
-              p_efto, p_exp, num_experts, expanded, inter, hidden, 32, sm_, act_params, cfg, stream);
+              p_efto, p_exp, num_experts, expanded, inter, hidden, gemv_group_size, sm_, act_params, cfg, stream);
         };
         auto launch_fc2 = [&](MoeGemvConfig cfg) {
           gemv::launch_moe_gemv_fp4_symmetric<T>(
@@ -1302,7 +1317,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
               gemv_fc2_weight,
               static_cast<const T*>(gemv_fp4_fc2_scales_.get()),
               static_cast<const T*>(fc2_bias), static_cast<T*>(p_fc2_buf.get()),
-              p_efto, p_exp, num_experts, expanded, hidden, inter, 32, sm_, cfg, stream);
+              p_efto, p_exp, num_experts, expanded, hidden, inter, gemv_group_size, sm_, cfg, stream);
         };
 
         if (do_tune) {
@@ -1338,7 +1353,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
           const bool log_tune = enable_fp4_gemv_autotune_log_;
           float best_fc1 = std::numeric_limits<float>::max();
           for (MoeGemvConfig cfg : kCandidates) {
-            if (!gemv::is_moe_gemv_fp4_supported(sm_, expanded, fc1_n, hidden, 32, cfg)) {
+            if (!gemv::is_moe_gemv_fp4_supported(sm_, expanded, fc1_n, hidden, gemv_group_size, cfg)) {
               continue;
             }
             const float ms = time_launch([&] { launch_fc1(cfg); });
@@ -1356,7 +1371,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
           launch_fc1(fc1_config);
           float best_fc2 = std::numeric_limits<float>::max();
           for (MoeGemvConfig cfg : kCandidates) {
-            if (!gemv::is_moe_gemv_fp4_supported(sm_, expanded, hidden, inter, 32, cfg)) {
+            if (!gemv::is_moe_gemv_fp4_supported(sm_, expanded, hidden, inter, gemv_group_size, cfg)) {
               continue;
             }
             const float ms = time_launch([&] { launch_fc2(cfg); });
@@ -1626,30 +1641,36 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
                               onnxruntime::llm::kernels::moe_gemv::Fp4MoeGemvUseInterleaved());
     }
     is_packed = false;
-  } else if (input_idx == 2 && quant_type_ == "fp4" && enable_fp4_gemv_) {
-    // Fused MXFP4 GEMV: lay out fc1 weights as [E, 2*inter, hidden/2] row-major. Keep
+  } else if (input_idx == 2 && (quant_type_ == "fp4" || quant_type_ == "nvfp4") && enable_fp4_gemv_) {
+    // Fused FP4 GEMV: lay out fc1 weights as [E, 2*inter, hidden/2] row-major. Keep
     // is_packed = false so the raw [E, hidden, n/2] initializer remains available for the
     // dequant fallback used by shapes the GEMV does not support. When the SM80 grouped-GEMM
-    // port is enabled, force the SM80 CUTLASS ColumnMajorTileInterleave layout (Lever A) so
-    // this buffer feeds the prefill grouped GEMM; the decode GEMV then reads its own ColToRow
-    // copy in gemv_fp4_fc1_weights_decode_ (packed below) since it cannot consume that layout.
+    // port is enabled (MXFP4 only), force the SM80 CUTLASS ColumnMajorTileInterleave layout
+    // (Lever A) so this buffer feeds the prefill grouped GEMM; the decode GEMV then reads its
+    // own ColToRow copy in gemv_fp4_fc1_weights_decode_ (packed below) since it cannot consume
+    // that layout. NVFP4 (block 16) has no native/SM80 path and always uses the plain ColToRow
+    // layout the non-interleaved GEMV consumes.
+    const bool nvfp4 = (quant_type_ == "nvfp4");
+    const bool use_interleave =
+        !nvfp4 && (onnxruntime::llm::kernels::moe_gemv::Fp4MoeGemvUseInterleaved() || enable_fp4_sm80_gemm_);
+    const bool sm80_pair = !nvfp4 && enable_fp4_sm80_gemm_;
     bool local_packed = false;
     PrePackRepackFP4Weights(tensor, stream, alloc, gemv_fp4_fc1_weights_, local_packed,
-                            onnxruntime::llm::kernels::moe_gemv::Fp4MoeGemvUseInterleaved() ||
-                                enable_fp4_sm80_gemm_,
-                            /*sm80_pair_interleave=*/enable_fp4_sm80_gemm_);
+                            use_interleave, /*sm80_pair_interleave=*/sm80_pair);
     if (enable_fp4_sm80_gemm_) {
       bool decode_packed = false;
       PrePackRepackFP4Weights(tensor, stream, alloc, gemv_fp4_fc1_weights_decode_, decode_packed,
                               onnxruntime::llm::kernels::moe_gemv::Fp4MoeGemvUseInterleaved(),
                               /*sm80_pair_interleave=*/false);
     }
-  } else if (input_idx == 5 && quant_type_ == "fp4" && enable_fp4_gemv_) {
+  } else if (input_idx == 5 && (quant_type_ == "fp4" || quant_type_ == "nvfp4") && enable_fp4_gemv_) {
+    const bool nvfp4 = (quant_type_ == "nvfp4");
+    const bool use_interleave =
+        !nvfp4 && (onnxruntime::llm::kernels::moe_gemv::Fp4MoeGemvUseInterleaved() || enable_fp4_sm80_gemm_);
+    const bool sm80_pair = !nvfp4 && enable_fp4_sm80_gemm_;
     bool local_packed = false;
     PrePackRepackFP4Weights(tensor, stream, alloc, gemv_fp4_fc2_weights_, local_packed,
-                            onnxruntime::llm::kernels::moe_gemv::Fp4MoeGemvUseInterleaved() ||
-                                enable_fp4_sm80_gemm_,
-                            /*sm80_pair_interleave=*/enable_fp4_sm80_gemm_);
+                            use_interleave, /*sm80_pair_interleave=*/sm80_pair);
     if (enable_fp4_sm80_gemm_) {
       bool decode_packed = false;
       PrePackRepackFP4Weights(tensor, stream, alloc, gemv_fp4_fc2_weights_decode_, decode_packed,
@@ -1687,7 +1708,7 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
       PrePackSwizzleBlockScales(tensor, stream, alloc, packed_fp4_fc1_block_scales_, is_packed);
     } else if (quant_type_ == "fp4" || quant_type_ == "nvfp4" || quant_type_ == "wfp4afp8") {
       PrePackCopyToGpu(tensor, stream, alloc, packed_fp4_fc1_block_scales_, is_packed);
-      if (quant_type_ == "fp4" && enable_fp4_gemv_ && tensor.Shape().NumDimensions() == 3) {
+      if ((quant_type_ == "fp4" || quant_type_ == "nvfp4") && enable_fp4_gemv_ && tensor.Shape().NumDimensions() == 3) {
         gemv_fp4_fc1_scale_e_ = tensor.Shape()[0];
         gemv_fp4_fc1_scale_n_ = tensor.Shape()[1];
         gemv_fp4_fc1_scale_kb_ = tensor.Shape()[2];
@@ -1713,7 +1734,7 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
       PrePackSwizzleBlockScales(tensor, stream, alloc, packed_fp4_fc2_block_scales_, is_packed);
     } else if (quant_type_ == "fp4" || quant_type_ == "nvfp4" || quant_type_ == "wfp4afp8") {
       PrePackCopyToGpu(tensor, stream, alloc, packed_fp4_fc2_block_scales_, is_packed);
-      if (quant_type_ == "fp4" && enable_fp4_gemv_ && tensor.Shape().NumDimensions() == 3) {
+      if ((quant_type_ == "fp4" || quant_type_ == "nvfp4") && enable_fp4_gemv_ && tensor.Shape().NumDimensions() == 3) {
         gemv_fp4_fc2_scale_e_ = tensor.Shape()[0];
         gemv_fp4_fc2_scale_n_ = tensor.Shape()[1];
         gemv_fp4_fc2_scale_kb_ = tensor.Shape()[2];
@@ -2117,7 +2138,8 @@ void QMoE::PrePackRepackFP4Weights(const Tensor& tensor, cudaStream_t stream, Al
 }
 
 void QMoE::TryBuildGemvFp4Scales(int fc, cudaStream_t stream, AllocatorPtr alloc) {
-  if (!enable_fp4_gemv_ || quant_type_ != "fp4") {
+  const bool is_nvfp4 = (quant_type_ == "nvfp4");
+  if (!enable_fp4_gemv_ || (quant_type_ != "fp4" && !is_nvfp4)) {
     return;
   }
   IAllocatorUniquePtr<void>& block = (fc == 1) ? packed_fp4_fc1_block_scales_ : packed_fp4_fc2_block_scales_;
@@ -2140,17 +2162,33 @@ void QMoE::TryBuildGemvFp4Scales(int fc, cudaStream_t stream, AllocatorPtr alloc
   out = IAllocator::MakeUniquePtr<void>(alloc, bytes, true);
 
   if (is_fp16_) {
-    LaunchQMoECombineFp4ScalesForGemv(
-        static_cast<const uint8_t*>(src_block.get()),
-        static_cast<const float*>(global.get()),
-        static_cast<half*>(out.get()),
-        static_cast<int>(experts), static_cast<int>(n), static_cast<int>(k_blocks), stream);
+    if (is_nvfp4) {
+      LaunchQMoECombineNvfp4ScalesForGemv(
+          static_cast<const uint8_t*>(src_block.get()),
+          static_cast<const float*>(global.get()),
+          static_cast<half*>(out.get()),
+          static_cast<int>(experts), static_cast<int>(n), static_cast<int>(k_blocks), stream);
+    } else {
+      LaunchQMoECombineFp4ScalesForGemv(
+          static_cast<const uint8_t*>(src_block.get()),
+          static_cast<const float*>(global.get()),
+          static_cast<half*>(out.get()),
+          static_cast<int>(experts), static_cast<int>(n), static_cast<int>(k_blocks), stream);
+    }
   } else {
-    LaunchQMoECombineFp4ScalesForGemv(
-        static_cast<const uint8_t*>(src_block.get()),
-        static_cast<const float*>(global.get()),
-        static_cast<__nv_bfloat16*>(out.get()),
-        static_cast<int>(experts), static_cast<int>(n), static_cast<int>(k_blocks), stream);
+    if (is_nvfp4) {
+      LaunchQMoECombineNvfp4ScalesForGemv(
+          static_cast<const uint8_t*>(src_block.get()),
+          static_cast<const float*>(global.get()),
+          static_cast<__nv_bfloat16*>(out.get()),
+          static_cast<int>(experts), static_cast<int>(n), static_cast<int>(k_blocks), stream);
+    } else {
+      LaunchQMoECombineFp4ScalesForGemv(
+          static_cast<const uint8_t*>(src_block.get()),
+          static_cast<const float*>(global.get()),
+          static_cast<__nv_bfloat16*>(out.get()),
+          static_cast<int>(experts), static_cast<int>(n), static_cast<int>(k_blocks), stream);
+    }
   }
   CUDA_CALL_THROW(cudaStreamSynchronize(stream));
 }

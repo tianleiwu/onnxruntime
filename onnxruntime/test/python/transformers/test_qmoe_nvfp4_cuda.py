@@ -18,6 +18,8 @@
 
 import unittest
 
+import os
+
 import numpy
 import torch
 import torch.nn.functional as F
@@ -288,6 +290,7 @@ class TestQMoENVFP4(unittest.TestCase):
         onnx_dtype,
         use_swiglu=False,
         block_size=NVFP4_BLOCK_SIZE,
+        gemv_mode=None,
     ):
         self._skip_if_no_fp4()
 
@@ -348,6 +351,12 @@ class TestQMoENVFP4(unittest.TestCase):
 
         opts = onnxruntime.SessionOptions()
         opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_DISABLE_ALL
+        # gemv_mode toggles the fused FP4 GEMV decode path (read once in the QMoE op ctor during
+        # session creation): "1" forces it on, "0" forces the dequant fallback, None leaves the
+        # default. Restore the previous value right after the session is built.
+        prev_gemv_env = os.environ.get("ORT_ENABLE_FP4_GEMV")
+        if gemv_mode is not None:
+            os.environ["ORT_ENABLE_FP4_GEMV"] = gemv_mode
         try:
             session = onnxruntime.InferenceSession(
                 onnx_model, opts, providers=[resolve_cuda_plugin_ep("CUDAExecutionProvider")]
@@ -356,6 +365,12 @@ class TestQMoENVFP4(unittest.TestCase):
             if "ENABLE_FP4" in str(e) or "requires USE_FP4_QMOE" in str(e):
                 self.skipTest(f"NVFP4 not supported in this build: {e}")
             raise
+        finally:
+            if gemv_mode is not None:
+                if prev_gemv_env is None:
+                    os.environ.pop("ORT_ENABLE_FP4_GEMV", None)
+                else:
+                    os.environ["ORT_ENABLE_FP4_GEMV"] = prev_gemv_env
 
         input_tensor = torch.randn(num_tokens, hidden_size, device=device, dtype=torch_dtype)
         router_logits = torch.randn(num_tokens, num_experts, device=device, dtype=torch_dtype)
@@ -520,6 +535,50 @@ class TestQMoENVFP4(unittest.TestCase):
             top_k=2,
             num_tokens=32,
             onnx_dtype=TensorProto.FLOAT16,
+        )
+
+    # ================================================================
+    # Fused FP4 GEMV decode fast path (block size 16). The GEMV support window requires
+    # n, k >= 512 and expanded rows (num_tokens * top_k) <= 8, plus SwiGLU fusion, so these
+    # decode-shaped SwiGLU cases route through the NVFP4 GEMV kernel (gemv_mode="1"). The
+    # gemv_mode="0" companion forces the dequant fallback on the identical shape; both must
+    # match the exact dequantized reference.
+    # ================================================================
+
+    def test_nvfp4_fp16_gemv_decode_swiglu(self):
+        self._run_nvfp4_moe_test(
+            hidden_size=512,
+            inter_size=512,
+            num_experts=4,
+            top_k=2,
+            num_tokens=2,
+            onnx_dtype=TensorProto.FLOAT16,
+            use_swiglu=True,
+            gemv_mode="1",
+        )
+
+    def test_nvfp4_bf16_gemv_decode_swiglu(self):
+        self._run_nvfp4_moe_test(
+            hidden_size=512,
+            inter_size=512,
+            num_experts=4,
+            top_k=2,
+            num_tokens=2,
+            onnx_dtype=TensorProto.BFLOAT16,
+            use_swiglu=True,
+            gemv_mode="1",
+        )
+
+    def test_nvfp4_fp16_gemv_disabled_swiglu(self):
+        self._run_nvfp4_moe_test(
+            hidden_size=512,
+            inter_size=512,
+            num_experts=4,
+            top_k=2,
+            num_tokens=2,
+            onnx_dtype=TensorProto.FLOAT16,
+            use_swiglu=True,
+            gemv_mode="0",
         )
 
 

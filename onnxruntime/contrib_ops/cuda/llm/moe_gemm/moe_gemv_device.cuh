@@ -331,6 +331,9 @@ static void dispatch_moe_gemv_group_size(TypeA* act, uint8_t* weight, TypeA* sca
   if (group_size <= 0) {
     launch_moe_gemv<Details, CtaN, Threads, 0, TypeA, AccT>(act, weight, scales, bias, out, expert_first_token_offset,
                                                             permuted_row_to_expert, num_experts, expanded_num_rows, n, k, stream);
+  } else if (group_size == 16) {
+    launch_moe_gemv<Details, CtaN, Threads, 16, TypeA, AccT>(act, weight, scales, bias, out, expert_first_token_offset,
+                                                             permuted_row_to_expert, num_experts, expanded_num_rows, n, k, stream);
   } else if (group_size == 32) {
     launch_moe_gemv<Details, CtaN, Threads, 32, TypeA, AccT>(act, weight, scales, bias, out, expert_first_token_offset,
                                                              permuted_row_to_expert, num_experts, expanded_num_rows, n, k, stream);
@@ -353,6 +356,10 @@ static void dispatch_moe_gemv_interleaved_swiglu_group_size(
     cutlass_kernels::ActivationParams activation_params, cudaStream_t stream) {
   if (group_size <= 0) {
     launch_moe_gemv_interleaved_swiglu<Details, CtaN, Threads, 0, TypeA, AccT>(
+        act, weight, scales, bias, out, expert_first_token_offset, permuted_row_to_expert, num_experts,
+        expanded_num_rows, inter_size, k, activation_params, stream);
+  } else if (group_size == 16) {
+    launch_moe_gemv_interleaved_swiglu<Details, CtaN, Threads, 16, TypeA, AccT>(
         act, weight, scales, bias, out, expert_first_token_offset, permuted_row_to_expert, num_experts,
         expanded_num_rows, inter_size, k, activation_params, stream);
   } else if (group_size == 32) {

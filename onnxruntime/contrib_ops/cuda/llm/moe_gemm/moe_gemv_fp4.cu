@@ -108,7 +108,7 @@ bool is_moe_gemv_fp4_supported(int sm, int64_t expanded_num_rows, int64_t n, int
   if (sm < 80) {
     return false;
   }
-  if (group_size != 32) {  // MXFP4 block size
+  if (group_size != 16 && group_size != 32) {  // 32 = MXFP4 block size, 16 = NVFP4 block size
     return false;
   }
   if (k % group_size != 0) {
@@ -131,6 +131,11 @@ bool is_moe_gemv_fp4_supported(int sm, int64_t expanded_num_rows, int64_t n, int
     // n % (CtaN*4) == 0 and k % 64 == 0. (gpt-oss-20b fc1 n=5760/k=2880 and fc2 n=2880/k=2880
     // both satisfy this.) `config` is ignored in this mode: CtaN/Threads are pinned to keep the
     // prepacked weight layout and the kernel dispatch in agreement.
+    // Lever A's kStepK=32 tile is tied to the MXFP4 block-32 scale layout, so it only supports
+    // group_size == 32; NVFP4 (block 16) must use the non-interleaved ColumnMajor path below.
+    if (group_size != 32) {
+      return false;
+    }
     if (n % (kInterleavedCtaN * 4) != 0) {
       return false;
     }
