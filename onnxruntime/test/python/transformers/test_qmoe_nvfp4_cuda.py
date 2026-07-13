@@ -16,9 +16,8 @@
 # ENABLE_FP4 + USE_FP4_QMOE build.
 # --------------------------------------------------------------------------
 
-import unittest
-
 import os
+import unittest
 
 import numpy
 import torch

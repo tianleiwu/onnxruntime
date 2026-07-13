@@ -182,10 +182,12 @@ void launch_moe_gemv_fp4_symmetric(T const* act, uint8_t const* weight, T const*
     return;
   }
   using Details = Fp4KernelDetails<T>;
-  // CtaN/Threads are pure parallelization/tiling knobs: the reduction and 16-bit accumulation
-  // are identical for every config, so this sweep is numerically bit-exact (no accuracy gate).
+  // AccT follows the Fp4LeverAAccT policy (fp16->fp16 accum, bf16->fp32 accum): bf16 has only 7
+  // mantissa bits, so 16-bit accumulation over K loses too much precision and fails tolerance
+  // (e.g. NVFP4 block-16 decode at k=512). CtaN/Threads remain pure parallelization/tiling knobs
+  // and the accumulation dtype is identical for every config, so this sweep stays bit-exact.
   auto launch = [&](auto cta_n, auto threads) {
-    fiv::dispatch_moe_gemv_group_size<Details, cta_n(), threads(), T>(
+    fiv::dispatch_moe_gemv_group_size<Details, cta_n(), threads(), T, Fp4LeverAAccT<T>>(
         const_cast<T*>(act), const_cast<uint8_t*>(weight), const_cast<T*>(scales), const_cast<T*>(bias), out,
         expert_first_token_offset, permuted_row_to_expert, num_experts, expanded_num_rows, n, k, group_size, stream);
   };
@@ -228,9 +230,10 @@ void launch_moe_gemv_fp4_symmetric_interleaved_swiglu(
     return;
   }
   using Details = Fp4KernelDetails<T>;
-  // CtaN/Threads are numerically bit-exact across configs (see launch_moe_gemv_fp4_symmetric).
+  // AccT follows the Fp4LeverAAccT policy (fp16->fp16, bf16->fp32); see launch_moe_gemv_fp4_symmetric.
+  // The CtaN/Threads sweep stays bit-exact across configs since the accumulation dtype is fixed.
   auto launch = [&](auto cta_n, auto threads) {
-    fiv::dispatch_moe_gemv_interleaved_swiglu_group_size<Details, cta_n(), threads(), T>(
+    fiv::dispatch_moe_gemv_interleaved_swiglu_group_size<Details, cta_n(), threads(), T, Fp4LeverAAccT<T>>(
         const_cast<T*>(act), const_cast<uint8_t*>(weight), const_cast<T*>(scales), const_cast<T*>(bias), out,
         expert_first_token_offset, permuted_row_to_expert, num_experts, expanded_num_rows, inter_size, k, group_size,
         activation_params, stream);
