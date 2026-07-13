@@ -95,7 +95,7 @@ class QMoE final : public CudaKernel, public MoEBase {
   // WFP4AFP8 (W4A8) requires SM100+ (Blackwell) block-scaled tensor ops. On older GPUs we
   // dequantize MXFP4 weights to FP16/BF16 and run the dense A16 MoE runner.
   bool use_wfp4afp8_dequant_fallback_ = false;
-  std::string quant_type_;  // "int", "fp4", "fp8", or "wfp4afp8"
+  std::string quant_type_;  // "int", "fp4", "nvfp4", "fp8", or "wfp4afp8"
 
   std::unique_ptr<onnxruntime::llm::kernels::cutlass_kernels::CutlassMoeFCRunnerInterface> m_moe_runner;
 

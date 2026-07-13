@@ -256,6 +256,29 @@ void LaunchQMoEDequantizeFp8Weights(
     int k,
     cudaStream_t stream);
 
+// NVFP4 weight dequantization: E2M1 4-bit weights with Float8E4M3FN block scales
+// (block size 16) and per-expert float32 global scales. Weight layout [E, K, N/2],
+// block-scale layout [E, N, K/16]. Mirrors LaunchQMoEDequantizeFp4Weights (MXFP4).
+void LaunchQMoEDequantizeNvfp4Weights(
+    const uint8_t* packed_weights,
+    const uint8_t* block_scales,
+    const float* global_scales,
+    half* output,
+    int num_experts,
+    int n,
+    int k,
+    cudaStream_t stream);
+
+void LaunchQMoEDequantizeNvfp4Weights(
+    const uint8_t* packed_weights,
+    const uint8_t* block_scales,
+    const float* global_scales,
+    __nv_bfloat16* output,
+    int num_experts,
+    int n,
+    int k,
+    cudaStream_t stream);
+
 // Repack column-major FP4 packed weights to row-major layout on GPU.
 // Input shape interpretation: [experts, k, n/2] (col-major packed),
 // output: [experts, n, k/2] (row-major packed).

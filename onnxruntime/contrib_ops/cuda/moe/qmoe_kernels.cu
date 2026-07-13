@@ -1216,6 +1216,85 @@ void LaunchQMoEDequantizeFp8Weights(
   LaunchQMoEDequantizeFp8WeightsImpl(weights, global_scales, output, num_experts, n, k, stream);
 }
 
+// NVFP4 dequantization. Identical structure to QMoEDequantizeFp4WeightsKernel (MXFP4) except:
+//   (a) block size is 16 (scale_k = k / 16) instead of 32,
+//   (b) the per-block scale is a Float8E4M3FN byte decoded via DecodeFloat8E4M3FN
+//       instead of a Float8E8M0 byte decoded via DecodeUE8M0.
+// Weight layout [E, K, N/2] (N-packed) and nibble selection are identical to the MXFP4 kernel.
+//   value = DecodeFp4E2M1(fp4_code) * DecodeE4M3(block_scale[n, k/16]) * global_scales[expert]
+template <typename T>
+__global__ void QMoEDequantizeNvfp4WeightsKernel(
+    const uint8_t* packed_weights,
+    const uint8_t* block_scales,
+    const float* global_scales,
+    T* output,
+    int num_experts,
+    int n,
+    int k) {
+  int64_t total = static_cast<int64_t>(num_experts) * n * k;
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= total) {
+    return;
+  }
+
+  int64_t expert_stride = static_cast<int64_t>(n) * k;
+  int expert = static_cast<int>(index / expert_stride);
+  int64_t offset = index - static_cast<int64_t>(expert) * expert_stride;
+  int row = static_cast<int>(offset / k);
+  int col = static_cast<int>(offset - static_cast<int64_t>(row) * k);
+
+  int packed_n = n / 2;
+  uint8_t packed = packed_weights[(static_cast<int64_t>(expert) * k + col) * packed_n + row / 2];
+  uint8_t fp4_code = (row & 1) == 0 ? (packed & 0x0F) : (packed >> 4);
+
+  constexpr int kNvfp4BlockSize = 16;
+  int scale_k = k / kNvfp4BlockSize;
+  uint8_t scale_code = block_scales[(static_cast<int64_t>(expert) * n + row) * scale_k + col / kNvfp4BlockSize];
+  float value = DecodeFp4E2M1(fp4_code) * DecodeFloat8E4M3FN(scale_code) * global_scales[expert];
+  output[index] = static_cast<T>(value);
+}
+
+template <typename T>
+void LaunchQMoEDequantizeNvfp4WeightsImpl(
+    const uint8_t* packed_weights,
+    const uint8_t* block_scales,
+    const float* global_scales,
+    T* output,
+    int num_experts,
+    int n,
+    int k,
+    cudaStream_t stream) {
+  int64_t total = static_cast<int64_t>(num_experts) * n * k;
+  constexpr int block = 256;
+  int grid = onnxruntime::narrow<int>((total + block - 1) / block);
+  QMoEDequantizeNvfp4WeightsKernel<<<grid, block, 0, stream>>>(
+      packed_weights, block_scales, global_scales, output, num_experts, n, k);
+}
+
+void LaunchQMoEDequantizeNvfp4Weights(
+    const uint8_t* packed_weights,
+    const uint8_t* block_scales,
+    const float* global_scales,
+    half* output,
+    int num_experts,
+    int n,
+    int k,
+    cudaStream_t stream) {
+  LaunchQMoEDequantizeNvfp4WeightsImpl(packed_weights, block_scales, global_scales, output, num_experts, n, k, stream);
+}
+
+void LaunchQMoEDequantizeNvfp4Weights(
+    const uint8_t* packed_weights,
+    const uint8_t* block_scales,
+    const float* global_scales,
+    __nv_bfloat16* output,
+    int num_experts,
+    int n,
+    int k,
+    cudaStream_t stream) {
+  LaunchQMoEDequantizeNvfp4WeightsImpl(packed_weights, block_scales, global_scales, output, num_experts, n, k, stream);
+}
+
 // Repack column-major FP4 packed weights to row-major layout.
 // Input: [experts, k, n/2] packed col-major (each byte holds 2 values along n).
 // Output: [experts, n, k/2] packed row-major (each byte holds 2 values along k).

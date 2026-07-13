@@ -145,7 +145,8 @@ namespace cuda {
           .TypeConstraint("T1", {DataTypeImpl::GetTensorType<uint8_t>(),       \
                                  DataTypeImpl::GetTensorType<Float8E4M3FN>()}) \
           .TypeConstraint("T2", {DataTypeImpl::GetTensorType<T>(),             \
-                                 DataTypeImpl::GetTensorType<Float8E8M0>()})   \
+                                 DataTypeImpl::GetTensorType<Float8E8M0>(),    \
+                                 DataTypeImpl::GetTensorType<Float8E4M3FN>()}) \
           .TypeConstraint("T4", DataTypeImpl::GetTensorType<float>()),         \
       QMoE);
 
@@ -159,8 +160,9 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
 
   block_size_ = op_kernel_info.GetAttrOrDefault<int64_t>("block_size", -1);
   this->quant_type_ = op_kernel_info.GetAttrOrDefault<std::string>("quant_type", "int");
-  ORT_ENFORCE(quant_type_ == "int" || quant_type_ == "fp4" || quant_type_ == "fp8" || quant_type_ == "wfp4afp8",
-              "quant_type must be 'int', 'fp4', 'fp8', or 'wfp4afp8', but got '", quant_type_, "'");
+  ORT_ENFORCE(quant_type_ == "int" || quant_type_ == "fp4" || quant_type_ == "nvfp4" ||
+                  quant_type_ == "fp8" || quant_type_ == "wfp4afp8",
+              "quant_type must be 'int', 'fp4', 'nvfp4', 'fp8', or 'wfp4afp8', but got '", quant_type_, "'");
   // ``weights_prepacked`` is an optional tri-state attribute (default -1) that
   // declares the layout of the int4/int8 fc1/fc2 weight initializers. The
   // concrete prepacked layouts selected by -1 and 1 are determined by the
@@ -186,6 +188,7 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
   weights_prepacked_ = (weights_prepacked_mode != 0);
 #if !defined(ENABLE_FP4) || !defined(USE_FP4_QMOE)
   ORT_ENFORCE(quant_type_ != "fp4", "QMoE quant_type='fp4' requires USE_FP4_QMOE with CUDA 12.8 or newer.");
+  ORT_ENFORCE(quant_type_ != "nvfp4", "QMoE quant_type='nvfp4' requires USE_FP4_QMOE with CUDA 12.8 or newer.");
   ORT_ENFORCE(quant_type_ != "wfp4afp8",
               "QMoE quant_type='wfp4afp8' requires USE_FP4_QMOE with CUDA 12.8 or newer.");
 #endif
@@ -205,7 +208,7 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
 #endif
   is_fp16_ = is_fp16;
 
-  if (quant_type_ == "fp4" || quant_type_ == "fp8" || quant_type_ == "wfp4afp8") {
+  if (quant_type_ == "fp4" || quant_type_ == "nvfp4" || quant_type_ == "fp8" || quant_type_ == "wfp4afp8") {
     if (quant_type_ == "fp4") {
       ORT_ENFORCE(expert_weight_bits_ == 4, "FP4 quantization requires expert_weight_bits=4");
 #if defined(ENABLE_FP4) && defined(USE_FP4_QMOE)
@@ -281,6 +284,13 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
 #else
       use_fp4_dequant_fallback_ = true;
 #endif
+    } else if (quant_type_ == "nvfp4") {
+      ORT_ENFORCE(expert_weight_bits_ == 4, "NVFP4 quantization requires expert_weight_bits=4");
+      // Native block-scaled CUTLASS GEMM for NVFP4 is Blackwell-only. On all currently
+      // supported GPUs (including SM90/H200) NVFP4 always uses the dequant-to-A16 fallback:
+      // dequantize E2M1 weights (E4M3 block scales, block size 16, per-expert global scale)
+      // to FP16/BF16 and run the dense A16 MoE runner.
+      use_fp4_dequant_fallback_ = true;
     } else if (quant_type_ == "wfp4afp8") {
       ORT_ENFORCE(expert_weight_bits_ == 4, "WFP4AFP8 (W4A8) quantization requires expert_weight_bits=4");
 #if defined(ENABLE_FP4) && defined(USE_FP4_QMOE) && defined(ENABLE_FP8)
@@ -356,7 +366,7 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
       }
 #endif
     } else {
-      // FP4/WFP4AFP8 dequant fallback or FP8 dequant fallback: use A16 runner
+      // FP4/NVFP4/WFP4AFP8 dequant fallback or FP8 dequant fallback: use A16 runner
       if (is_fp16) {
         m_moe_runner = std::make_unique<CutlassMoeFCRunner<half, half, half>>(
             sm_, activation_type_, normalize_routing_weights_, use_sparse_mixer_);
@@ -398,13 +408,19 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
 
 Status QMoE::ComputeInternal(OpKernelContext* context) const {
   const bool is_fp4 = (quant_type_ == "fp4");
+  const bool is_nvfp4 = (quant_type_ == "nvfp4");
+  // NVFP4 shares the E2M1 4-bit weight format, [E,K,N/2] weight layout, and the per-expert
+  // global-scale (15/16) + block-scale (3/6) inputs with MXFP4 "fp4"; it differs only in the
+  // block-scale decode (Float8E4M3FN vs Float8E8M0) and block size (16 vs 32). Treat both as an
+  // fp4-family type wherever weight-scale handling is shared.
+  const bool is_fp4_family = is_fp4 || is_nvfp4;
   const bool is_fp8 = (quant_type_ == "fp8");
   const bool is_wfp4afp8 = (quant_type_ == "wfp4afp8");
   const bool is_int = (quant_type_ == "int");
-  // Modes that consume MXFP4 weight block scales (inputs 3/6) and per-expert global weight scales.
-  const bool uses_fp4_weight_scales = is_fp4 || is_wfp4afp8;
+  // Modes that consume FP4 weight block scales (inputs 3/6) and per-expert global weight scales.
+  const bool uses_fp4_weight_scales = is_fp4_family || is_wfp4afp8;
   // Modes that consume per-expert FP-format global weight scales (inputs 15/16).
-  const bool uses_global_weight_scales = is_fp4 || is_fp8 || is_wfp4afp8;
+  const bool uses_global_weight_scales = is_fp4_family || is_fp8 || is_wfp4afp8;
   const Tensor* input = context->Input<Tensor>(0);
   const Tensor* router_probs = context->Input<Tensor>(1);
   // When PrePack consumed the int4/int8 expert-weight initializers
@@ -533,7 +549,9 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   }
 
   if (uses_fp4_weight_scales) {
-    constexpr int64_t fp4_block_size = 32;
+    // MXFP4 ("fp4"/"wfp4afp8") uses block size 32 with Float8E8M0 block scales; NVFP4 ("nvfp4")
+    // uses block size 16 with Float8E4M3FN block scales. Both are consumed as raw uint8 bytes.
+    const int64_t fp4_block_size = is_nvfp4 ? 16 : 32;
     ORT_RETURN_IF_NOT(moe_params.hidden_size % fp4_block_size == 0,
                       "QMoE quant_type='fp4'/'wfp4afp8' requires hidden_size to be a multiple of ",
                       fp4_block_size, " for MXFP4 block scales, got hidden_size=", moe_params.hidden_size, ".");
@@ -541,10 +559,14 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
                       "QMoE quant_type='fp4'/'wfp4afp8' requires inter_size to be a multiple of ",
                       fp4_block_size, " for MXFP4 block scales, got inter_size=", moe_params.inter_size, ".");
     const int64_t fc1_out_size = is_fused_swiglu ? moe_params.inter_size * 2 : moe_params.inter_size;
-    auto check_fp4_block_scale = [](const Tensor* tensor, const char* name, int64_t num_experts,
-                                    int64_t n, int64_t k) -> Status {
-      ORT_RETURN_IF_NOT(tensor != nullptr, "QMoE quant_type='fp4'/'wfp4afp8' requires ", name, ".");
-      ORT_RETURN_IF_NOT(tensor->IsDataType<Float8E8M0>(), name, " must be a float8e8m0 MXFP block-scale tensor.");
+    auto check_fp4_block_scale = [is_nvfp4](const Tensor* tensor, const char* name, int64_t num_experts,
+                                            int64_t n, int64_t k) -> Status {
+      ORT_RETURN_IF_NOT(tensor != nullptr, "QMoE quant_type='fp4'/'nvfp4'/'wfp4afp8' requires ", name, ".");
+      if (is_nvfp4) {
+        ORT_RETURN_IF_NOT(tensor->IsDataType<Float8E4M3FN>(), name, " must be a float8e4m3fn NVFP4 block-scale tensor.");
+      } else {
+        ORT_RETURN_IF_NOT(tensor->IsDataType<Float8E8M0>(), name, " must be a float8e8m0 MXFP block-scale tensor.");
+      }
       const auto& dims = tensor->Shape().GetDims();
       ORT_RETURN_IF_NOT(dims.size() == 3 && dims[0] == num_experts && dims[1] == n && dims[2] == k,
                         name, " must have shape (", num_experts, ", ", n, ", ", k, "), got ", tensor->Shape().ToString(), ".");
@@ -703,7 +725,10 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
       // Weight type: FP4 for MXFP4, INT4 for 4-bit integer, INT8 for 8-bit integer. When the
       // native FP4 path routes to the dense fallback for this call, profile the dense (A16) tactic.
       onnxruntime::llm::nvinfer::DataType wtype;
-      if (is_fp4) {
+      if (is_nvfp4) {
+        // NVFP4 always uses the dequant fallback, so profile against the dense (A16) tactic.
+        wtype = dtype;
+      } else if (is_fp4) {
         // fp4_sm80_prefill runs the e2m1 weights through the SM80 fused-dequant grouped GEMM,
         // whose scratch + groupwise scale layout match INT4-groupwise (4-bit weight + activation-dtype
         // scales). Profile against kINT4 so the workspace is sized for the groupwise path
@@ -1413,14 +1438,17 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   }
   IAllocatorUniquePtr<void> dequant_fc1_weights;
   IAllocatorUniquePtr<void> dequant_fc2_weights;
-  // FP4 (W4A16) and WFP4AFP8 (W4A8) share the MXFP4 weight format. When the native CUTLASS path
-  // is unavailable on the current SM, or when native FP4 routes this call to the dense fallback for
-  // the large per-expert-M regime, dequantize MXFP4 weights to FP16/BF16 and run the dense A16 runner.
-  if (((is_fp4 && !route_native_fp4) || (is_wfp4afp8 && use_wfp4afp8_dequant_fallback_)) && !fp4_sm80_prefill) {
-    // The dequant kernel expects raw [E, n, k_blocks] e8m0 block scales. When native FP4 is enabled
+  // FP4 (W4A16) and WFP4AFP8 (W4A8) share the MXFP4 weight format (Float8E8M0 block scales, block 32).
+  // NVFP4 (W4A16) uses Float8E4M3FN block scales with block 16 and always runs the dequant fallback.
+  // When the native CUTLASS path is unavailable on the current SM (always for NVFP4), or when native
+  // FP4 routes this call to the dense fallback for the large per-expert-M regime, dequantize the E2M1
+  // weights to FP16/BF16 and run the dense A16 runner.
+  if (is_nvfp4 ||
+      (((is_fp4 && !route_native_fp4) || (is_wfp4afp8 && use_wfp4afp8_dequant_fallback_)) && !fp4_sm80_prefill)) {
+    // The dequant kernel expects raw [E, n, k_blocks] block scales. When native FP4 is enabled
     // (this is the large per-expert-M fallback), packed_fp4_*_block_scales_ holds the TMA-swizzled
-    // layout, so use the raw copy kept in gemv_fp4_*_block_raw_ instead. On the SM<90 dequant-only
-    // build that raw copy is absent and packed_fp4_*_block_scales_ already holds the raw scales.
+    // layout, so use the raw copy kept in gemv_fp4_*_block_raw_ instead. NVFP4 and the SM<90
+    // dequant-only build have no raw copy, so packed_fp4_*_block_scales_ already holds the raw scales.
     const void* p_fc1_block_scales = gemv_fp4_fc1_block_raw_ ? gemv_fp4_fc1_block_raw_.get()
                                                              : (packed_fp4_fc1_block_scales_ ? packed_fp4_fc1_block_scales_.get()
                                                                                              : (fp4_fc1_block_scales ? fp4_fc1_block_scales->DataRaw() : nullptr));
@@ -1445,25 +1473,33 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
     dequant_fc1_weights = GetScratchBuffer<void>(fc1_bytes, GetComputeStream(context));
     dequant_fc2_weights = GetScratchBuffer<void>(fc2_bytes, GetComputeStream(context));
 
-    if (is_fp16_) {
-      LaunchQMoEDequantizeFp4Weights(static_cast<const uint8_t*>(fc1_experts_weights->DataRaw()),
-                                     static_cast<const uint8_t*>(p_fc1_block_scales),
-                                     static_cast<const float*>(p_fc1_global_scale),
-                                     static_cast<half*>(dequant_fc1_weights.get()), num_experts, fc1_n, fc1_k, stream);
-      LaunchQMoEDequantizeFp4Weights(static_cast<const uint8_t*>(fc2_experts_weights->DataRaw()),
-                                     static_cast<const uint8_t*>(p_fc2_block_scales),
-                                     static_cast<const float*>(p_fc2_global_scale),
-                                     static_cast<half*>(dequant_fc2_weights.get()), num_experts, fc2_n, fc2_k, stream);
-    } else {
-      LaunchQMoEDequantizeFp4Weights(static_cast<const uint8_t*>(fc1_experts_weights->DataRaw()),
-                                     static_cast<const uint8_t*>(p_fc1_block_scales),
-                                     static_cast<const float*>(p_fc1_global_scale),
-                                     static_cast<__nv_bfloat16*>(dequant_fc1_weights.get()), num_experts, fc1_n, fc1_k, stream);
-      LaunchQMoEDequantizeFp4Weights(static_cast<const uint8_t*>(fc2_experts_weights->DataRaw()),
-                                     static_cast<const uint8_t*>(p_fc2_block_scales),
-                                     static_cast<const float*>(p_fc2_global_scale),
-                                     static_cast<__nv_bfloat16*>(dequant_fc2_weights.get()), num_experts, fc2_n, fc2_k, stream);
-    }
+    // Choose the FP4 (MXFP4 / E8M0, block 32) or NVFP4 (E4M3, block 16) dequant launcher.
+    auto dequant = [&](const uint8_t* weights, const uint8_t* block_scales, const float* global_scale,
+                       void* out, int n, int k) {
+      if (is_fp16_) {
+        half* out_h = static_cast<half*>(out);
+        if (is_nvfp4) {
+          LaunchQMoEDequantizeNvfp4Weights(weights, block_scales, global_scale, out_h, num_experts, n, k, stream);
+        } else {
+          LaunchQMoEDequantizeFp4Weights(weights, block_scales, global_scale, out_h, num_experts, n, k, stream);
+        }
+      } else {
+        __nv_bfloat16* out_b = static_cast<__nv_bfloat16*>(out);
+        if (is_nvfp4) {
+          LaunchQMoEDequantizeNvfp4Weights(weights, block_scales, global_scale, out_b, num_experts, n, k, stream);
+        } else {
+          LaunchQMoEDequantizeFp4Weights(weights, block_scales, global_scale, out_b, num_experts, n, k, stream);
+        }
+      }
+    };
+    dequant(static_cast<const uint8_t*>(fc1_experts_weights->DataRaw()),
+            static_cast<const uint8_t*>(p_fc1_block_scales),
+            static_cast<const float*>(p_fc1_global_scale),
+            dequant_fc1_weights.get(), fc1_n, fc1_k);
+    dequant(static_cast<const uint8_t*>(fc2_experts_weights->DataRaw()),
+            static_cast<const uint8_t*>(p_fc2_block_scales),
+            static_cast<const float*>(p_fc2_global_scale),
+            dequant_fc2_weights.get(), fc2_n, fc2_k);
     fc1_weight_data = dequant_fc1_weights.get();
     fc2_weight_data = dequant_fc2_weights.get();
   } else if (is_fp8 && use_fp8_dequant_fallback_) {
@@ -1649,7 +1685,7 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
       }
     } else if (quant_type_ == "wfp4afp8" && !use_wfp4afp8_dequant_fallback_) {
       PrePackSwizzleBlockScales(tensor, stream, alloc, packed_fp4_fc1_block_scales_, is_packed);
-    } else if (quant_type_ == "fp4" || quant_type_ == "wfp4afp8") {
+    } else if (quant_type_ == "fp4" || quant_type_ == "nvfp4" || quant_type_ == "wfp4afp8") {
       PrePackCopyToGpu(tensor, stream, alloc, packed_fp4_fc1_block_scales_, is_packed);
       if (quant_type_ == "fp4" && enable_fp4_gemv_ && tensor.Shape().NumDimensions() == 3) {
         gemv_fp4_fc1_scale_e_ = tensor.Shape()[0];
@@ -1675,7 +1711,7 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
       }
     } else if (quant_type_ == "wfp4afp8" && !use_wfp4afp8_dequant_fallback_) {
       PrePackSwizzleBlockScales(tensor, stream, alloc, packed_fp4_fc2_block_scales_, is_packed);
-    } else if (quant_type_ == "fp4" || quant_type_ == "wfp4afp8") {
+    } else if (quant_type_ == "fp4" || quant_type_ == "nvfp4" || quant_type_ == "wfp4afp8") {
       PrePackCopyToGpu(tensor, stream, alloc, packed_fp4_fc2_block_scales_, is_packed);
       if (quant_type_ == "fp4" && enable_fp4_gemv_ && tensor.Shape().NumDimensions() == 3) {
         gemv_fp4_fc2_scale_e_ = tensor.Shape()[0];
@@ -1696,7 +1732,7 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
     PrePackComputeBias(tensor, stream, alloc, packed_fc2_scales_, packed_fc2_bias_, is_packed);
     DUMP_PACK_TENSOR("packed_fc2_bias", packed_fc2_bias_, tensor);
   } else if ((input_idx == 15 || input_idx == 16) &&
-             (quant_type_ == "fp4" || quant_type_ == "fp8" || quant_type_ == "wfp4afp8")) {
+             (quant_type_ == "fp4" || quant_type_ == "nvfp4" || quant_type_ == "fp8" || quant_type_ == "wfp4afp8")) {
     if (input_idx == 15) {
       PrePackCopyToGpu(tensor, stream, alloc, packed_fc1_global_scale_, is_packed);
       TryBuildGemvFp4Scales(1, stream, alloc);
