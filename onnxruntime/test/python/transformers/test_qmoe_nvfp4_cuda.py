@@ -589,10 +589,10 @@ class TestQMoENVFP4(unittest.TestCase):
 
     # ================================================================
     # Fused FP4 GEMV decode fast path (block size 16). The GEMV support window requires
-    # n, k >= 512 and expanded rows (num_tokens * top_k) <= 8, plus SwiGLU fusion, so these
-    # decode-shaped SwiGLU cases route through the NVFP4 GEMV kernel (gemv_mode="1"). The
-    # gemv_mode="0" companion forces the dequant fallback on the identical shape; both must
-    # match the exact dequantized reference.
+    # n, k >= 512 and expanded rows (num_tokens * top_k) <= kMaxProfiledExpandedRows (24),
+    # plus SwiGLU fusion, so these decode-shaped SwiGLU cases route through the NVFP4 GEMV
+    # kernel (gemv_mode="1"). The gemv_mode="0" companion forces the dequant fallback on the
+    # identical shape; both must match the exact dequantized reference.
     # ================================================================
 
     def test_nvfp4_fp16_gemv_decode_swiglu(self):
@@ -626,6 +626,62 @@ class TestQMoENVFP4(unittest.TestCase):
             num_experts=4,
             top_k=2,
             num_tokens=2,
+            onnx_dtype=TensorProto.FLOAT16,
+            use_swiglu=True,
+            gemv_mode="0",
+        )
+
+    # ----------------------------------------------------------------
+    # Multi-Token Prediction (MTP) decode shapes on a Qwen-style top_k=8 model.
+    # expanded_num_rows = num_tokens * top_k, so a 2-token verify is 2*8 = 16 and a
+    # 3-token verify is 3*8 = 24. These exceed the old kMaxProfiledExpandedRows = 8
+    # window; raising it to 24 lets them keep taking the GEMV fast path. Each case is
+    # validated against the exact dequantized reference (and the fallback companion).
+    # ----------------------------------------------------------------
+
+    def test_nvfp4_fp16_gemv_mtp_2token_swiglu(self):
+        self._run_nvfp4_moe_test(
+            hidden_size=512,
+            inter_size=512,
+            num_experts=8,
+            top_k=8,
+            num_tokens=2,
+            onnx_dtype=TensorProto.FLOAT16,
+            use_swiglu=True,
+            gemv_mode="1",
+        )
+
+    def test_nvfp4_bf16_gemv_mtp_2token_swiglu(self):
+        self._run_nvfp4_moe_test(
+            hidden_size=512,
+            inter_size=512,
+            num_experts=8,
+            top_k=8,
+            num_tokens=2,
+            onnx_dtype=TensorProto.BFLOAT16,
+            use_swiglu=True,
+            gemv_mode="1",
+        )
+
+    def test_nvfp4_fp16_gemv_mtp_3token_swiglu(self):
+        self._run_nvfp4_moe_test(
+            hidden_size=512,
+            inter_size=512,
+            num_experts=8,
+            top_k=8,
+            num_tokens=3,
+            onnx_dtype=TensorProto.FLOAT16,
+            use_swiglu=True,
+            gemv_mode="1",
+        )
+
+    def test_nvfp4_fp16_gemv_mtp_3token_fallback_swiglu(self):
+        self._run_nvfp4_moe_test(
+            hidden_size=512,
+            inter_size=512,
+            num_experts=8,
+            top_k=8,
+            num_tokens=3,
             onnx_dtype=TensorProto.FLOAT16,
             use_swiglu=True,
             gemv_mode="0",

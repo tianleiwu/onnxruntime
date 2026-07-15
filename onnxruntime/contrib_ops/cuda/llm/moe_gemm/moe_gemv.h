@@ -18,7 +18,13 @@ namespace onnxruntime::llm {
 namespace kernels {
 namespace moe_gemv {
 
-inline constexpr int64_t kMaxProfiledExpandedRows = 8;
+// Raised from 8 to 24 to cover Qwen-style top_k=8 MoE decode with Multi-Token
+// Prediction (MTP): expanded_num_rows = num_tokens * top_k, so a 2-token verify is
+// 2*8 = 16 and a 3-token verify is 3*8 = 24. The GEMV kernel launches one thread
+// block per expanded row (CtaM = 1, grid.x = expanded_num_rows) with no compile-time
+// M limit, and the FP4 GEMV autotuner profiles the live runtime shape, so widening
+// this gate simply lets larger (still small) decode batches take the GEMV fast path.
+inline constexpr int64_t kMaxProfiledExpandedRows = 24;
 inline constexpr int64_t kMaxProfiledExpandedRowsForSmallProblemDim = 4;
 inline constexpr int64_t kMinProfiledProblemDim = 512;
 // Lowered from 704 to 512 so block-wise decode shapes (e.g. Qwen top_k=8,
