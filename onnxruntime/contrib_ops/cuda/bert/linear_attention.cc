@@ -121,6 +121,18 @@ Status LinearAttention<T>::ComputeInternal(OpKernelContext* context) const {
   TensorShape state_shape({batch_size, kv_num_heads_, d_k, d_v});
   Tensor* present_state_tensor = context->Output(1, state_shape);
 
+  // Optional per-position state output(2): present_state_all [B, seq_len, H_kv, d_k, d_v].
+  // Only allocated/populated when the node actually has a 3rd output; otherwise the
+  // launcher receives nullptr and the kernels skip all per-position writes (zero overhead).
+  T* present_state_all_data = nullptr;
+  if (context->OutputCount() > 2) {
+    TensorShape state_all_shape({batch_size, seq_len, kv_num_heads_, d_k, d_v});
+    Tensor* present_state_all_tensor = context->Output(2, state_all_shape);
+    if (present_state_all_tensor != nullptr) {
+      present_state_all_data = present_state_all_tensor->MutableData<T>();
+    }
+  }
+
   // If past_state is nullptr, zero-init present_state on device
   if (past_state_tensor == nullptr) {
     CUDA_RETURN_IF_ERROR(cudaMemsetAsync(
@@ -169,7 +181,8 @@ Status LinearAttention<T>::ComputeInternal(OpKernelContext* context) const {
       needs_beta,
       beta_per_head,
       needs_retrieval,
-      GetDeviceProp().maxThreadsPerBlock);
+      GetDeviceProp().maxThreadsPerBlock,
+      reinterpret_cast<CudaT*>(present_state_all_data));
 }
 
 }  // namespace cuda

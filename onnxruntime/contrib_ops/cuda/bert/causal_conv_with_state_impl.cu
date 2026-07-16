@@ -47,7 +47,8 @@ __global__ void CausalConvDecodeKernel(
     int batch_channels,                // = batch_size * channels (actual element count)
     int channels,
     int kernel_size,
-    bool apply_silu) {
+    bool apply_silu,
+    T* __restrict__ present_state_all) {  // [B, 1, C, K-1] or nullptr
   const int bc = blockIdx.x * blockDim.x + threadIdx.x;
   if (bc >= batch_channels) return;
   const int b = bc / channels;
@@ -89,6 +90,14 @@ __global__ void CausalConvDecodeKernel(
   if (pad > 0) {
     ps_out[pad - 1] = from_float<T>(input_val);
   }
+
+  // Optional per-position state: seq_len==1, so the single position equals present_state.
+  if (present_state_all != nullptr) {
+    T* psa = present_state_all + (int64_t)b * channels * pad + (int64_t)c * pad;
+    for (int k = 0; k < pad; ++k) {
+      psa[k] = ps_out[k];
+    }
+  }
 }
 
 template <typename T, int K>
@@ -101,7 +110,8 @@ __global__ void CausalConvDecodeKernelFixedK(
     T* __restrict__ present_state,
     int batch_channels,
     int channels,
-    bool apply_silu) {
+    bool apply_silu,
+    T* __restrict__ present_state_all) {  // [B, 1, C, K-1] or nullptr
   const int bc = blockIdx.x * blockDim.x + threadIdx.x;
   if (bc >= batch_channels) return;
 
@@ -136,6 +146,15 @@ __global__ void CausalConvDecodeKernelFixedK(
     }
     ps_out[pad - 1] = input[static_cast<int64_t>(b) * channels + c];
   }
+
+  // Optional per-position state: seq_len==1, so the single position equals present_state.
+  if (present_state_all != nullptr) {
+    T* psa = present_state_all + static_cast<int64_t>(b) * channels * pad + static_cast<int64_t>(c) * pad;
+#pragma unroll
+    for (int k = 0; k < pad; ++k) {
+      psa[k] = ps_out[k];
+    }
+  }
 }
 
 // =============================================================================
@@ -155,7 +174,8 @@ __global__ void CausalConvPrefillKernel(
     int seq_len,
     int channels,
     int kernel_size,
-    bool apply_silu) {
+    bool apply_silu,
+    T* __restrict__ present_state_all) {  // [B, seq_len, C, K-1] or nullptr
   const int b = blockIdx.x;
   const int c = blockIdx.y;
   const int tid = threadIdx.x;
@@ -206,6 +226,18 @@ __global__ void CausalConvPrefillKernel(
   for (int i = tid; i < pad; i += blockDim.x) {
     ps[i] = from_float<T>(s_padded[padded_len - pad + i]);
   }
+
+  // Optional: emit conv carry state AFTER each token t. The state after token t is the
+  // pad-length window ending at position t in the [past_state, input] stream, i.e.
+  // s_padded[t + 1 .. t + pad]. Layout [B, seq_len, C, pad] row-major.
+  if (present_state_all != nullptr) {
+    for (int t = tid; t < seq_len; t += blockDim.x) {
+      T* psa = present_state_all + (((int64_t)b * seq_len + t) * channels + c) * pad;
+      for (int p = 0; p < pad; ++p) {
+        psa[p] = from_float<T>(s_padded[t + 1 + p]);
+      }
+    }
+  }
 }
 
 // =============================================================================
@@ -229,7 +261,8 @@ __global__ void CausalConvPrefillKernelBatched(
     int seq_len,
     int channels,
     int kernel_size,
-    bool apply_silu) {
+    bool apply_silu,
+    T* __restrict__ present_state_all) {  // [B, seq_len, C, K-1] or nullptr
   const int b = blockIdx.x;
   const int c_base = blockIdx.y * CPB;
   const int tid = threadIdx.x;
@@ -294,6 +327,16 @@ __global__ void CausalConvPrefillKernelBatched(
     for (int i = local_tid; i < pad; i += threads_per_channel) {
       ps[i] = from_float<T>(s_padded[padded_len - pad + i]);
     }
+
+    // Optional: emit conv carry state AFTER each token t (window s_padded[t+1 .. t+pad]).
+    if (present_state_all != nullptr) {
+      for (int t = local_tid; t < seq_len; t += threads_per_channel) {
+        T* psa = present_state_all + (((int64_t)b * seq_len + t) * channels + c) * pad;
+        for (int p = 0; p < pad; ++p) {
+          psa[p] = from_float<T>(s_padded[t + 1 + p]);
+        }
+      }
+    }
   }
 }
 
@@ -313,7 +356,8 @@ Status LaunchCausalConvWithStateKernel(
     int seq_len,
     int kernel_size,
     bool apply_silu,
-    int max_threads_per_block) {
+    int max_threads_per_block,
+    T* present_state_all) {
   if (seq_len == 1) {
     // Decode fast-path: one thread per (batch, channel)
     int total = batch_size * channels;
@@ -323,27 +367,27 @@ Status LaunchCausalConvWithStateKernel(
       case 2:
         CausalConvDecodeKernelFixedK<T, 2><<<blocks, threads, 0, stream>>>(
             input, weight, bias, past_state, output, present_state,
-            total, channels, apply_silu);
+            total, channels, apply_silu, present_state_all);
         break;
       case 3:
         CausalConvDecodeKernelFixedK<T, 3><<<blocks, threads, 0, stream>>>(
             input, weight, bias, past_state, output, present_state,
-            total, channels, apply_silu);
+            total, channels, apply_silu, present_state_all);
         break;
       case 4:
         CausalConvDecodeKernelFixedK<T, 4><<<blocks, threads, 0, stream>>>(
             input, weight, bias, past_state, output, present_state,
-            total, channels, apply_silu);
+            total, channels, apply_silu, present_state_all);
         break;
       case 5:
         CausalConvDecodeKernelFixedK<T, 5><<<blocks, threads, 0, stream>>>(
             input, weight, bias, past_state, output, present_state,
-            total, channels, apply_silu);
+            total, channels, apply_silu, present_state_all);
         break;
       default:
         CausalConvDecodeKernel<T><<<blocks, threads, 0, stream>>>(
             input, weight, bias, past_state, output, present_state,
-            total, channels, kernel_size, apply_silu);
+            total, channels, kernel_size, apply_silu, present_state_all);
         break;
     }
   } else {
@@ -381,7 +425,7 @@ Status LaunchCausalConvWithStateKernel(
 
       CausalConvPrefillKernelBatched<T, CPB><<<grid, block, smem_size, stream>>>(
           input, weight, bias, past_state, output, present_state,
-          seq_len, channels, kernel_size, apply_silu);
+          seq_len, channels, kernel_size, apply_silu, present_state_all);
     } else {
       // Original single-channel-per-block path for long sequences
       const dim3 grid(batch_size, channels, 1);
@@ -405,7 +449,7 @@ Status LaunchCausalConvWithStateKernel(
 
       CausalConvPrefillKernel<T><<<grid, block, smem_size, stream>>>(
           input, weight, bias, past_state, output, present_state,
-          seq_len, channels, kernel_size, apply_silu);
+          seq_len, channels, kernel_size, apply_silu, present_state_all);
     }
   }
 
@@ -415,16 +459,16 @@ Status LaunchCausalConvWithStateKernel(
 // Explicit instantiations
 template Status LaunchCausalConvWithStateKernel<float>(
     cudaStream_t, const float*, const float*, const float*, const float*,
-    float*, float*, int, int, int, int, bool, int);
+    float*, float*, int, int, int, int, bool, int, float*);
 
 template Status LaunchCausalConvWithStateKernel<half>(
     cudaStream_t, const half*, const half*, const half*, const half*,
-    half*, half*, int, int, int, int, bool, int);
+    half*, half*, int, int, int, int, bool, int, half*);
 
 #if __CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__)
 template Status LaunchCausalConvWithStateKernel<__nv_bfloat16>(
     cudaStream_t, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
-    __nv_bfloat16*, __nv_bfloat16*, int, int, int, int, bool, int);
+    __nv_bfloat16*, __nv_bfloat16*, int, int, int, int, bool, int, __nv_bfloat16*);
 #endif
 
 }  // namespace cuda

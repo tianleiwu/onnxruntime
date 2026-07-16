@@ -2309,6 +2309,13 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
                 "Updated carry state. For ndim=1: (batch_size, channels, k_1 - 1). "
                 "Contains the last (k-1) values from the virtual input along the causal axis.",
                 "T")
+        .Output(2,
+                "present_state_all",
+                "Optional per-position carry state, i.e. present_state after each token, with the "
+                "seq_len (causal) dimension inserted at axis 1. For ndim=1: "
+                "(batch_size, seq_len, channels, k_1 - 1). present_state_all[:, seq_len-1] equals present_state.",
+                "T",
+                OpSchema::Optional)
         .TypeConstraint("T",
                         {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"},
                         "Constrain input and output types to float tensors.")
@@ -2348,6 +2355,25 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
               state_shape.add_dim();  // unknown
             }
             updateOutputShape(ctx, 1, state_shape);
+
+            // Output 2 (optional): present_state_all = present_state with the seq_len (causal)
+            // dimension inserted at axis 1. For ndim=1: (B, seq_len, C, k_last-1).
+            if (ctx.getNumOutputs() > 2) {
+              propagateElemTypeFromInputToOutput(ctx, 0, 2);
+              TensorShapeProto all_shape;
+              *all_shape.add_dim() = input_shape.dim(0);                              // batch_size
+              *all_shape.add_dim() = input_shape.dim(input_shape.dim_size() - 1);     // seq_len (causal)
+              *all_shape.add_dim() = input_shape.dim(1);                              // channels
+              for (int64_t i = 0; i < ndim - 1; ++i) {
+                *all_shape.add_dim() = input_shape.dim(static_cast<int>(2 + i));
+              }
+              if (weight_shape.dim(last_kernel_dim).has_dim_value()) {
+                all_shape.add_dim()->set_dim_value(weight_shape.dim(last_kernel_dim).dim_value() - 1);
+              } else {
+                all_shape.add_dim();  // unknown
+              }
+              updateOutputShape(ctx, 2, all_shape);
+            }
           }
         }));
 
@@ -2437,6 +2463,12 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
                 "present_state",
                 "Updated recurrent state with shape (B, H_kv, d_k, d_v). Always 4D.",
                 "S")
+        .Output(2,
+                "present_state_all",
+                "Optional per-position recurrent state, i.e. present_state after each token, with "
+                "shape (B, T, H_kv, d_k, d_v). present_state_all[:, T-1] equals present_state.",
+                "S",
+                OpSchema::Optional)
         .TypeConstraint("T",
                         {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"},
                         "Constrain input and output types to float tensors.")
@@ -2502,6 +2534,31 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
             updateOutputShape(ctx, 1, state_shape);
           } else if (hasInputShape(ctx, 3)) {
             propagateShapeFromInputToOutput(ctx, 3, 1);
+          }
+
+          // Output 2 (optional): present_state_all shape (B, T, H_kv, d_k, d_v) — 5D.
+          if (ctx.getNumOutputs() > 2 && hasInputShape(ctx, 0) && hasInputShape(ctx, 2) &&
+              q_num_heads > 0 && kv_num_heads > 0) {
+            auto& query_shape = getInputShape(ctx, 0);
+            auto& value_shape = getInputShape(ctx, 2);
+            if (query_shape.dim_size() >= 3 && value_shape.dim_size() >= 3) {
+              propagateElemTypeFromInputToOutput(ctx, 0, 2);
+              TensorShapeProto all_shape;
+              *all_shape.add_dim() = query_shape.dim(0);           // B
+              *all_shape.add_dim() = query_shape.dim(1);           // T
+              all_shape.add_dim()->set_dim_value(kv_num_heads);    // H_kv
+              if (query_shape.dim(2).has_dim_value()) {
+                all_shape.add_dim()->set_dim_value(query_shape.dim(2).dim_value() / q_num_heads);
+              } else {
+                all_shape.add_dim();
+              }
+              if (value_shape.dim(2).has_dim_value()) {
+                all_shape.add_dim()->set_dim_value(value_shape.dim(2).dim_value() / kv_num_heads);
+              } else {
+                all_shape.add_dim();
+              }
+              updateOutputShape(ctx, 2, all_shape);
+            }
           }
         }));
 

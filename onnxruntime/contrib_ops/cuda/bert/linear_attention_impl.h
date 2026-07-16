@@ -36,7 +36,8 @@ Status LaunchLinearAttentionKernel(
     bool needs_beta,
     bool beta_per_head,
     bool needs_retrieval,
-    int max_threads_per_block);
+    int max_threads_per_block,
+    T* present_state_all = nullptr);  // [B, T, H_kv, d_k, d_v] optional per-position state
 
 }  // namespace cuda
 }  // namespace contrib
