@@ -101,9 +101,9 @@ Status CausalConvWithState<T>::ComputeInternal(OpKernelContext* context) const {
   if (context->OutputCount() > 2) {
     ORT_RETURN_IF_NOT(state_all_capacity_ == 0 || batch_size == 1,
                       "state_all_capacity currently supports batch_size=1 only");
-    ORT_RETURN_IF_NOT(state_all_capacity_ == 0 || L <= state_all_capacity_,
-                      "sequence length exceeds state_all_capacity");
-    const int state_all_length = state_all_capacity_ > 0 ? state_all_capacity_ : L;
+    const int state_all_length = state_all_capacity_ > 0 && L <= state_all_capacity_
+                     ? state_all_capacity_
+                     : L;
     TensorShape state_all_shape({batch_size, state_all_length, channels, pad});
     Tensor* present_state_all_tensor = context->Output(2, state_all_shape);
     if (present_state_all_tensor != nullptr) {
