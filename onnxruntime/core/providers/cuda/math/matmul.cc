@@ -2,7 +2,6 @@
 // Licensed under the MIT License.
 
 #include "core/providers/cuda/math/matmul.h"
-#include "core/platform/env_var_utils.h"
 
 #include "core/providers/cuda/shared_inc/fpgeneric.h"
 #include "core/providers/cuda/cuda_allocator.h"
@@ -323,36 +322,6 @@ Status MatMul<T>::ComputeDefault(OpKernelContext* ctx, MatMulComputeHelper& help
   auto& device_prop = GetDeviceProp();
 
   if (helper.OutputOffsets().size() == 1) {
-    if constexpr (std::is_same_v<T, MLFloat16>) {
-      const bool force_sequential_m1 =
-          ParseEnvironmentVariableWithDefault<int>("ORT_MATMUL_FORCE_SEQUENTIAL_M1", 0) == 1;
-      if (force_sequential_m1 && !transa && !transb && left_X->Shape().NumDimensions() == 2 &&
-          right_X->Shape().NumDimensions() == 2 && helper.M() >= 2) {
-        const auto* left_data = reinterpret_cast<const CudaT*>(left_X->Data<T>());
-        auto* output_data = reinterpret_cast<CudaT*>(Y->MutableData<T>());
-        for (int64_t row = 0; row < helper.M(); ++row) {
-          CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(
-              GetCublasHandle(ctx),
-              transB,
-              transA,
-              static_cast<int>(helper.N()),
-              1,
-              static_cast<int>(helper.K()),
-              &alpha,
-              reinterpret_cast<const CudaT*>(right_X->Data<T>()),
-              ldb,
-              left_data + row * helper.K(),
-              lda,
-              &zero,
-              output_data + row * helper.N(),
-              ldc,
-              device_prop,
-              UseTF32()));
-        }
-        return Status::OK();
-      }
-    }
-
     CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(
         GetCublasHandle(ctx),
         transB,
