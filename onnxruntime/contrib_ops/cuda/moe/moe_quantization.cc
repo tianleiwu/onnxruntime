@@ -53,6 +53,10 @@ bool Fp4GemvAutotuneLogEnabled() {
   return onnxruntime::ParseEnvironmentVariableWithDefault<int>("ORT_FP4_GEMV_AUTOTUNE_LOG", 0) == 1;
 }
 
+bool ForceSequentialM1QMoE() {
+  return onnxruntime::ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_FORCE_SEQUENTIAL_M1", 0) == 1;
+}
+
 const char* QMoEGemvConfigName(onnxruntime::llm::kernels::moe_gemv::MoeGemvConfig config) {
   using onnxruntime::llm::kernels::moe_gemv::MoeGemvConfig;
   if (config == MoeGemvConfig::kCtaN16) {
@@ -1316,6 +1320,39 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
 
       auto run_fused = [&](auto* t_ptr) {
         using T = std::remove_pointer_t<decltype(t_ptr)>;
+        if (num_rows >= 2 && ForceSequentialM1QMoE()) {
+          const int64_t row_expanded = static_cast<int64_t>(k_);
+          for (int64_t row = 0; row < num_rows; ++row) {
+            ck::fusedBuildExpertMapsSortFirstToken(
+                expert_indices + row * k_, p_r2u, unpermuted_row_to_permuted_row, p_exp, p_efto,
+                1, num_experts, static_cast<int>(k_), 0, num_experts, stream);
+            ck::expandInputRowsKernelLauncher<T, T>(
+                static_cast<const T*>(input->DataRaw()) + row * hidden, static_cast<T*>(p_act_buf.get()),
+                nullptr, nullptr, p_r2u, 1, hidden, static_cast<int>(k_), num_experts,
+                quant_params, false, p_efto, nullptr, nullptr, nullptr, stream);
+            gemv::launch_moe_gemv_fp4_symmetric_interleaved_swiglu<T>(
+                static_cast<const T*>(p_act_buf.get()),
+                gemv_fc1_weight,
+                static_cast<const T*>(gemv_fp4_fc1_scales_.get()),
+                static_cast<const T*>(fc1_bias), static_cast<T*>(p_fc1_buf.get()),
+                p_efto, p_exp, num_experts, row_expanded, inter, hidden, gemv_group_size, sm_, act_params,
+                MoeGemvConfig::kDefault, stream);
+            gemv::launch_moe_gemv_fp4_symmetric<T>(
+                static_cast<const T*>(p_fc1_buf.get()),
+                gemv_fc2_weight,
+                static_cast<const T*>(gemv_fp4_fc2_scales_.get()),
+                static_cast<const T*>(fc2_bias), static_cast<T*>(p_fc2_buf.get()),
+                p_efto, p_exp, num_experts, row_expanded, hidden, inter, gemv_group_size, sm_,
+                MoeGemvConfig::kDefault, stream);
+            ck::finalizeMoeRoutingKernelLauncher<T, T, T>(
+                static_cast<const T*>(p_fc2_buf.get()), static_cast<T*>(output->MutableDataRaw()) + row * hidden,
+                nullptr, expert_scales + row * k_, unpermuted_row_to_permuted_row, p_r2u,
+                expert_indices + row * k_, p_efto, 1, hidden, static_cast<int64_t>(k_), num_experts,
+                parallelism_config, false, stream);
+          }
+          return;
+        }
+
         ck::expandInputRowsKernelLauncher<T, T>(
             static_cast<const T*>(input->DataRaw()), static_cast<T*>(p_act_buf.get()),
             nullptr, nullptr, p_r2u, num_rows, hidden, static_cast<int>(k_), num_experts,
