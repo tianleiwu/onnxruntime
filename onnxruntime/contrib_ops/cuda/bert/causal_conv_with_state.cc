@@ -35,10 +35,6 @@ CausalConvWithState<T>::CausalConvWithState(const OpKernelInfo& info) : CudaKern
   activation_ = info.GetAttrOrDefault<std::string>("activation", "none");
   ORT_ENFORCE(activation_ == "none" || activation_ == "silu" || activation_ == "swish",
               "activation must be one of: none, silu, swish");
-
-  int64_t state_all_capacity = info.GetAttrOrDefault<int64_t>("state_all_capacity", 0);
-  ORT_ENFORCE(state_all_capacity >= 0);
-  state_all_capacity_ = static_cast<int>(state_all_capacity);
 }
 
 template <typename T>
@@ -99,12 +95,7 @@ Status CausalConvWithState<T>::ComputeInternal(OpKernelContext* context) const {
   // launcher receives nullptr and the kernels skip all per-position writes (zero overhead).
   T* present_state_all_data = nullptr;
   if (context->OutputCount() > 2) {
-    ORT_RETURN_IF_NOT(state_all_capacity_ == 0 || batch_size == 1,
-                      "state_all_capacity currently supports batch_size=1 only");
-    ORT_RETURN_IF_NOT(state_all_capacity_ == 0 || L <= state_all_capacity_,
-                      "sequence length exceeds state_all_capacity");
-    const int state_all_length = state_all_capacity_ > 0 ? state_all_capacity_ : L;
-    TensorShape state_all_shape({batch_size, state_all_length, channels, pad});
+    TensorShape state_all_shape({batch_size, L, channels, pad});
     Tensor* present_state_all_tensor = context->Output(2, state_all_shape);
     if (present_state_all_tensor != nullptr) {
       present_state_all_data = present_state_all_tensor->MutableData<T>();

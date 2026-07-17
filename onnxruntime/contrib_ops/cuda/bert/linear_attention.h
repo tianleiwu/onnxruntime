@@ -24,7 +24,6 @@ class LinearAttention final : public onnxruntime::cuda::CudaKernel {
   std::string update_rule_;
   float scale_;
   int chunk_size_;
-  int state_all_capacity_;
 };
 
 }  // namespace cuda
