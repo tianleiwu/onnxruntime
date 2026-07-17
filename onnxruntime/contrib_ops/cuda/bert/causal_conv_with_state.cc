@@ -93,12 +93,11 @@ Status CausalConvWithState<T>::ComputeInternal(OpKernelContext* context) const {
   // Optional per-position state output(2): present_state_all [B, seq_len, C, K-1].
   // Only allocated/populated when the node actually has a 3rd output; otherwise the
   // launcher receives nullptr and the kernels skip all per-position writes (zero overhead).
-  T* present_state_all_data = nullptr;
   if (context->OutputCount() > 2) {
     TensorShape state_all_shape({batch_size, L, channels, pad});
     Tensor* present_state_all_tensor = context->Output(2, state_all_shape);
     if (present_state_all_tensor != nullptr) {
-      present_state_all_data = present_state_all_tensor->MutableData<T>();
+      (void)present_state_all_tensor->MutableData<T>();
     }
   }
 
@@ -125,7 +124,7 @@ Status CausalConvWithState<T>::ComputeInternal(OpKernelContext* context) const {
       K,
       apply_silu,
       GetDeviceProp().maxThreadsPerBlock,
-      reinterpret_cast<CudaT*>(present_state_all_data));
+      nullptr);
 }
 
 }  // namespace cuda
