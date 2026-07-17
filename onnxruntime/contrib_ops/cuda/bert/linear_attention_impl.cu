@@ -28,6 +28,7 @@
 #include "contrib_ops/cuda/bert/linear_attention_impl.h"
 #include "core/providers/cuda/cu_inc/common.cuh"
 #include "core/providers/cuda/cu_inc/cuda_type_helper.cuh"
+#include "core/platform/env_var_utils.h"
 
 namespace onnxruntime {
 namespace contrib {
@@ -905,6 +906,7 @@ __global__ void LinearAttentionDecodeColKernel(
     bool needs_beta,
     bool beta_per_head,
     bool needs_retrieval,
+    bool force_sequential_state_roundtrip,
     T* __restrict__ present_state_all) {  // [B, T, H_kv, DK, d_v] or nullptr
   const int b = blockIdx.x;
   const int h_kv = blockIdx.y;
@@ -1013,6 +1015,12 @@ __global__ void LinearAttentionDecodeColKernel(
       }
       output[bt * output_hidden + readout_heads.output_head * d_v + col] = from_float<T>(scale * acc);
     }
+    if (force_sequential_state_roundtrip && t + 1 < seq_len) {
+#pragma unroll
+      for (int i = 0; i < DK; ++i) {
+        s_col[i] = to_float(from_float<T>(s_col[i]));
+      }
+    }
     __syncthreads();  // before next token overwrites k_sh/g_sh
   }
 
@@ -1073,6 +1081,8 @@ Status LaunchLinearAttentionKernel(
     // to the v1 warp-per-column kernel (which handles any d_v). DK=256 also
     // uses v1 to avoid the high per-thread register footprint of s_col[256].
     if (d_k <= 128 && d_v % kColsPerBlock == 0) {
+      const bool force_sequential_state_roundtrip =
+          ParseEnvironmentVariableWithDefault<bool>("ORT_LINEAR_ATTENTION_FORCE_SEQUENTIAL_STATE_ROUNDTRIP", false);
       const dim3 decode_grid(batch_size, kv_num_heads,
                              (d_v + kColsPerBlock - 1) / kColsPerBlock);
       const dim3 decode_block(kColsPerBlock, 1, 1);
@@ -1082,7 +1092,8 @@ Status LaunchLinearAttentionKernel(
         LinearAttentionDecodeColKernel<T, DK><<<decode_grid, decode_block, 0, stream>>>(
             query, key, value, present_state, decay, beta, output,
             seq_len, q_num_heads, kv_num_heads, n_k_heads, d_v, output_hidden, scale,
-            needs_decay, decay_per_key_dim, needs_beta, beta_per_head, needs_retrieval, present_state_all);
+            needs_decay, decay_per_key_dim, needs_beta, beta_per_head, needs_retrieval,
+            force_sequential_state_roundtrip, present_state_all);
         return CUDA_CALL(cudaGetLastError());
       };
 
