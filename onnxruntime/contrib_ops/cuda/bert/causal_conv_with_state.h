@@ -21,6 +21,7 @@ class CausalConvWithState final : public onnxruntime::cuda::CudaKernel {
  private:
   int ndim_;
   std::string activation_;
+  int state_all_capacity_;
 };
 
 }  // namespace cuda

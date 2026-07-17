@@ -2279,6 +2279,10 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
               "Spatial dimensionality: 1, 2, or 3. Default is 1.",
               AttributeProto::INT,
               static_cast<int64_t>(1))
+          .Attr("state_all_capacity",
+            "Fixed capacity of optional present_state_all axis 1. Zero uses the input sequence length.",
+            AttributeProto::INT,
+            static_cast<int64_t>(0))
         .Input(0,
                "input",
                "Input tensor with shape (batch_size, channels, ...). Channels-first layout. "
@@ -2362,7 +2366,12 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
               propagateElemTypeFromInputToOutput(ctx, 0, 2);
               TensorShapeProto all_shape;
               *all_shape.add_dim() = input_shape.dim(0);                              // batch_size
-              *all_shape.add_dim() = input_shape.dim(input_shape.dim_size() - 1);     // seq_len (causal)
+              int64_t state_all_capacity = getAttribute(ctx, "state_all_capacity", 0);
+              if (state_all_capacity > 0) {
+                all_shape.add_dim()->set_dim_value(state_all_capacity);
+              } else {
+                *all_shape.add_dim() = input_shape.dim(input_shape.dim_size() - 1);   // seq_len (causal)
+              }
               *all_shape.add_dim() = input_shape.dim(1);                              // channels
               for (int64_t i = 0; i < ndim - 1; ++i) {
                 *all_shape.add_dim() = input_shape.dim(static_cast<int>(2 + i));
@@ -2420,6 +2429,10 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
               "Tuning hint; does not affect output correctness.",
               AttributeProto::INT,
               static_cast<int64_t>(64))
+          .Attr("state_all_capacity",
+            "Fixed capacity of optional present_state_all axis 1. Zero uses the input sequence length.",
+            AttributeProto::INT,
+            static_cast<int64_t>(0))
         .Input(0,
                "query",
                "Query vectors with 3D packed shape (B, T, H_q * d_k). "
@@ -2545,7 +2558,12 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
               propagateElemTypeFromInputToOutput(ctx, 0, 2);
               TensorShapeProto all_shape;
               *all_shape.add_dim() = query_shape.dim(0);           // B
-              *all_shape.add_dim() = query_shape.dim(1);           // T
+              int64_t state_all_capacity = getAttribute(ctx, "state_all_capacity", 0);
+              if (state_all_capacity > 0) {
+                all_shape.add_dim()->set_dim_value(state_all_capacity);
+              } else {
+                *all_shape.add_dim() = query_shape.dim(1);         // T
+              }
               all_shape.add_dim()->set_dim_value(kv_num_heads);    // H_kv
               if (query_shape.dim(2).has_dim_value()) {
                 all_shape.add_dim()->set_dim_value(query_shape.dim(2).dim_value() / q_num_heads);
