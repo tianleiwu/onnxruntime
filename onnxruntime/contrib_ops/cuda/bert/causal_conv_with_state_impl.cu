@@ -41,9 +41,9 @@ __global__ void CausalConvDecodeKernel(
     const T* __restrict__ input,       // [B, C, 1]
     const T* __restrict__ weight,      // [C, 1, K]
     const T* __restrict__ bias,        // [C] or nullptr
-    const T* past_state,  // [B, C, K-1] or nullptr
+    const T* __restrict__ past_state,  // [B, C, K-1] or nullptr
     T* __restrict__ output,            // [B, C, 1]
-    T* present_state,     // [B, C, K-1]
+    T* __restrict__ present_state,     // [B, C, K-1]
     int batch_channels,                // = batch_size * channels (actual element count)
     int channels,
     int kernel_size,
@@ -105,9 +105,9 @@ __global__ void CausalConvDecodeKernelFixedK(
     const T* __restrict__ input,
     const T* __restrict__ weight,
     const T* __restrict__ bias,
-    const T* past_state,
+    const T* __restrict__ past_state,
     T* __restrict__ output,
-    T* present_state,
+    T* __restrict__ present_state,
     int batch_channels,
     int channels,
     bool apply_silu,
@@ -168,9 +168,9 @@ __global__ void CausalConvPrefillKernel(
     const T* __restrict__ input,       // [B, C, L]
     const T* __restrict__ weight,      // [C, 1, K]
     const T* __restrict__ bias,        // [C] or nullptr
-    const T* past_state,  // [B, C, K-1] or nullptr
+    const T* __restrict__ past_state,  // [B, C, K-1] or nullptr
     T* __restrict__ output,            // [B, C, L]
-    T* present_state,     // [B, C, K-1]
+    T* __restrict__ present_state,     // [B, C, K-1]
     int seq_len,
     int channels,
     int kernel_size,
@@ -255,9 +255,9 @@ __global__ void CausalConvPrefillKernelBatched(
     const T* __restrict__ input,       // [B, C, L]
     const T* __restrict__ weight,      // [C, 1, K]
     const T* __restrict__ bias,        // [C] or nullptr
-    const T* past_state,  // [B, C, K-1] or nullptr
+    const T* __restrict__ past_state,  // [B, C, K-1] or nullptr
     T* __restrict__ output,            // [B, C, L]
-    T* present_state,     // [B, C, K-1]
+    T* __restrict__ present_state,     // [B, C, K-1]
     int seq_len,
     int channels,
     int kernel_size,
