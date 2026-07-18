@@ -36,6 +36,10 @@ static bool IsRouterGemvSpecializationDisabled() {
   return ParseEnvironmentVariableWithDefault<bool>("ORT_DISABLE_QMOE_ROUTER_GEMV_SPECIALIZATION", false);
 }
 
+static bool ForceSequentialM1Kernel() {
+  return ParseEnvironmentVariableWithDefault<bool>("ORT_MATMULNBITS_FORCE_SEQUENTIAL_M1", false);
+}
+
 // The router GEMV kernel handles any symmetric (no zero point) M=1 shape with an int4 group size of
 // 32 or 64 (whichever quantizes best) and N divisible by kColsPerThreadBlock. We gate on the exact
 // GPT-OSS-20B router shape to avoid changing the dispatch for general MatMulNBits cases. K must be a
@@ -1107,6 +1111,18 @@ bool TryMatMul4Bits(
 
   if (bias_data != nullptr) {
     return false;
+  }
+
+  if (m >= 2 && ForceSequentialM1Kernel()) {
+    for (int row = 0; row < m; ++row) {
+      if (!TryMatMul4Bits(output + static_cast<size_t>(row) * n,
+                          a_data + static_cast<size_t>(row) * k,
+                          b_data_quant, scales_data, zero_points, bias_data,
+                          1, n, k, block_size, shared_mem_per_block, stream)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   // The register-tiled batched path (half/bf16, 2 <= m <= cap) launches with no shared memory, so try

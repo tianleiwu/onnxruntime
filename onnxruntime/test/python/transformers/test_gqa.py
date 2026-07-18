@@ -2766,6 +2766,127 @@ def fused_kernel_test_cases():
         yield f"fused_config_{i}", config
 
 
+@unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
+class TestFlashDecodeMultiTokenParity(unittest.TestCase):
+    def test_shared_buffer_multitoken_decode_matches_flash_attention(self):
+        device = "cuda"
+        torch_type = torch.float16
+        ort_type = TensorProto.FLOAT16
+
+        config = GQAConfig(
+            batch_size=1,
+            q_sequence_length=4,
+            kv_sequence_length=4,
+            num_heads=16,
+            kv_num_heads=2,
+            head_size=128,
+            past_kv_sequence_length=64,
+            buffer_sequence_length=128,
+            rotary=False,
+            packed=False,
+            share_buffer=True,
+            softcap=0.0,
+        )
+
+        torch.manual_seed(123)
+        std = 0.1
+        q = (
+            torch.randn(
+                config.batch_size,
+                config.q_sequence_length,
+                config.num_heads,
+                config.head_size,
+                device=device,
+                dtype=torch_type,
+            )
+            * std
+        )
+        k = (
+            torch.randn(
+                config.batch_size,
+                config.kv_num_heads,
+                config.buffer_sequence_length,
+                config.head_size,
+                device=device,
+                dtype=torch_type,
+            )
+            * std
+        )
+        v = torch.randn_like(k) * std
+
+        past_len = config.past_kv_sequence_length
+        k[:, :, past_len:, :] = 0
+        v[:, :, past_len:, :] = 0
+
+        new_k = (
+            torch.randn(
+                config.batch_size,
+                config.kv_sequence_length,
+                config.kv_num_heads,
+                config.head_size,
+                device=device,
+                dtype=torch_type,
+            )
+            * std
+        )
+        new_v = torch.randn_like(new_k) * std
+
+        seqlens_k = torch.tensor([past_len + config.kv_sequence_length - 1], dtype=torch.int32, device=device)
+
+        def run_once(disable_flash_decode: bool):
+            with (
+                scoped_env_var("ORT_ENABLE_XQA", "0"),
+                scoped_env_var("ORT_ENABLE_CUDNN_FLASH_ATTENTION", "0"),
+                scoped_env_var("ORT_DISABLE_FLASH_ATTENTION", "0"),
+                scoped_env_var("ORT_DISABLE_FLASH_DECODE", "1" if disable_flash_decode else "0"),
+            ):
+                out, present_k, present_v = gqa_past_func(
+                    q=q,
+                    k=k.clone(),
+                    v=v.clone(),
+                    config=config,
+                    new_k=new_k,
+                    new_v=new_v,
+                    cos=None,
+                    sin=None,
+                    seqlens_k=seqlens_k,
+                    position_ids=None,
+                    attention_bias=None,
+                    head_sink=None,
+                    k_scale=None,
+                    v_scale=None,
+                    ep="CUDAExecutionProvider",
+                    device=device,
+                    share_buffer=True,
+                    ort_type=ort_type,
+                )
+            return out, present_k, present_v
+
+        out_fast, pk_fast, pv_fast = run_once(disable_flash_decode=False)
+        out_ref, pk_ref, pv_ref = run_once(disable_flash_decode=True)
+
+        numpy.testing.assert_allclose(
+            out_fast.to(torch.float32).detach().cpu().numpy(),
+            out_ref.to(torch.float32).detach().cpu().numpy(),
+            rtol=2e-3,
+            atol=2e-3,
+        )
+
+        valid_len = past_len + config.kv_sequence_length
+        numpy.testing.assert_allclose(
+            pk_fast[:, :, :valid_len, :].to(torch.float32).detach().cpu().numpy(),
+            pk_ref[:, :, :valid_len, :].to(torch.float32).detach().cpu().numpy(),
+            rtol=2e-3,
+            atol=2e-3,
+        )
+        numpy.testing.assert_allclose(
+            pv_fast[:, :, :valid_len, :].to(torch.float32).detach().cpu().numpy(),
+            pv_ref[:, :, :valid_len, :].to(torch.float32).detach().cpu().numpy(),
+            rtol=2e-3,
+            atol=2e-3,
+        )
+
+
 def gqa_xqa_test_cases():
     # Decoding config (seq_len=1, share_buffer=True)
     # Testing different group sizes and query types
