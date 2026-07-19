@@ -149,14 +149,17 @@ FP4 e2m1 (both MXFP4 and NVFP4) are symmetric formats with no zero-point.
 | `"int"` (8-bit) | W8A16 | FP16/BF16 | INT8 group-wise | SM75+ | — | always |
 | `"fp8"` | W8A16-fp8 | BF16/FP16 | FP8 e4m3 (no packing) | **SM90+** native | dequant→A16 on SM<90 | `ENABLE_FP8` (CUDA ≥ 11.8) |
 | `"fp4"` | W4A16-MXFP4 | BF16/FP16 | MXFP4 e2m1, group=32 | **SM120+** native | dequant→A16 on SM<120 | `ENABLE_FP4` + `USE_FP4_QMOE` (CUDA ≥ 12.8) |
-| `"nvfp4"` | W4A16-NVFP4 | BF16/FP16 | NVFP4 e2m1, group=16, `float8e4m3fn` block scale + per-expert FP32 global scale | dequant→A16 (all SM) + **fused GEMV decode** | `ENABLE_FP4` + `USE_FP4_QMOE` (CUDA ≥ 12.8) |
+| `"nvfp4"` | W4A16-NVFP4 | BF16/FP16 (quantized to NVFP4 in-runner) | NVFP4 e2m1, group=16, `float8e4m3fn` block scale + per-expert FP32 global scale | **SM120+** native block-scaled FP4×FP4 | dequant→A16 on SM<120 + **fused GEMV decode** | `ENABLE_FP4` + `USE_FP4_QMOE` (CUDA ≥ 12.8) |
 | `"wfp4afp8"` | W4A8-MXFP4×FP8 | FP8 e4m3 (quantized in-runner) | MXFP4 e2m1, group=32 | **SM100+** native | dequant→A16 on SM<100 | `ENABLE_FP4` + `USE_FP4_QMOE` + `ENABLE_FP8` |
 
 Selection logic (see [moe_quantization.cc](onnxruntime/contrib_ops/cuda/moe/moe_quantization.cc)):
 
 ```cpp
 if (quant_type_ == "fp4")      use_fp4_dequant_fallback_      = (sm_ < 120);
-if (quant_type_ == "nvfp4")    use_fp4_dequant_fallback_      = true;   // no native block-scaled path yet; fused GEMV decode covers small-decode shapes
+// nvfp4 native FP4xFP4 block-scaled GEMM is enabled on SM120/SM121 when the SM120 kernels are
+// compiled and the static weight shape is 64-aligned (opt out via ORT_ENABLE_NVFP4_CUTLASS_GEMM=0).
+// The fused GEMV decode path still serves small-decode shapes; the dequant->A16 fallback covers SM<120.
+if (quant_type_ == "nvfp4")    use_fp4_dequant_fallback_      = !enable_nvfp4_cutlass_gemm_;
 if (quant_type_ == "wfp4afp8") use_wfp4afp8_dequant_fallback_ = (sm_ < 100);
 if (quant_type_ == "fp8")      use_fp8_dequant_fallback_      = (sm_ < 90);
 ```
@@ -228,7 +231,7 @@ switch is cached on first use.
 | FP16/BF16 (no quant, MoE op) | Ampere GemmGrouped | TMA WS (same-type) | TMA WS / valid Blackwell spec | TMA WS / Ampere fallback |
 | FP8 W8A16 native | dequant fallback | TMA WS | TMA WS | SM89 FP8 kernel redirect |
 | FP4 W4A16 native | dequant fallback | dequant fallback | dequant fallback | TMA WS mixed-input FP4 |
-| NVFP4 W4A16 (group-16) | dequant fallback + fused GEMV decode | dequant fallback + fused GEMV decode | dequant fallback + fused GEMV decode | dequant fallback + fused GEMV decode |
+| NVFP4 W4A16 (group-16) | dequant fallback + fused GEMV decode | dequant fallback + fused GEMV decode | dequant fallback + fused GEMV decode | Block-scaled tensor op (FP4×FP4) + fused GEMV decode |
 | WFP4AFP8 native | dequant fallback | dequant fallback | Block-scaled tensor op | Block-scaled tensor op |
 | FP32 | Ampere GemmGrouped (forced) | same | same | same |
 
@@ -777,6 +780,7 @@ debug switches.
 | `ORT_FP4_SM80_GEMM` | `1` | Routes SM80/Ampere FP4 prefill through the fused-dequant grouped GEMM. Set to `0` to force dense fallback for debugging or comparison. Decode still routes through fused MXFP4 GEMV when supported. |
 | `ORT_ENABLE_FP4_CUTLASS_GEMM` | `0` | Opt-in native SM90 WFP4A16 CUTLASS GEMM (fast prefill). Requires FP16, SM90, and aligned shapes (`hidden`/`inter` divisible by 256). Must be combined with `ORT_ENABLE_FP4_CUTLASS_UNSAFE=1`. |
 | `ORT_ENABLE_FP4_CUTLASS_UNSAFE` | `0` | Confirms use of the experimental native SM90 path. Without it, a request to enable native GEMM logs a warning and falls back to dequant/GEMV. |
+| `ORT_ENABLE_NVFP4_CUTLASS_GEMM` | on (SM120/121) | Native NVFP4 block-scaled FP4×FP4 grouped GEMM on Blackwell SM120/SM121. Enabled by default when the SM120 kernels are compiled and the static weight shape is 64-aligned. Set to `0` to force the dequant/GEMV fallback (debugging). No effect on SM<120. |
 | `ORT_FP4_PREFILL_MIN_TOKENS` | `64` | When native CUTLASS is enabled, the per-node decode threshold. Tokens with `M >= threshold` (prefill) route to native CUTLASS; `M < threshold` (decode) route to the fused GEMV. Both weight/scale layouts are pre-packed so one node serves both regimes. |
 
 When native CUTLASS is enabled, weights and scales are dual-prepacked (native layout plus
@@ -833,12 +837,20 @@ NVFP4 is the format emitted by NVIDIA Model-Optimizer (e.g. `nvidia/Qwen3.6-35B-
 
 ### 9b.1 Dispatch
 
-There is no native block-scaled CUTLASS path for NVFP4 today (that is Blackwell-only and not yet
-wired), so NVFP4 **always** uses the dequant-to-A16 fallback ([§4.3](#43-dequant-to-a16-fallback))
-for prefill / GEMV-unsupported shapes, and the **fused GEMV decode fast path**
-([§4](#4-architecture-dispatch--kernel-paths)) for small-decode shapes. `enable_fp4_gemv_` is on by
-default for NVFP4 (opt-out `ORT_ENABLE_FP4_GEMV=0`); `enable_fp4_sm80_gemm_` stays off (the SM80
-grouped-GEMM FP4 prefill path is MXFP4-only).
+On Blackwell **SM120/SM121** (GeForce/RTX Blackwell), NVFP4 runs a **native block-scaled FP4×FP4
+grouped GEMM** (the SM120 TMA warp-specialized `nv_float4_t` tensor-op kernels). The BF16/FP16
+activation is quantized to NVFP4 (E2M1 + per-block-16 E4M3 scale) inside the runner's
+`expandInputRowsKernel`, and the per-expert weight global scale is applied as the epilogue alpha.
+This path is enabled by default on SM120/SM121 (opt-out `ORT_ENABLE_NVFP4_CUTLASS_GEMM=0`), requires
+the SM120 kernels to be compiled (arch `120` in the build) and a 64-aligned static weight shape, and
+serves prefill / GEMV-unsupported shapes; the **fused GEMV decode fast path**
+([§4](#4-architecture-dispatch--kernel-paths)) still serves small-decode shapes.
+
+On every other GPU (SM<120, or when the native path is disabled/unsupported) NVFP4 uses the
+dequant-to-A16 fallback ([§4.3](#43-dequant-to-a16-fallback)) for prefill / GEMV-unsupported shapes
+plus the fused GEMV decode path. `enable_fp4_gemv_` is on by default for NVFP4 (opt-out
+`ORT_ENABLE_FP4_GEMV=0`); `enable_fp4_sm80_gemm_` stays off (the SM80 grouped-GEMM FP4 prefill path
+is MXFP4-only).
 
 ### 9b.2 Fused GEMV decode (group-16)
 

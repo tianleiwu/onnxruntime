@@ -11,11 +11,14 @@
 # scale (weight_scale_2). Dequant:
 #   w = DecodeFp4E2M1(code) * DecodeE4M3(block_scale) * global_scale[expert]
 #
-# Two decode paths are exercised: the dequant-to-A16 fallback (native block-scaled
-# CUTLASS GEMM is Blackwell-only, so this is the general path) and, for small-decode
-# SwiGLU shapes, the fused FP4 GEMV kernel (forced on via ORT_ENABLE_FP4_GEMV=1; a
-# gemv_mode="0" companion checks the fallback on the same shape). Both paths are
-# SM-agnostic; the tests require SM80+ / CUDA / an ENABLE_FP4 + USE_FP4_QMOE build.
+# Two decode paths are exercised: the dequant-to-A16 fallback (used on every
+# non-Blackwell GPU) and, for small-decode SwiGLU shapes, the fused FP4 GEMV
+# kernel (forced on via ORT_ENABLE_FP4_GEMV=1; a gemv_mode="0" companion checks
+# the fallback on the same shape). On Blackwell SM120/SM121 a native block-scaled
+# FP4xFP4 grouped GEMM is additionally available (default-on, forced via
+# ORT_ENABLE_NVFP4_CUTLASS_GEMM=1); the test_nvfp4_native_* cases exercise it and
+# are skipped on non-Blackwell GPUs. The SM-agnostic tests require SM80+ / CUDA /
+# an ENABLE_FP4 + USE_FP4_QMOE build.
 # --------------------------------------------------------------------------
 
 import os
@@ -292,6 +295,7 @@ class TestQMoENVFP4(unittest.TestCase):
         use_swiglu=False,
         block_size=NVFP4_BLOCK_SIZE,
         gemv_mode=None,
+        native_mode=None,
     ):
         self._skip_if_no_fp4()
 
@@ -358,6 +362,12 @@ class TestQMoENVFP4(unittest.TestCase):
         prev_gemv_env = os.environ.get("ORT_ENABLE_FP4_GEMV")
         if gemv_mode is not None:
             os.environ["ORT_ENABLE_FP4_GEMV"] = gemv_mode
+        # native_mode toggles the SM120 native block-scaled FP4xFP4 grouped GEMM (read once in the
+        # QMoE op ctor during session creation): "1" forces it on, "0" forces the dequant/GEMV
+        # fallback, None leaves the default (on for SM120/SM121). Restore afterwards.
+        prev_native_env = os.environ.get("ORT_ENABLE_NVFP4_CUTLASS_GEMM")
+        if native_mode is not None:
+            os.environ["ORT_ENABLE_NVFP4_CUTLASS_GEMM"] = native_mode
         try:
             session = onnxruntime.InferenceSession(
                 onnx_model, opts, providers=[resolve_cuda_plugin_ep("CUDAExecutionProvider")]
@@ -372,6 +382,11 @@ class TestQMoENVFP4(unittest.TestCase):
                     os.environ.pop("ORT_ENABLE_FP4_GEMV", None)
                 else:
                     os.environ["ORT_ENABLE_FP4_GEMV"] = prev_gemv_env
+            if native_mode is not None:
+                if prev_native_env is None:
+                    os.environ.pop("ORT_ENABLE_NVFP4_CUTLASS_GEMM", None)
+                else:
+                    os.environ["ORT_ENABLE_NVFP4_CUTLASS_GEMM"] = prev_native_env
 
         input_tensor = torch.randn(num_tokens, hidden_size, device=device, dtype=torch_dtype)
         router_logits = torch.randn(num_tokens, num_experts, device=device, dtype=torch_dtype)
@@ -550,6 +565,59 @@ class TestQMoENVFP4(unittest.TestCase):
             num_tokens=32,
             onnx_dtype=TensorProto.BFLOAT16,
             use_swiglu=True,
+        )
+
+    # ----------------------------------------------------------------
+    # Native block-scaled FP4xFP4 grouped GEMM (Blackwell SM120 only).
+    # Forced on via ORT_ENABLE_NVFP4_CUTLASS_GEMM=1. The native path
+    # requires a 64-aligned hidden/inter (block-scaled SF alignment), so
+    # these shapes use hidden=inter=128 and a prefill token count (the
+    # small-decode fused GEMV is disabled here so the grouped GEMM runs).
+    # Skipped on non-Blackwell GPUs, where the op falls back to dequant.
+    # ----------------------------------------------------------------
+    def _skip_if_not_sm120(self):
+        sm = _cuda_sm()
+        if sm != 120 and sm != 121:
+            self.skipTest(f"Native NVFP4 block-scaled GEMM requires Blackwell SM120/SM121, got SM{sm}")
+
+    def test_nvfp4_native_fp16_silu(self):
+        self._skip_if_not_sm120()
+        self._run_nvfp4_moe_test(
+            hidden_size=128,
+            inter_size=128,
+            num_experts=4,
+            top_k=2,
+            num_tokens=128,
+            onnx_dtype=TensorProto.FLOAT16,
+            gemv_mode="0",
+            native_mode="1",
+        )
+
+    def test_nvfp4_native_bf16_silu(self):
+        self._skip_if_not_sm120()
+        self._run_nvfp4_moe_test(
+            hidden_size=128,
+            inter_size=128,
+            num_experts=4,
+            top_k=2,
+            num_tokens=128,
+            onnx_dtype=TensorProto.BFLOAT16,
+            gemv_mode="0",
+            native_mode="1",
+        )
+
+    def test_nvfp4_native_fp16_swiglu(self):
+        self._skip_if_not_sm120()
+        self._run_nvfp4_moe_test(
+            hidden_size=128,
+            inter_size=128,
+            num_experts=4,
+            top_k=2,
+            num_tokens=128,
+            onnx_dtype=TensorProto.FLOAT16,
+            use_swiglu=True,
+            gemv_mode="0",
+            native_mode="1",
         )
 
     @parameterized.expand(

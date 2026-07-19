@@ -299,17 +299,45 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
 #endif
     } else if (quant_type_ == "nvfp4") {
       ORT_ENFORCE(expert_weight_bits_ == 4, "NVFP4 quantization requires expert_weight_bits=4");
-      // Native block-scaled CUTLASS GEMM for NVFP4 is Blackwell-only. On all currently
-      // supported GPUs (including SM90/H200) NVFP4 always uses the dequant-to-A16 fallback:
-      // dequantize E2M1 weights (E4M3 block scales, block size 16, per-expert global scale)
-      // to FP16/BF16 and run the dense A16 MoE runner.
+      // Native block-scaled CUTLASS grouped GEMM for NVFP4 (E2M1 weights, Float8E4M3FN block
+      // scales, block size 16, per-expert global scale) is Blackwell-only: it uses the SM120
+      // TMA warp-specialized FP4xFP4 block-scaled tensor-op kernels. The BF16/FP16 activation is
+      // quantized to NVFP4 (E2M1 + per-block(16) E4M3 scale) inside the runner's
+      // expandInputRowsKernel; the per-expert weight global scale is applied as the epilogue alpha.
+      // On every non-Blackwell GPU (including SM90/H200) NVFP4 falls back to dequantizing the E2M1
+      // weights to FP16/BF16 and running the dense A16 MoE runner (plus the fused GEMV decode path).
       use_fp4_dequant_fallback_ = true;
 #if defined(ENABLE_FP4) && defined(USE_FP4_QMOE)
+      // Enable the native NVFP4 path on SM120/SM121 (GeForce/RTX Blackwell), where the FP4xFP4
+      // TMA warp-specialized kernels are compiled (COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS).
+      // Opt out via ORT_ENABLE_NVFP4_CUTLASS_GEMM=0 for debugging (forces the dequant/GEMV path).
+      // When the SM120 kernels were not compiled into this build (arch 120 not requested), stay on
+      // the dequant fallback so a mismatched build/GPU degrades gracefully instead of throwing.
+#if defined(COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS)
+      const bool nvfp4_native_arch = (sm_ == 120 || sm_ == 121);
+#else
+      const bool nvfp4_native_arch = false;
+#endif
+      const bool requested_nvfp4_cutlass_gemm =
+          onnxruntime::ParseEnvironmentVariableWithDefault<int>("ORT_ENABLE_NVFP4_CUTLASS_GEMM", 1) == 1;
+      const bool nvfp4_cutlass_shape_supported = StaticFp4CutlassShapeSupported(
+          op_kernel_info,
+          activation_type_ == onnxruntime::llm::kernels::cutlass_kernels::ActivationType::Swiglu);
+      enable_nvfp4_cutlass_gemm_ =
+          nvfp4_native_arch && requested_nvfp4_cutlass_gemm && nvfp4_cutlass_shape_supported;
+      if (enable_nvfp4_cutlass_gemm_) {
+        use_fp4_dequant_fallback_ = false;
+      } else if (requested_nvfp4_cutlass_gemm && nvfp4_native_arch && !nvfp4_cutlass_shape_supported) {
+        LOGS_DEFAULT(WARNING) << "QMoE native NVFP4 CUTLASS GEMM was requested, but the static FP4 weight "
+                                 "shape does not meet the block-scaled alignment requirements; falling back "
+                                 "to the NVFP4 dequant/GEMV path.";
+      }
       // Fused FP4 GEMV (W4A16) decode fast path, shared with MXFP4 but with block size 16 and
       // Float8E4M3FN block scales. Default-on (opt-out via ORT_ENABLE_FP4_GEMV=0): small-decode
       // shapes route through the fused GEMV instead of re-dequantizing every expert to dense
-      // BF16/FP16 each token, and any unsupported shape (prefill / large batch) falls through to
-      // the dequant fallback. NVFP4 has no native CUTLASS/SM80 path, so those stay disabled.
+      // BF16/FP16 each token. On SM120 the native block-scaled GEMM coexists with the GEMV
+      // (GEMV serves decode, native serves prefill and any GEMV-unsupported shape); on older GPUs
+      // the GEMV + dequant fallback are the only paths.
       {
         const char* v = std::getenv("ORT_ENABLE_FP4_GEMV");
         enable_fp4_gemv_ = (v == nullptr || v[0] == '\0' || v[0] != '0');
@@ -364,6 +392,22 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
       // time) into the runner, so inference-time config/tactic selection does not re-read the
       // environment (which may have changed since the session was created, e.g. in unit tests).
       m_moe_runner->setUseSm80Fp4(enable_fp4_sm80_gemm_);
+#endif
+    } else if (quant_type_ == "nvfp4" && !use_fp4_dequant_fallback_) {
+#if defined(ENABLE_FP4) && defined(USE_FP4_QMOE)
+      // Native NVFP4 (W4A16 block-scaled) on SM120: FP4 activations + FP4 weights, BF16/FP16
+      // input/output. Template parameters: <T=fp4, WeightType=fp4, OutputType=BF16/FP16,
+      // InputType=BF16/FP16>. CUTLASS routes this through the SM120 FP4xFP4 block-scaled tensor-op
+      // path. The runner accepts BF16/FP16 input from the caller and quantizes it to NVFP4 inside
+      // expandInputRowsKernel (NVFP4 branch, triggered by fp4.fc{1,2}.weight_block_scale non-null).
+      if (is_fp16) {
+        m_moe_runner = std::make_unique<CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, half, half>>(
+            sm_, activation_type_, normalize_routing_weights_, use_sparse_mixer_);
+      } else {
+        m_moe_runner =
+            std::make_unique<CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, __nv_bfloat16, __nv_bfloat16>>(
+                sm_, activation_type_, normalize_routing_weights_, use_sparse_mixer_);
+      }
 #endif
     } else if (quant_type_ == "wfp4afp8" && !use_wfp4afp8_dequant_fallback_) {
 #if defined(ENABLE_FP4) && defined(USE_FP4_QMOE) && defined(ENABLE_FP8) && defined(USE_FP8_QMOE)
@@ -696,6 +740,11 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   const bool route_native_fp4 =
       fp4_native_available &&
       (fp4_native_max_tokens_per_expert_ <= 0 || avg_tokens_per_expert <= fp4_native_max_tokens_per_expert_);
+  // Native NVFP4 (W4A16 block-scaled) on SM120. Unlike MXFP4 there is no dense-A16 crossover
+  // fallback runner: the native FP4xFP4 grouped GEMM serves every shape that falls through the
+  // fused GEMV decode fast path (which returns early below for small-M). ``m_moe_runner`` is the
+  // native fp4/fp4 runner constructed when ``!use_fp4_dequant_fallback_``.
+  const bool route_native_nvfp4 = is_nvfp4 && !use_fp4_dequant_fallback_;
   // SM80 FP4 grouped-GEMM prefill path. Active only when ORT_FP4_SM80_GEMM=1 and the
   // GEMV prepack produced the SM80 CUTLASS-interleaved e2m1 weights + activation-dtype group scales. Decode
   // shapes are still served by the fused GEMV (which returns early below); everything that
@@ -754,13 +803,19 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
       onnxruntime::llm::nvinfer::DataType dtype = is_fp16_ ? onnxruntime::llm::nvinfer::DataType::kHALF : onnxruntime::llm::nvinfer::DataType::kBF16;
       if (is_wfp4afp8 && !use_wfp4afp8_dequant_fallback_) {
         dtype = onnxruntime::llm::nvinfer::DataType::kFP8;
+      } else if (route_native_nvfp4) {
+        // Native NVFP4 quantizes the BF16/FP16 activation to FP4 (E2M1) inside the runner; the
+        // profiler keys the FP4xFP4 block-scaled tactic on an FP4 activation dtype.
+        dtype = onnxruntime::llm::nvinfer::DataType::kFP4;
       }
       // Weight type: FP4 for MXFP4, INT4 for 4-bit integer, INT8 for 8-bit integer. When the
       // native FP4 path routes to the dense fallback for this call, profile the dense (A16) tactic.
       onnxruntime::llm::nvinfer::DataType wtype;
       if (is_nvfp4) {
-        // NVFP4 always uses the dequant fallback, so profile against the dense (A16) tactic.
-        wtype = dtype;
+        // Native NVFP4 (SM120) profiles the FP4xFP4 block-scaled tactic (kFP4 weight). When NVFP4
+        // runs the dequant fallback (non-Blackwell / GEMV-unsupported shapes), the dense (A16)
+        // runner is used, so profile against the dense tactic instead.
+        wtype = route_native_nvfp4 ? onnxruntime::llm::nvinfer::DataType::kFP4 : dtype;
       } else if (is_fp4) {
         // fp4_sm80_prefill runs the e2m1 weights through the SM80 fused-dequant grouped GEMM,
         // whose scratch + groupwise scale layout match INT4-groupwise (4-bit weight + activation-dtype
@@ -1152,6 +1207,31 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
           static_cast<const MXFPXElementSF*>(p_fc2_block_scales),
           static_cast<const float*>(p_fc2_global_scale));
     }
+  } else if (is_nvfp4 && route_native_nvfp4) {
+    // Native NVFP4 (SM120 block-scaled): E2M1 weights + Float8E4M3FN block scales (block 16) +
+    // per-expert weight global scale. The BF16/FP16 activation is quantized to NVFP4 dynamically
+    // inside the runner (act_global_scale = nullptr => pure per-block E4M3 scale, no activation
+    // global scale). The per-expert weight global scale is applied as the epilogue alpha, which is
+    // numerically consistent because the stored E4M3 weight block scales already absorb 1/global.
+    const void* p_fc1_block_scales = packed_fp4_fc1_block_scales_ ? packed_fp4_fc1_block_scales_.get()
+                                                                  : (fp4_fc1_block_scales ? fp4_fc1_block_scales->DataRaw() : nullptr);
+    const void* p_fc1_global_scale = packed_fc1_global_scale_ ? packed_fc1_global_scale_.get()
+                                                              : (fc1_global_scale ? fc1_global_scale->DataRaw() : nullptr);
+    const void* p_fc2_block_scales = packed_fp4_fc2_block_scales_ ? packed_fp4_fc2_block_scales_.get()
+                                                                  : (fp4_fc2_block_scales ? fp4_fc2_block_scales->DataRaw() : nullptr);
+    const void* p_fc2_global_scale = packed_fc2_global_scale_ ? packed_fc2_global_scale_.get()
+                                                              : (fc2_global_scale ? fc2_global_scale->DataRaw() : nullptr);
+    ORT_RETURN_IF_NOT(p_fc1_block_scales && p_fc1_global_scale && p_fc2_block_scales && p_fc2_global_scale,
+                      "QMoE native quant_type='nvfp4' requires fc1_scales, fc2_scales, fc1_global_scale, "
+                      "and fc2_global_scale.");
+    using NVFP4ElementSF = onnxruntime::llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF;
+    quant_params = onnxruntime::llm::kernels::cutlass_kernels::QuantParams::FP4(
+        /*fc1_act_global_scale=*/nullptr,
+        static_cast<const NVFP4ElementSF*>(p_fc1_block_scales),
+        static_cast<const float*>(p_fc1_global_scale),
+        /*fc2_act_global_scale=*/nullptr,
+        static_cast<const NVFP4ElementSF*>(p_fc2_block_scales),
+        static_cast<const float*>(p_fc2_global_scale));
   } else if (is_wfp4afp8) {
     // W4A8 (WFP4AFP8): MXFP4 weights + FP8 e4m3 activations.
     //   - Weight block scales (uint8 MXFPX) are read from fc*_scales (inputs 3/6)
@@ -1445,7 +1525,8 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
     // grouped GEMM uses). The activation-dtype group scales are wired via quant_params above.
     fc1_weight_data = gemv_fp4_fc1_weights_.get();
     fc2_weight_data = gemv_fp4_fc2_weights_.get();
-  } else if ((is_fp4 && route_native_fp4) || (is_wfp4afp8 && !use_wfp4afp8_dequant_fallback_)) {
+  } else if ((is_fp4 && route_native_fp4) || route_native_nvfp4 ||
+             (is_wfp4afp8 && !use_wfp4afp8_dequant_fallback_)) {
     // The native CUTLASS FP4 paths consume weights in the repacked FP4
     // layout produced by PrePack. If PrePack never ran (e.g.
     // ``session.disable_prepacking`` is set) the repacked buffers stay null and
@@ -1474,11 +1555,12 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   IAllocatorUniquePtr<void> dequant_fc1_weights;
   IAllocatorUniquePtr<void> dequant_fc2_weights;
   // FP4 (W4A16) and WFP4AFP8 (W4A8) share the MXFP4 weight format (Float8E8M0 block scales, block 32).
-  // NVFP4 (W4A16) uses Float8E4M3FN block scales with block 16 and always runs the dequant fallback.
-  // When the native CUTLASS path is unavailable on the current SM (always for NVFP4), or when native
-  // FP4 routes this call to the dense fallback for the large per-expert-M regime, dequantize the E2M1
-  // weights to FP16/BF16 and run the dense A16 runner.
-  if (is_nvfp4 ||
+  // NVFP4 (W4A16) uses Float8E4M3FN block scales with block 16; it runs the native SM120 block-scaled
+  // FP4xFP4 grouped GEMM when ``route_native_nvfp4`` and otherwise the dequant fallback.
+  // When the native CUTLASS path is unavailable on the current SM (NVFP4 off Blackwell, or MXFP4
+  // routed to the dense fallback for the large per-expert-M regime), dequantize the E2M1 weights to
+  // FP16/BF16 and run the dense A16 runner.
+  if ((is_nvfp4 && !route_native_nvfp4) ||
       (((is_fp4 && !route_native_fp4) || (is_wfp4afp8 && use_wfp4afp8_dequant_fallback_)) && !fp4_sm80_prefill)) {
     // The dequant kernel expects raw [E, n, k_blocks] block scales. When native FP4 is enabled
     // (this is the large per-expert-M fallback), packed_fp4_*_block_scales_ holds the TMA-swizzled
@@ -1650,23 +1732,28 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
 #endif
 
   if (input_idx == 2 && ((quant_type_ == "fp4" && !use_fp4_dequant_fallback_) ||
+                         (quant_type_ == "nvfp4" && !use_fp4_dequant_fallback_) ||
                          (quant_type_ == "wfp4afp8" && !use_wfp4afp8_dequant_fallback_))) {
     PrePackRepackFP4Weights(tensor, stream, alloc, packed_fp4_fc1_weights_, is_packed);
     // Native CUTLASS + GEMV coexist: also pre-pack the GEMV layout for decode (interleaved
-    // layout when ORT_FP4_GEMV_INTERLEAVED=1, else the [E,n,k/2] row-major layout).
-    if (quant_type_ == "fp4" && enable_fp4_gemv_) {
+    // layout when ORT_FP4_GEMV_INTERLEAVED=1 for MXFP4, else the [E,n,k/2] row-major layout).
+    // NVFP4 (block 16) has no SM80/interleaved path and always uses the plain ColToRow layout.
+    if ((quant_type_ == "fp4" || quant_type_ == "nvfp4") && enable_fp4_gemv_) {
+      const bool nvfp4 = (quant_type_ == "nvfp4");
       bool local_packed = false;
       PrePackRepackFP4Weights(tensor, stream, alloc, gemv_fp4_fc1_weights_, local_packed,
-                              onnxruntime::llm::kernels::moe_gemv::Fp4MoeGemvUseInterleaved());
+                              !nvfp4 && onnxruntime::llm::kernels::moe_gemv::Fp4MoeGemvUseInterleaved());
     }
     is_packed = false;
   } else if (input_idx == 5 && ((quant_type_ == "fp4" && !use_fp4_dequant_fallback_) ||
+                                (quant_type_ == "nvfp4" && !use_fp4_dequant_fallback_) ||
                                 (quant_type_ == "wfp4afp8" && !use_wfp4afp8_dequant_fallback_))) {
     PrePackRepackFP4Weights(tensor, stream, alloc, packed_fp4_fc2_weights_, is_packed);
-    if (quant_type_ == "fp4" && enable_fp4_gemv_) {
+    if ((quant_type_ == "fp4" || quant_type_ == "nvfp4") && enable_fp4_gemv_) {
+      const bool nvfp4 = (quant_type_ == "nvfp4");
       bool local_packed = false;
       PrePackRepackFP4Weights(tensor, stream, alloc, gemv_fp4_fc2_weights_, local_packed,
-                              onnxruntime::llm::kernels::moe_gemv::Fp4MoeGemvUseInterleaved());
+                              !nvfp4 && onnxruntime::llm::kernels::moe_gemv::Fp4MoeGemvUseInterleaved());
     }
     is_packed = false;
   } else if (input_idx == 2 && (quant_type_ == "fp4" || quant_type_ == "nvfp4") && enable_fp4_gemv_) {
@@ -1736,6 +1823,19 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
         gemv_fp4_fc1_scale_kb_ = tensor.Shape()[2];
         TryBuildGemvFp4Scales(1, stream, alloc);
       }
+    } else if (quant_type_ == "nvfp4" && !use_fp4_dequant_fallback_) {
+      // Native NVFP4 (SM120) consumes the swizzled 128x4 SF atom layout, same as WFP4AFP8; the
+      // Float8E4M3FN block scales (block 16) are interleaved by PrePackSwizzleBlockScales. Keep a
+      // raw copy + dims so the coexisting GEMV decode path can build its combined scale layout.
+      PrePackSwizzleBlockScales(tensor, stream, alloc, packed_fp4_fc1_block_scales_, is_packed);
+      if (enable_fp4_gemv_ && tensor.Shape().NumDimensions() == 3) {
+        bool raw_packed = false;
+        PrePackCopyToGpu(tensor, stream, alloc, gemv_fp4_fc1_block_raw_, raw_packed);
+        gemv_fp4_fc1_scale_e_ = tensor.Shape()[0];
+        gemv_fp4_fc1_scale_n_ = tensor.Shape()[1];
+        gemv_fp4_fc1_scale_kb_ = tensor.Shape()[2];
+        TryBuildGemvFp4Scales(1, stream, alloc);
+      }
     } else if (quant_type_ == "wfp4afp8" && !use_wfp4afp8_dequant_fallback_) {
       PrePackSwizzleBlockScales(tensor, stream, alloc, packed_fp4_fc1_block_scales_, is_packed);
     } else if (quant_type_ == "fp4" || quant_type_ == "nvfp4" || quant_type_ == "wfp4afp8") {
@@ -1761,6 +1861,18 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
     }
     if (quant_type_ == "fp4" && !use_fp4_dequant_fallback_) {
       PrePackFp4ScalesForTmaWs(tensor, stream, alloc, packed_fp4_fc2_block_scales_, is_packed);
+      if (enable_fp4_gemv_ && tensor.Shape().NumDimensions() == 3) {
+        bool raw_packed = false;
+        PrePackCopyToGpu(tensor, stream, alloc, gemv_fp4_fc2_block_raw_, raw_packed);
+        gemv_fp4_fc2_scale_e_ = tensor.Shape()[0];
+        gemv_fp4_fc2_scale_n_ = tensor.Shape()[1];
+        gemv_fp4_fc2_scale_kb_ = tensor.Shape()[2];
+        TryBuildGemvFp4Scales(2, stream, alloc);
+      }
+    } else if (quant_type_ == "nvfp4" && !use_fp4_dequant_fallback_) {
+      // Native NVFP4 (SM120): swizzle the Float8E4M3FN block scales (block 16) into the 128x4 SF
+      // atom layout, and keep a raw copy + dims for the coexisting GEMV decode path.
+      PrePackSwizzleBlockScales(tensor, stream, alloc, packed_fp4_fc2_block_scales_, is_packed);
       if (enable_fp4_gemv_ && tensor.Shape().NumDimensions() == 3) {
         bool raw_packed = false;
         PrePackCopyToGpu(tensor, stream, alloc, gemv_fp4_fc2_block_raw_, raw_packed);
@@ -1990,8 +2102,15 @@ void QMoE::PrePackIntExpertWeights(const Tensor& tensor, cudaStream_t stream, Al
 void QMoE::PrePackSwizzleBlockScales(const Tensor& tensor, cudaStream_t stream, AllocatorPtr alloc,
                                      IAllocatorUniquePtr<void>& packed_buf, bool& is_packed) {
   auto shape = tensor.Shape();
-  ORT_ENFORCE(shape.NumDimensions() == 3, "Expected 3D FP4 block scales for WFP4AFP8 native prepack");
-  ORT_ENFORCE(tensor.IsDataType<Float8E8M0>(), "Expected Float8E8M0 FP4 block scales for WFP4AFP8 native prepack");
+  ORT_ENFORCE(shape.NumDimensions() == 3, "Expected 3D FP4 block scales for native block-scaled prepack");
+  // MXFP4 (WFP4AFP8) block scales are Float8E8M0 (block size 32); NVFP4 block scales are
+  // Float8E4M3FN (block size 16). The interleave kernel operates on raw uint8 bytes and lays them
+  // into the same Sm1xx 128x4 SF atom regardless of the numeric interpretation, so both element
+  // types share this path; only the scale-column count (K/32 vs K/16) differs and comes from the
+  // input shape.
+  ORT_ENFORCE(tensor.IsDataType<Float8E8M0>() || tensor.IsDataType<Float8E4M3FN>(),
+              "Expected Float8E8M0 (MXFP4) or Float8E4M3FN (NVFP4) FP4 block scales for native "
+              "block-scaled prepack");
 
   const int64_t experts = shape[0];
   const int64_t rows = shape[1];

@@ -3303,6 +3303,14 @@ template class CutlassMoeFCRunner<half, __nv_fp4_e2m1>;
 #ifdef ENABLE_BF16
 template class CutlassMoeFCRunner<__nv_bfloat16, __nv_fp4_e2m1>;
 #endif
+// Native NVFP4 (W4A16 block-scaled): FP4 e2m1 activations + FP4 e2m1 weights, BF16/FP16
+// input/output. InputType differs from T (the GEMM activation type) so the runner can accept
+// BF16/FP16 user input and quantize it to NVFP4 inside expandInputRowsKernel. Native CUTLASS path
+// requires SM120+ (Blackwell FP4xFP4 block-scaled tensor ops).
+template class CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, half, half>;
+#ifdef ENABLE_BF16
+template class CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, __nv_bfloat16, __nv_bfloat16>;
+#endif
 #if defined(ENABLE_FP8) && defined(USE_FP8_QMOE)
 // W4A8 (WFP4AFP8): FP8 e4m3 activations + MXFP4 weights, BF16/FP16 input/output.
 // InputType differs from T (the GEMM activation type) so the runner can accept BF16/FP16 user
