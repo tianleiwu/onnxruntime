@@ -83,6 +83,26 @@ Status MatMulBlockScaledFp4::ComputeImpl(OpKernelContext* context) const {
   const int n_i = SafeInt<int>(helper.N());
   const int k_i = SafeInt<int>(helper.K());
 
+  // Decode fast path: for small M (autoregressive generation) this is a memory-bound GEMV.
+  // A fused warp-per-column kernel reads the packed NVFP4 weight directly, avoiding both the
+  // [N, K] dequant scratch buffer and the cuBLAS GEMM (which is underutilized at M == 1).
+  constexpr int kGemvMaxM = 8;
+  if (m_i > 0 && m_i <= kGemvMaxM && block_size_ == 16 && (k_i % 32 == 0)) {
+    return LaunchMatMulBlockScaledFp4Gemv(
+        Y->MutableDataRaw(),
+        a->DataRaw(),
+        b->DataRaw(),
+        weight_scale->DataRaw(),
+        weight_scale_2->Data<float>(),
+        bias != nullptr ? bias->DataRaw() : nullptr,
+        m_i,
+        n_i,
+        k_i,
+        SafeInt<int>(block_size_),
+        std::is_same<T, BFloat16>::value,
+        Stream(context));
+  }
+
   // Dequantize the packed NVFP4 weight into a scratch [N, K] buffer of the activation type.
   IAllocatorUniquePtr<CudaT> b_dequant = GetScratchBuffer<CudaT>(SafeInt<size_t>(N_) * SafeInt<size_t>(K_),
                                                                  context->GetComputeStream());

@@ -51,4 +51,23 @@ Status LaunchAddBiasNvFp4(void* y,
                           bool is_bf16,
                           cudaStream_t stream);
 
+// Fused NVFP4 weight-only GEMV fast path for the decode phase (small M). Reads the packed
+// NVFP4 weight directly (no [N, K] dequant buffer). a is [M, K] activation (FP16/BF16),
+// b_packed is [N, K/2] uint8 (two E2M1 values per byte), weight_scale is [N, ceil(K/block_size)]
+// uint8 (raw E4M3 bytes), weight_scale_2 is a device fp32 scalar, bias is an optional [N] vector
+// (may be null). Output y is [M, N] in the activation type. Requires block_size == 16 and
+// k % 32 == 0. Runs on any architecture with NVFP4 conversion intrinsics (CUDA >= 12.8).
+Status LaunchMatMulBlockScaledFp4Gemv(void* y,
+                                      const void* a,
+                                      const void* b_packed,
+                                      const void* weight_scale,
+                                      const float* weight_scale_2,
+                                      const void* bias,
+                                      int m,
+                                      int n,
+                                      int k,
+                                      int block_size,
+                                      bool is_bf16,
+                                      cudaStream_t stream);
+
 }  // namespace onnxruntime::contrib::cuda

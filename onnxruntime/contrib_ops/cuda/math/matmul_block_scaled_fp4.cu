@@ -97,6 +97,126 @@ __global__ void AddBiasKernel(T* __restrict__ y, const T* __restrict__ bias, int
   y[idx] = FromFloat<T>(ToFloat<T>(y[idx]) + ToFloat<T>(bias[col]));
 }
 
+// -----------------------------------------------------------------------------
+// Fused NVFP4 weight-only GEMV fast path for the decode phase (small M).
+//
+// Each warp computes one output element Y[row, col]. The 32 lanes cooperatively
+// reduce over K reading the packed NVFP4 weight directly (two E2M1 values per
+// byte) with 16-byte coalesced loads, so the weight is streamed exactly once and
+// no [N, K] dequantized buffer is materialized. Each lane consumes 32 contiguous
+// K elements = 16 packed bytes, which span exactly two 16-element blocks; the two
+// per-block E4M3 scales are folded in per half. The global fp32 scale is applied
+// once after the warp reduction. Runs on any architecture with NVFP4 conversion
+// intrinsics (CUDA >= 12.8), including SM90 and SM120.
+template <typename T>
+__device__ __forceinline__ void LoadFp4Gemv32A(const T* ptr, float (&out)[32]);
+
+template <>
+__device__ __forceinline__ void LoadFp4Gemv32A<half>(const half* ptr, float (&out)[32]) {
+  const uint4* p = reinterpret_cast<const uint4*>(ptr);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const uint4 raw = p[j];
+    const half* v = reinterpret_cast<const half*>(&raw);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      out[j * 8 + i] = __half2float(v[i]);
+    }
+  }
+}
+
+template <>
+__device__ __forceinline__ void LoadFp4Gemv32A<nv_bfloat16>(const nv_bfloat16* ptr, float (&out)[32]) {
+  const uint4* p = reinterpret_cast<const uint4*>(ptr);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const uint4 raw = p[j];
+    const nv_bfloat16* v = reinterpret_cast<const nv_bfloat16*>(&raw);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      out[j * 8 + i] = __bfloat162float(v[i]);
+    }
+  }
+}
+
+template <typename T>
+__global__ void MatMulBlockScaledFp4GemvKernel(T* __restrict__ y,
+                                               const T* __restrict__ a,
+                                               const uint8_t* __restrict__ b_packed,
+                                               const uint8_t* __restrict__ weight_scale,
+                                               const float* __restrict__ weight_scale_2,
+                                               const T* __restrict__ bias,
+                                               int m,
+                                               int n,
+                                               int k,
+                                               int k_blocks) {
+  const int lane = threadIdx.x;                            // 0..31
+  const int col = blockIdx.x * blockDim.y + threadIdx.y;   // n
+  const int row = blockIdx.y;                              // m
+  if (row >= m || col >= n) {
+    return;
+  }
+
+  const T* a_row = a + static_cast<size_t>(row) * k;
+  const uint8_t* b_row = b_packed + static_cast<size_t>(col) * (k >> 1);
+  const uint8_t* ws_row = weight_scale + static_cast<size_t>(col) * k_blocks;
+
+  constexpr int kBlockSize = 16;
+  constexpr int kElemsPerLane = 32;             // two 16-element blocks
+  const int stride = 32 * kElemsPerLane;        // 1024 elements per warp iteration
+
+  float acc = 0.0f;
+  for (int base = 0; base < k; base += stride) {
+    const int koff = base + lane * kElemsPerLane;
+    if (koff < k) {
+      const uint4 packed = *reinterpret_cast<const uint4*>(b_row + (koff >> 1));
+      const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&packed);
+      float b_vals[32];
+#pragma unroll
+      for (int i = 0; i < 16; ++i) {
+        const __half2_raw hr = __nv_cvt_fp4x2_to_halfraw2(
+            static_cast<__nv_fp4x2_storage_t>(bytes[i]), __NV_E2M1);
+        const float2 f = __half22float2(__half2(hr));
+        b_vals[i * 2] = f.x;
+        b_vals[i * 2 + 1] = f.y;
+      }
+
+      float a_vals[32];
+      LoadFp4Gemv32A<T>(a_row + koff, a_vals);
+
+      const int kb0 = koff / kBlockSize;
+      const int kb1 = kb0 + 1;
+      float p0 = 0.0f;
+      float p1 = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 16; ++i) {
+        p0 += a_vals[i] * b_vals[i];
+      }
+#pragma unroll
+      for (int i = 16; i < 32; ++i) {
+        p1 += a_vals[i] * b_vals[i];
+      }
+      const float s0 = __half2float(__nv_cvt_fp8_to_halfraw(
+          static_cast<__nv_fp8_storage_t>(ws_row[kb0]), __NV_E4M3));
+      const float s1 = __half2float(__nv_cvt_fp8_to_halfraw(
+          static_cast<__nv_fp8_storage_t>(ws_row[kb1]), __NV_E4M3));
+      acc += p0 * s0 + p1 * s1;
+    }
+  }
+
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, offset);
+  }
+  if (lane == 0) {
+    float result = acc * (*weight_scale_2);
+    if (bias != nullptr) {
+      result += ToFloat<T>(bias[col]);
+    }
+    y[static_cast<size_t>(row) * n + col] = FromFloat<T>(result);
+  }
+}
+
 }  // namespace
 
 #endif  // CUDA_VERSION >= 12080
@@ -170,6 +290,56 @@ Status LaunchAddBiasNvFp4(void* y,
   ORT_UNUSED_PARAMETER(bias);
   ORT_UNUSED_PARAMETER(m);
   ORT_UNUSED_PARAMETER(n);
+  ORT_UNUSED_PARAMETER(is_bf16);
+  ORT_UNUSED_PARAMETER(stream);
+  return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "MatMulBlockScaledFp4 requires CUDA 12.8 or newer for NVFP4 support.");
+#endif
+}
+
+Status LaunchMatMulBlockScaledFp4Gemv(void* y,
+                                      const void* a,
+                                      const void* b_packed,
+                                      const void* weight_scale,
+                                      const float* weight_scale_2,
+                                      const void* bias,
+                                      int m,
+                                      int n,
+                                      int k,
+                                      int block_size,
+                                      bool is_bf16,
+                                      cudaStream_t stream) {
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12080
+  if (m <= 0 || n <= 0 || k <= 0) {
+    return Status::OK();
+  }
+  const int k_blocks = (k + block_size - 1) / block_size;
+  constexpr int kWarpsPerBlock = 8;
+  const dim3 threads{32, kWarpsPerBlock};
+  const dim3 blocks{static_cast<unsigned int>((n + kWarpsPerBlock - 1) / kWarpsPerBlock),
+                    static_cast<unsigned int>(m)};
+  const uint8_t* bp = reinterpret_cast<const uint8_t*>(b_packed);
+  const uint8_t* ws = reinterpret_cast<const uint8_t*>(weight_scale);
+  if (is_bf16) {
+    MatMulBlockScaledFp4GemvKernel<nv_bfloat16><<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<nv_bfloat16*>(y), reinterpret_cast<const nv_bfloat16*>(a), bp, ws, weight_scale_2,
+        reinterpret_cast<const nv_bfloat16*>(bias), m, n, k, k_blocks);
+  } else {
+    MatMulBlockScaledFp4GemvKernel<half><<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<half*>(y), reinterpret_cast<const half*>(a), bp, ws, weight_scale_2,
+        reinterpret_cast<const half*>(bias), m, n, k, k_blocks);
+  }
+  return CUDA_CALL(cudaGetLastError());
+#else
+  ORT_UNUSED_PARAMETER(y);
+  ORT_UNUSED_PARAMETER(a);
+  ORT_UNUSED_PARAMETER(b_packed);
+  ORT_UNUSED_PARAMETER(weight_scale);
+  ORT_UNUSED_PARAMETER(weight_scale_2);
+  ORT_UNUSED_PARAMETER(bias);
+  ORT_UNUSED_PARAMETER(m);
+  ORT_UNUSED_PARAMETER(n);
+  ORT_UNUSED_PARAMETER(k);
+  ORT_UNUSED_PARAMETER(block_size);
   ORT_UNUSED_PARAMETER(is_bf16);
   ORT_UNUSED_PARAMETER(stream);
   return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "MatMulBlockScaledFp4 requires CUDA 12.8 or newer for NVFP4 support.");

@@ -31,6 +31,23 @@ Status LaunchMatMulBlockScaledFp8(const void* input_a,
                                   bool fp16_scales,
                                   cudaStream_t stream);
 
+// Fused GEMV fast path for the decode phase (small M). Same operands and layout as
+// LaunchMatMulBlockScaledFp8, but each warp reduces one output column, streaming the
+// packed FP8 weight exactly once (no dequant buffer, no underutilized M==1 tensor-core
+// GEMM). Requires k % 16 == 0 and block_size % 16 == 0. Runs on any architecture.
+Status LaunchMatMulBlockScaledFp8Gemv(const void* input_a,
+                                      const void* input_b,
+                                      const void* scale_a,
+                                      const void* scale_b,
+                                      void* output,
+                                      int m,
+                                      int n,
+                                      int k,
+                                      int block_size,
+                                      bool fp16_io,
+                                      bool fp16_scales,
+                                      cudaStream_t stream);
+
 // Converts a buffer of MLFloat16 (fp16) values to fp32. Used to normalize the
 // block scales before invoking the CUTLASS fast-path GEMM, which expects fp32 scales.
 void LaunchConvertHalfToFloat(const void* src_fp16, float* dst, int64_t count, cudaStream_t stream);

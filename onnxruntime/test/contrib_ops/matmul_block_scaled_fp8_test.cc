@@ -217,6 +217,53 @@ TEST(MatMulBlockScaledFp8OpTest, Fp8FastPathWeightLayoutBF16) {
   execution_providers.push_back(DefaultCudaExecutionProvider());
   test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
 }
+
+// Exercises the fused decode GEMV fast path (small M): M == 1 with a large multi-block K so
+// the kernel's outer K loop and all 32 warp lanes participate. Y[0, n] = sum_b block_size *
+// scaleA[0, b] * scaleB[n, b]. Distinct per-block scaleA / scaleB values also validate the
+// K-major scale layouts and the per-column weight mapping on the GEMV path.
+TEST(MatMulBlockScaledFp8OpTest, Fp8GemvDecodeMultiBlockBF16) {
+  if (!HasCudaEnvironment(800)) {
+    GTEST_SKIP() << "CUDA device does not support FP8 matrix data types.";
+  }
+
+  constexpr int64_t m = 1;
+  constexpr int64_t n = 4;
+  constexpr int64_t block_size = 128;
+  constexpr int64_t k = 1024;  // 8 K-blocks, > 512 so the warp outer loop iterates
+  constexpr int64_t k_blocks = k / block_size;
+
+  std::vector<float> scale_a(m * k_blocks);
+  for (int64_t b = 0; b < k_blocks; ++b) {
+    scale_a[b] = 1.0f + static_cast<float>(b);  // 1..8
+  }
+  std::vector<float> scale_b(n * k_blocks);
+  for (int64_t j = 0; j < n; ++j) {
+    for (int64_t b = 0; b < k_blocks; ++b) {
+      scale_b[j * k_blocks + b] = (j % 2 == 0) ? 1.0f : 0.5f;
+    }
+  }
+  std::vector<float> expected(m * n);
+  for (int64_t j = 0; j < n; ++j) {
+    float acc = 0.0f;
+    for (int64_t b = 0; b < k_blocks; ++b) {
+      acc += scale_a[b] * scale_b[j * k_blocks + b];
+    }
+    expected[j] = static_cast<float>(block_size) * acc;
+  }
+
+  OpTester test("MatMulBlockScaledFp8", 1, onnxruntime::kMSDomain);
+  test.AddAttribute("block_size", block_size);
+  test.AddInput<Float8E4M3FN>("A", {m, k}, std::vector<Float8E4M3FN>(m * k, Float8E4M3FN(1.0f)));
+  test.AddInput<Float8E4M3FN>("B", {n, k}, std::vector<Float8E4M3FN>(k * n, Float8E4M3FN(1.0f)));
+  test.AddInput<float>("scaleA", {m, k_blocks}, scale_a);
+  test.AddInput<float>("scaleB", {n, k_blocks}, scale_b);
+  test.AddOutput<BFloat16>("Y", {m, n}, FloatsToBFloat16s(expected));
+
+  std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+  execution_providers.push_back(DefaultCudaExecutionProvider());
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+}
 #endif
 
 }  // namespace onnxruntime::test

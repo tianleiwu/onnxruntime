@@ -71,6 +71,18 @@ Status MatMulBlockScaledFp8::ComputeInternal(OpKernelContext* context) const {
   const int n_i = gsl::narrow_cast<int>(n);
   const int k_i = gsl::narrow_cast<int>(k);
 
+  // Decode fast path: for small M (e.g. autoregressive generation) the problem is a
+  // memory-bound GEMV. A fused warp-per-column kernel streams the packed FP8 weight
+  // exactly once and avoids the underutilized M==1 tensor-core GEMM below.
+  constexpr int kGemvMaxM = 8;
+  if (m_i > 0 && m_i <= kGemvMaxM && (k_i % 16 == 0) && (block_size_ % 16 == 0)) {
+    return LaunchMatMulBlockScaledFp8Gemv(input_a->DataRaw(), input_b->DataRaw(),
+                                          scale_a->DataRaw(), scale_b->DataRaw(),
+                                          output->MutableDataRaw(), m_i, n_i, k_i,
+                                          gsl::narrow_cast<int>(block_size_), fp16_io, fp16_scales,
+                                          Stream(context));
+  }
+
 #if defined(ORT_ENABLE_BLOCKQUANT_SM90) || defined(ORT_ENABLE_BLOCKQUANT_SM100)
   // Fast path: CUTLASS tensor-core blockwise-scaled FP8 GEMM on Hopper / Blackwell.
   // Restricted to the FP8 A -> BF16 Y case with block_size 128 and K/N aligned to 16 (fp8 128-bit access).
