@@ -104,10 +104,10 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     KernelSchedule>::CollectiveOp;
 
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue>;
+    Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue,
+    cutlass::gemm::PersistentScheduler>;
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-
 using StrideA = typename Gemm::GemmKernel::StrideA;
 using StrideB = typename Gemm::GemmKernel::StrideB;
 using StrideC = typename Gemm::GemmKernel::StrideC;
@@ -156,8 +156,7 @@ typename Gemm::Arguments MakeArguments(const void* a_fp8,
 }  // namespace
 
 size_t GetBlockQuantizedFp8GemmSm90WorkspaceSize(int m, int n, int k) {
-  auto arguments = MakeArguments(nullptr, nullptr, nullptr, nullptr, nullptr, m, n, k);
-  return Gemm::get_workspace_size(arguments);
+    return Gemm::get_workspace_size(MakeArguments(nullptr, nullptr, nullptr, nullptr, nullptr, m, n, k));
 }
 
 Status LaunchBlockQuantizedFp8GemmSm90(const void* a_fp8,
@@ -175,23 +174,19 @@ Status LaunchBlockQuantizedFp8GemmSm90(const void* a_fp8,
   ORT_RETURN_IF_NOT(block_size == kScaleGranularityK,
                     "SM90 blockwise FP8 GEMM only supports block_size == ", kScaleGranularityK);
 
-  auto arguments = MakeArguments(a_fp8, b_fp8, scale_a, scale_b, output_bf16, m, n, k);
-
-  Gemm gemm;
-  cutlass::Status status = gemm.can_implement(arguments);
-  ORT_RETURN_IF_NOT(status == cutlass::Status::kSuccess,
-                    "SM90 blockwise FP8 GEMM cannot implement the given problem: ",
-                    cutlassGetStatusString(status));
-
-  status = gemm.initialize(arguments, workspace, stream);
-  ORT_RETURN_IF_NOT(status == cutlass::Status::kSuccess,
-                    "SM90 blockwise FP8 GEMM initialize failed: ", cutlassGetStatusString(status));
-
-  status = gemm.run(stream);
-  ORT_RETURN_IF_NOT(status == cutlass::Status::kSuccess,
-                    "SM90 blockwise FP8 GEMM run failed: ", cutlassGetStatusString(status));
-
-  return CUDA_CALL(cudaGetLastError());
+    auto arguments = MakeArguments(a_fp8, b_fp8, scale_a, scale_b, output_bf16, m, n, k);
+    Gemm gemm;
+    cutlass::Status status = gemm.can_implement(arguments);
+    ORT_RETURN_IF_NOT(status == cutlass::Status::kSuccess,
+                                        "SM90 blockwise FP8 GEMM cannot implement the given problem: ",
+                                        cutlassGetStatusString(status));
+    status = gemm.initialize(arguments, workspace, stream);
+    ORT_RETURN_IF_NOT(status == cutlass::Status::kSuccess,
+                                        "SM90 blockwise FP8 GEMM initialize failed: ", cutlassGetStatusString(status));
+    status = gemm.run(stream);
+    ORT_RETURN_IF_NOT(status == cutlass::Status::kSuccess,
+                                        "SM90 blockwise FP8 GEMM run failed: ", cutlassGetStatusString(status));
+    return CUDA_CALL(cudaGetLastError());
 }
 
 }  // namespace onnxruntime::contrib::cuda

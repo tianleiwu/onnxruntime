@@ -86,4 +86,20 @@ Status LaunchBlockQuantizedFp8GemmSm100(const void* a_fp8,
                                         cudaStream_t stream);
 size_t GetBlockQuantizedFp8GemmSm100WorkspaceSize(int m, int n, int k);
 
+// Native SM120 software-blockwise FP8 GEMM. Uses FP32 scales with the same
+// per-row/per-column K=128 contract as the SM90 and SM100 variants.
+Status LaunchBlockQuantizedFp8GemmSm120(const void* a_fp8,
+                                        const void* b_fp8,
+                                        const float* scale_a,
+                                        const float* scale_b,
+                                        void* output_bf16,
+                                        int m,
+                                        int n,
+                                        int k,
+                                        int block_size,
+                                        void* workspace,
+                                        size_t workspace_size,
+                                        cudaStream_t stream);
+size_t GetBlockQuantizedFp8GemmSm120WorkspaceSize(int m, int n, int k);
+
 }  // namespace onnxruntime::contrib::cuda

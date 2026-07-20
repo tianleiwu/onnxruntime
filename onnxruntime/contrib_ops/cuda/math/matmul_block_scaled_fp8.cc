@@ -83,7 +83,7 @@ Status MatMulBlockScaledFp8::ComputeInternal(OpKernelContext* context) const {
                                           Stream(context));
   }
 
-#if defined(ORT_ENABLE_BLOCKQUANT_SM90) || defined(ORT_ENABLE_BLOCKQUANT_SM100)
+#if defined(ORT_ENABLE_BLOCKQUANT_SM90) || defined(ORT_ENABLE_BLOCKQUANT_SM100) || defined(ORT_ENABLE_BLOCKQUANT_SM120)
   // Fast path: CUTLASS tensor-core blockwise-scaled FP8 GEMM on Hopper / Blackwell.
   // Restricted to the FP8 A -> BF16 Y case with block_size 128 and K/N aligned to 16 (fp8 128-bit access).
   if (!fp16_io && output->IsDataType<BFloat16>() && block_size_ == 128 &&
@@ -110,6 +110,16 @@ Status MatMulBlockScaledFp8::ComputeInternal(OpKernelContext* context) const {
 
     bool handled = false;
     Status fast_status = Status::OK();
+  #if defined(ORT_ENABLE_BLOCKQUANT_SM120)
+    if (sm_ >= 120) {
+      const size_t ws = GetBlockQuantizedFp8GemmSm120WorkspaceSize(m_i, n_i, k_i);
+      auto ws_buf = GetScratchBuffer<uint8_t>(ws, context->GetComputeStream());
+      fast_status = LaunchBlockQuantizedFp8GemmSm120(
+        input_a->DataRaw(), input_b->DataRaw(), sfa, sfb, output->MutableDataRaw(),
+        m_i, n_i, k_i, gsl::narrow_cast<int>(block_size_), ws_buf.get(), ws, Stream(context));
+      handled = true;
+    }
+  #endif
 #if defined(ORT_ENABLE_BLOCKQUANT_SM90)
     if (sm_ == 90) {
       const size_t ws = GetBlockQuantizedFp8GemmSm90WorkspaceSize(m_i, n_i, k_i);
@@ -121,7 +131,7 @@ Status MatMulBlockScaledFp8::ComputeInternal(OpKernelContext* context) const {
     }
 #endif
 #if defined(ORT_ENABLE_BLOCKQUANT_SM100)
-    if (!handled && sm_ >= 100) {
+  if (!handled && sm_ >= 100 && sm_ < 120) {
       const size_t ws = GetBlockQuantizedFp8GemmSm100WorkspaceSize(m_i, n_i, k_i);
       auto ws_buf = GetScratchBuffer<uint8_t>(ws, context->GetComputeStream());
       fast_status = LaunchBlockQuantizedFp8GemmSm100(

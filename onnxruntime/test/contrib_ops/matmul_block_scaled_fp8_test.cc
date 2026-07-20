@@ -264,6 +264,51 @@ TEST(MatMulBlockScaledFp8OpTest, Fp8GemvDecodeMultiBlockBF16) {
   execution_providers.push_back(DefaultCudaExecutionProvider());
   test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
 }
+
+TEST(MatMulBlockScaledFp8OpTest, Fp8GemvDecodeFourRowsBF16) {
+  if (!HasCudaEnvironment(800)) {
+    GTEST_SKIP() << "CUDA device does not support FP8 matrix data types.";
+  }
+
+  constexpr int64_t m = 4;
+  constexpr int64_t n = 5;
+  constexpr int64_t block_size = 128;
+  constexpr int64_t k = 1024;
+  constexpr int64_t k_blocks = k / block_size;
+
+  std::vector<float> scale_a(m * k_blocks);
+  for (int64_t row = 0; row < m; ++row) {
+    for (int64_t block = 0; block < k_blocks; ++block) {
+      scale_a[row * k_blocks + block] = static_cast<float>(row + 1);
+    }
+  }
+  std::vector<float> scale_b(n * k_blocks);
+  for (int64_t col = 0; col < n; ++col) {
+    for (int64_t block = 0; block < k_blocks; ++block) {
+      scale_b[col * k_blocks + block] = static_cast<float>(col + 1) * 0.25f;
+    }
+  }
+  std::vector<float> expected(m * n);
+  for (int64_t row = 0; row < m; ++row) {
+    for (int64_t col = 0; col < n; ++col) {
+      expected[row * n + col] = static_cast<float>(k) *
+                                static_cast<float>(row + 1) *
+                                static_cast<float>(col + 1) * 0.25f;
+    }
+  }
+
+  OpTester test("MatMulBlockScaledFp8", 1, onnxruntime::kMSDomain);
+  test.AddAttribute("block_size", block_size);
+  test.AddInput<Float8E4M3FN>("A", {m, k}, std::vector<Float8E4M3FN>(m * k, Float8E4M3FN(1.0f)));
+  test.AddInput<Float8E4M3FN>("B", {n, k}, std::vector<Float8E4M3FN>(n * k, Float8E4M3FN(1.0f)));
+  test.AddInput<float>("scaleA", {m, k_blocks}, scale_a);
+  test.AddInput<float>("scaleB", {n, k_blocks}, scale_b);
+  test.AddOutput<BFloat16>("Y", {m, n}, FloatsToBFloat16s(expected));
+
+  std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+  execution_providers.push_back(DefaultCudaExecutionProvider());
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+}
 #endif
 
 }  // namespace onnxruntime::test

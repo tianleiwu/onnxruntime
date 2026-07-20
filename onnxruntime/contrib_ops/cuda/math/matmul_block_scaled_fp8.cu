@@ -85,7 +85,7 @@ __device__ __forceinline__ void LoadFp8Gemv16A<half>(const half* ptr, float (&ou
   }
 }
 
-template <typename AType, typename OutputType, typename ScaleType>
+template <int RowsPerWarp, typename AType, typename OutputType, typename ScaleType>
 __global__ void MatMulBlockScaledFp8GemvKernel(const AType* __restrict__ input_a,
                                                const __nv_fp8_e4m3* __restrict__ input_b,
                                                const ScaleType* __restrict__ scale_a,
@@ -98,44 +98,60 @@ __global__ void MatMulBlockScaledFp8GemvKernel(const AType* __restrict__ input_a
                                                int k_blocks) {
   const int lane = threadIdx.x;                                // 0..31
   const int col = blockIdx.x * blockDim.y + threadIdx.y;       // n
-  const int row = blockIdx.y;                                  // m
-  if (row >= m || col >= n) {
+  const int row_base = blockIdx.y * RowsPerWarp;                // m
+  if (row_base >= m || col >= n) {
     return;
   }
 
-  const AType* a_row = input_a + static_cast<size_t>(row) * k;
   const __nv_fp8_e4m3* b_row = input_b + static_cast<size_t>(col) * k;
-  const ScaleType* sa_row = scale_a + static_cast<size_t>(row) * k_blocks;
   const ScaleType* sb_row = scale_b + static_cast<size_t>(col) * k_blocks;
 
   constexpr int kElemsPerLane = 16;
   const int stride = 32 * kElemsPerLane;  // 512 elements per warp iteration
 
-  float acc = 0.0f;
+  float acc[RowsPerWarp] = {};
   for (int base = 0; base < k; base += stride) {
     const int koff = base + lane * kElemsPerLane;
     if (koff < k) {
       const uint4 b_raw = *reinterpret_cast<const uint4*>(b_row + koff);
       const __nv_fp8_e4m3* bp = reinterpret_cast<const __nv_fp8_e4m3*>(&b_raw);
-      float a_vals[16];
-      LoadFp8Gemv16A<AType>(a_row + koff, a_vals);
-
-      float partial = 0.0f;
-#pragma unroll
-      for (int i = 0; i < kElemsPerLane; ++i) {
-        partial += a_vals[i] * static_cast<float>(bp[i]);
-      }
       const int kb = koff / block_size;
-      acc += partial * static_cast<float>(sa_row[kb]) * static_cast<float>(sb_row[kb]);
+      const float b_scale = static_cast<float>(sb_row[kb]);
+#pragma unroll
+      for (int row_offset = 0; row_offset < RowsPerWarp; ++row_offset) {
+        const int row = row_base + row_offset;
+        if (row < m) {
+          const AType* a_row = input_a + static_cast<size_t>(row) * k;
+          const ScaleType* sa_row = scale_a + static_cast<size_t>(row) * k_blocks;
+          float a_vals[16];
+          LoadFp8Gemv16A<AType>(a_row + koff, a_vals);
+
+          float partial = 0.0f;
+#pragma unroll
+          for (int i = 0; i < kElemsPerLane; ++i) {
+            partial += a_vals[i] * static_cast<float>(bp[i]);
+          }
+          acc[row_offset] += partial * static_cast<float>(sa_row[kb]) * b_scale;
+        }
+      }
     }
   }
 
 #pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    acc += __shfl_down_sync(0xffffffffu, acc, offset);
+  for (int row_offset = 0; row_offset < RowsPerWarp; ++row_offset) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      acc[row_offset] += __shfl_down_sync(0xffffffffu, acc[row_offset], offset);
+    }
   }
   if (lane == 0) {
-    output[static_cast<size_t>(row) * n + col] = OutputType(acc);
+#pragma unroll
+    for (int row_offset = 0; row_offset < RowsPerWarp; ++row_offset) {
+      const int row = row_base + row_offset;
+      if (row < m) {
+        output[static_cast<size_t>(row) * n + col] = OutputType(acc[row_offset]);
+      }
+    }
   }
 }
 #endif
@@ -226,29 +242,39 @@ Status LaunchMatMulBlockScaledFp8Gemv(const void* input_a,
   const int k_blocks = (k + block_size - 1) / block_size;
   constexpr int kWarpsPerBlock = 8;
   const dim3 threads{32, kWarpsPerBlock};
-  const dim3 blocks{static_cast<unsigned int>((n + kWarpsPerBlock - 1) / kWarpsPerBlock),
-                    static_cast<unsigned int>(m)};
   const auto* b = reinterpret_cast<const __nv_fp8_e4m3*>(input_b);
-  if (fp16_io && fp16_scales) {
-    MatMulBlockScaledFp8GemvKernel<<<blocks, threads, 0, stream>>>(
+  const auto launch = [&]<int RowsPerWarp>() {
+    const dim3 blocks{static_cast<unsigned int>((n + kWarpsPerBlock - 1) / kWarpsPerBlock),
+                      static_cast<unsigned int>((m + RowsPerWarp - 1) / RowsPerWarp)};
+    if (fp16_io && fp16_scales) {
+      MatMulBlockScaledFp8GemvKernel<RowsPerWarp><<<blocks, threads, 0, stream>>>(
         reinterpret_cast<const half*>(input_a), b,
         reinterpret_cast<const half*>(scale_a), reinterpret_cast<const half*>(scale_b),
         reinterpret_cast<half*>(output), m, n, k, block_size, k_blocks);
-  } else if (fp16_io) {
-    MatMulBlockScaledFp8GemvKernel<<<blocks, threads, 0, stream>>>(
+    } else if (fp16_io) {
+      MatMulBlockScaledFp8GemvKernel<RowsPerWarp><<<blocks, threads, 0, stream>>>(
         reinterpret_cast<const half*>(input_a), b,
         reinterpret_cast<const float*>(scale_a), reinterpret_cast<const float*>(scale_b),
         reinterpret_cast<half*>(output), m, n, k, block_size, k_blocks);
-  } else if (fp16_scales) {
-    MatMulBlockScaledFp8GemvKernel<<<blocks, threads, 0, stream>>>(
+    } else if (fp16_scales) {
+      MatMulBlockScaledFp8GemvKernel<RowsPerWarp><<<blocks, threads, 0, stream>>>(
         reinterpret_cast<const __nv_fp8_e4m3*>(input_a), b,
         reinterpret_cast<const half*>(scale_a), reinterpret_cast<const half*>(scale_b),
         reinterpret_cast<__nv_bfloat16*>(output), m, n, k, block_size, k_blocks);
+    } else {
+      MatMulBlockScaledFp8GemvKernel<RowsPerWarp><<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const __nv_fp8_e4m3*>(input_a), b,
+        reinterpret_cast<const float*>(scale_a), reinterpret_cast<const float*>(scale_b),
+        reinterpret_cast<__nv_bfloat16*>(output), m, n, k, block_size, k_blocks);
+    }
+  };
+
+  if (m == 1) {
+    launch.template operator()<1>();
+  } else if (m <= 2) {
+    launch.template operator()<2>();
   } else {
-    MatMulBlockScaledFp8GemvKernel<<<blocks, threads, 0, stream>>>(
-        reinterpret_cast<const __nv_fp8_e4m3*>(input_a), b,
-        reinterpret_cast<const float*>(scale_a), reinterpret_cast<const float*>(scale_b),
-        reinterpret_cast<__nv_bfloat16*>(output), m, n, k, block_size, k_blocks);
+    launch.template operator()<4>();
   }
   return CUDA_CALL(cudaGetLastError());
 #else
