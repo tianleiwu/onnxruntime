@@ -138,6 +138,52 @@ TEST(MatMulBlockScaledFp8OpTest, Fp8FastPathMultiBlockK256BF16) {
   test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
 }
 
+TEST(MatMulBlockScaledFp8OpTest, Fp8SmallMHopperBF16) {
+  if (!HasCudaEnvironment(900)) {
+    GTEST_SKIP() << "CUDA device does not support the FP8 tensor-core fast path (requires SM90+).";
+  }
+
+  constexpr int64_t n = 80;
+  constexpr int64_t block_size = 128;
+  constexpr int64_t k = 256;
+  constexpr int64_t k_blocks = k / block_size;
+
+  for (const int64_t m : {9, 32, 64}) {
+    std::vector<float> scale_a(m * k_blocks);
+    for (int64_t row = 0; row < m; ++row) {
+      scale_a[row * k_blocks] = (row % 3 == 0) ? 0.5f : 1.0f;
+      scale_a[row * k_blocks + 1] = (row % 2 == 0) ? 1.5f : 0.5f;
+    }
+
+    std::vector<float> scale_b(n * k_blocks);
+    for (int64_t column = 0; column < n; ++column) {
+      scale_b[column * k_blocks] = (column % 4 == 0) ? 2.0f : 0.5f;
+      scale_b[column * k_blocks + 1] = (column < 64) ? 0.5f : 1.0f;
+    }
+
+    std::vector<float> expected(m * n);
+    for (int64_t row = 0; row < m; ++row) {
+      for (int64_t column = 0; column < n; ++column) {
+        expected[row * n + column] = static_cast<float>(block_size) *
+                                     (scale_a[row * k_blocks] * scale_b[column * k_blocks] +
+                                      scale_a[row * k_blocks + 1] * scale_b[column * k_blocks + 1]);
+      }
+    }
+
+    OpTester test("MatMulBlockScaledFp8", 1, onnxruntime::kMSDomain);
+    test.AddAttribute("block_size", block_size);
+    test.AddInput<Float8E4M3FN>("A", {m, k}, std::vector<Float8E4M3FN>(m * k, Float8E4M3FN(1.0f)));
+    test.AddInput<Float8E4M3FN>("B", {n, k}, std::vector<Float8E4M3FN>(n * k, Float8E4M3FN(1.0f)));
+    test.AddInput<float>("scaleA", {m, k_blocks}, scale_a);
+    test.AddInput<float>("scaleB", {n, k_blocks}, scale_b);
+    test.AddOutput<BFloat16>("Y", {m, n}, FloatsToBFloat16s(expected));
+
+    std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+    execution_providers.push_back(DefaultCudaExecutionProvider());
+    test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+  }
+}
+
 // Fast path with K = 16 (< block_size): a single partial K-block sharing one scale, so
 // Y[m, n] = K * scaleA[m] * scaleB[n]. Exercises the K-residue / sub-block-size path.
 TEST(MatMulBlockScaledFp8OpTest, Fp8FastPathPartialBlockK16BF16) {

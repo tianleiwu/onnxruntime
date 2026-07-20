@@ -26,6 +26,8 @@
 #endif
 
 #include "cutlass/cutlass.h"
+#include "cutlass/arch/barrier.h"
+#include "cutlass/arch/mma_sm90.h"
 #include "cutlass/numeric_types.h"
 #include "cute/tensor.hpp"
 #include "cutlass/detail/blockwise_scale_layout.hpp"
@@ -63,6 +65,158 @@ constexpr int AlignmentD = AlignmentC;
 
 using ElementAccumulator = float;
 using ElementCompute = float;
+
+// Small-M Hopper kernel adapted from the DeepGEMM dataflow: one 64x64 output tile per CTA,
+// TMA loads of 64x128 FP8 tiles, and a single warpgroup issuing m64n64k32 WGMMA operations.
+// Unlike DeepGEMM's blockwise B scaling, ORT has one B scale per output column, so scale
+// promotion uses the coordinate of every accumulator fragment element.
+constexpr int kSmallMMin = 9;
+constexpr int kSmallMMax = 64;
+constexpr int kSmallTileM = 64;
+constexpr int kSmallTileN = 64;
+constexpr int kSmallTileK = 128;
+
+using SmallTileShape = Shape<Int<kSmallTileM>, Int<kSmallTileN>, Int<kSmallTileK>>;
+using SmallSmemLayoutA = decltype(tile_to_shape(
+    GMMA::Layout_K_SW128_Atom<ElementA>{}, make_shape(Int<kSmallTileM>{}, Int<kSmallTileK>{})));
+using SmallSmemLayoutB = decltype(tile_to_shape(
+    GMMA::Layout_K_SW128_Atom<ElementB>{}, make_shape(Int<kSmallTileN>{}, Int<kSmallTileK>{})));
+using SmallTiledMma = decltype(make_tiled_mma(
+    SM90_64x64x32_F32E4M3E4M3_SS_TN<GMMA::ScaleIn::One, GMMA::ScaleIn::One>{}));
+
+template <typename TmaA, typename TmaB>
+struct alignas(128) SmallMSharedStorage {
+  cute::ArrayEngine<ElementA, cosize_v<SmallSmemLayoutA>> a;
+  cute::ArrayEngine<ElementB, cosize_v<SmallSmemLayoutB>> b;
+  uint64_t tma_barrier;
+};
+
+template <typename TmaA, typename TmaB>
+__global__ void __launch_bounds__(128)
+    SmallMBlockScaledFp8Kernel(int m,
+                               int n,
+                               int k,
+                               const ElementA* a,
+                               CUTLASS_GRID_CONSTANT TmaA const tma_a,
+                               const ElementB* b,
+                               CUTLASS_GRID_CONSTANT TmaB const tma_b,
+                               const float* scale_a,
+                               const float* scale_b,
+                               ElementD* output) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)
+  extern __shared__ char shared_memory[];
+  using SharedStorage = SmallMSharedStorage<TmaA, TmaB>;
+  SharedStorage& storage = *reinterpret_cast<SharedStorage*>(shared_memory);
+
+  cute::Tensor s_a = make_tensor(make_smem_ptr(storage.a.begin()), SmallSmemLayoutA{});
+  cute::Tensor s_b = make_tensor(make_smem_ptr(storage.b.begin()), SmallSmemLayoutB{});
+  cute::Tensor m_a = tma_a.get_tma_tensor(make_shape(m, k));
+  cute::Tensor m_b = tma_b.get_tma_tensor(make_shape(n, k));
+  cute::Tensor g_a = local_tile(m_a, SmallTileShape{}, make_coord(0, _, _), Step<_1, X, _1>{});
+  cute::Tensor g_b = local_tile(m_b, SmallTileShape{}, make_coord(_, blockIdx.x, _), Step<X, _1, _1>{});
+
+  auto [tAgA, tAsA] = tma_partition(
+      tma_a, Int<0>{}, Layout<_1>{}, group_modes<0, 2>(s_a), group_modes<0, 2>(g_a));
+  auto [tBgB, tBsB] = tma_partition(
+      tma_b, Int<0>{}, Layout<_1>{}, group_modes<0, 2>(s_b), group_modes<0, 2>(g_b));
+
+  using TmaBarrier = cutlass::arch::ClusterTransactionBarrier;
+  if (threadIdx.x == 0) {
+    TmaBarrier::init(&storage.tma_barrier, 1);
+  }
+  __syncthreads();
+
+  SmallTiledMma tiled_mma;
+  auto thread_mma = tiled_mma.get_thread_slice(threadIdx.x);
+  cute::Tensor tCsA = thread_mma.partition_A(s_a);
+  cute::Tensor tCsB = thread_mma.partition_B(s_b);
+  cute::Tensor tCrA = thread_mma.make_fragment_A(tCsA);
+  cute::Tensor tCrB = thread_mma.make_fragment_B(tCsB);
+
+  cute::Tensor c_output = make_identity_tensor(make_shape(Int<kSmallTileM>{}, Int<kSmallTileN>{}));
+  cute::Tensor tCcOutput = thread_mma.partition_C(c_output);
+  cute::Tensor tCrOutput = thread_mma.make_fragment_C(tCcOutput);
+  clear(tCrOutput);
+
+  const int k_blocks = k / kSmallTileK;
+  for (int k_block = 0; k_block < k_blocks; ++k_block) {
+    if (threadIdx.x == 0) {
+      TmaBarrier::arrive_and_expect_tx(
+          &storage.tma_barrier, sizeof(storage.a) + sizeof(storage.b));
+      copy(tma_a.with(storage.tma_barrier), tAgA(_, k_block), tAsA);
+      copy(tma_b.with(storage.tma_barrier), tBgB(_, k_block), tBsB);
+    }
+    TmaBarrier::wait(&storage.tma_barrier, k_block & 1);
+
+    cute::Tensor tCrBlock = thread_mma.make_fragment_C(tCcOutput);
+    clear(tCrBlock);
+    warpgroup_arrive();
+    gemm(tiled_mma, tCrA, tCrB, tCrBlock);
+    warpgroup_commit_batch();
+    warpgroup_wait<0>();
+
+#pragma unroll
+    for (int i = 0; i < size(tCrOutput); ++i) {
+      const int row = get<0>(tCcOutput(i));
+      const int column = static_cast<int>(blockIdx.x) * kSmallTileN + get<1>(tCcOutput(i));
+      if (row < m && column < n) {
+        const float combined_scale = scale_a[row * k_blocks + k_block] *
+                                     scale_b[column * k_blocks + k_block];
+        tCrOutput(i) += tCrBlock(i) * combined_scale;
+      }
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int i = 0; i < size(tCrOutput); ++i) {
+    const int row = get<0>(tCcOutput(i));
+    const int column = static_cast<int>(blockIdx.x) * kSmallTileN + get<1>(tCcOutput(i));
+    if (row < m && column < n) {
+      output[row * n + column] = static_cast<ElementD>(tCrOutput(i));
+    }
+  }
+#endif
+}
+
+bool CanUseSmallMKernel(int m, int n, int k) {
+  return m >= kSmallMMin && m <= kSmallMMax && n > 0 && k > 0 && k % kSmallTileK == 0;
+}
+
+Status LaunchSmallMKernel(const void* a_fp8,
+                          const void* b_fp8,
+                          const float* scale_a,
+                          const float* scale_b,
+                          void* output_bf16,
+                          int m,
+                          int n,
+                          int k,
+                          cudaStream_t stream) {
+  auto problem_shape = make_shape(m, n, k);
+  auto stride_a = make_stride(k, Int<1>{});
+  auto stride_b = make_stride(k, Int<1>{});
+  cute::Tensor tensor_a = make_tensor(reinterpret_cast<const ElementA*>(a_fp8),
+                                      make_shape(m, k), stride_a);
+  cute::Tensor tensor_b = make_tensor(reinterpret_cast<const ElementB*>(b_fp8),
+                                      make_shape(n, k), stride_b);
+  auto tma_a = make_tma_atom(SM90_TMA_LOAD{}, tensor_a, SmallSmemLayoutA{},
+                             make_shape(Int<kSmallTileM>{}, Int<kSmallTileK>{}));
+  auto tma_b = make_tma_atom(SM90_TMA_LOAD{}, tensor_b, SmallSmemLayoutB{},
+                             make_shape(Int<kSmallTileN>{}, Int<kSmallTileK>{}));
+
+  using TmaA = decltype(tma_a);
+  using TmaB = decltype(tma_b);
+  using SharedStorage = SmallMSharedStorage<TmaA, TmaB>;
+  auto kernel = &SmallMBlockScaledFp8Kernel<TmaA, TmaB>;
+  CUDA_RETURN_IF_ERROR(cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(SharedStorage)));
+  kernel<<<dim3((n + kSmallTileN - 1) / kSmallTileN), 128, sizeof(SharedStorage), stream>>>(
+      get<0>(problem_shape), get<1>(problem_shape), get<2>(problem_shape),
+      reinterpret_cast<const ElementA*>(a_fp8), tma_a,
+      reinterpret_cast<const ElementB*>(b_fp8), tma_b,
+      scale_a, scale_b, reinterpret_cast<ElementD*>(output_bf16));
+  return CUDA_CALL(cudaGetLastError());
+}
 
 using ArchTag = cutlass::arch::Sm90;
 using OperatorClass = cutlass::arch::OpClassTensorOp;
@@ -156,6 +310,9 @@ typename Gemm::Arguments MakeArguments(const void* a_fp8,
 }  // namespace
 
 size_t GetBlockQuantizedFp8GemmSm90WorkspaceSize(int m, int n, int k) {
+    if (CanUseSmallMKernel(m, n, k)) {
+        return 0;
+    }
     return Gemm::get_workspace_size(MakeArguments(nullptr, nullptr, nullptr, nullptr, nullptr, m, n, k));
 }
 
@@ -173,6 +330,10 @@ Status LaunchBlockQuantizedFp8GemmSm90(const void* a_fp8,
                                        cudaStream_t stream) {
   ORT_RETURN_IF_NOT(block_size == kScaleGranularityK,
                     "SM90 blockwise FP8 GEMM only supports block_size == ", kScaleGranularityK);
+
+    if (CanUseSmallMKernel(m, n, k)) {
+        return LaunchSmallMKernel(a_fp8, b_fp8, scale_a, scale_b, output_bf16, m, n, k, stream);
+    }
 
     auto arguments = MakeArguments(a_fp8, b_fp8, scale_a, scale_b, output_bf16, m, n, k);
     Gemm gemm;
