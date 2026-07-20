@@ -21,9 +21,9 @@ namespace onnxruntime::test {
 
 // A -> [M, K] all ones per row scaled by (m + 1); weights are constant per row, so the
 // operator must reproduce Y[m, n] = W_val[n] * sum_k A[m, k].
-TEST(MatMulNvFp4OpTest, WeightOnlyBasicFp16) {
+TEST(MatMulBlockScaledFp4OpTest, WeightOnlyBasicFp16) {
   if (!HasCudaEnvironment(800)) {
-    GTEST_SKIP() << "CUDA device is required for MatMulNvFp4.";
+    GTEST_SKIP() << "CUDA device is required for MatMulBlockScaledFp4.";
   }
 
   constexpr int64_t m = 2;
@@ -49,7 +49,7 @@ TEST(MatMulNvFp4OpTest, WeightOnlyBasicFp16) {
   // W[0, :] = 1.0, W[1, :] = 2.0; sum_k A[0, :] = 16, sum_k A[1, :] = 32.
   std::vector<float> expected = {16.0f, 32.0f, 32.0f, 64.0f};
 
-  OpTester test("MatMulNvFp4", 1, onnxruntime::kMSDomain);
+  OpTester test("MatMulBlockScaledFp4", 1, onnxruntime::kMSDomain);
   test.AddAttribute<int64_t>("K", k);
   test.AddAttribute<int64_t>("N", n);
   test.AddAttribute<int64_t>("block_size", 16);
@@ -66,9 +66,9 @@ TEST(MatMulNvFp4OpTest, WeightOnlyBasicFp16) {
 
 // Exercises non-unit per-block E4M3 scales, a global weight_scale_2, negative weights, bias and
 // a skipped optional input_scale, with BF16 activations/output.
-TEST(MatMulNvFp4OpTest, WeightOnlyScalesBiasBf16) {
+TEST(MatMulBlockScaledFp4OpTest, WeightOnlyScalesBiasBf16) {
   if (!HasCudaEnvironment(800)) {
-    GTEST_SKIP() << "CUDA device is required for MatMulNvFp4.";
+    GTEST_SKIP() << "CUDA device is required for MatMulBlockScaledFp4.";
   }
 
   constexpr int64_t m = 1;
@@ -91,7 +91,7 @@ TEST(MatMulNvFp4OpTest, WeightOnlyScalesBiasBf16) {
   std::vector<float> bias = {1.0f, 2.0f};
   std::vector<float> expected = {97.0f, -46.0f};
 
-  OpTester test("MatMulNvFp4", 1, onnxruntime::kMSDomain);
+  OpTester test("MatMulBlockScaledFp4", 1, onnxruntime::kMSDomain);
   test.AddAttribute<int64_t>("K", k);
   test.AddAttribute<int64_t>("N", n);
   test.AddAttribute<int64_t>("block_size", 16);

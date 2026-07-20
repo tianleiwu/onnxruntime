@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-#include "contrib_ops/cuda/math/matmul_nvfp4.h"
+#include "contrib_ops/cuda/math/matmul_block_scaled_fp4.h"
 
 #include <cuda.h>
 #include <cuda_fp16.h>
@@ -140,7 +140,7 @@ Status LaunchDequantizeNvFp4(void* b_dequant,
   ORT_UNUSED_PARAMETER(block_size);
   ORT_UNUSED_PARAMETER(is_bf16);
   ORT_UNUSED_PARAMETER(stream);
-  return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "MatMulNvFp4 requires CUDA 12.8 or newer for NVFP4 support.");
+  return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "MatMulBlockScaledFp4 requires CUDA 12.8 or newer for NVFP4 support.");
 #endif
 }
 
@@ -172,7 +172,7 @@ Status LaunchAddBiasNvFp4(void* y,
   ORT_UNUSED_PARAMETER(n);
   ORT_UNUSED_PARAMETER(is_bf16);
   ORT_UNUSED_PARAMETER(stream);
-  return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "MatMulNvFp4 requires CUDA 12.8 or newer for NVFP4 support.");
+  return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "MatMulBlockScaledFp4 requires CUDA 12.8 or newer for NVFP4 support.");
 #endif
 }
 

@@ -79,12 +79,12 @@ function(onnxruntime_extract_sm_specific_cuda_sources CU_SRC_LIST)
     endif()
   endif()
 
-  # Hand-written blockwise-scaled FP8 GEMM SM90 kernel (contrib MatMulBlockQuantized fast path).
+  # Hand-written blockwise-scaled FP8 GEMM SM90 kernel (contrib MatMulBlockScaledFp8 fast path).
   # Always isolate it from the main list so it is never compiled for non-SM90 architectures; it
   # is compiled at 90a-real in the SM90 OBJECT library when an SM90+ architecture is present.
   set(_blockquant_sm90_srcs)
   foreach(_src IN LISTS _list)
-    if(_src MATCHES "matmul_block_quantized_sm90\\.cu$")
+    if(_src MATCHES "matmul_block_scaled_fp8_sm90\\.cu$")
       list(APPEND _blockquant_sm90_srcs "${_src}")
     endif()
   endforeach()
@@ -97,7 +97,7 @@ function(onnxruntime_extract_sm_specific_cuda_sources CU_SRC_LIST)
   # main list; compiled at 100a-real in a dedicated OBJECT library when an SM100 architecture is present.
   set(_sm100_srcs)
   foreach(_src IN LISTS _list)
-    if(_src MATCHES "matmul_block_quantized_sm100\\.cu$")
+    if(_src MATCHES "matmul_block_scaled_fp8_sm100\\.cu$")
       list(APPEND _sm100_srcs "${_src}")
     endif()
   endforeach()

@@ -1,37 +1,37 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-#include "contrib_ops/cuda/math/matmul_block_quantized.h"
+#include "contrib_ops/cuda/math/matmul_block_scaled_fp8.h"
 
 #include "core/providers/cuda/cuda_common.h"
 
 namespace onnxruntime::contrib::cuda {
 
 #if !defined(DISABLE_FLOAT8_TYPES)
-#define MATMUL_BLOCK_QUANTIZED_ACTIVATION_CONSTRAINTS BuildKernelDefConstraints<Float8E4M3FN, MLFloat16>()
+#define MATMUL_BLOCK_SCALED_FP8_ACTIVATION_CONSTRAINTS BuildKernelDefConstraints<Float8E4M3FN, MLFloat16>()
 
 ONNX_OPERATOR_KERNEL_EX(
-    MatMulBlockQuantized,
+    MatMulBlockScaledFp8,
     kMSDomain,
     1,
     kCudaExecutionProvider,
     (*KernelDefBuilder::Create())
-        .TypeConstraint("TA", MATMUL_BLOCK_QUANTIZED_ACTIVATION_CONSTRAINTS)
+        .TypeConstraint("TA", MATMUL_BLOCK_SCALED_FP8_ACTIVATION_CONSTRAINTS)
         .TypeConstraint("TB", BuildKernelDefConstraints<Float8E4M3FN>())
         .TypeConstraint("TS", BuildKernelDefConstraints<float, MLFloat16>())
         .TypeConstraint("TY", BuildKernelDefConstraints<BFloat16, MLFloat16>()),
-    MatMulBlockQuantized);
+    MatMulBlockScaledFp8);
 #endif
 
-MatMulBlockQuantized::MatMulBlockQuantized(const OpKernelInfo& info)
+MatMulBlockScaledFp8::MatMulBlockScaledFp8(const OpKernelInfo& info)
     : CudaKernel(info), block_size_(info.GetAttrOrDefault<int64_t>("block_size", 128)) {
   ORT_ENFORCE(block_size_ > 0, "block_size must be positive.");
   sm_ = GetDeviceProp().major * 10 + GetDeviceProp().minor;
 }
 
-Status MatMulBlockQuantized::ComputeInternal(OpKernelContext* context) const {
+Status MatMulBlockScaledFp8::ComputeInternal(OpKernelContext* context) const {
 #if defined(DISABLE_FLOAT8_TYPES)
-  return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "MatMulBlockQuantized requires float8 support.");
+  return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "MatMulBlockScaledFp8 requires float8 support.");
 #else
   const Tensor* input_a = context->Input<Tensor>(0);
   const Tensor* input_b = context->Input<Tensor>(1);
@@ -46,16 +46,16 @@ Status MatMulBlockQuantized::ComputeInternal(OpKernelContext* context) const {
   const auto& a_shape = input_a->Shape();
   const auto& b_shape = input_b->Shape();
   const int64_t a_rank = a_shape.NumDimensions();
-  ORT_ENFORCE(a_shape[a_rank - 1] == b_shape[0], "A and B have incompatible K dimensions.");
+  ORT_ENFORCE(a_shape[a_rank - 1] == b_shape[1], "A and B have incompatible K dimensions.");
 
   const int64_t m = a_shape.SizeToDimension(a_rank - 1);
   const int64_t k = a_shape[a_rank - 1];
-  const int64_t n = b_shape[1];
+  const int64_t n = b_shape[0];
   const int64_t k_blocks = (k + block_size_ - 1) / block_size_;
   ORT_ENFORCE(scale_a->Shape() == TensorShape({m, k_blocks}),
               "scaleA must have shape [M, ceil(K / block_size)].");
-  ORT_ENFORCE(scale_b->Shape() == TensorShape({k_blocks, n}),
-              "scaleB must have shape [ceil(K / block_size), N].");
+  ORT_ENFORCE(scale_b->Shape() == TensorShape({n, k_blocks}),
+              "scaleB must have shape [N, ceil(K / block_size)].");
 
   TensorShapeVector output_shape = a_shape.AsShapeVector();
   output_shape.back() = n;
@@ -63,7 +63,7 @@ Status MatMulBlockQuantized::ComputeInternal(OpKernelContext* context) const {
   const bool fp16_io = input_a->IsDataType<MLFloat16>();
   const bool fp16_scales = scale_a->IsDataType<MLFloat16>();
   ORT_ENFORCE(fp16_io == output->IsDataType<MLFloat16>(),
-              "MatMulBlockQuantized supports FP8 A with BF16 Y or FP16 A with FP16 Y.");
+              "MatMulBlockScaledFp8 supports FP8 A with BF16 Y or FP16 A with FP16 Y.");
   ORT_ENFORCE(fp16_scales == scale_b->IsDataType<MLFloat16>(),
               "scaleA and scaleB must have the same element type.");
 
@@ -124,7 +124,7 @@ Status MatMulBlockQuantized::ComputeInternal(OpKernelContext* context) const {
   }
 #endif
 
-  return LaunchMatMulBlockQuantized(input_a->DataRaw(), input_b->DataRaw(),
+  return LaunchMatMulBlockScaledFp8(input_a->DataRaw(), input_b->DataRaw(),
                                     scale_a->DataRaw(), scale_b->DataRaw(),
                                     output->MutableDataRaw(), m_i,
                                     n_i, k_i,

@@ -7,9 +7,9 @@
 
 namespace onnxruntime::contrib::cuda {
 
-class MatMulBlockQuantized final : public onnxruntime::cuda::CudaKernel {
+class MatMulBlockScaledFp8 final : public onnxruntime::cuda::CudaKernel {
  public:
-  explicit MatMulBlockQuantized(const OpKernelInfo& info);
+  explicit MatMulBlockScaledFp8(const OpKernelInfo& info);
 
   Status ComputeInternal(OpKernelContext* context) const override;
 
@@ -18,7 +18,7 @@ class MatMulBlockQuantized final : public onnxruntime::cuda::CudaKernel {
   int sm_{0};
 };
 
-Status LaunchMatMulBlockQuantized(const void* input_a,
+Status LaunchMatMulBlockScaledFp8(const void* input_a,
                                   const void* input_b,
                                   const void* scale_a,
                                   const void* scale_b,
@@ -36,8 +36,8 @@ Status LaunchMatMulBlockQuantized(const void* input_a,
 void LaunchConvertHalfToFloat(const void* src_fp16, float* dst, int64_t count, cudaStream_t stream);
 
 // Fast CUTLASS blockwise-scaled FP8 (E4M3) GEMM for NVIDIA Hopper (SM90).
-// A is [M, K] row-major fp8, B is [K, N] row-major fp8 (== [N, K] column-major),
-// scale_a is [M, K/block_size] fp32 (K-major), scale_b is [K/block_size, N] fp32 (MN-major),
+// A is [M, K] row-major fp8, B is [N, K] row-major fp8 (K-major),
+// scale_a is [M, K/block_size] fp32 (K-major), scale_b is [N, K/block_size] fp32 (K-major),
 // output is [M, N] row-major bfloat16. Requires block_size == 128.
 Status LaunchBlockQuantizedFp8GemmSm90(const void* a_fp8,
                                        const void* b_fp8,

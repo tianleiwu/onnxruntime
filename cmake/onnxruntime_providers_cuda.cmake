@@ -565,7 +565,7 @@
             CUDA_ARCHITECTURES "90a-real"
             NVCC_THREADS "${onnxruntime_NVCC_THREADS}"
             SOURCES ${_ort_sm90_all_srcs})
-          # The blockwise-scaled FP8 GEMM SM90 fast path (matmul_block_quantized_sm90.cu) is part of
+          # The blockwise-scaled FP8 GEMM SM90 fast path (matmul_block_scaled_fp8_sm90.cu) is part of
           # the SM90 OBJECT library. Enable its dispatch in the parent provider translation units.
           target_compile_definitions(onnxruntime_providers_cuda PRIVATE ORT_ENABLE_BLOCKQUANT_SM90)
           if(TARGET onnxruntime_providers_cuda_obj)

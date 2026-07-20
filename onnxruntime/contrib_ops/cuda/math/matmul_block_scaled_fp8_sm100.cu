@@ -2,14 +2,14 @@
 // Licensed under the MIT License.
 
 // CUTLASS tensor-core implementation of the blockwise-scaled FP8 (E4M3) GEMM used by the
-// MatMulBlockQuantized contrib operator, targeting NVIDIA Blackwell (SM100).
+// MatMulBlockScaledFp8 contrib operator, targeting NVIDIA Blackwell (SM100).
 //
 // This translation unit is compiled at exactly 100a-real inside a dedicated CUDA OBJECT
 // library (see cmake/onnxruntime_providers_cuda.cmake). The dispatcher in
-// matmul_block_quantized.cc only references the symbols defined here when the SM100 object
+// matmul_block_scaled_fp8.cc only references the symbols defined here when the SM100 object
 // library is built (guarded by ORT_ENABLE_BLOCKQUANT_SM100 on the parent target).
 
-#include "contrib_ops/cuda/math/matmul_block_quantized.h"
+#include "contrib_ops/cuda/math/matmul_block_scaled_fp8.h"
 
 #if !defined(DISABLE_FLOAT8_TYPES)
 
@@ -43,7 +43,7 @@ using namespace cute;
 
 // GEMM operand configuration (see the SM90 variant for the layout rationale).
 //   A: [M, K] row-major fp8 e4m3
-//   B: [K, N] row-major fp8 e4m3  == [N, K] column-major (CUTLASS TN layout)
+//   B: [N, K] row-major fp8 e4m3 (K-major; CUTLASS ColumnMajor B == TN layout)
 //   D: [M, N] row-major bf16
 using ElementA = cutlass::float_e4m3_t;
 using LayoutA = cutlass::layout::RowMajor;
@@ -71,13 +71,13 @@ using OperatorClass = cutlass::arch::OpClassTensorOp;
 using MmaTileShape = Shape<_128, _128, _128>;
 using ClusterShape = Shape<_1, _1, _1>;
 
-// scale_a: [M, K/128] fp32, K-major.  scale_b: [K/128, N] fp32, MN-major.
+// scale_a: [M, K/128] fp32, K-major.  scale_b: [N, K/128] fp32, K-major.
 constexpr int kScaleGranularityM = 1;
 constexpr int kScaleGranularityN = 1;
 constexpr int kScaleGranularityK = 128;
 using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<
     kScaleGranularityM, kScaleGranularityN, kScaleGranularityK,
-    cute::UMMA::Major::K, cute::UMMA::Major::MN>;
+    cute::UMMA::Major::K, cute::UMMA::Major::K>;
 
 using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
 using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());

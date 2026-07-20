@@ -14,9 +14,9 @@ namespace onnxruntime::contrib::cuda {
 // The weight is dequantized to the activation type (FP16/BF16) and multiplied with the FP16/BF16
 // activation via cuBLAS. This path works on any CUDA architecture (including Hopper/SM90) because
 // it does not rely on native NVFP4 block-scaled tensor cores (SM100/SM120 only).
-class MatMulNvFp4 final : public onnxruntime::cuda::CudaKernel {
+class MatMulBlockScaledFp4 final : public onnxruntime::cuda::CudaKernel {
  public:
-  explicit MatMulNvFp4(const OpKernelInfo& info);
+  explicit MatMulBlockScaledFp4(const OpKernelInfo& info);
 
   Status ComputeInternal(OpKernelContext* context) const override;
 

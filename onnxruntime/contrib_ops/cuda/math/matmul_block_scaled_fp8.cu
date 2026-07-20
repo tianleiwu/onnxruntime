@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-#include "contrib_ops/cuda/math/matmul_block_quantized.h"
+#include "contrib_ops/cuda/math/matmul_block_scaled_fp8.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -13,7 +13,7 @@ namespace onnxruntime::contrib::cuda {
 
 #if !defined(DISABLE_FLOAT8_TYPES) && CUDA_VERSION >= 11080
 template <typename InputType, typename OutputType, typename ScaleType>
-__global__ void MatMulBlockQuantizedKernel(const InputType* input_a,
+__global__ void MatMulBlockScaledFp8Kernel(const InputType* input_a,
                                            const __nv_fp8_e4m3* input_b,
                                            const ScaleType* scale_a,
                                            const ScaleType* scale_b,
@@ -28,13 +28,14 @@ __global__ void MatMulBlockQuantizedKernel(const InputType* input_a,
     return;
   }
 
+  const int k_blocks = (k + block_size - 1) / block_size;
   float sum = 0.0f;
   for (int k_index = 0; k_index < k; ++k_index) {
     const int scale_index = k_index / block_size;
     const float a_value = static_cast<float>(input_a[row * k + k_index]) *
-                          static_cast<float>(scale_a[row * ((k + block_size - 1) / block_size) + scale_index]);
-    const float b_value = static_cast<float>(input_b[k_index * n + column]) *
-                          static_cast<float>(scale_b[scale_index * n + column]);
+                          static_cast<float>(scale_a[row * k_blocks + scale_index]);
+    const float b_value = static_cast<float>(input_b[column * k + k_index]) *
+                          static_cast<float>(scale_b[column * k_blocks + scale_index]);
     sum += a_value * b_value;
   }
 
@@ -60,7 +61,7 @@ void LaunchConvertHalfToFloat(const void* src_fp16, float* dst, int64_t count, c
   ConvertHalfToFloatKernel<<<blocks, threads, 0, stream>>>(reinterpret_cast<const half*>(src_fp16), dst, count);
 }
 
-Status LaunchMatMulBlockQuantized(const void* input_a,
+Status LaunchMatMulBlockScaledFp8(const void* input_a,
                                   const void* input_b,
                                   const void* scale_a,
                                   const void* scale_b,
@@ -78,19 +79,19 @@ Status LaunchMatMulBlockQuantized(const void* input_a,
                     static_cast<unsigned int>((m + threads.y - 1) / threads.y)};
   const auto* b = reinterpret_cast<const __nv_fp8_e4m3*>(input_b);
   if (fp16_io && fp16_scales) {
-    MatMulBlockQuantizedKernel<<<blocks, threads, 0, stream>>>(reinterpret_cast<const half*>(input_a), b,
+    MatMulBlockScaledFp8Kernel<<<blocks, threads, 0, stream>>>(reinterpret_cast<const half*>(input_a), b,
                                                                reinterpret_cast<const half*>(scale_a), reinterpret_cast<const half*>(scale_b),
                                                                reinterpret_cast<half*>(output), m, n, k, block_size);
   } else if (fp16_io) {
-    MatMulBlockQuantizedKernel<<<blocks, threads, 0, stream>>>(reinterpret_cast<const half*>(input_a), b,
+    MatMulBlockScaledFp8Kernel<<<blocks, threads, 0, stream>>>(reinterpret_cast<const half*>(input_a), b,
                                                                reinterpret_cast<const float*>(scale_a), reinterpret_cast<const float*>(scale_b),
                                                                reinterpret_cast<half*>(output), m, n, k, block_size);
   } else if (fp16_scales) {
-    MatMulBlockQuantizedKernel<<<blocks, threads, 0, stream>>>(reinterpret_cast<const __nv_fp8_e4m3*>(input_a), b,
+    MatMulBlockScaledFp8Kernel<<<blocks, threads, 0, stream>>>(reinterpret_cast<const __nv_fp8_e4m3*>(input_a), b,
                                                                reinterpret_cast<const half*>(scale_a), reinterpret_cast<const half*>(scale_b),
                                                                reinterpret_cast<__nv_bfloat16*>(output), m, n, k, block_size);
   } else {
-    MatMulBlockQuantizedKernel<<<blocks, threads, 0, stream>>>(reinterpret_cast<const __nv_fp8_e4m3*>(input_a), b,
+    MatMulBlockScaledFp8Kernel<<<blocks, threads, 0, stream>>>(reinterpret_cast<const __nv_fp8_e4m3*>(input_a), b,
                                                                reinterpret_cast<const float*>(scale_a), reinterpret_cast<const float*>(scale_b),
                                                                reinterpret_cast<__nv_bfloat16*>(output), m, n, k, block_size);
   }
@@ -108,7 +109,7 @@ Status LaunchMatMulBlockQuantized(const void* input_a,
   ORT_UNUSED_PARAMETER(fp16_io);
   ORT_UNUSED_PARAMETER(fp16_scales);
   ORT_UNUSED_PARAMETER(stream);
-  return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "MatMulBlockQuantized requires CUDA 11.8 or later.");
+  return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "MatMulBlockScaledFp8 requires CUDA 11.8 or later.");
 #endif
 }
 

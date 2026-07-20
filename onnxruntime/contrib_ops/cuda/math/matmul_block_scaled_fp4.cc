@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-#include "contrib_ops/cuda/math/matmul_nvfp4.h"
+#include "contrib_ops/cuda/math/matmul_block_scaled_fp4.h"
 
 #include <type_traits>
 
@@ -14,7 +14,7 @@ namespace onnxruntime::contrib::cuda {
 using namespace onnxruntime::cuda;
 
 ONNX_OPERATOR_KERNEL_EX(
-    MatMulNvFp4,
+    MatMulBlockScaledFp4,
     kMSDomain,
     1,
     kCudaExecutionProvider,
@@ -23,9 +23,9 @@ ONNX_OPERATOR_KERNEL_EX(
         .TypeConstraint("T1", BuildKernelDefConstraints<uint8_t>())
         .TypeConstraint("T2", BuildKernelDefConstraints<uint8_t>())
         .TypeConstraint("T3", BuildKernelDefConstraints<float>()),
-    MatMulNvFp4);
+    MatMulBlockScaledFp4);
 
-MatMulNvFp4::MatMulNvFp4(const OpKernelInfo& info) : CudaKernel(info) {
+MatMulBlockScaledFp4::MatMulBlockScaledFp4(const OpKernelInfo& info) : CudaKernel(info) {
   ORT_ENFORCE(info.GetAttr<int64_t>("K", &K_).IsOK());
   ORT_ENFORCE(info.GetAttr<int64_t>("N", &N_).IsOK());
   block_size_ = info.GetAttrOrDefault<int64_t>("block_size", static_cast<int64_t>(16));
@@ -36,7 +36,7 @@ MatMulNvFp4::MatMulNvFp4(const OpKernelInfo& info) : CudaKernel(info) {
 }
 
 template <typename T>
-Status MatMulNvFp4::ComputeImpl(OpKernelContext* context) const {
+Status MatMulBlockScaledFp4::ComputeImpl(OpKernelContext* context) const {
   typedef typename ToCudaType<T>::MappedType CudaT;
 
   const Tensor* a = context->Input<Tensor>(0);
@@ -131,7 +131,7 @@ Status MatMulNvFp4::ComputeImpl(OpKernelContext* context) const {
   return Status::OK();
 }
 
-Status MatMulNvFp4::ComputeInternal(OpKernelContext* context) const {
+Status MatMulBlockScaledFp4::ComputeInternal(OpKernelContext* context) const {
   const Tensor* a = context->Input<Tensor>(0);
   if (a->IsDataType<MLFloat16>()) {
     return ComputeImpl<MLFloat16>(context);
@@ -140,7 +140,7 @@ Status MatMulNvFp4::ComputeInternal(OpKernelContext* context) const {
     return ComputeImpl<BFloat16>(context);
   }
   return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
-                         "MatMulNvFp4 only supports FP16 or BF16 activations.");
+                         "MatMulBlockScaledFp4 only supports FP16 or BF16 activations.");
 }
 
 }  // namespace onnxruntime::contrib::cuda
