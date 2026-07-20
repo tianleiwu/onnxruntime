@@ -62,7 +62,7 @@ endfunction()
 #
 # Removes matched files from <cu_src_list_var> and stores them in the output variables.
 function(onnxruntime_extract_sm_specific_cuda_sources CU_SRC_LIST)
-  cmake_parse_arguments(PARSE_ARGV 1 _EXTRACT "" "SM90_SOURCES;SM120_SOURCES" "")
+  cmake_parse_arguments(PARSE_ARGV 1 _EXTRACT "" "SM90_SOURCES;SM100_SOURCES;SM120_SOURCES" "")
 
   set(_list "${${CU_SRC_LIST}}")
 
@@ -77,6 +77,32 @@ function(onnxruntime_extract_sm_specific_cuda_sources CU_SRC_LIST)
     if(_sm90_srcs)
       list(REMOVE_ITEM _list ${_sm90_srcs})
     endif()
+  endif()
+
+  # Hand-written blockwise-scaled FP8 GEMM SM90 kernel (contrib MatMulBlockQuantized fast path).
+  # Always isolate it from the main list so it is never compiled for non-SM90 architectures; it
+  # is compiled at 90a-real in the SM90 OBJECT library when an SM90+ architecture is present.
+  set(_blockquant_sm90_srcs)
+  foreach(_src IN LISTS _list)
+    if(_src MATCHES "matmul_block_quantized_sm90\\.cu$")
+      list(APPEND _blockquant_sm90_srcs "${_src}")
+    endif()
+  endforeach()
+  if(_blockquant_sm90_srcs)
+    list(REMOVE_ITEM _list ${_blockquant_sm90_srcs})
+    list(APPEND _sm90_srcs ${_blockquant_sm90_srcs})
+  endif()
+
+  # Hand-written blockwise-scaled FP8 GEMM SM100 (Blackwell) kernel. Always isolate it from the
+  # main list; compiled at 100a-real in a dedicated OBJECT library when an SM100 architecture is present.
+  set(_sm100_srcs)
+  foreach(_src IN LISTS _list)
+    if(_src MATCHES "matmul_block_quantized_sm100\\.cu$")
+      list(APPEND _sm100_srcs "${_src}")
+    endif()
+  endforeach()
+  if(_sm100_srcs)
+    list(REMOVE_ITEM _list ${_sm100_srcs})
   endif()
 
   # Extract SM120 TMA WS generated files
@@ -94,6 +120,9 @@ function(onnxruntime_extract_sm_specific_cuda_sources CU_SRC_LIST)
 
   set("${CU_SRC_LIST}" "${_list}" PARENT_SCOPE)
   set("${_EXTRACT_SM90_SOURCES}" "${_sm90_srcs}" PARENT_SCOPE)
+  if(_EXTRACT_SM100_SOURCES)
+    set("${_EXTRACT_SM100_SOURCES}" "${_sm100_srcs}" PARENT_SCOPE)
+  endif()
   set("${_EXTRACT_SM120_SOURCES}" "${_sm120_srcs}" PARENT_SCOPE)
 endfunction()
 
