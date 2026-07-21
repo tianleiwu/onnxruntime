@@ -75,6 +75,19 @@ Status LaunchMatMulBlockScaledFp4Gemv(void* y,
                                       bool is_bf16,
                                       cudaStream_t stream);
 
+Status LaunchMatMulBlockScaledFp4GemvWithSwizzledScale(void* y,
+                                                       const void* a,
+                                                       const void* b_packed,
+                                                       const void* b_scale,
+                                                       const float* weight_scale_2,
+                                                       const void* bias,
+                                                       int m,
+                                                       int n,
+                                                       int k,
+                                                       int block_size,
+                                                       bool is_bf16,
+                                                       cudaStream_t stream);
+
 // Native Blackwell SM120 NVFP4 x NVFP4 GEMM path. The caller provides scratch buffers for
 // packed activation FP4, swizzled A/B scale tensors, alpha, and CUTLASS workspace. A is [M, K]
 // FP16/BF16, B is [N, K/2] packed NVFP4, weight_scale is [N, K/16] E4M3, and Y is [M, N]

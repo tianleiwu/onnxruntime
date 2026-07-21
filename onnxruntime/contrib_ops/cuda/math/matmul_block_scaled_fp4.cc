@@ -146,6 +146,23 @@ Status MatMulBlockScaledFp4::ComputeImpl(OpKernelContext* context) const {
   // [N, K] dequant scratch buffer and the cuBLAS GEMM (which is underutilized at M == 1).
   constexpr int kGemvMaxM = 8;
   if (m_i > 0 && m_i <= kGemvMaxM && block_size_ == 16 && (k_i % 32 == 0)) {
+#if defined(ORT_ENABLE_BLOCKQUANT_SM120)
+    if (b_scale_prepacked_ != nullptr) {
+      return LaunchMatMulBlockScaledFp4GemvWithSwizzledScale(
+          Y->MutableDataRaw(),
+          a->DataRaw(),
+          b->DataRaw(),
+          b_scale_prepacked_.get(),
+          weight_scale_2->Data<float>(),
+          bias != nullptr ? bias->DataRaw() : nullptr,
+          m_i,
+          n_i,
+          k_i,
+          SafeInt<int>(block_size_),
+          std::is_same<T, BFloat16>::value,
+          Stream(context));
+    }
+#endif
     return LaunchMatMulBlockScaledFp4Gemv(
         Y->MutableDataRaw(),
         a->DataRaw(),
