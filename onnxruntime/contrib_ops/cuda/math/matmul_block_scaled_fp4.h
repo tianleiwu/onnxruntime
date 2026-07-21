@@ -18,6 +18,9 @@ class MatMulBlockScaledFp4 final : public onnxruntime::cuda::CudaKernel {
  public:
   explicit MatMulBlockScaledFp4(const OpKernelInfo& info);
 
+  Status PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
+                 bool& is_packed, PrePackedWeights* prepacked_weights) override;
+
   Status ComputeInternal(OpKernelContext* context) const override;
 
  private:
@@ -27,6 +30,8 @@ class MatMulBlockScaledFp4 final : public onnxruntime::cuda::CudaKernel {
   int64_t K_;
   int64_t N_;
   int64_t block_size_;
+  int sm_{0};
+  IAllocatorUniquePtr<uint8_t> b_scale_prepacked_;
 };
 
 // Dequantizes NVFP4 (E2M1) weights with per-block E4M3 scales and a global fp32 scale into
@@ -69,5 +74,36 @@ Status LaunchMatMulBlockScaledFp4Gemv(void* y,
                                       int block_size,
                                       bool is_bf16,
                                       cudaStream_t stream);
+
+// Native Blackwell SM120 NVFP4 x NVFP4 GEMM path. The caller provides scratch buffers for
+// packed activation FP4, swizzled A/B scale tensors, alpha, and CUTLASS workspace. A is [M, K]
+// FP16/BF16, B is [N, K/2] packed NVFP4, weight_scale is [N, K/16] E4M3, and Y is [M, N]
+// FP16/BF16. Requires block_size == 16, K % 32 == 0, and N % 32 == 0.
+Status LaunchRepackWeightScaleNvFp4ForNativeSm120(void* b_scale,
+                                                  const void* weight_scale,
+                                                  int n,
+                                                  int k,
+                                                  int block_size,
+                                                  cudaStream_t stream);
+
+Status LaunchMatMulBlockScaledFp4NativeSm120(void* y,
+                                             const void* a,
+                                             const void* b_packed,
+                                             const void* weight_scale,
+                                             const float* weight_scale_2,
+                                             const float* input_scale,
+                                             void* a_packed,
+                                             void* a_scale,
+                                             const void* b_scale,
+                                             float* alpha,
+                                             int m,
+                                             int n,
+                                             int k,
+                                             int block_size,
+                                             bool is_bf16,
+                                             void* workspace,
+                                             size_t workspace_size,
+                                             cudaStream_t stream);
+size_t GetMatMulBlockScaledFp4NativeSm120WorkspaceSize(int m, int n, int k, bool is_bf16);
 
 }  // namespace onnxruntime::contrib::cuda

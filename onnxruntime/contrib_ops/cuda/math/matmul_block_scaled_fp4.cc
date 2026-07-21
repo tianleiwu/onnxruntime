@@ -3,12 +3,14 @@
 
 #include "contrib_ops/cuda/math/matmul_block_scaled_fp4.h"
 
+#include <algorithm>
 #include <type_traits>
 
 #include "core/common/safeint.h"
 #include "core/providers/cuda/cuda_common.h"
 #include "core/providers/cuda/shared_inc/fpgeneric.h"
 #include "core/providers/cpu/math/matmul_helper.h"
+#include "core/platform/env_var_utils.h"
 
 namespace onnxruntime::contrib::cuda {
 using namespace onnxruntime::cuda;
@@ -25,6 +27,20 @@ ONNX_OPERATOR_KERNEL_EX(
         .TypeConstraint("T3", BuildKernelDefConstraints<float>()),
     MatMulBlockScaledFp4);
 
+namespace {
+
+constexpr int kWeightScaleInputIndex = 2;
+
+bool IsNativeSm120Fp4Enabled() {
+  return ParseEnvironmentVariableWithDefault<bool>("ORT_MATMUL_BLOCK_SCALED_FP4_NATIVE_SM120", false);
+}
+
+int64_t RoundUp(int64_t value, int64_t alignment) {
+  return ((value + alignment - 1) / alignment) * alignment;
+}
+
+}  // namespace
+
 MatMulBlockScaledFp4::MatMulBlockScaledFp4(const OpKernelInfo& info) : CudaKernel(info) {
   ORT_ENFORCE(info.GetAttr<int64_t>("K", &K_).IsOK());
   ORT_ENFORCE(info.GetAttr<int64_t>("N", &N_).IsOK());
@@ -33,6 +49,49 @@ MatMulBlockScaledFp4::MatMulBlockScaledFp4(const OpKernelInfo& info) : CudaKerne
   ORT_ENFORCE(N_ > 0, "N must be positive, got ", N_);
   ORT_ENFORCE(block_size_ > 0, "block_size must be positive, got ", block_size_);
   ORT_ENFORCE(K_ % 2 == 0, "K must be even for packed NVFP4 weights, got ", K_);
+  sm_ = GetDeviceProp().major * 10 + GetDeviceProp().minor;
+}
+
+Status MatMulBlockScaledFp4::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
+                                     bool& is_packed, PrePackedWeights* /*prepacked_weights*/) {
+  is_packed = false;
+
+#if defined(ORT_ENABLE_BLOCKQUANT_SM120)
+  if (input_idx != kWeightScaleInputIndex || !IsNativeSm120Fp4Enabled() || sm_ < 120 || sm_ >= 130 ||
+      block_size_ != 16 || K_ % 32 != 0 || N_ % 32 != 0) {
+    return Status::OK();
+  }
+
+  const int64_t k_blocks = K_ / 16;
+  ORT_RETURN_IF_NOT(tensor.Shape().Size() >= N_ * k_blocks,
+                    "weight_scale tensor is too small; expected at least ", N_ * k_blocks, " E4M3 scales.");
+
+  const int64_t rounded_k_blocks = RoundUp(k_blocks, 4);
+  const int64_t rounded_n = RoundUp(N_, 128);
+  b_scale_prepacked_ = IAllocator::MakeUniquePtr<uint8_t>(
+      alloc, SafeInt<size_t>(rounded_n) * SafeInt<size_t>(rounded_k_blocks), true);
+
+  cudaStream_t stream = cudaStreamLegacy;
+  const void* weight_scale = tensor.DataRaw();
+  IAllocatorUniquePtr<uint8_t> weight_scale_device;
+  if (tensor.Location().device.Type() != OrtDevice::GPU) {
+    const size_t weight_scale_bytes = SafeInt<size_t>(N_) * SafeInt<size_t>(k_blocks);
+    weight_scale_device = IAllocator::MakeUniquePtr<uint8_t>(alloc, weight_scale_bytes, true);
+    CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(weight_scale_device.get(), weight_scale, weight_scale_bytes,
+                                         cudaMemcpyDefault, stream));
+    weight_scale = weight_scale_device.get();
+  }
+
+  ORT_RETURN_IF_ERROR(LaunchRepackWeightScaleNvFp4ForNativeSm120(
+      b_scale_prepacked_.get(), weight_scale, SafeInt<int>(N_), SafeInt<int>(K_), SafeInt<int>(block_size_), stream));
+  CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream));
+#else
+  ORT_UNUSED_PARAMETER(tensor);
+  ORT_UNUSED_PARAMETER(input_idx);
+  ORT_UNUSED_PARAMETER(alloc);
+#endif
+
+  return Status::OK();
 }
 
 template <typename T>
@@ -60,9 +119,8 @@ Status MatMulBlockScaledFp4::ComputeImpl(OpKernelContext* context) const {
   ORT_ENFORCE(weight_scale_2->Shape().Size() == 1, "weight_scale_2 must be a scalar.");
   if (input_scale != nullptr) {
     ORT_ENFORCE(input_scale->Shape().Size() == 1, "input_scale must be a scalar.");
-    // input_scale is accepted for parity with quantized checkpoints but is a no-op on the
-    // weight-only FP16/BF16 activation path (the activation is not quantized here). It is
-    // reserved for the future native NVFP4 x NVFP4 path on Blackwell (SM100/SM120).
+    // input_scale is used only by the opt-in native NVFP4 x NVFP4 path. The default
+    // weight-only FP16/BF16 activation path keeps full-precision activations.
   }
   if (bias != nullptr) {
     ORT_ENFORCE(bias->Shape().Size() == N_, "bias must have shape [N].");
@@ -102,6 +160,66 @@ Status MatMulBlockScaledFp4::ComputeImpl(OpKernelContext* context) const {
         std::is_same<T, BFloat16>::value,
         Stream(context));
   }
+
+#if defined(ORT_ENABLE_BLOCKQUANT_SM120)
+  if (IsNativeSm120Fp4Enabled() && sm_ >= 120 && sm_ < 130 && block_size_ == 16 &&
+      (k_i % 32 == 0) && (n_i % 32 == 0)) {
+    constexpr int64_t kScaleVectorSize = 16;
+    const int64_t k_scale_blocks = RoundUp(k_i / kScaleVectorSize, 4);
+    const int64_t rounded_m = RoundUp(m_i, 128);
+    const int64_t rounded_n = RoundUp(n_i, 128);
+
+    auto a_packed = GetScratchBuffer<uint8_t>(SafeInt<size_t>(m_i) * SafeInt<size_t>(k_i / 2),
+                                              context->GetComputeStream());
+    auto a_scale = GetScratchBuffer<uint8_t>(SafeInt<size_t>(rounded_m) * SafeInt<size_t>(k_scale_blocks),
+                                             context->GetComputeStream());
+    IAllocatorUniquePtr<uint8_t> b_scale;
+    const void* b_scale_data = b_scale_prepacked_.get();
+    if (b_scale_data == nullptr) {
+      b_scale = GetScratchBuffer<uint8_t>(SafeInt<size_t>(rounded_n) * SafeInt<size_t>(k_scale_blocks),
+                                          context->GetComputeStream());
+      ORT_RETURN_IF_ERROR(LaunchRepackWeightScaleNvFp4ForNativeSm120(
+          b_scale.get(), weight_scale->DataRaw(), n_i, k_i, SafeInt<int>(block_size_), Stream(context)));
+      b_scale_data = b_scale.get();
+    }
+    auto alpha = GetScratchBuffer<float>(1, context->GetComputeStream());
+    const size_t workspace_size = GetMatMulBlockScaledFp4NativeSm120WorkspaceSize(
+        m_i, n_i, k_i, std::is_same<T, BFloat16>::value);
+    auto workspace = GetScratchBuffer<uint8_t>(workspace_size, context->GetComputeStream());
+
+    ORT_RETURN_IF_ERROR(LaunchMatMulBlockScaledFp4NativeSm120(
+        Y->MutableDataRaw(),
+        a->DataRaw(),
+        b->DataRaw(),
+        weight_scale->DataRaw(),
+        weight_scale_2->Data<float>(),
+        input_scale != nullptr ? input_scale->Data<float>() : nullptr,
+        a_packed.get(),
+        a_scale.get(),
+        b_scale_data,
+        alpha.get(),
+        m_i,
+        n_i,
+        k_i,
+        SafeInt<int>(block_size_),
+        std::is_same<T, BFloat16>::value,
+        workspace.get(),
+        workspace_size,
+        Stream(context)));
+
+    if (bias != nullptr) {
+      ORT_RETURN_IF_ERROR(LaunchAddBiasNvFp4(
+          Y->MutableDataRaw(),
+          bias->DataRaw(),
+          m_i,
+          n_i,
+          std::is_same<T, BFloat16>::value,
+          Stream(context)));
+    }
+
+    return Status::OK();
+  }
+#endif
 
   // Dequantize the packed NVFP4 weight into a scratch [N, K] buffer of the activation type.
   IAllocatorUniquePtr<CudaT> b_dequant = GetScratchBuffer<CudaT>(SafeInt<size_t>(N_) * SafeInt<size_t>(K_),

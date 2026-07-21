@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import statistics
 import time
 from contextlib import nullcontext
@@ -264,10 +265,28 @@ def _fp4_reference(a: torch.Tensor, b_dequantized: torch.Tensor, bias: torch.Ten
     return result.to(a.dtype).float()
 
 
+def _fp4_native_sm120_enabled() -> bool:
+    return os.environ.get("ORT_MATMUL_BLOCK_SCALED_FP4_NATIVE_SM120", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _fp4_native_sm120_supported(case: Case) -> bool:
+    block_size = case.block_size or 16
+    return (
+        _fp4_native_sm120_enabled()
+        and case.m > 8
+        and block_size == 16
+        and case.k % 32 == 0
+        and case.n % 32 == 0
+        and case.activation_dtype in {"fp16", "bf16"}
+    )
+
+
 def _fp4_expected_path(case: Case) -> str:
     block_size = case.block_size or 16
     if case.m > 0 and case.m <= 8 and block_size == 16 and case.k % 32 == 0:
         return "fp4_gemv"
+    if _fp4_native_sm120_supported(case):
+        return "sm120_native_fp4_gemm"
     return "fp4_dequant_cublas"
 
 
@@ -301,7 +320,11 @@ def _make_inputs(case: Case) -> tuple[bytes, torch.Tensor, torch.Tensor, str]:
     if case.bias:
         bias = (torch.randn((case.n,), generator=generator, device="cuda") * 0.25).to(activation_dtype).contiguous()
     model = _make_fp4_model(case, b_packed, weight_scale, bias)
-    reference = _fp4_reference(a, b_dequantized, bias)
+    if _fp4_native_sm120_supported(case):
+        _, _, a_dequantized = _quantize_fp4(a.float(), block_size)
+        reference = _fp4_reference(a_dequantized.to(activation_dtype), b_dequantized, bias)
+    else:
+        reference = _fp4_reference(a, b_dequantized, bias)
     return model, a, reference, _fp4_expected_path(case)
 
 
