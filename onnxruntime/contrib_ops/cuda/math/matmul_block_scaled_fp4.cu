@@ -111,29 +111,6 @@ __global__ void AddBiasKernel(T* __restrict__ y, const T* __restrict__ bias, int
 template <typename T>
 __device__ __forceinline__ void LoadFp4Gemv32A(const T* ptr, float (&out)[32]);
 
-__device__ __forceinline__ int SwizzledScaleRowBase(int row, int num_k_tiles) {
-  const int row_tile = row >> 7;
-  const int outer_row = row & 31;
-  const int inner_row = (row >> 5) & 3;
-  return (row_tile * num_k_tiles << 9) | (outer_row << 4) | (inner_row << 2);
-}
-
-template <bool UseSwizzledScale>
-__device__ __forceinline__ uint8_t LoadWeightScale(const uint8_t* weight_scale,
-                                                   int col,
-                                                   int k_block,
-                                                   int k_blocks,
-                                                   int swizzled_scale_row_base) {
-  if constexpr (UseSwizzledScale) {
-    ORT_UNUSED_PARAMETER(col);
-    ORT_UNUSED_PARAMETER(k_blocks);
-    return __ldg(weight_scale + swizzled_scale_row_base + ((k_block >> 2) << 9) + (k_block & 3));
-  } else {
-    ORT_UNUSED_PARAMETER(swizzled_scale_row_base);
-    return __ldg(weight_scale + static_cast<size_t>(col) * k_blocks + k_block);
-  }
-}
-
 template <>
 __device__ __forceinline__ void LoadFp4Gemv32A<half>(const half* ptr, float (&out)[32]) {
   const uint4* p = reinterpret_cast<const uint4*>(ptr);
@@ -162,7 +139,7 @@ __device__ __forceinline__ void LoadFp4Gemv32A<nv_bfloat16>(const nv_bfloat16* p
   }
 }
 
-template <typename T, bool UseSwizzledScale>
+template <typename T>
 __global__ void MatMulBlockScaledFp4GemvKernel(T* __restrict__ y,
                                                const T* __restrict__ a,
                                                const uint8_t* __restrict__ b_packed,
@@ -182,11 +159,7 @@ __global__ void MatMulBlockScaledFp4GemvKernel(T* __restrict__ y,
 
   const T* a_row = a + static_cast<size_t>(row) * k;
   const uint8_t* b_row = b_packed + static_cast<size_t>(col) * (k >> 1);
-  int swizzled_scale_row_base = 0;
-  if constexpr (UseSwizzledScale) {
-    const int rounded_k_blocks = ((k_blocks + 3) / 4) * 4;
-    swizzled_scale_row_base = SwizzledScaleRowBase(col, rounded_k_blocks / 4);
-  }
+  const uint8_t* ws_row = weight_scale + static_cast<size_t>(col) * k_blocks;
 
   constexpr int kBlockSize = 16;
   constexpr int kElemsPerLane = 32;       // two 16-element blocks
@@ -224,13 +197,9 @@ __global__ void MatMulBlockScaledFp4GemvKernel(T* __restrict__ y,
         p1 += a_vals[i] * b_vals[i];
       }
       const float s0 = __half2float(__nv_cvt_fp8_to_halfraw(
-          static_cast<__nv_fp8_storage_t>(
-              LoadWeightScale<UseSwizzledScale>(weight_scale, col, kb0, k_blocks, swizzled_scale_row_base)),
-          __NV_E4M3));
+          static_cast<__nv_fp8_storage_t>(ws_row[kb0]), __NV_E4M3));
       const float s1 = __half2float(__nv_cvt_fp8_to_halfraw(
-          static_cast<__nv_fp8_storage_t>(
-              LoadWeightScale<UseSwizzledScale>(weight_scale, col, kb1, k_blocks, swizzled_scale_row_base)),
-          __NV_E4M3));
+          static_cast<__nv_fp8_storage_t>(ws_row[kb1]), __NV_E4M3));
       acc += p0 * s0 + p1 * s1;
     }
   }
@@ -351,11 +320,11 @@ Status LaunchMatMulBlockScaledFp4Gemv(void* y,
   const uint8_t* bp = reinterpret_cast<const uint8_t*>(b_packed);
   const uint8_t* ws = reinterpret_cast<const uint8_t*>(weight_scale);
   if (is_bf16) {
-    MatMulBlockScaledFp4GemvKernel<nv_bfloat16, false><<<blocks, threads, 0, stream>>>(
+    MatMulBlockScaledFp4GemvKernel<nv_bfloat16><<<blocks, threads, 0, stream>>>(
         reinterpret_cast<nv_bfloat16*>(y), reinterpret_cast<const nv_bfloat16*>(a), bp, ws, weight_scale_2,
         reinterpret_cast<const nv_bfloat16*>(bias), m, n, k, k_blocks);
   } else {
-    MatMulBlockScaledFp4GemvKernel<half, false><<<blocks, threads, 0, stream>>>(
+    MatMulBlockScaledFp4GemvKernel<half><<<blocks, threads, 0, stream>>>(
         reinterpret_cast<half*>(y), reinterpret_cast<const half*>(a), bp, ws, weight_scale_2,
         reinterpret_cast<const half*>(bias), m, n, k, k_blocks);
   }
@@ -365,57 +334,6 @@ Status LaunchMatMulBlockScaledFp4Gemv(void* y,
   ORT_UNUSED_PARAMETER(a);
   ORT_UNUSED_PARAMETER(b_packed);
   ORT_UNUSED_PARAMETER(weight_scale);
-  ORT_UNUSED_PARAMETER(weight_scale_2);
-  ORT_UNUSED_PARAMETER(bias);
-  ORT_UNUSED_PARAMETER(m);
-  ORT_UNUSED_PARAMETER(n);
-  ORT_UNUSED_PARAMETER(k);
-  ORT_UNUSED_PARAMETER(block_size);
-  ORT_UNUSED_PARAMETER(is_bf16);
-  ORT_UNUSED_PARAMETER(stream);
-  return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "MatMulBlockScaledFp4 requires CUDA 12.8 or newer for NVFP4 support.");
-#endif
-}
-
-Status LaunchMatMulBlockScaledFp4GemvWithSwizzledScale(void* y,
-                                                       const void* a,
-                                                       const void* b_packed,
-                                                       const void* b_scale,
-                                                       const float* weight_scale_2,
-                                                       const void* bias,
-                                                       int m,
-                                                       int n,
-                                                       int k,
-                                                       int block_size,
-                                                       bool is_bf16,
-                                                       cudaStream_t stream) {
-#if defined(CUDA_VERSION) && CUDA_VERSION >= 12080
-  if (m <= 0 || n <= 0 || k <= 0) {
-    return Status::OK();
-  }
-  ORT_RETURN_IF_NOT(block_size == 16, "Swizzled-scale FP4 GEMV only supports block_size == 16.");
-  const int k_blocks = (k + block_size - 1) / block_size;
-  constexpr int kWarpsPerBlock = 8;
-  const dim3 threads{32, kWarpsPerBlock};
-  const dim3 blocks{static_cast<unsigned int>((n + kWarpsPerBlock - 1) / kWarpsPerBlock),
-                    static_cast<unsigned int>(m)};
-  const uint8_t* bp = reinterpret_cast<const uint8_t*>(b_packed);
-  const uint8_t* bs = reinterpret_cast<const uint8_t*>(b_scale);
-  if (is_bf16) {
-    MatMulBlockScaledFp4GemvKernel<nv_bfloat16, true><<<blocks, threads, 0, stream>>>(
-        reinterpret_cast<nv_bfloat16*>(y), reinterpret_cast<const nv_bfloat16*>(a), bp, bs, weight_scale_2,
-        reinterpret_cast<const nv_bfloat16*>(bias), m, n, k, k_blocks);
-  } else {
-    MatMulBlockScaledFp4GemvKernel<half, true><<<blocks, threads, 0, stream>>>(
-        reinterpret_cast<half*>(y), reinterpret_cast<const half*>(a), bp, bs, weight_scale_2,
-        reinterpret_cast<const half*>(bias), m, n, k, k_blocks);
-  }
-  return CUDA_CALL(cudaGetLastError());
-#else
-  ORT_UNUSED_PARAMETER(y);
-  ORT_UNUSED_PARAMETER(a);
-  ORT_UNUSED_PARAMETER(b_packed);
-  ORT_UNUSED_PARAMETER(b_scale);
   ORT_UNUSED_PARAMETER(weight_scale_2);
   ORT_UNUSED_PARAMETER(bias);
   ORT_UNUSED_PARAMETER(m);
