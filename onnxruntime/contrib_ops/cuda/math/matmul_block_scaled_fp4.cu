@@ -150,9 +150,9 @@ __global__ void MatMulBlockScaledFp4GemvKernel(T* __restrict__ y,
                                                int n,
                                                int k,
                                                int k_blocks) {
-  const int lane = threadIdx.x;                            // 0..31
-  const int col = blockIdx.x * blockDim.y + threadIdx.y;   // n
-  const int row = blockIdx.y;                              // m
+  const int lane = threadIdx.x;                           // 0..31
+  const int col = blockIdx.x * blockDim.y + threadIdx.y;  // n
+  const int row = blockIdx.y;                             // m
   if (row >= m || col >= n) {
     return;
   }
@@ -162,8 +162,8 @@ __global__ void MatMulBlockScaledFp4GemvKernel(T* __restrict__ y,
   const uint8_t* ws_row = weight_scale + static_cast<size_t>(col) * k_blocks;
 
   constexpr int kBlockSize = 16;
-  constexpr int kElemsPerLane = 32;             // two 16-element blocks
-  const int stride = 32 * kElemsPerLane;        // 1024 elements per warp iteration
+  constexpr int kElemsPerLane = 32;       // two 16-element blocks
+  const int stride = 32 * kElemsPerLane;  // 1024 elements per warp iteration
 
   float acc = 0.0f;
   for (int base = 0; base < k; base += stride) {

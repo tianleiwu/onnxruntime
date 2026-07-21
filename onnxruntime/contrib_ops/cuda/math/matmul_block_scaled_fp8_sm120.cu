@@ -100,8 +100,7 @@ typename Gemm::Arguments MakeArguments(const void* a_fp8,
       {reinterpret_cast<const ElementA*>(a_fp8), stride_a,
        reinterpret_cast<const ElementB*>(b_fp8), stride_b,
        scale_a, layout_sfa, scale_b, layout_sfb},
-      {{}, reinterpret_cast<ElementC*>(output_bf16), stride_c,
-       reinterpret_cast<ElementD*>(output_bf16), stride_d}};
+      {{}, reinterpret_cast<ElementC*>(output_bf16), stride_c, reinterpret_cast<ElementD*>(output_bf16), stride_d}};
   arguments.epilogue.thread.alpha = 1.0f;
   arguments.epilogue.thread.beta = 0.0f;
   return arguments;

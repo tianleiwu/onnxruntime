@@ -96,9 +96,9 @@ __global__ void MatMulBlockScaledFp8GemvKernel(const AType* __restrict__ input_a
                                                int k,
                                                int block_size,
                                                int k_blocks) {
-  const int lane = threadIdx.x;                                // 0..31
-  const int col = blockIdx.x * blockDim.y + threadIdx.y;       // n
-  const int row_base = blockIdx.y * RowsPerWarp;                // m
+  const int lane = threadIdx.x;                           // 0..31
+  const int col = blockIdx.x * blockDim.y + threadIdx.y;  // n
+  const int row_base = blockIdx.y * RowsPerWarp;          // m
   if (row_base >= m || col >= n) {
     return;
   }
@@ -248,24 +248,24 @@ Status LaunchMatMulBlockScaledFp8Gemv(const void* input_a,
                       static_cast<unsigned int>((m + RowsPerWarp - 1) / RowsPerWarp)};
     if (fp16_io && fp16_scales) {
       MatMulBlockScaledFp8GemvKernel<RowsPerWarp><<<blocks, threads, 0, stream>>>(
-        reinterpret_cast<const half*>(input_a), b,
-        reinterpret_cast<const half*>(scale_a), reinterpret_cast<const half*>(scale_b),
-        reinterpret_cast<half*>(output), m, n, k, block_size, k_blocks);
+          reinterpret_cast<const half*>(input_a), b,
+          reinterpret_cast<const half*>(scale_a), reinterpret_cast<const half*>(scale_b),
+          reinterpret_cast<half*>(output), m, n, k, block_size, k_blocks);
     } else if (fp16_io) {
       MatMulBlockScaledFp8GemvKernel<RowsPerWarp><<<blocks, threads, 0, stream>>>(
-        reinterpret_cast<const half*>(input_a), b,
-        reinterpret_cast<const float*>(scale_a), reinterpret_cast<const float*>(scale_b),
-        reinterpret_cast<half*>(output), m, n, k, block_size, k_blocks);
+          reinterpret_cast<const half*>(input_a), b,
+          reinterpret_cast<const float*>(scale_a), reinterpret_cast<const float*>(scale_b),
+          reinterpret_cast<half*>(output), m, n, k, block_size, k_blocks);
     } else if (fp16_scales) {
       MatMulBlockScaledFp8GemvKernel<RowsPerWarp><<<blocks, threads, 0, stream>>>(
-        reinterpret_cast<const __nv_fp8_e4m3*>(input_a), b,
-        reinterpret_cast<const half*>(scale_a), reinterpret_cast<const half*>(scale_b),
-        reinterpret_cast<__nv_bfloat16*>(output), m, n, k, block_size, k_blocks);
+          reinterpret_cast<const __nv_fp8_e4m3*>(input_a), b,
+          reinterpret_cast<const half*>(scale_a), reinterpret_cast<const half*>(scale_b),
+          reinterpret_cast<__nv_bfloat16*>(output), m, n, k, block_size, k_blocks);
     } else {
       MatMulBlockScaledFp8GemvKernel<RowsPerWarp><<<blocks, threads, 0, stream>>>(
-        reinterpret_cast<const __nv_fp8_e4m3*>(input_a), b,
-        reinterpret_cast<const float*>(scale_a), reinterpret_cast<const float*>(scale_b),
-        reinterpret_cast<__nv_bfloat16*>(output), m, n, k, block_size, k_blocks);
+          reinterpret_cast<const __nv_fp8_e4m3*>(input_a), b,
+          reinterpret_cast<const float*>(scale_a), reinterpret_cast<const float*>(scale_b),
+          reinterpret_cast<__nv_bfloat16*>(output), m, n, k, block_size, k_blocks);
     }
   };
 
