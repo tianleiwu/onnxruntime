@@ -69,6 +69,7 @@
   onnxruntime_filter_cuda_cu_sources(onnxruntime_cuda_contrib_ops_cu_srcs)
   onnxruntime_extract_sm_specific_cuda_sources(onnxruntime_cuda_contrib_ops_cu_srcs
     SM90_SOURCES onnxruntime_cuda_sm90_tma_srcs
+    SM100_SOURCES onnxruntime_cuda_sm100_tma_srcs
     SM120_SOURCES onnxruntime_cuda_sm120_tma_srcs
   )
   onnxruntime_extract_flash_attention_sources(onnxruntime_cuda_contrib_ops_cu_srcs
@@ -565,6 +566,27 @@
             CUDA_ARCHITECTURES "90a-real"
             NVCC_THREADS "${onnxruntime_NVCC_THREADS}"
             SOURCES ${_ort_sm90_all_srcs})
+          # The blockwise-scaled FP8 GEMM SM90 fast path (matmul_block_scaled_fp8_sm90.cu) is part of
+          # the SM90 OBJECT library. Enable its dispatch in the parent provider translation units.
+          target_compile_definitions(onnxruntime_providers_cuda PRIVATE ORT_ENABLE_BLOCKQUANT_SM90)
+          if(TARGET onnxruntime_providers_cuda_obj)
+            target_compile_definitions(onnxruntime_providers_cuda_obj PRIVATE ORT_ENABLE_BLOCKQUANT_SM90)
+          endif()
+        endif()
+      endif()
+
+      # Blackwell (SM100) blockwise-scaled FP8 GEMM fast path. Compiled at 100a-real in a dedicated
+      # OBJECT library only when an SM100 architecture is targeted.
+      if(onnxruntime_cuda_sm100_tma_srcs AND "100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+        onnxruntime_add_cuda_object_library(
+          NAME onnxruntime_providers_cuda_sm100_blockquant
+          PARENT onnxruntime_providers_cuda
+          CUDA_ARCHITECTURES "100a-real"
+          NVCC_THREADS "${onnxruntime_NVCC_THREADS}"
+          SOURCES ${onnxruntime_cuda_sm100_tma_srcs})
+        target_compile_definitions(onnxruntime_providers_cuda PRIVATE ORT_ENABLE_BLOCKQUANT_SM100)
+        if(TARGET onnxruntime_providers_cuda_obj)
+          target_compile_definitions(onnxruntime_providers_cuda_obj PRIVATE ORT_ENABLE_BLOCKQUANT_SM100)
         endif()
       endif()
 

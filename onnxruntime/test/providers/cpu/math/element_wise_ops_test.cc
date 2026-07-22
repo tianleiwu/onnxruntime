@@ -11,6 +11,7 @@
 #include "test/common/cuda_op_test_utils.h"
 #include "test/common/trt_op_test_utils.h"
 #include "test/common/random_generator.h"
+#include "test/unittest_util/conversion.h"
 #include "core/util/math.h"
 #include <algorithm>
 #include <limits>
@@ -28,13 +29,6 @@
 
 namespace onnxruntime {
 namespace test {
-
-std::vector<MLFloat16> MakeMLFloat16(const std::initializer_list<float>& input) {
-  std::vector<MLFloat16> output;
-  std::transform(input.begin(), input.end(), std::back_inserter(output),
-                 [](float fl) { return MLFloat16(fl); });
-  return output;
-}
 
 void TestBinaryFloat16(const char* op_name,
                        const std::vector<int64_t>& lhs_dim,

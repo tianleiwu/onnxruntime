@@ -2996,6 +2996,44 @@ ONNX_MS_OPERATOR_SET_SCHEMA(GemmFloat8, 1,
                                   updateOutputShape(ctx, 0, {first_input_shape.dim(transA ? 1 : 0), second_input_shape.dim(transB ? 0 : 1)});
                                 }));
 
+ONNX_MS_OPERATOR_SET_SCHEMA(MatMulBlockScaledFp8, 1,
+                            OpSchema()
+                                .SetDoc(R"DOC(Blockwise-scaled FP8 E4M3 matrix multiplication with a block-quantized weight tensor.)DOC")
+                                .Attr(
+                                    "block_size",
+                                    "Number of K values covered by one scale. The default is 128.",
+                                    AttributeProto::INT,
+                                    static_cast<int64_t>(128))
+                                .Input(0, "A", "Row-major FP8 E4M3 or FP16 activation tensor of shape [..., K].", "TA")
+                                .Input(1, "B", "Row-major FP8 E4M3 tensor of shape [N, K].", "TB")
+                                .Input(2, "scaleA", "FP32 or FP16 activation scales of shape [M, ceil(K / block_size)], where M is the product of A's leading dimensions.", "TS")
+                                .Input(3, "scaleB", "FP32 or FP16 scales of shape [N, ceil(K / block_size)].", "TS")
+                                .Output(0, "Y", "BF16 output for FP8 A or FP16 output for FP16 A, of shape [..., N].", "TY")
+                                .TypeConstraint("TA", {"tensor(float8e4m3fn)", "tensor(float16)"}, "Constrain A to FP8 E4M3 or FP16.")
+                                .TypeConstraint("TB", {"tensor(float8e4m3fn)"}, "Constrain B to FP8 E4M3.")
+                                .TypeConstraint("TS", {"tensor(float)", "tensor(float16)"}, "Constrain both scales to FP32 or FP16.")
+                                .TypeConstraint("TY", {"tensor(bfloat16)", "tensor(float16)"}, "Constrain output to BF16 or FP16.")
+                                .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
+                                  if (!hasNInputShapes(ctx, 2)) {
+                                    return;
+                                  }
+                                  const auto& a_shape = getInputShape(ctx, 0);
+                                  const auto& b_shape = getInputShape(ctx, 1);
+                                  if (a_shape.dim_size() < 1 || b_shape.dim_size() != 2) {
+                                    fail_shape_inference("A must have rank at least 1 and B must have rank 2.");
+                                  }
+                                  if (a_shape.dim(a_shape.dim_size() - 1).has_dim_value() && b_shape.dim(1).has_dim_value() &&
+                                      a_shape.dim(a_shape.dim_size() - 1).dim_value() != b_shape.dim(1).dim_value()) {
+                                    fail_shape_inference("A and B have incompatible K dimensions.");
+                                  }
+                                  ONNX_NAMESPACE::TensorShapeProto output_shape;
+                                  for (int i = 0; i < a_shape.dim_size() - 1; ++i) {
+                                    *output_shape.add_dim() = a_shape.dim(i);
+                                  }
+                                  *output_shape.add_dim() = b_shape.dim(0);
+                                  updateOutputShape(ctx, 0, output_shape);
+                                }));
+
 ONNX_MS_OPERATOR_SET_SCHEMA(
     MatMulBlockScaledFp4, 1,
     OpSchema()

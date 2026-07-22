@@ -4,7 +4,7 @@
 # --------------------------------------------------------------------------
 
 """
-Accuracy and latency harness for the CUDA MatMulBlockScaledFp4 contrib op.
+Accuracy and latency harness for CUDA MatMulBlockScaledFp8 and MatMulBlockScaledFp4.
 
 The script builds a single-node com.microsoft contrib-op model, binds CUDA tensors with
 I/O binding, compares the output with an FP32 dequantized reference, and prints one JSON
@@ -12,12 +12,12 @@ record per case. It is intended for opt-in Blackwell profiling, not for normal C
 
 Examples:
   python profile_matmul_block_scaled.py --suite smoke
+  python profile_matmul_block_scaled.py --op fp8 --m 32 --n 4096 --k 4096 --repeat 200
   python profile_matmul_block_scaled.py --op fp4 --activation-dtype bf16 --m 1 --n 4096 --k 4096 --bias
-  python profile_matmul_block_scaled.py --op fp4 --m 16 --n 11008 --k 4096 --repeat 200
 
 For kernel-level evidence, wrap a representative case with nsys:
   nsys profile -t cuda,nvtx -o block_scaled --export=sqlite \
-      python profile_matmul_block_scaled.py --op fp4 --m 16 --n 4096 --k 4096
+      python profile_matmul_block_scaled.py --op fp8 --m 32 --n 4096 --k 4096
 """
 
 from __future__ import annotations
@@ -53,6 +53,7 @@ RESULT_PREFIX = "MATMUL_BLOCK_SCALED_RESULT "
 _TORCH_TO_ONNX = {
     torch.float16: TensorProto.FLOAT16,
     torch.bfloat16: TensorProto.BFLOAT16,
+    torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else torch.uint8: TensorProto.FLOAT8E4M3FN,
 }
 _FP4_POS_VALUES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
 
@@ -64,6 +65,7 @@ class Case:
     n: int
     k: int
     activation_dtype: str
+    scale_dtype: str = "fp32"
     block_size: int | None = None
     bias: bool = False
     seed: int = 0
@@ -87,6 +89,10 @@ def _torch_dtype(name: str) -> torch.dtype:
         return torch.float16
     if name == "bf16":
         return torch.bfloat16
+    if name == "fp8":
+        if not hasattr(torch, "float8_e4m3fn"):
+            raise RuntimeError("torch.float8_e4m3fn is required for FP8 activation cases.")
+        return torch.float8_e4m3fn
     raise ValueError(f"Unsupported dtype: {name}")
 
 
@@ -133,6 +139,61 @@ def _model_bytes(nodes, graph_inputs, graph_outputs, initializers, name: str) ->
         opset_imports=[helper.make_opsetid("com.microsoft", 1), helper.make_opsetid("", 17)],
     )
     return model.SerializeToString()
+
+
+def _make_fp8_model(case: Case, b_fp8: torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor) -> bytes:
+    activation_onnx_type = _onnx_dtype(case.activation_dtype)
+    output_onnx_type = TensorProto.BFLOAT16 if case.activation_dtype == "fp8" else TensorProto.FLOAT16
+    scale_onnx_type = TensorProto.FLOAT16 if case.scale_dtype == "fp16" else TensorProto.FLOAT
+    block_size = case.block_size or 128
+
+    node = helper.make_node(
+        "MatMulBlockScaledFp8",
+        ["A", "B", "scaleA", "scaleB"],
+        ["Y"],
+        domain="com.microsoft",
+        block_size=block_size,
+    )
+    initializers = [
+        helper.make_tensor("B", TensorProto.FLOAT8E4M3FN, [case.n, case.k], _raw_uint8(b_fp8), raw=True),
+        _make_float_initializer("scaleA", scale_a, scale_onnx_type),
+        _make_float_initializer("scaleB", scale_b, scale_onnx_type),
+    ]
+    graph_inputs = [helper.make_tensor_value_info("A", activation_onnx_type, [case.m, case.k])]
+    graph_outputs = [helper.make_tensor_value_info("Y", output_onnx_type, [case.m, case.n])]
+    return _model_bytes([node], graph_inputs, graph_outputs, initializers, "MatMulBlockScaledFp8_Profile")
+
+
+def _fp8_reference(
+    a: torch.Tensor,
+    b_fp8: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    output_dtype: torch.dtype,
+    block_size: int,
+) -> torch.Tensor:
+    k_blocks = math.ceil(a.shape[1] / block_size)
+    result = torch.zeros((a.shape[0], b_fp8.shape[0]), dtype=torch.float32, device=a.device)
+    a_f32 = a.float()
+    b_f32 = b_fp8.float()
+    scale_a_f32 = scale_a.float()
+    scale_b_f32 = scale_b.float()
+    for block in range(k_blocks):
+        start = block * block_size
+        end = min(start + block_size, a.shape[1])
+        a_block = a_f32[:, start:end] * scale_a_f32[:, block : block + 1]
+        b_block = b_f32[:, start:end] * scale_b_f32[:, block : block + 1]
+        result += a_block @ b_block.T
+    return result.to(output_dtype).float()
+
+
+def _fp8_expected_path(case: Case) -> str:
+    block_size = case.block_size or 128
+    if case.m > 0 and case.m <= 8 and case.k % 16 == 0 and block_size % 16 == 0:
+        return "fp8_gemv"
+    if case.activation_dtype == "fp8" and block_size == 128 and case.k % block_size == 0 and case.n % 16 == 0:
+        return "sm120_blockwise_fp8_gemm"
+    return "fp8_scalar_fallback"
 
 
 def _quantize_fp4(weight: torch.Tensor, block_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -232,7 +293,24 @@ def _fp4_expected_path(case: Case) -> str:
 def _make_inputs(case: Case) -> tuple[bytes, torch.Tensor, torch.Tensor, str]:
     generator = torch.Generator(device="cuda")
     generator.manual_seed(case.seed)
-    block_size = case.block_size or 16
+    block_size = case.block_size or (128 if case.op == "fp8" else 16)
+
+    if case.op == "fp8":
+        b_float = torch.randn((case.n, case.k), generator=generator, device="cuda", dtype=torch.float32) * 0.75
+        b_fp8 = b_float.to(torch.float8_e4m3fn).contiguous()
+        k_blocks = math.ceil(case.k / block_size)
+        scale_dtype = torch.float16 if case.scale_dtype == "fp16" else torch.float32
+        scale_a = (torch.rand((case.m, k_blocks), generator=generator, device="cuda") * 1.5 + 0.25).to(scale_dtype)
+        scale_b = (torch.rand((case.n, k_blocks), generator=generator, device="cuda") * 1.5 + 0.25).to(scale_dtype)
+        if case.activation_dtype == "fp8":
+            a = (torch.randn((case.m, case.k), generator=generator, device="cuda") * 0.75).to(torch.float8_e4m3fn)
+            output_dtype = torch.bfloat16
+        else:
+            a = (torch.randn((case.m, case.k), generator=generator, device="cuda") * 0.75).to(torch.float16)
+            output_dtype = torch.float16
+        model = _make_fp8_model(case, b_fp8, scale_a, scale_b)
+        reference = _fp8_reference(a, b_fp8, scale_a, scale_b, output_dtype, block_size)
+        return model, a.contiguous(), reference, _fp8_expected_path(case)
 
     activation_dtype = _torch_dtype(case.activation_dtype)
     a = (torch.randn((case.m, case.k), generator=generator, device="cuda") * 0.75).to(activation_dtype).contiguous()
@@ -299,7 +377,9 @@ def _summarize_times(times_ms: list[float]) -> dict[str, float]:
 
 def run_case(case: Case, warmup: int, repeat: int, atol: float, rtol: float) -> dict[str, Any]:
     model, a, reference, expected_path = _make_inputs(case)
-    output_dtype = _torch_dtype(case.activation_dtype)
+    output_dtype = (
+        torch.bfloat16 if case.op == "fp8" and case.activation_dtype == "fp8" else _torch_dtype(case.activation_dtype)
+    )
     y = torch.empty((case.m, case.n), dtype=output_dtype, device="cuda")
     session = _make_session(model)
     times_ms = _run_timed(session, a, y, warmup, repeat)
@@ -314,8 +394,9 @@ def run_case(case: Case, warmup: int, repeat: int, atol: float, rtol: float) -> 
         "m": case.m,
         "n": case.n,
         "k": case.k,
-        "block_size": case.block_size or 16,
+        "block_size": case.block_size or (128 if case.op == "fp8" else 16),
         "activation_dtype": case.activation_dtype,
+        "scale_dtype": case.scale_dtype if case.op == "fp8" else None,
         "bias": case.bias,
         "expected_path": expected_path,
         "passed": passed,
@@ -338,6 +419,7 @@ def _default_cases(args) -> list[Case]:
                 n=args.n,
                 k=args.k,
                 activation_dtype=args.activation_dtype,
+                scale_dtype=args.scale_dtype,
                 block_size=args.block_size,
                 bias=args.bias,
                 seed=args.seed,
@@ -345,33 +427,48 @@ def _default_cases(args) -> list[Case]:
         ]
 
     cases = []
+    include_fp8 = args.op in ("all", "fp8")
+    include_fp4 = args.op in ("all", "fp4")
     if args.suite == "smoke":
-        cases.extend(
-            [
-                Case("fp4", 1, 80, 256, "fp16", bias=True, seed=args.seed + 3),
-                Case("fp4", 32, 128, 256, "bf16", bias=False, seed=args.seed + 4),
-            ]
-        )
+        if include_fp8:
+            cases.extend(
+                [
+                    Case("fp8", 1, 80, 256, "fp8", seed=args.seed),
+                    Case("fp8", 32, 128, 256, "fp8", seed=args.seed + 1),
+                    Case("fp8", 16, 80, 256, "fp16", scale_dtype="fp16", seed=args.seed + 2),
+                ]
+            )
+        if include_fp4:
+            cases.extend(
+                [
+                    Case("fp4", 1, 80, 256, "fp16", bias=True, seed=args.seed + 3),
+                    Case("fp4", 32, 128, 256, "bf16", bias=False, seed=args.seed + 4),
+                ]
+            )
         return cases
 
     matrix_ms = [1, 2, 4, 8] if args.suite == "decode" else [16, 32, 64, 128]
-    matrix_shapes = [(4096, 4096), (4096, 11008)]
+    matrix_shapes = [(4096, 4096), (4096, 11008)] if args.suite != "smoke" else [(256, 128)]
     for k, n in matrix_shapes:
-        cases.extend(
-            Case("fp4", m, n, k, args.activation_dtype, bias=args.bias, seed=args.seed + 100 + m) for m in matrix_ms
-        )
+        if include_fp8:
+            cases.extend(Case("fp8", m, n, k, "fp8", seed=args.seed + m) for m in matrix_ms)
+        if include_fp4:
+            cases.extend(
+                Case("fp4", m, n, k, args.activation_dtype, bias=args.bias, seed=args.seed + 100 + m) for m in matrix_ms
+            )
     return cases
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Profile the CUDA block-scaled FP4 MatMul contrib op")
-    parser.add_argument("--op", choices=["fp4"], default="fp4")
+    parser = argparse.ArgumentParser(description="Profile CUDA block-scaled FP8/FP4 MatMul contrib ops")
+    parser.add_argument("--op", choices=["fp8", "fp4", "all"], default="all")
     parser.add_argument("--suite", choices=["smoke", "decode", "prefill"], default="smoke")
     parser.add_argument("--m", type=int, help="M rows for single-case mode")
     parser.add_argument("--n", type=int, help="N columns for single-case mode")
     parser.add_argument("--k", type=int, help="K reduction dimension for single-case mode")
     parser.add_argument("--block-size", type=int, help="Override block_size attribute")
-    parser.add_argument("--activation-dtype", choices=["fp16", "bf16"], default="fp16")
+    parser.add_argument("--activation-dtype", choices=["fp8", "fp16", "bf16"], default="fp8")
+    parser.add_argument("--scale-dtype", choices=["fp32", "fp16"], default="fp32")
     parser.add_argument("--bias", action="store_true", help="Enable FP4 bias")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=50)
@@ -387,6 +484,12 @@ def main() -> None:
     single_case_args = [args.m is not None, args.n is not None, args.k is not None]
     if any(single_case_args) and not all(single_case_args):
         raise ValueError("Single-case mode requires all of --m, --n and --k.")
+    if all(single_case_args) and args.op == "all":
+        raise ValueError("Single-case mode requires --op fp8 or --op fp4, not --op all.")
+    if all(single_case_args) and args.op == "fp8" and args.activation_dtype == "bf16":
+        raise ValueError("FP8 MatMulBlockScaledFp8 supports fp8 or fp16 activation_dtype.")
+    if args.op in ("all", "fp4") and args.activation_dtype == "fp8":
+        args.activation_dtype = "fp16"
 
     results = [run_case(case, args.warmup, args.repeat, args.atol, args.rtol) for case in _default_cases(args)]
     failures = [result for result in results if not result["passed"]]
