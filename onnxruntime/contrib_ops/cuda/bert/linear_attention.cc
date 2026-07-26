@@ -121,10 +121,25 @@ Status LinearAttention<T>::ComputeInternal(OpKernelContext* context) const {
   TensorShape state_shape({batch_size, kv_num_heads_, d_k, d_v});
   Tensor* present_state_tensor = context->Output(1, state_shape);
 
-  // If past_state is nullptr, zero-init present_state on device
+  // Optional per-position state output(2): present_state_all [B, seq_len, H_kv, d_k, d_v].
+  // Only allocated/populated when the node actually has a 3rd output; otherwise the
+  // launcher receives nullptr and the kernels skip all per-position writes (zero overhead).
+  T* present_state_all_data = nullptr;
+  if (context->OutputCount() > 2) {
+    TensorShape state_all_shape({batch_size, seq_len, kv_num_heads_, d_k, d_v});
+    Tensor* present_state_all_tensor = context->Output(2, state_all_shape);
+    if (present_state_all_tensor != nullptr) {
+      present_state_all_data = present_state_all_tensor->MutableData<T>();
+    }
+  }
+
+  T* present_state_data = present_state_tensor->MutableData<T>();
+  const T* initial_state_data = present_state_data;
+
+  // If past_state is nullptr, zero-init the buffer used as the initial state.
   if (past_state_tensor == nullptr) {
     CUDA_RETURN_IF_ERROR(cudaMemsetAsync(
-        present_state_tensor->MutableData<T>(), 0,
+        present_state_data, 0,
         static_cast<size_t>(batch_size) * kv_num_heads_ * d_k * d_v * sizeof(T),
         Stream(context)));
   } else {
@@ -136,13 +151,7 @@ Status LinearAttention<T>::ComputeInternal(OpKernelContext* context) const {
                     past_shape[2] == d_k && past_shape[3] == d_v,
                 "past_state shape mismatch: expected (", batch_size, ", ", kv_num_heads_, ", ", d_k, ", ", d_v,
                 "), got (", past_shape[0], ", ", past_shape[1], ", ", past_shape[2], ", ", past_shape[3], ")");
-    // Copy past_state -> present_state (will be updated in-place by kernel)
-    CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        present_state_tensor->MutableData<T>(),
-        past_state_tensor->Data<T>(),
-        static_cast<size_t>(batch_size) * kv_num_heads_ * d_k * d_v * sizeof(T),
-        cudaMemcpyDeviceToDevice,
-        Stream(context)));
+    initial_state_data = past_state_tensor->Data<T>();
   }
 
   typedef typename OrtToCudaType<T>::type CudaT;
@@ -155,7 +164,8 @@ Status LinearAttention<T>::ComputeInternal(OpKernelContext* context) const {
       decay_tensor ? reinterpret_cast<const CudaT*>(decay_tensor->Data<T>()) : nullptr,
       beta_tensor ? reinterpret_cast<const CudaT*>(beta_tensor->Data<T>()) : nullptr,
       reinterpret_cast<CudaT*>(output_tensor->MutableData<T>()),
-      reinterpret_cast<CudaT*>(present_state_tensor->MutableData<T>()),
+      reinterpret_cast<const CudaT*>(initial_state_data),
+      reinterpret_cast<CudaT*>(present_state_data),
       batch_size,
       seq_len,
       q_num_heads_,
@@ -169,7 +179,8 @@ Status LinearAttention<T>::ComputeInternal(OpKernelContext* context) const {
       needs_beta,
       beta_per_head,
       needs_retrieval,
-      GetDeviceProp().maxThreadsPerBlock);
+      GetDeviceProp().maxThreadsPerBlock,
+      reinterpret_cast<CudaT*>(present_state_all_data));
 }
 
 }  // namespace cuda

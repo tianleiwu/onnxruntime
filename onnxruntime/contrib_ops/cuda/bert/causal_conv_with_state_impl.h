@@ -28,7 +28,8 @@ Status LaunchCausalConvWithStateKernel(
     int seq_len,
     int kernel_size,
     bool apply_silu,
-    int max_threads_per_block);
+    int max_threads_per_block,
+    T* present_state_all = nullptr);  // [B, seq_len, C, K-1] optional per-position state
 
 }  // namespace cuda
 }  // namespace contrib

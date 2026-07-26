@@ -16,13 +16,14 @@ namespace cuda {
 template <typename T>
 Status LaunchLinearAttentionKernel(
     cudaStream_t stream,
-    const T* query,    // [B, T, H_q * d_k]
-    const T* key,      // [B, T, n_k * d_k]
-    const T* value,    // [B, T, H_kv * d_v]
-    const T* decay,    // [B, T, H_kv] or [B, T, H_kv * d_k] or nullptr
-    const T* beta,     // [B, T, H_kv] or [B, T, 1] or nullptr
-    T* output,         // [B, T, max(H_q, H_kv) * d_v]
-    T* present_state,  // [B, H_kv, d_k, d_v] -- in-place (caller pre-fills from past)
+    const T* query,       // [B, T, H_q * d_k]
+    const T* key,         // [B, T, n_k * d_k]
+    const T* value,       // [B, T, H_kv * d_v]
+    const T* decay,       // [B, T, H_kv] or [B, T, H_kv * d_k] or nullptr
+    const T* beta,        // [B, T, H_kv] or [B, T, 1] or nullptr
+    T* output,            // [B, T, max(H_q, H_kv) * d_v]
+    const T* past_state,  // [B, H_kv, d_k, d_v] -- may alias present_state
+    T* present_state,     // [B, H_kv, d_k, d_v]
     int batch_size,
     int seq_len,
     int q_num_heads,
@@ -36,7 +37,8 @@ Status LaunchLinearAttentionKernel(
     bool needs_beta,
     bool beta_per_head,
     bool needs_retrieval,
-    int max_threads_per_block);
+    int max_threads_per_block,
+    T* present_state_all = nullptr);  // [B, T, H_kv, d_k, d_v] optional per-position state
 
 }  // namespace cuda
 }  // namespace contrib

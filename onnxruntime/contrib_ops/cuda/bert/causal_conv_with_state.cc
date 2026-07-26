@@ -90,6 +90,18 @@ Status CausalConvWithState<T>::ComputeInternal(OpKernelContext* context) const {
   TensorShape state_shape({batch_size, channels, pad});
   Tensor* present_state_tensor = context->Output(1, state_shape);
 
+  // Optional per-position state output(2): present_state_all [B, seq_len, C, K-1].
+  // Only allocated/populated when the node actually has a 3rd output; otherwise the
+  // launcher receives nullptr and the kernels skip all per-position writes (zero overhead).
+  T* present_state_all_data = nullptr;
+  if (context->OutputCount() > 2) {
+    TensorShape state_all_shape({batch_size, L, channels, pad});
+    Tensor* present_state_all_tensor = context->Output(2, state_all_shape);
+    if (present_state_all_tensor != nullptr) {
+      present_state_all_data = present_state_all_tensor->MutableData<T>();
+    }
+  }
+
   // Note: no need to zero-initialize present_state — the kernel writes all
   // positions unconditionally.  When past_state is null, the kernel uses
   // zeros for the padding region internally.
@@ -112,7 +124,8 @@ Status CausalConvWithState<T>::ComputeInternal(OpKernelContext* context) const {
       L,
       K,
       apply_silu,
-      GetDeviceProp().maxThreadsPerBlock);
+      GetDeviceProp().maxThreadsPerBlock,
+      reinterpret_cast<CudaT*>(present_state_all_data));
 }
 
 }  // namespace cuda
