@@ -114,27 +114,71 @@ __global__ void AddBiasKernel(T* __restrict__ y, const T* __restrict__ bias, int
 //
 // __nv_cvt_fp4x2_to_halfraw2() is emulated in software on pre-Blackwell parts and
 // costs ~10 ALU ops per pair, which dominates the decode GEMV below (measured 3.5x
-// slowdown on H200). Instead build the target float directly from the code bits:
-// for c = s e1 e0 m the pattern (s << 15) | ((c & 7) << <mantissa_msb_shift>) has
-// exponent field == e and mantissa == m/2, i.e. exactly value * 2^-(bias - 1).
-// Multiplying by 2^(bias - 1) afterwards recovers the value, and the e == 0
-// subnormal encodings fall out correctly as well. Verified exhaustively against the
-// intrinsic for all 256 packed byte values, for both half and bfloat16.
+// slowdown on H200). E2M1 has only eight magnitudes {0, 0.5, 1, 1.5, 2, 3, 4, 6},
+// so the 16-bit float bit pattern is built directly with a `prmt.b32` byte-select
+// from packed magnitude constants plus a shifted sign bit. One prmt performs *four*
+// magnitude lookups at once, so a whole 32-bit weight word (eight codes) decodes in
+// ~14 instructions instead of ~48 for the per-byte bit-twiddling it replaces. This
+// matters because the GEMV is instruction-issue bound, not bandwidth bound (it runs
+// at 1.57 TB/s = 33% of H200 HBM peak).
+//
+// The magnitude bytes below are the exact half/bf16 encodings of the eight FP4
+// values, so the decoded value is bit-identical to the previous path (which produced
+// value * 2^-(bias - 1) and multiplied by 2^(bias - 1) afterwards) and to the
+// __nv_cvt_fp4x2_to_halfraw2() intrinsic. The scalar fallback keeps the host-side
+// build working and is used when inline PTX is unavailable.
+//
+// Shared with the QMoE FP4 GEMV; see Fp4I2FConverter in
+// contrib_ops/cuda/llm/fpA_intB_gemv/details.h for the same decode.
 template <typename T>
 struct Fp4Cvt;
 
 template <>
 struct Fp4Cvt<half> {
   using T2 = half2;
-  static __device__ __forceinline__ T2 Raw(uint32_t b) {
-    const uint32_t lo = ((b & 0x07u) << 9) | ((b & 0x08u) << 12);
-    const uint32_t hi = ((b & 0x70u) << 5) | ((b & 0x80u) << 8);
-    const uint32_t bits = lo | (hi << 16);
-    T2 r;
-    memcpy(&r, &bits, sizeof(r));
-    return r;
+
+  // Decodes four consecutive E2M1 codes. `mag_sel` holds the four 3-bit magnitudes as the four
+  // low nibbles (bit 3 cleared so prmt stays in byte-select mode rather than sign-replicate
+  // mode); `sgn_sel` holds the four sign bits as 0/1 nibbles.
+  static __device__ __forceinline__ void DecodeQuad(uint32_t mag_sel, uint32_t sgn_sel,
+                                                    T2& lo2, T2& hi2) {
+#if defined(__CUDA_ARCH__)
+    // Sign bytes: nibble 0 -> 0x00, nibble 1 -> 0x80 (bit 7 of the half high byte).
+    uint32_t sb;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(sb) : "r"(0x00008000u), "r"(0u), "r"(sgn_sel));
+    // half high byte per magnitude (low byte is always 0):
+    //   codes 0..3 -> {0x00, 0x38, 0x3C, 0x3E}, codes 4..7 -> {0x40, 0x42, 0x44, 0x46}.
+    uint32_t hb;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(hb) : "r"(0x3E3C3800u), "r"(0x46444240u), "r"(mag_sel));
+    hb |= sb;
+    // Expand {b0,b1,b2,b3} to {0,b0,0,b1} and {0,b2,0,b3}, pulling the zero low bytes from the
+    // second (all-zero) prmt operand.
+    uint32_t lo, hi;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(lo) : "r"(hb), "r"(0u), "n"(0x1404));
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(hi) : "r"(hb), "r"(0u), "n"(0x3424));
+    memcpy(&lo2, &lo, sizeof(lo2));
+    memcpy(&hi2, &hi, sizeof(hi2));
+#else
+    ScalarDecodeQuad(mag_sel, sgn_sel, lo2, hi2);
+#endif
   }
-  static __device__ __forceinline__ T2 Scale() { return __float2half2_rn(16384.0f); }  // 2^14
+
+  static __device__ __forceinline__ void ScalarDecodeQuad(uint32_t mag_sel, uint32_t sgn_sel,
+                                                          T2& lo2, T2& hi2) {
+    constexpr uint16_t kMag[8] = {0x0000u, 0x3800u, 0x3C00u, 0x3E00u,
+                                  0x4000u, 0x4200u, 0x4400u, 0x4600u};
+    uint16_t e[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      e[i] = static_cast<uint16_t>(kMag[(mag_sel >> (4 * i)) & 0x7u] |
+                                   (((sgn_sel >> (4 * i)) & 0x1u) << 15));
+    }
+    const uint32_t lo = static_cast<uint32_t>(e[0]) | (static_cast<uint32_t>(e[1]) << 16);
+    const uint32_t hi = static_cast<uint32_t>(e[2]) | (static_cast<uint32_t>(e[3]) << 16);
+    memcpy(&lo2, &lo, sizeof(lo2));
+    memcpy(&hi2, &hi, sizeof(hi2));
+  }
+
   static __device__ __forceinline__ T2 Mul(T2 a, T2 b) { return __hmul2(a, b); }
   static __device__ __forceinline__ float2 ToFloat2(T2 v) { return __half22float2(v); }
 };
@@ -142,17 +186,45 @@ struct Fp4Cvt<half> {
 template <>
 struct Fp4Cvt<nv_bfloat16> {
   using T2 = nv_bfloat162;
-  static __device__ __forceinline__ T2 Raw(uint32_t b) {
-    const uint32_t lo = ((b & 0x07u) << 6) | ((b & 0x08u) << 12);
-    const uint32_t hi = ((b & 0x70u) << 2) | ((b & 0x80u) << 8);
-    const uint32_t bits = lo | (hi << 16);
-    T2 r;
-    memcpy(&r, &bits, sizeof(r));
-    return r;
+
+  static __device__ __forceinline__ void DecodeQuad(uint32_t mag_sel, uint32_t sgn_sel,
+                                                    T2& lo2, T2& hi2) {
+#if defined(__CUDA_ARCH__)
+    uint32_t sb;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(sb) : "r"(0x00008000u), "r"(0u), "r"(sgn_sel));
+    // bf16 high byte {0x00,0x3F,0x3F,0x3F, 0x40,0x40,0x40,0x40} and
+    //      low  byte {0x00,0x00,0x80,0xC0, 0x00,0x40,0x80,0xC0}.
+    uint32_t hb, lb;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(hb) : "r"(0x3F3F3F00u), "r"(0x40404040u), "r"(mag_sel));
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(lb) : "r"(0xC0800000u), "r"(0xC0804000u), "r"(mag_sel));
+    hb |= sb;
+    // bf16 needs both bytes: interleave low/high bytes of elements 0,1 and 2,3.
+    uint32_t lo, hi;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(lo) : "r"(lb), "r"(hb), "n"(0x5140));
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(hi) : "r"(lb), "r"(hb), "n"(0x7362));
+    memcpy(&lo2, &lo, sizeof(lo2));
+    memcpy(&hi2, &hi, sizeof(hi2));
+#else
+    ScalarDecodeQuad(mag_sel, sgn_sel, lo2, hi2);
+#endif
   }
-  static __device__ __forceinline__ T2 Scale() {
-    return __float2bfloat162_rn(85070591730234615865843651857942052864.0f);  // 2^126
+
+  static __device__ __forceinline__ void ScalarDecodeQuad(uint32_t mag_sel, uint32_t sgn_sel,
+                                                          T2& lo2, T2& hi2) {
+    constexpr uint16_t kMag[8] = {0x0000u, 0x3F00u, 0x3F80u, 0x3FC0u,
+                                  0x4000u, 0x4040u, 0x4080u, 0x40C0u};
+    uint16_t e[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      e[i] = static_cast<uint16_t>(kMag[(mag_sel >> (4 * i)) & 0x7u] |
+                                   (((sgn_sel >> (4 * i)) & 0x1u) << 15));
+    }
+    const uint32_t lo = static_cast<uint32_t>(e[0]) | (static_cast<uint32_t>(e[1]) << 16);
+    const uint32_t hi = static_cast<uint32_t>(e[2]) | (static_cast<uint32_t>(e[3]) << 16);
+    memcpy(&lo2, &lo, sizeof(lo2));
+    memcpy(&hi2, &hi, sizeof(hi2));
   }
+
   static __device__ __forceinline__ T2 Mul(T2 a, T2 b) { return __hmul2(a, b); }
   static __device__ __forceinline__ float2 ToFloat2(T2 v) { return __bfloat1622float2(v); }
 };
@@ -182,7 +254,6 @@ __global__ void MatMulBlockQuantizedFp4WeightGemvKernel(T* __restrict__ y,
   const uint8_t* b_row = b_packed + static_cast<size_t>(col) * (k >> 1);
   const uint8_t* ws_row = weight_scale + static_cast<size_t>(col) * k_blocks;
 
-  const T2 up = Cvt::Scale();
   constexpr int kBlockSize = 16;
   constexpr int kElemsPerLane = 32;       // two 16-element blocks
   const int stride = 32 * kElemsPerLane;  // 1024 elements per warp iteration
@@ -192,7 +263,7 @@ __global__ void MatMulBlockQuantizedFp4WeightGemvKernel(T* __restrict__ y,
     const int koff = base + lane * kElemsPerLane;
     if (koff < k) {
       const uint4 packed = *reinterpret_cast<const uint4*>(b_row + (koff >> 1));
-      const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&packed);
+      const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
 
       const uint4* ap = reinterpret_cast<const uint4*>(a_row + koff);
       uint4 a0 = ap[0], a1 = ap[1], a2 = ap[2], a3 = ap[3];
@@ -200,16 +271,20 @@ __global__ void MatMulBlockQuantizedFp4WeightGemvKernel(T* __restrict__ y,
                          reinterpret_cast<const T2*>(&a2), reinterpret_cast<const T2*>(&a3)};
 
       // fp32 accumulation per 16-element scale block, matching the reference path.
-      float p0 = 0.0f;
-      float p1 = 0.0f;
+      // Each 32-bit weight word holds 8 codes = 4 T2 pairs; words 0/1 cover the first
+      // 16-element scale block and words 2/3 the second.
+      float p[2] = {0.0f, 0.0f};
 #pragma unroll
-      for (int i = 0; i < 16; ++i) {
-        const T2 bb = Cvt::Mul(Cvt::Raw(bytes[i]), up);
-        const float2 pv = Cvt::ToFloat2(Cvt::Mul(av[i >> 2][i & 3], bb));
-        if (i < 8) {
-          p0 += pv.x + pv.y;
-        } else {
-          p1 += pv.x + pv.y;
+      for (int w = 0; w < 4; ++w) {
+        const uint32_t mag = words[w] & 0x77777777u;
+        const uint32_t sgn = (words[w] >> 3) & 0x11111111u;
+        T2 b2[4];
+        Cvt::DecodeQuad(mag, sgn, b2[0], b2[1]);
+        Cvt::DecodeQuad(mag >> 16, sgn >> 16, b2[2], b2[3]);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const float2 pv = Cvt::ToFloat2(Cvt::Mul(av[w][j], b2[j]));
+          p[w >> 1] += pv.x + pv.y;
         }
       }
 
@@ -219,7 +294,7 @@ __global__ void MatMulBlockQuantizedFp4WeightGemvKernel(T* __restrict__ y,
           static_cast<__nv_fp8_storage_t>(ws_row[kb0]), __NV_E4M3));
       const float s1 = __half2float(__nv_cvt_fp8_to_halfraw(
           static_cast<__nv_fp8_storage_t>(ws_row[kb1]), __NV_E4M3));
-      acc += p0 * s0 + p1 * s1;
+      acc += p[0] * s0 + p[1] * s1;
     }
   }
 
