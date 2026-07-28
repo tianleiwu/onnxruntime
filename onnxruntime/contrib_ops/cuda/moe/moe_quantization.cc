@@ -45,10 +45,10 @@ void LogQMoESwigluFusionRemapOnce() {
 void LogQMoEFp4DualLayoutOnce() {
   static std::once_flag log_info;
   std::call_once(log_info, []() {
-    LOGS_DEFAULT(INFO) << "QMoE MXFP4: ORT_QMOE_FP4_LOW_MEMORY=0 requested, keeping a second "
-                          "GEMV-native copy of the e2m1 expert weights alongside the SM80 "
-                          "grouped-GEMM layout. This doubles the persistent MoE weight footprint; "
-                          "unset it to let the decode GEMV un-permute the SM80 layout in-register.";
+    LOGS_DEFAULT(INFO) << "QMoE MXFP4: this expert shape is outside the interleaved GEMV rules, so "
+                          "the decode GEMV needs its own copy of the e2m1 weights alongside the "
+                          "SM80 grouped-GEMM layout. This doubles the persistent MoE weight "
+                          "footprint; shapes with k % 64 == 0 and n % 16 == 0 avoid it.";
   });
 }
 
@@ -302,18 +302,6 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
         // consumer of the raw [E, K, N/2] e2m1 initializer) is unreachable. Let PrePack release the
         // initializer instead of pinning ~9 GiB of dead device memory for a 20B-class MXFP4 MoE.
         release_fp4_raw_weights_ = true;
-        // Prefill needs the SM80 pair-interleaved layout; the decode GEMV un-permutes that same
-        // buffer in-register (Fp4KernelDetailsSm80Pair), so one copy of the e2m1 weights serves
-        // both regimes. PrePack only falls back to a second, GEMV-native copy when the shape
-        // misses the interleaved rules (see is_moe_gemv_fp4_sm80_layout_supported) or when this
-        // override forces it:
-        //   ORT_QMOE_FP4_LOW_MEMORY=0 -> always keep both layouts (pre-converter behavior)
-        //   unset / anything else     -> single layout wherever the GEMV supports it
-        force_fp4_gemv_decode_copy_ =
-            onnxruntime::ParseEnvironmentVariableWithDefault<int64_t>("ORT_QMOE_FP4_LOW_MEMORY", -1) == 0;
-        if (force_fp4_gemv_decode_copy_) {
-          LogQMoEFp4DualLayoutOnce();
-        }
       }
       // Capture the fused MXFP4 GEMV autotune knobs once here (at op-construction time) instead of
       // re-reading the environment on every inference call, so a session's autotune behavior cannot
@@ -1822,10 +1810,10 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
     // initializer remains available for the dequant fallback used by shapes the GEMV does not
     // support. When the SM80 grouped-GEMM
     // port is enabled (MXFP4 only), force the SM80 CUTLASS ColumnMajorTileInterleave layout
-    // so this buffer feeds the prefill grouped GEMM. The decode GEMV normally reads that same
-    // buffer and inverts the nibble pair-interleave in-register, so no second copy is needed;
-    // only when the shape misses the interleaved GEMV rules (or ORT_QMOE_FP4_LOW_MEMORY=0 forces
-    // it) do we pack a dedicated GEMV-native copy into gemv_fp4_fc1_weights_decode_. NVFP4
+    // so this buffer feeds the prefill grouped GEMM. The decode GEMV reads that same buffer and
+    // inverts the nibble pair-interleave in-register (Fp4KernelDetailsSm80Pair), so one copy of
+    // the e2m1 weights serves both regimes; only when the shape misses the interleaved GEMV rules
+    // do we pack a dedicated GEMV-native copy into gemv_fp4_fc1_weights_decode_. NVFP4
     // (block 16) has no native/SM80 path and always uses the plain ColToRow layout the
     // non-interleaved GEMV consumes.
     const bool nvfp4 = (quant_type_ == "nvfp4");
@@ -1835,11 +1823,14 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
     bool local_packed = false;
     PrePackRepackFP4Weights(tensor, stream, alloc, gemv_fp4_fc1_weights_, local_packed,
                             use_interleave, /*sm80_pair_interleave=*/sm80_pair);
-    if (sm80_pair && !force_fp4_gemv_decode_copy_) {
+    if (sm80_pair) {
       // Raw initializer is [E, K, N/2]; the GEMV problem is n = N, k = K.
       const auto& raw_shape = tensor.Shape();
       gemv_fp4_fc1_reads_sm80_layout_ = onnxruntime::llm::kernels::moe_gemv::is_moe_gemv_fp4_sm80_layout_supported(
           raw_shape[2] * 2, raw_shape[1], /*group_size=*/32);
+      if (!gemv_fp4_fc1_reads_sm80_layout_) {
+        LogQMoEFp4DualLayoutOnce();
+      }
     }
     if (enable_fp4_sm80_gemm_ && !gemv_fp4_fc1_reads_sm80_layout_) {
       bool decode_packed = false;
@@ -1861,10 +1852,13 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
     bool local_packed = false;
     PrePackRepackFP4Weights(tensor, stream, alloc, gemv_fp4_fc2_weights_, local_packed,
                             use_interleave, /*sm80_pair_interleave=*/sm80_pair);
-    if (sm80_pair && !force_fp4_gemv_decode_copy_) {
+    if (sm80_pair) {
       const auto& raw_shape = tensor.Shape();
       gemv_fp4_fc2_reads_sm80_layout_ = onnxruntime::llm::kernels::moe_gemv::is_moe_gemv_fp4_sm80_layout_supported(
           raw_shape[2] * 2, raw_shape[1], /*group_size=*/32);
+      if (!gemv_fp4_fc2_reads_sm80_layout_) {
+        LogQMoEFp4DualLayoutOnce();
+      }
     }
     if (enable_fp4_sm80_gemm_ && !gemv_fp4_fc2_reads_sm80_layout_) {
       bool decode_packed = false;

@@ -166,16 +166,10 @@ class QMoE final : public CudaKernel, public MoEBase {
   // ``session.use_device_allocator_for_initializers = 1``; otherwise it is merely recycled inside
   // the arena for later activation/KV allocations.
   bool release_fp4_raw_weights_ = false;
-  // When true, PrePack allocates a SECOND (ColToRow / steps-1-3) copy of the e2m1 weights for the
-  // decode GEMV even on shapes where the GEMV could decode the SM80 pair-interleaved buffer
-  // directly, doubling the persistent MXFP4 weight footprint (~9 GiB -> ~18 GiB for a 20B-class
-  // MoE). Off by default; set ORT_QMOE_FP4_LOW_MEMORY=0 to restore the two-layout behavior for
-  // A/B comparisons or for shapes the pair-interleaved GEMV does not cover.
-  bool force_fp4_gemv_decode_copy_ = false;
   // Set by PrePack (per weight tensor) when the decode GEMV will read the SM80 pair-interleaved
   // buffer in gemv_fp4_fc*_weights_ instead of a dedicated gemv_fp4_fc*_weights_decode_ copy.
-  // False when SM80 GEMM is off (gemv_fp4_fc*_weights_ is already GEMV-native), when the shape
-  // misses the interleaved rules, or when force_fp4_gemv_decode_copy_ is set.
+  // False when SM80 GEMM is off (gemv_fp4_fc*_weights_ is already GEMV-native) or when the shape
+  // misses the interleaved rules.
   bool gemv_fp4_fc1_reads_sm80_layout_ = false;
   bool gemv_fp4_fc2_reads_sm80_layout_ = false;
   // When native CUTLASS WFP4A16 is enabled, GEMV is also pre-packed and used for decode shapes
