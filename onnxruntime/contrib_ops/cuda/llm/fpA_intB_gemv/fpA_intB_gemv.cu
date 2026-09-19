@@ -47,10 +47,12 @@ void kernel_launcher(int kernel_arch, Params& params, cudaStream_t s) {
 #if USE_COMPACT_FPA_INTB_GEMM
   ORT_ENFORCE(kernel_arch < 90 || kernel_arch >= 100,
               "The compact fpA_intB GEMV does not support the SM90 weight layout");
-  ORT_ENFORCE(params.type == KernelType::FP16Int8Groupwise || params.type == KernelType::FP16Int4Groupwise,
+  ORT_ENFORCE(params.type == KernelType::FP16Int8Groupwise || params.type == KernelType::FP16Int4Groupwise ||
+                  params.type == KernelType::FP16Int2Groupwise,
               "The compact fpA_intB GEMV supports only FP16 groupwise kernels");
   EXEC(KernelType::FP16Int8Groupwise, FP16DetailsA, Int8DetailsW, ColumnMajorInterleaved, true);
   EXEC(KernelType::FP16Int4Groupwise, FP16DetailsA, Int4DetailsW, ColumnMajorInterleaved, true);
+  EXEC(KernelType::FP16Int2Groupwise, FP16DetailsA, Int2DetailsW, ColumnMajorInterleaved, true);
 #else
   if (kernel_arch < 80) {
     EXEC(KernelType::FP16Int8Groupwise, FP16DetailsA, Int8DetailsW, ColumnMajorInterleaved, true);
