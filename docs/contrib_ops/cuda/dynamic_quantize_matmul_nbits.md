@@ -1903,6 +1903,124 @@ weights are not a valid common benchmark in this checkout: MatMulNBits
 terminates with integer divide-by-zero for the first K=2048, block=2048 case,
 matching the limitation already observed on H200.
 
+#### 8.15.2 Prepacked W2/W4/W8 versus prepacked MatMulNBits on H200
+
+`weight_prepacked=1` accepts W2 block 64, W4 block 32, and W8 block 32.
+This experiment compares the three variants that consume the SM80 fpA_intB
+layout, so each pair of prepacked variants reads byte-identical weights.
+
+Setup:
+
+- Hardware and build: one NVIDIA H200 (SM90), CUDA 13.0 source build of the
+  commit that introduced W2/W8 prepacked dispatch (compact fpA_intB tactic set),
+  and the SM90 grouped path left enabled for the standard-layout Dynamic
+  baseline.
+- Operators, all FP16 A/Y, FP16 scales, no bias, constant weights/scales:
+  `dyn_std` is DynamicQuantizeMatMulNBits with standard blobs, `dyn_pre` is
+  DynamicQuantizeMatMulNBits with `weight_prepacked=1`, and `mnb_pre` is
+  MatMulNBits with `weight_prepacked=1` and `accuracy_level=0`.
+- Activations use `dynamic_per_token`, so each row is one activation interval.
+  Random uniform uint8 weight bytes, scales in [0.001, 0.01], normal A,
+  seed 0.
+- Shapes: K=N=4096 and the Qwen qkv shape K=5120, N=6144. M in
+  {1, 8, 9, 16, 32, 64, 128, 512}.
+- Timing: CUDA-event median over nine trials of 100 replays after 20 warmups,
+  with ORT CUDA Graph enabled and a shared user compute stream. The two
+  shapes ran concurrently on different GPUs. Times are device latency in
+  microseconds.
+- Correctness: `dyn_pre` output equals `dyn_std` bit-for-bit in all 48 cases.
+  The last column is the relative RMSE of `dyn_pre` against `mnb_pre`; it is
+  the expected activation-quantization error, not a kernel mismatch.
+
+Reproduction (the script lives in the author's dev scripts, not in this
+repository; it reuses the numpy SM80 packer from
+`test_dynamic_quantize_matmul_nbits.py`):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=$ORT_BUILD python bench_prepacked.py \
+    --ort-root $ORT_ROOT --shapes 4096x4096 --out b1.json
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=$ORT_BUILD python bench_prepacked.py \
+    --ort-root $ORT_ROOT --shapes 5120x6144 --out b2.json
+```
+
+**K=4096, N=4096**
+
+| Width | M | Standard Dynamic (us) | Prepacked Dynamic (us) | Prepacked MatMulNBits (us) | MatMulNBits / prepacked Dynamic | Dynamic RMSE vs MatMulNBits |
+|---|---|---|---|---|---|---|
+| W2 b64 | 1 | 26.0 | 31.7 | 12.6 | 0.40x | 1.02% |
+| W2 b64 | 8 | 25.5 | 31.8 | 19.4 | 0.61x | 0.92% |
+| W2 b64 | 9 | 27.7 | 32.4 | 26.1 | 0.81x | 0.91% |
+| W2 b64 | 16 | 26.1 | 33.6 | 26.6 | 0.79x | 0.86% |
+| W2 b64 | 32 | 25.4 | 33.7 | 27.6 | 0.82x | 0.88% |
+| W2 b64 | 64 | 24.8 | 39.5 | 32.0 | 0.81x | 0.87% |
+| W2 b64 | 128 | 29.1 | 58.6 | 37.1 | 0.63x | 0.85% |
+| W2 b64 | 512 | 82.2 | 181.4 | 93.4 | 0.51x | 0.86% |
+| W4 b32 | 1 | 37.9 | 40.6 | 15.5 | 0.38x | 1.00% |
+| W4 b32 | 8 | 38.0 | 38.5 | 17.6 | 0.46x | 0.92% |
+| W4 b32 | 9 | 36.9 | 39.3 | 28.0 | 0.71x | 0.86% |
+| W4 b32 | 16 | 36.3 | 40.7 | 28.2 | 0.69x | 0.89% |
+| W4 b32 | 32 | 37.4 | 41.2 | 29.4 | 0.71x | 0.88% |
+| W4 b32 | 64 | 36.4 | 52.3 | 33.4 | 0.64x | 0.86% |
+| W4 b32 | 128 | 42.7 | 82.1 | 39.0 | 0.47x | 0.87% |
+| W4 b32 | 512 | 125.8 | 273.9 | 101.0 | 0.37x | 0.87% |
+| W8 b32 | 1 | 37.9 | 39.0 | 14.5 | 0.37x | 0.90% |
+| W8 b32 | 8 | 37.4 | 39.3 | 18.1 | 0.46x | 0.88% |
+| W8 b32 | 9 | 37.3 | 39.4 | 27.2 | 0.69x | 0.82% |
+| W8 b32 | 16 | 37.7 | 38.9 | 27.0 | 0.69x | 0.85% |
+| W8 b32 | 32 | 36.5 | 39.4 | 28.4 | 0.72x | 0.87% |
+| W8 b32 | 64 | 35.4 | 52.1 | 33.2 | 0.64x | 0.87% |
+| W8 b32 | 128 | 42.2 | 80.2 | 38.8 | 0.48x | 0.88% |
+| W8 b32 | 512 | 125.9 | 269.0 | 99.7 | 0.37x | 0.87% |
+
+**K=5120, N=6144**
+
+| Width | M | Standard Dynamic (us) | Prepacked Dynamic (us) | Prepacked MatMulNBits (us) | MatMulNBits / prepacked Dynamic | Dynamic RMSE vs MatMulNBits |
+|---|---|---|---|---|---|---|
+| W2 b64 | 1 | 44.0 | 37.3 | 15.0 | 0.40x | 0.88% |
+| W2 b64 | 8 | 40.2 | 37.4 | 25.2 | 0.67x | 0.94% |
+| W2 b64 | 9 | 41.4 | 36.4 | 31.1 | 0.85x | 0.81% |
+| W2 b64 | 16 | 39.8 | 38.5 | 31.3 | 0.81x | 0.87% |
+| W2 b64 | 32 | 35.9 | 45.7 | 32.8 | 0.72x | 0.91% |
+| W2 b64 | 64 | 32.7 | 57.0 | 36.7 | 0.64x | 0.88% |
+| W2 b64 | 128 | 42.9 | 95.4 | 52.7 | 0.55x | 0.88% |
+| W2 b64 | 512 | 100.3 | 323.2 | 163.9 | 0.51x | 0.87% |
+| W4 b32 | 1 | 60.4 | 48.1 | 16.7 | 0.35x | 0.92% |
+| W4 b32 | 8 | 56.6 | 45.8 | 22.6 | 0.49x | 0.90% |
+| W4 b32 | 9 | 57.6 | 46.6 | 32.3 | 0.69x | 0.87% |
+| W4 b32 | 16 | 53.8 | 48.5 | 33.2 | 0.68x | 0.89% |
+| W4 b32 | 32 | 50.3 | 62.8 | 34.0 | 0.54x | 0.88% |
+| W4 b32 | 64 | 49.6 | 81.4 | 38.5 | 0.47x | 0.89% |
+| W4 b32 | 128 | 69.3 | 142.1 | 57.4 | 0.40x | 0.87% |
+| W4 b32 | 512 | 159.2 | 500.2 | 175.7 | 0.35x | 0.88% |
+| W8 b32 | 1 | 60.4 | 45.8 | 15.3 | 0.34x | 0.88% |
+| W8 b32 | 8 | 56.3 | 46.5 | 23.8 | 0.51x | 0.88% |
+| W8 b32 | 9 | 57.6 | 46.3 | 32.0 | 0.69x | 0.90% |
+| W8 b32 | 16 | 55.0 | 47.2 | 32.4 | 0.69x | 0.90% |
+| W8 b32 | 32 | 52.0 | 64.9 | 33.4 | 0.52x | 0.89% |
+| W8 b32 | 64 | 49.8 | 81.0 | 38.5 | 0.48x | 0.88% |
+| W8 b32 | 128 | 68.6 | 142.4 | 58.2 | 0.41x | 0.89% |
+| W8 b32 | 512 | 159.4 | 493.0 | 178.1 | 0.36x | 0.88% |
+
+Findings:
+
+- Prepacked Dynamic is slower than prepacked MatMulNBits at every measured
+  point, 0.34x-0.85x. It is closest at M=9-16 (0.68x-0.85x). At M=1 it is
+  0.34x-0.40x, and at M>=128 it is 0.35x-0.63x.
+- A likely cause is the extra activation-quantization passes plus a 16-row
+  `mma.sync` tile that does not scale with M; this was not profiled. Both
+  prepacked variants read the same compact weight bytes, so weight memory
+  traffic is not the difference.
+- On SM90 the standard-layout Dynamic path uses the Hopper grouped-scale
+  kernel with a signed-INT8 weight copy made at initialization. At M>=64 that
+  path is faster than prepacked dispatch (for example W4 at M=512, K=N=4096:
+  125.8 us versus 273.9 us). At M<=16 the two are within about 25% of each other: prepacked is up
+  to 20% faster for K=5120, N=6144 and up to 25% slower for K=N=4096.
+  Prepacked dispatch on Hopper therefore mainly avoids the N*K signed-weight
+  copy and does not improve latency.
+- The prepacked path is intended for SM80/SM86, where no Hopper grouped
+  kernel exists and the standard-layout path is the slow generic kernel
+  (section 8.15.1 measured 36.8x at W4 M=8). This experiment did not run on
+  SM80/SM86 hardware, so that benefit is not re-measured for W2 and W8.
 
 ## 9. Delivery Plan and Acceptance
 
