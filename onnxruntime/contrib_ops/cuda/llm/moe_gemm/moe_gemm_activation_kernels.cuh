@@ -31,6 +31,31 @@ namespace onnxruntime::llm::kernels::cutlass_kernels {
 
 constexpr static int ACTIVATION_THREADS_PER_BLOCK = 256;
 
+// Squared ReLU (relu(x)^2), the non-gated MLP activation of Nemotron-H.
+template <typename T>
+struct ReLu2;
+
+template <>
+struct ReLu2<float> {
+  __host__ __device__ float operator()(float x) const {
+    const float r = x > 0.0f ? x : 0.0f;
+    return r * r;
+  }
+};
+
+template <int N>
+struct ReLu2<cutlass::Array<float, N>> {
+  __host__ __device__ cutlass::Array<float, N> operator()(cutlass::Array<float, N> const& x) const {
+    cutlass::Array<float, N> y;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < N; ++i) {
+      const float r = x[i] > 0.0f ? x[i] : 0.0f;
+      y[i] = r * r;
+    }
+    return y;
+  }
+};
+
 struct QuantParams;
 
 template <class ActivationOutputType, class GemmOutputType, template <class> class ActFn>
@@ -129,8 +154,9 @@ void doGatedActivation(ActivationOutputType* output, const GemmOutputType* gemm_
       case ActivationType::Gelu:
         return &doGatedActivationKernel<ActivationOutputType, GemmOutputType, GELU>;
       case ActivationType::Relu:
-      case ActivationType::Relu2:
         return &doGatedActivationKernel<ActivationOutputType, GemmOutputType, ReLu>;
+      case ActivationType::Relu2:
+        return &doGatedActivationKernel<ActivationOutputType, GemmOutputType, ReLu2>;
       case ActivationType::Identity:
       default:
         return &doGatedActivationKernel<ActivationOutputType, GemmOutputType, Identity>;
@@ -384,8 +410,9 @@ void doActivation(T* output, const GemmOutputType* gemm_result, const float* fp8
         case ActivationType::Geglu:
           return &doActivationKernel<T, GemmOutputType, ScaleBiasType, GELU, decltype(block_scaling_type)::value>;
         case ActivationType::Relu:
-        case ActivationType::Relu2:
           return &doActivationKernel<T, GemmOutputType, ScaleBiasType, ReLu, decltype(block_scaling_type)::value>;
+        case ActivationType::Relu2:
+          return &doActivationKernel<T, GemmOutputType, ScaleBiasType, ReLu2, decltype(block_scaling_type)::value>;
         case ActivationType::Silu:
         case ActivationType::Swiglu:
         case ActivationType::SwigluBias:

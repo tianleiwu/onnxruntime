@@ -2539,10 +2539,23 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
                                                                                        ? static_cast<const ScaleBiasType*>(quant_params.groupwise.fc1.weight_zeros)
                                                                                        : nullptr,
                                                                                    fc1_expert_biases, reinterpret_cast<OutputType*>(output), alpha_scale_ptr_array, /*occupancy*/ nullptr,
-                                                                                   fc1_activation_type, expanded_num_rows, /*N*/ int64_t(fc1_out_size),
+                                                                                   // Relu2 has no GEMM epilogue: run the GEMM as Identity and square-ReLU in place.
+                                                                                   fc1_activation_type == ActivationType::Relu2 ? ActivationType::Identity : fc1_activation_type,
+                                                                                   expanded_num_rows, /*N*/ int64_t(fc1_out_size),
                                                                                    /*K*/ hidden_size, num_experts_per_node, quant_params.groupwise.group_size, bias_is_broadcast,
                                                                                    /*use_fused_moe*/ false, stream, activation_params, config};
     gemm_runner.moeGemmBiasAct(universal_input, TmaWarpSpecializedGroupedGemmInput{});
+    if (fc1_activation_type == ActivationType::Relu2) {
+      if constexpr (std::is_same_v<UnfusedGemmOutputType, OutputType> && std::is_same_v<T, OutputType>) {
+        doActivation<T, UnfusedGemmOutputType, ScaleBiasType>(output, static_cast<const UnfusedGemmOutputType*>(output),
+                                               nullptr, static_cast<const ScaleBiasType*>(nullptr), bias_is_broadcast, expert_first_token_offset,
+                                               num_experts_per_node, inter_size, expanded_num_rows,
+                                               ActivationType::Relu2, quant_params, false, nullptr, stream,
+                                               activation_params);
+      } else {
+        ORT_THROW("Relu2 MoE activation is only supported for matching GEMM and activation types");
+      }
+    }
 
     sync_check_cuda_error(stream);
   } else {

@@ -1517,7 +1517,7 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
     OpSchema()
         .SetDoc(qMoE_ver1_doc)
         .Attr("activation_type",
-              "Activation function to use. Choose from relu, gelu, silu, swiglu and identity. Default is relu",
+              "Activation function to use. Choose from relu, relu2 (squared ReLU, CUDA EP only), gelu, silu, swiglu and identity. Default is relu",
               AttributeProto::STRING,
               std::string("relu"))
         .Attr("k",
